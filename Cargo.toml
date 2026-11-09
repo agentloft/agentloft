@@ -43,6 +43,16 @@ base64 = "0.22"
 ignore = "0.4"
 portable-pty = "0.9"
 
+# embedded browser (loft-browser, macOS): versions match wry's objc2 stack
+wry = { version = "0.57.1", default-features = false }
+objc2 = "0.6.3"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSString", "NSError", "NSData", "NSDictionary", "NSValue", "NSGeometry", "NSObject", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSView", "NSResponder", "NSWindow", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKContentWorld", "WKFrameInfo", "WKSnapshotConfiguration", "WKBackForwardList", "WKBackForwardListItem"] }
+base64 = "0.22"
+url = "2"
+
 # misc
 anyhow = "1"
 thiserror = "2"

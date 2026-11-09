@@ -1,0 +1,956 @@
+//! [`BrowserView`]: toolbar, native web view, and the automation entry point.
+
+use crate::address::{DEFAULT_SEARCH_TEMPLATE, SchemePolicy, normalize_address, scheme_policy};
+use crate::command::{
+    BrowserCommand, BrowserError, EVAL_TIMEOUT, NAVIGATION_TIMEOUT, SCRIPT_TIMEOUT,
+};
+use crate::native::{JsWorld, LoadMark, NativeEvent, NativeWebView, PageState};
+use crate::script::{self, Helper};
+use crate::snapshot::{MAX_SNAPSHOT_CHARS, PageSnapshot, format_snapshot};
+use crate::surface::Surface;
+use base64::Engine as _;
+use futures::StreamExt as _;
+use futures::future::{Either, select};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::{
+    App, AppContext as _, BackgroundExecutor, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render,
+    SharedString, Styled as _, Subscription, Task, Window, actions, div,
+    prelude::FluentBuilder as _, px, relative,
+};
+use serde_json::{Value, json};
+use std::future::Future;
+use std::pin::pin;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+actions!(
+    loft_browser,
+    [GoBack, GoForward, ReloadPage, StopLoading, FocusAddressBar]
+);
+
+const KEY_CONTEXT: &str = "BrowserView";
+const TOOLBAR_HEIGHT: f32 = 40.;
+/// How often the view re-reads URL/title/progress while a page loads, and
+/// while idle (catches `pushState` URL changes and focus moves).
+const BUSY_POLL: Duration = Duration::from_millis(100);
+const IDLE_POLL: Duration = Duration::from_millis(400);
+/// Cap on the JSON text `Eval` returns.
+const MAX_EVAL_CHARS: usize = 100_000;
+
+/// Binds the browser's shortcuts (active while the view has focus).
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-l", FocusAddressBar, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-r", ReloadPage, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-[", GoBack, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-]", GoForward, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-.", StopLoading, Some(KEY_CONTEXT)),
+    ]);
+}
+
+/// Emitted as the page changes, whoever caused it (user, page or agent).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserEvent {
+    UrlChanged(String),
+    TitleChanged(String),
+    LoadingChanged(bool),
+}
+
+/// An embedded browser: a gpui-kit toolbar over a native web view that an
+/// agent can drive with [`BrowserView::execute`].
+pub struct BrowserView {
+    focus_handle: FocusHandle,
+    native: Option<Rc<NativeWebView>>,
+    /// Why there is no native view (unsupported platform, creation error).
+    unavailable: Option<SharedString>,
+    address: Entity<InputState>,
+    /// The user is typing in the address bar; don't overwrite it.
+    editing_address: bool,
+    /// Text to put in the address bar on the next render.
+    pending_address: Option<String>,
+    page: PageState,
+    visible: bool,
+    /// Error banner under the toolbar (bad address, failed or blocked load).
+    notice: Option<SharedString>,
+    /// The last host-initiated load, to explain it if it fails.
+    host_load: Option<(LoadMark, String)>,
+    search_template: String,
+    _tasks: Vec<Task<()>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<BrowserEvent> for BrowserView {}
+
+impl Focusable for BrowserView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl BrowserView {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let address =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter address"));
+        let (events_tx, mut events_rx) = futures::channel::mpsc::unbounded();
+        let (native, unavailable) = match NativeWebView::new(window, events_tx) {
+            Ok(native) => (Some(Rc::new(native)), None),
+            Err(err) => {
+                tracing::warn!("loft-browser: no native web view: {err:#}");
+                (None, Some(SharedString::from(format!("{err:#}"))))
+            }
+        };
+
+        let subscriptions = vec![
+            cx.subscribe_in(&address, window, Self::on_address_event),
+            // GPUI focus left the page (a shortcut, another panel): hand
+            // AppKit key focus back to GPUI as well.
+            cx.on_blur(&focus_handle, window, |this, _, _| {
+                if let Some(native) = &this.native {
+                    native.release_focus();
+                }
+            }),
+        ];
+
+        let mut tasks = Vec::new();
+        if native.is_some() {
+            // WebKit delegate callbacks only enqueue events; apply them here,
+            // outside any GPUI update.
+            tasks.push(cx.spawn_in(window, async move |this, cx| {
+                while let Some(event) = events_rx.next().await {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.on_native_event(event, window, cx)
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+            tasks.push(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    let Ok(delay) = this.update_in(cx, |this, window, cx| this.sync(window, cx))
+                    else {
+                        break;
+                    };
+                    cx.background_executor().timer(delay).await;
+                }
+            }));
+        }
+
+        Self {
+            focus_handle,
+            native,
+            unavailable,
+            address,
+            editing_address: false,
+            pending_address: None,
+            page: PageState::default(),
+            visible: true,
+            notice: None,
+            host_load: None,
+            search_template: DEFAULT_SEARCH_TEMPLATE.to_owned(),
+            _tasks: tasks,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Navigates to a URL or address-bar style input (bare words search).
+    /// Invalid or blocked input shows a notice instead.
+    pub fn navigate(&mut self, url: &str, cx: &mut Context<Self>) {
+        let result = normalize_address(url, &self.search_template)
+            .and_then(|url| self.load_url(url.as_str(), cx));
+        if let Err(err) = result {
+            self.notice = Some(err.to_string().into());
+            cx.notify();
+        }
+    }
+
+    /// The current page URL, once a page has loaded.
+    pub fn url(&self) -> Option<&str> {
+        self.page.url.as_deref()
+    }
+
+    /// The current page title, if it has one.
+    pub fn title(&self) -> Option<&str> {
+        self.page.title.as_deref().filter(|t| !t.is_empty())
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.page.loading
+    }
+
+    /// Shows or hides the web view. A hidden view keeps its page and can
+    /// still be driven by [`Self::execute`]. Independently of this flag the
+    /// native view is hidden whenever the element is not painted.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            if !visible && let Some(native) = &self.native {
+                native.set_hidden(true);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The search URL template for bare words; `{}` is the encoded query.
+    pub fn set_search_template(&mut self, template: impl Into<String>) {
+        self.search_template = template.into();
+    }
+
+    /// Focuses and selects the address bar.
+    pub fn focus_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(native) = &self.native {
+            native.release_focus();
+        }
+        self.address.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    /// Gives the page keyboard focus, as clicking into it would.
+    pub fn focus_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+        if let Some(native) = &self.native {
+            native.focus();
+        }
+    }
+
+    /// Runs one automation command. The task resolves with a JSON result
+    /// (see the crate docs for each command's shape) or an error that
+    /// downcasts to [`BrowserError`].
+    pub fn execute(
+        &mut self,
+        cmd: BrowserCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Value>> {
+        let Some(native) = self.native.clone() else {
+            let reason = self
+                .unavailable
+                .as_ref()
+                .map_or("no web view".into(), |s| s.to_string());
+            return Task::ready(Err(BrowserError::Unsupported(reason).into()));
+        };
+        let executor = cx.background_executor().clone();
+        tracing::debug!(action = cmd.action(), "loft-browser: execute");
+
+        let spawn = |cx: &mut Context<Self>, fut: std::pin::Pin<Box<dyn Future<Output = Result<Value, BrowserError>>>>| {
+            cx.spawn(async move |_, _| fut.await.map_err(anyhow::Error::from))
+        };
+
+        match cmd {
+            BrowserCommand::Navigate { url } => {
+                let target = match normalize_address(&url, &self.search_template) {
+                    Ok(url) => url.to_string(),
+                    Err(err) => return Task::ready(Err(err.into())),
+                };
+                let mark = match self.load_url(&target, cx) {
+                    Ok(mark) => mark,
+                    Err(err) => return Task::ready(Err(err.into())),
+                };
+                spawn(
+                    cx,
+                    Box::pin(async move {
+                        wait_for_load(&native, &executor, mark, &target).await?;
+                        Ok(page_summary(&native))
+                    }),
+                )
+            }
+            BrowserCommand::Back | BrowserCommand::Forward | BrowserCommand::Reload => {
+                let state = native.state();
+                let mark = native.load_mark();
+                let what = match cmd {
+                    BrowserCommand::Back if !state.can_go_back => {
+                        return Task::ready(Err(BrowserError::Action(
+                            "there is no previous page in the history".into(),
+                        )
+                        .into()));
+                    }
+                    BrowserCommand::Forward if !state.can_go_forward => {
+                        return Task::ready(Err(BrowserError::Action(
+                            "there is no next page in the history".into(),
+                        )
+                        .into()));
+                    }
+                    BrowserCommand::Back => {
+                        native.go_back();
+                        "the previous page".to_owned()
+                    }
+                    BrowserCommand::Forward => {
+                        native.go_forward();
+                        "the next page".to_owned()
+                    }
+                    _ => {
+                        native.reload();
+                        state.url.unwrap_or_else(|| "the page".into())
+                    }
+                };
+                self.notice = None;
+                cx.notify();
+                spawn(
+                    cx,
+                    Box::pin(async move {
+                        wait_for_load(&native, &executor, mark, &what).await?;
+                        Ok(page_summary(&native))
+                    }),
+                )
+            }
+            BrowserCommand::Snapshot => spawn(
+                cx,
+                Box::pin(async move {
+                    let raw = run_helper(&native, &executor, Helper::Snapshot, json!({})).await?;
+                    let snapshot: PageSnapshot = serde_json::from_value(raw)
+                        .map_err(|e| BrowserError::Script(format!("unreadable snapshot: {e}")))?;
+                    let formatted = format_snapshot(&snapshot, MAX_SNAPSHOT_CHARS);
+                    Ok(json!({
+                        "url": snapshot.url,
+                        "title": snapshot.title,
+                        "snapshot": formatted.text,
+                        "refs": formatted.refs_total,
+                        "truncated": formatted.truncated,
+                    }))
+                }),
+            ),
+            BrowserCommand::Click { ref_id } => spawn(
+                cx,
+                Box::pin(interact(
+                    native,
+                    executor,
+                    Helper::Click,
+                    json!({ "ref": ref_id }),
+                    Some(ref_id),
+                )),
+            ),
+            BrowserCommand::Type {
+                ref_id,
+                text,
+                submit,
+            } => spawn(
+                cx,
+                Box::pin(interact(
+                    native,
+                    executor,
+                    Helper::Type,
+                    json!({ "ref": ref_id, "text": text, "submit": submit }),
+                    Some(ref_id),
+                )),
+            ),
+            BrowserCommand::Press { key } => spawn(
+                cx,
+                Box::pin(interact(
+                    native,
+                    executor,
+                    Helper::Press,
+                    json!({ "key": key }),
+                    None,
+                )),
+            ),
+            BrowserCommand::Scroll { dy } => spawn(
+                cx,
+                Box::pin(async move {
+                    let raw =
+                        run_helper(&native, &executor, Helper::Scroll, json!({ "dy": dy })).await?;
+                    action_result(raw, None)
+                }),
+            ),
+            BrowserCommand::Eval { script } => spawn(
+                cx,
+                Box::pin(async move { eval(&native, &executor, &script).await }),
+            ),
+            BrowserCommand::Screenshot => spawn(
+                cx,
+                Box::pin(async move {
+                    let shot = with_timeout(
+                        native.screenshot(),
+                        SCRIPT_TIMEOUT,
+                        &executor,
+                        "taking a screenshot",
+                    )
+                    .await?
+                    .map_err(|_| BrowserError::Closed)?
+                    .map_err(|e| BrowserError::Action(format!("screenshot failed: {e}")))?;
+                    Ok(json!({
+                        "mime_type": "image/png",
+                        "width": shot.width,
+                        "height": shot.height,
+                        "scale": shot.scale,
+                        "data": base64::engine::general_purpose::STANDARD.encode(&shot.png),
+                    }))
+                }),
+            ),
+        }
+    }
+
+    // -- internals --------------------------------------------------------------
+
+    fn load_url(&mut self, url: &str, cx: &mut Context<Self>) -> Result<LoadMark, BrowserError> {
+        let Some(native) = &self.native else {
+            return Err(BrowserError::Unsupported(
+                self.unavailable
+                    .as_ref()
+                    .map_or("no web view".into(), |s| s.to_string()),
+            ));
+        };
+        let mark = native.load_mark();
+        native
+            .load(url)
+            .map_err(|e| BrowserError::NavigationFailed(format!("{e:#}")))?;
+        self.notice = None;
+        self.host_load = Some((mark, url.to_owned()));
+        if !self.editing_address {
+            self.pending_address = Some(url.to_owned());
+        }
+        cx.notify();
+        Ok(mark)
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(native) = &self.native
+            && self.page.can_go_back
+        {
+            native.go_back();
+            self.notice = None;
+            cx.notify();
+        }
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(native) = &self.native
+            && self.page.can_go_forward
+        {
+            native.go_forward();
+            self.notice = None;
+            cx.notify();
+        }
+    }
+
+    fn reload_or_stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(native) = &self.native {
+            if self.page.loading {
+                native.stop();
+            } else {
+                native.reload();
+                self.notice = None;
+            }
+            cx.notify();
+        }
+    }
+
+    fn on_native_event(&mut self, event: NativeEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            NativeEvent::Load | NativeEvent::TitleChanged | NativeEvent::Blocked(_) => {
+                self.sync(window, cx);
+            }
+            NativeEvent::OpenInPlace(url) => {
+                // Pages may open http(s)/about targets; never file:.
+                if scheme_policy(&url) == SchemePolicy::Allowed
+                    && let Err(err) = self.load_url(&url, cx)
+                {
+                    tracing::warn!("loft-browser: could not open {url}: {err}");
+                }
+            }
+        }
+    }
+
+    /// Re-reads the native state, emits events for what changed, and returns
+    /// how long to wait before the next poll.
+    fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
+        let Some(native) = self.native.clone() else {
+            return IDLE_POLL;
+        };
+        let page = native.state();
+        if page != self.page {
+            if page.url != self.page.url {
+                if let Some(url) = &page.url {
+                    cx.emit(BrowserEvent::UrlChanged(url.clone()));
+                }
+                if !self.editing_address {
+                    self.pending_address = Some(page.url.clone().unwrap_or_default());
+                }
+            }
+            if page.title != self.page.title {
+                cx.emit(BrowserEvent::TitleChanged(
+                    page.title.clone().unwrap_or_default(),
+                ));
+            }
+            if page.loading != self.page.loading {
+                cx.emit(BrowserEvent::LoadingChanged(page.loading));
+            }
+            self.page = page;
+            cx.notify();
+        }
+        if !self.page.loading
+            && let Some((mark, url)) = self.host_load.take()
+        {
+            let progress = native.load_progress(mark);
+            // A finished load succeeded even if a subframe was blocked.
+            if !progress.finished && (progress.started || progress.blocked.is_some()) {
+                self.notice = Some(match progress.blocked {
+                    Some(blocked) => format!(
+                        "Blocked {blocked}: only http, https and about URLs (and files the app opens) may load"
+                    ),
+                    None => format!("Couldn't load {url}"),
+                }
+                .into());
+                cx.notify();
+            } else if !progress.started && !progress.finished {
+                // Not begun yet; check again next time.
+                self.host_load = Some((mark, url));
+            }
+        }
+        // Clicking into the page gives it AppKit key focus; mirror that in
+        // GPUI so the address bar blurs and the browser's shortcuts apply.
+        if native.is_focused() && !self.focus_handle.is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
+        if self.page.loading {
+            BUSY_POLL
+        } else {
+            IDLE_POLL
+        }
+    }
+
+    fn on_address_event(
+        &mut self,
+        state: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::PressEnter { .. } => {
+                let input = state.read(cx).value().to_string();
+                self.editing_address = false;
+                self.navigate(&input, cx);
+                window.focus(&self.focus_handle, cx);
+            }
+            InputEvent::Focus => {
+                self.editing_address = true;
+                state.update(cx, |state, cx| state.select_all(window, cx));
+            }
+            InputEvent::Blur => {
+                self.editing_address = false;
+                self.pending_address = Some(self.page.url.clone().unwrap_or_default());
+                cx.notify();
+            }
+            InputEvent::Change => {}
+        }
+    }
+}
+
+impl Render for BrowserView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.editing_address
+            && let Some(text) = self.pending_address.take()
+        {
+            let display = if text == "about:blank" {
+                String::new()
+            } else {
+                text
+            };
+            self.address
+                .update(cx, |state, cx| state.set_value(display, window, cx));
+        }
+
+        let theme = cx.theme();
+        let (background, border, muted_foreground, primary, danger) = (
+            theme.background,
+            theme.border,
+            theme.muted_foreground,
+            theme.primary,
+            theme.danger,
+        );
+        let loading = self.page.loading;
+        let progress = self.page.progress.clamp(0.08, 1.0) as f32;
+
+        let address_prefix = if loading {
+            Spinner::new()
+                .xsmall()
+                .color(muted_foreground)
+                .into_any_element()
+        } else {
+            let icon = match self.page.url.as_deref() {
+                Some(url) if url.starts_with("file:") => IconName::File,
+                _ => IconName::Globe,
+            };
+            Icon::new(icon)
+                .xsmall()
+                .text_color(muted_foreground)
+                .into_any_element()
+        };
+
+        let toolbar = h_flex()
+            .relative()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_shrink_0()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Button::new("loft-browser-back")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ArrowLeft)
+                    .accessibility_label("Back")
+                    .disabled(!self.page.can_go_back)
+                    .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
+            )
+            .child(
+                Button::new("loft-browser-forward")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ArrowRight)
+                    .accessibility_label("Forward")
+                    .disabled(!self.page.can_go_forward)
+                    .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
+            )
+            .child(
+                Button::new("loft-browser-reload")
+                    .ghost()
+                    .small()
+                    .icon(if loading {
+                        IconName::Close
+                    } else {
+                        IconName::RotateCw
+                    })
+                    .accessibility_label(if loading { "Stop" } else { "Reload" })
+                    .disabled(self.native.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.reload_or_stop(cx))),
+            )
+            .child(
+                div().flex_1().min_w_0().pl_1().child(
+                    Input::new(&self.address)
+                        .small()
+                        .prefix(address_prefix)
+                        .disabled(self.native.is_none()),
+                ),
+            )
+            .when(loading, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom(px(-1.))
+                        .h(px(2.))
+                        .w(relative(progress))
+                        .bg(primary),
+                )
+            });
+
+        let notice = self.notice.clone().map(|notice| {
+            h_flex()
+                .flex_shrink_0()
+                .px_3()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(border)
+                .text_xs()
+                .text_color(danger)
+                .child(Icon::new(IconName::TriangleAlert).xsmall())
+                .child(div().flex_1().min_w_0().truncate().child(notice))
+                .child(
+                    Button::new("loft-browser-dismiss")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .accessibility_label("Dismiss")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        })),
+                )
+        });
+
+        let content = match &self.native {
+            Some(native) => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(Surface::new(native.clone(), self.visible))
+                .into_any_element(),
+            None => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_4()
+                .text_sm()
+                .text_color(muted_foreground)
+                .child(Icon::new(IconName::Globe).large())
+                .child(self.unavailable.clone().unwrap_or_default())
+                .into_any_element(),
+        };
+
+        v_flex()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(background)
+            .on_action(cx.listener(|this, _: &GoBack, _, cx| this.go_back(cx)))
+            .on_action(cx.listener(|this, _: &GoForward, _, cx| this.go_forward(cx)))
+            .on_action(cx.listener(|this, _: &ReloadPage, _, cx| {
+                if let Some(native) = &this.native {
+                    native.reload();
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &StopLoading, _, cx| {
+                if let Some(native) = &this.native {
+                    native.stop();
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusAddressBar, window, cx| {
+                this.focus_address_bar(window, cx)
+            }))
+            .child(toolbar)
+            .children(notice)
+            .child(content)
+    }
+}
+
+// -- automation helpers (run on the foreground executor) ----------------------------
+
+fn page_summary(native: &NativeWebView) -> Value {
+    let state = native.state();
+    json!({ "url": state.url, "title": state.title.unwrap_or_default() })
+}
+
+async fn with_timeout<F: Future>(
+    fut: F,
+    after: Duration,
+    executor: &BackgroundExecutor,
+    what: &str,
+) -> Result<F::Output, BrowserError> {
+    let timer = executor.timer(after);
+    match select(pin!(fut), pin!(timer)).await {
+        Either::Left((out, _)) => Ok(out),
+        Either::Right(_) => Err(BrowserError::Timeout {
+            what: what.to_owned(),
+            after,
+        }),
+    }
+}
+
+/// Runs a helper from `agent.js` in the isolated world and parses its JSON.
+async fn run_helper(
+    native: &NativeWebView,
+    executor: &BackgroundExecutor,
+    helper: Helper,
+    args: Value,
+) -> Result<Value, BrowserError> {
+    let body = script::helper_call(helper, &args);
+    let reply = with_timeout(
+        native.call_js(&body, JsWorld::Agent),
+        SCRIPT_TIMEOUT,
+        executor,
+        "waiting for the page to run the automation script",
+    )
+    .await?
+    .map_err(|_| BrowserError::Closed)?
+    .map_err(BrowserError::Script)?
+    .ok_or_else(|| BrowserError::Script("the automation script returned nothing".into()))?;
+    serde_json::from_str(&reply)
+        .map_err(|e| BrowserError::Script(format!("unreadable automation result: {e}")))
+}
+
+/// `{ok: true, …}` → the rest of the object; `{ok: false, code, error}` → error.
+fn action_result(mut value: Value, ref_id: Option<u32>) -> Result<Value, BrowserError> {
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("ok");
+        }
+        return Ok(value);
+    }
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("the action failed")
+        .to_owned();
+    Err(match (code, ref_id) {
+        ("ref_not_found", Some(id)) => BrowserError::RefNotFound(id),
+        _ => BrowserError::Action(message),
+    })
+}
+
+/// Click/type/press: run the helper, then wait for any navigation it caused.
+async fn interact(
+    native: Rc<NativeWebView>,
+    executor: BackgroundExecutor,
+    helper: Helper,
+    args: Value,
+    ref_id: Option<u32>,
+) -> Result<Value, BrowserError> {
+    let mark = native.load_mark();
+    let url_before = native.state().url;
+    let raw = run_helper(&native, &executor, helper, args).await?;
+    let mut result = action_result(raw, ref_id)?;
+
+    // Give a navigation triggered by the action a moment to start.
+    let start = Instant::now();
+    let mut navigated = false;
+    while start.elapsed() < Duration::from_millis(500) {
+        let progress = native.load_progress(mark);
+        if progress.loading || progress.started || progress.finished {
+            navigated = true;
+            break;
+        }
+        executor.timer(Duration::from_millis(50)).await;
+    }
+    if navigated && let Err(err) = wait_for_load(&native, &executor, mark, "the new page").await {
+        result["navigation_error"] = json!(err.to_string());
+    }
+    let state = native.state();
+    result["navigated"] = json!(navigated || state.url != url_before);
+    result["url"] = json!(state.url);
+    result["title"] = json!(state.title.unwrap_or_default());
+    Ok(result)
+}
+
+/// Waits until a load that began after `mark` finishes.
+///
+/// WebKit reports start (commit) and finish, but not provisional failures,
+/// so a load that stops without finishing is reported as failed. A
+/// navigation that never starts (same-document, a no-op) succeeds after a
+/// short grace period.
+async fn wait_for_load(
+    native: &NativeWebView,
+    executor: &BackgroundExecutor,
+    mark: LoadMark,
+    what: &str,
+) -> Result<(), BrowserError> {
+    const POLL: Duration = Duration::from_millis(50);
+    const STOP_GRACE: Duration = Duration::from_millis(300);
+    const NEVER_STARTED: Duration = Duration::from_millis(1500);
+    let start = Instant::now();
+    let mut active = false;
+    let mut stopped_since: Option<Instant> = None;
+    loop {
+        let progress = native.load_progress(mark);
+        if progress.finished && !progress.loading {
+            return Ok(());
+        }
+        active |= progress.loading || progress.started;
+        if progress.loading {
+            stopped_since = None;
+        } else if active {
+            if stopped_since.get_or_insert_with(Instant::now).elapsed() >= STOP_GRACE {
+                return Err(match progress.blocked {
+                    Some(url) => BrowserError::Blocked(format!(
+                        "loading {what} was redirected to {url}, which is not an http, https or about URL"
+                    )),
+                    None => BrowserError::NavigationFailed(format!(
+                        "{what} did not load (the host could not be reached, the connection failed, \
+                         or the load was cancelled)"
+                    )),
+                });
+            }
+        } else if start.elapsed() >= NEVER_STARTED {
+            return match progress.blocked {
+                Some(url) => Err(BrowserError::Blocked(format!(
+                    "{url} is not an http, https or about URL"
+                ))),
+                None => Ok(()),
+            };
+        }
+        if start.elapsed() >= NAVIGATION_TIMEOUT {
+            let state = native.state();
+            return Err(BrowserError::Timeout {
+                what: format!(
+                    "waiting for {what} to load (still loading; currently at {})",
+                    state.url.unwrap_or_else(|| "no page".into())
+                ),
+                after: NAVIGATION_TIMEOUT,
+            });
+        }
+        executor.timer(POLL).await;
+    }
+}
+
+/// `Eval`: an expression, or an async function body if it isn't one.
+async fn eval(
+    native: &NativeWebView,
+    executor: &BackgroundExecutor,
+    script: &str,
+) -> Result<Value, BrowserError> {
+    // Compiles without running, so nothing executes twice.
+    let probe = with_timeout(
+        native.call_js(&script::eval_probe(script), JsWorld::Page),
+        SCRIPT_TIMEOUT,
+        executor,
+        "compiling the script",
+    )
+    .await?;
+    let is_expression = matches!(probe, Ok(Ok(Some(_))));
+    let body = if is_expression {
+        script::eval_expression(script)
+    } else {
+        script::eval_function_body(script)
+    };
+    let reply = with_timeout(
+        native.call_js(&body, JsWorld::Page),
+        EVAL_TIMEOUT,
+        executor,
+        "waiting for the script to finish",
+    )
+    .await?
+    .map_err(|_| BrowserError::Closed)?
+    .map_err(BrowserError::Script)?
+    .unwrap_or_else(|| "null".to_owned());
+    if reply.len() > MAX_EVAL_CHARS {
+        let mut cut = MAX_EVAL_CHARS;
+        while !reply.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return Ok(json!({
+            "truncated": true,
+            "total_chars": reply.len(),
+            "json_prefix": &reply[..cut],
+        }));
+    }
+    serde_json::from_str(&reply)
+        .map_err(|e| BrowserError::Script(format!("the result is not valid JSON: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_results() {
+        let ok = action_result(json!({"ok": true, "clicked": "link \"x\""}), Some(1)).unwrap();
+        assert_eq!(ok, json!({"clicked": "link \"x\""}));
+        assert_eq!(
+            action_result(
+                json!({"ok": false, "code": "ref_not_found", "error": "e"}),
+                Some(9)
+            ),
+            Err(BrowserError::RefNotFound(9))
+        );
+        assert_eq!(
+            action_result(
+                json!({"ok": false, "code": "disabled", "error": "button is disabled"}),
+                Some(2)
+            ),
+            Err(BrowserError::Action("button is disabled".into()))
+        );
+        assert!(matches!(
+            action_result(json!(null), None),
+            Err(BrowserError::Action(_))
+        ));
+    }
+}
