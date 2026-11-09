@@ -2381,7 +2381,63 @@ impl WorkspaceView {
         };
         let thread_id = model.thread.id.clone();
         let running = model.running_turn().is_some();
-        let waiting = model.open_requests().next().is_some();
+        // Open approvals whose card isn't on screen (a background subagent's
+        // step, or a step inside folded work) are pinned above the composer.
+        let shown_items: std::collections::HashSet<usize> = state
+            .rows
+            .iter()
+            .flat_map(|r| match r {
+                crate::store::Row::Item(i) => vec![*i],
+                crate::store::Row::ToolGroup { members } => members.clone(),
+                _ => vec![],
+            })
+            .collect();
+        let pinned: Vec<AnyElement> = model
+            .open_requests()
+            .filter(|req| {
+                let ix = req
+                    .item_id
+                    .as_ref()
+                    .and_then(|id| model.items.iter().position(|i| &i.id == id));
+                ix.is_none_or(|ix| !shown_items.contains(&ix))
+            })
+            .map(|req| {
+                // Say whose request it is when a subagent asks.
+                let from = req
+                    .item_id
+                    .as_ref()
+                    .and_then(|id| model.items.iter().find(|i| &i.id == id))
+                    .and_then(|i| i.parent_id.as_ref())
+                    .and_then(|pid| model.items.iter().find(|i| &i.id == pid))
+                    .and_then(|parent| match &parent.body {
+                        loft_protocol::ItemBody::ToolCall { title, .. } => Some(title.clone()),
+                        _ => None,
+                    });
+                v_flex()
+                    .gap_1()
+                    .children(from.map(|title| {
+                        h_flex()
+                            .gap_1p5()
+                            .px_1()
+                            .text_xs()
+                            .text_color(p.muted_foreground)
+                            .child(crate::brand::agent_logo(
+                                model.thread.harness.as_str(),
+                                px(12.),
+                                p,
+                            ))
+                            .child(format!("Subagent “{title}” asks"))
+                    }))
+                    .child(crate::items::approval_card(
+                        req,
+                        &self.store,
+                        p,
+                        &model.thread.cwd,
+                    ))
+                    .into_any_element()
+            })
+            .collect();
+        let waiting = pinned.is_empty() && model.open_requests().next().is_some();
         let empty = model.items.is_empty();
         let harness_choices = self.store.read(cx).available_harnesses();
         let known_models = self
@@ -2604,6 +2660,9 @@ impl WorkspaceView {
                         .max_w(p.content_width)
                         .gap_1()
                         .children(queued_list)
+                        .when(!pinned.is_empty(), |d| {
+                            d.child(v_flex().gap_2().pb_2().children(pinned))
+                        })
                         .when(waiting, |d| {
                             d.child(
                                 h_flex()

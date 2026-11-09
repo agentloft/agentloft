@@ -1130,7 +1130,7 @@ fn first_line(text: &str) -> Option<String> {
     (!plain.is_empty()).then(|| plain.chars().take(160).collect())
 }
 
-fn approval_card(
+pub(crate) fn approval_card(
     req: &RuntimeRequest,
     store: &Entity<AppStore>,
     p: &Palette,
