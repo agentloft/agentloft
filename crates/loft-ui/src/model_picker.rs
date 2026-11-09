@@ -145,14 +145,22 @@ impl ModelPicker {
             return;
         }
         self.highlighted = (self.highlighted as isize + delta).rem_euclid(n) as usize;
-        self.effort_cursor = None;
         self.scroll.scroll_to_item(self.highlighted);
         cx.notify();
     }
 
+    /// The model whose efforts are shown: the one in use. Hovering or
+    /// arrowing through others doesn't change it; picking one does.
+    fn effort_model<'a>(&self, snap: &'a Snapshot) -> Option<&'a ModelInfo> {
+        snap.models
+            .iter()
+            .find(|m| is_current(m, snap.current_model.as_deref()))
+            .or_else(|| snap.models.get(self.highlighted))
+    }
+
     fn move_effort(&mut self, delta: isize, cx: &mut Context<Self>) {
         let snap = self.snapshot(cx);
-        let Some(model) = snap.models.get(self.highlighted) else {
+        let Some(model) = self.effort_model(&snap) else {
             return;
         };
         if model.efforts.is_empty() {
@@ -166,16 +174,22 @@ impl ModelPicker {
         cx.notify();
     }
 
-    /// ⏎: the highlighted model with the chosen effort.
+    /// ⏎: the highlighted model, with the effort chosen with ←/→ (when
+    /// that model offers it).
     fn confirm(&mut self, cx: &mut Context<Self>) {
         let snap = self.snapshot(cx);
         let Some(model) = snap.models.get(self.highlighted).cloned() else {
             return;
         };
-        let effort = match self.effort_cursor {
-            Some(0) => Some(None),
-            Some(i) => Some(model.efforts.get(i - 1).cloned()),
-            None => None,
+        let ladder = self.effort_model(&snap).map(|m| m.efforts.clone());
+        let effort = match (self.effort_cursor, ladder) {
+            (Some(0), _) => Some(None),
+            (Some(i), Some(levels)) => levels
+                .get(i - 1)
+                .filter(|e| model.efforts.contains(e))
+                .cloned()
+                .map(Some),
+            _ => None,
         };
         self.apply(&model, effort, &snap, cx);
         cx.emit(PickerEvent::Close);
@@ -224,7 +238,7 @@ impl ModelPicker {
 
     fn pick_effort(&mut self, level: usize, cx: &mut Context<Self>) {
         let snap = self.snapshot(cx);
-        if let Some(model) = snap.models.get(self.highlighted).cloned() {
+        if let Some(model) = self.effort_model(&snap).cloned() {
             let effort = match level {
                 0 => None,
                 i => model.efforts.get(i - 1).cloned(),
@@ -378,7 +392,6 @@ impl ModelPicker {
                 .on_mouse_move(cx.listener(move |this, _, _, cx| {
                     if this.highlighted != ix {
                         this.highlighted = ix;
-                        this.effort_cursor = None;
                         cx.notify();
                     }
                 }))
@@ -396,7 +409,7 @@ impl ModelPicker {
             .border_l_1()
             .border_color(p.border)
             .p_1();
-        let Some(model) = snap.models.get(self.highlighted) else {
+        let Some(model) = self.effort_model(snap) else {
             return column.into_any_element();
         };
         let heading = h_flex()
