@@ -698,7 +698,7 @@ impl WorkspaceView {
     }
 
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let (projects, all_threads, selected, conn, error) = {
+        let (projects, all_threads, selected, conn, error, unread) = {
             let store = self.store.read(cx);
             (
                 store.workspace.projects.clone(),
@@ -706,6 +706,7 @@ impl WorkspaceView {
                 store.selected.clone(),
                 store.conn.clone(),
                 store.last_error.clone(),
+                store.unread.clone(),
             )
         };
         let query = self.query.clone();
@@ -749,6 +750,7 @@ impl WorkspaceView {
                     thread,
                     depth,
                     selected.as_ref() == Some(&thread.id),
+                    unread.contains(&thread.id),
                     p,
                     cx,
                 ));
@@ -1913,6 +1915,7 @@ fn thread_row(
     thread: &loft_protocol::Thread,
     depth: usize,
     active: bool,
+    unread: bool,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
@@ -1930,6 +1933,13 @@ fn thread_row(
         ThreadStatus::Error => Icon::new(IconName::CircleAlert)
             .xsmall()
             .text_color(p.danger)
+            .into_any_element(),
+        // Finished while you were elsewhere.
+        _ if unread => div()
+            .size(px(7.))
+            .mr_1()
+            .rounded_full()
+            .bg(p.accent)
             .into_any_element(),
         _ => div()
             .text_xs()

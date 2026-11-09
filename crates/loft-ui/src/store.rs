@@ -100,6 +100,8 @@ pub struct AppStore {
     pub last_error: Option<String>,
     /// Text to prefill a thread's composer with (a fork's handoff digest).
     pub drafts: HashMap<ThreadId, String>,
+    /// Threads that finished a turn while not selected (sidebar dot).
+    pub unread: std::collections::HashSet<ThreadId>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
@@ -124,6 +126,7 @@ impl AppStore {
             queued: HashMap::new(),
             last_error: None,
             drafts: HashMap::new(),
+            unread: Default::default(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
             daemon_pid: None,
@@ -264,6 +267,7 @@ impl AppStore {
                     }
                 } else if Some(sub_id) == self.ws_sub {
                     self.workspace.apply_snapshot(snapshot);
+                    self.refresh_badge();
                     // Reopen the most recently active thread on launch.
                     if self.selected.is_none()
                         && let Some(first) = self
@@ -284,7 +288,19 @@ impl AppStore {
             }
             ClientEvent::Event { sub_id, event } => {
                 if Some(sub_id) == self.ws_sub {
+                    let before = match &event.event {
+                        Event::ThreadUpdated { thread } => self
+                            .workspace
+                            .threads
+                            .iter()
+                            .find(|t| t.id == thread.id)
+                            .map(|t| t.status),
+                        _ => None,
+                    };
                     if self.workspace.apply_event(&event) {
+                        if let Event::ThreadUpdated { thread } = &event.event {
+                            self.on_status_change(&thread.id, before, thread.status, cx);
+                        }
                         cx.notify();
                     }
                 } else if let Some(id) = self.subs.get(&sub_id).cloned()
@@ -324,6 +340,38 @@ impl AppStore {
         }
     }
 
+    /// Unread dots, the Dock badge and bounce for thread status changes.
+    fn on_status_change(
+        &mut self,
+        id: &ThreadId,
+        before: Option<loft_protocol::ThreadStatus>,
+        after: loft_protocol::ThreadStatus,
+        cx: &mut Context<Self>,
+    ) {
+        use loft_protocol::ThreadStatus::*;
+        let finished =
+            matches!(before, Some(Running | WaitingApproval)) && matches!(after, Idle | Error);
+        let needs_you = after == WaitingApproval && before != Some(WaitingApproval);
+        if finished && self.selected.as_ref() != Some(id) {
+            self.unread.insert(id.clone());
+        }
+        if finished || needs_you {
+            crate::attention::request(cx);
+        }
+        self.refresh_badge();
+    }
+
+    /// Dock badge: threads waiting for approval.
+    fn refresh_badge(&self) {
+        let waiting = self
+            .workspace
+            .threads
+            .iter()
+            .filter(|t| t.status == loft_protocol::ThreadStatus::WaitingApproval)
+            .count();
+        crate::attention::set_badge(waiting);
+    }
+
     // -- actions ------------------------------------------------------------
 
     pub fn select_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
@@ -335,6 +383,7 @@ impl AppStore {
                 self.subs.insert(sub, id.clone());
             }
         }
+        self.unread.remove(&id);
         self.selected = Some(id);
         cx.notify();
     }

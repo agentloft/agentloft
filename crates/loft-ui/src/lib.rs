@@ -3,6 +3,7 @@
 
 pub mod assets;
 mod attachments;
+mod attention;
 pub mod brand;
 mod items;
 pub mod panel;
