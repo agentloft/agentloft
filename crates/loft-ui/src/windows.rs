@@ -54,8 +54,12 @@ struct SavedWindow {
     thread: Option<ThreadId>,
     #[serde(default)]
     group: usize,
+    /// Before columns: the panes, one per column.
     #[serde(default)]
     panes: Vec<ThreadId>,
+    /// Columns of stacked panes.
+    #[serde(default)]
+    layout: Vec<Vec<ThreadId>>,
 }
 
 fn session_file(paths: &Paths) -> std::path::PathBuf {
@@ -77,7 +81,8 @@ fn save_session(cx: &mut App) {
         saved.push(SavedWindow {
             thread: store.selected.clone(),
             group: ix,
-            panes: store.panes.clone(),
+            panes: Vec::new(),
+            layout: store.layout.clone(),
         });
     }
     if let Ok(json) = serde_json::to_vec_pretty(&saved) {
@@ -97,24 +102,31 @@ pub fn restore(cx: &mut App) {
         return;
     }
     // Windows that were tabs of one group come back as panes of one window.
-    let mut windows: Vec<(usize, Option<ThreadId>, Vec<ThreadId>)> = Vec::new();
+    let mut windows: Vec<(usize, Option<ThreadId>, Vec<Vec<ThreadId>>)> = Vec::new();
     for w in saved {
-        let mut panes = w.panes;
-        if panes.is_empty() {
-            panes.extend(w.thread.clone());
+        let mut layout = w.layout;
+        if layout.is_empty() {
+            layout = w.panes.into_iter().map(|t| vec![t]).collect();
+        }
+        if layout.is_empty() {
+            layout.extend(w.thread.clone().map(|t| vec![t]));
         }
         match windows.iter_mut().find(|(g, ..)| *g == w.group) {
             Some((_, _, existing)) => {
-                for id in panes {
-                    if !existing.contains(&id) {
-                        existing.push(id);
+                for col in layout {
+                    let col: Vec<ThreadId> = col
+                        .into_iter()
+                        .filter(|id| !existing.iter().flatten().any(|e| e == id))
+                        .collect();
+                    if !col.is_empty() {
+                        existing.push(col);
                     }
                 }
             }
-            None => windows.push((w.group, w.thread, panes)),
+            None => windows.push((w.group, w.thread, layout)),
         }
     }
-    for (_, thread, panes) in windows {
+    for (_, thread, layout) in windows {
         if let Some(handle) = open(thread.clone(), Placement::Window, cx)
             && let Some(env) = cx.try_global::<AppEnv>()
             && let Some(store) = env
@@ -124,14 +136,14 @@ pub fn restore(cx: &mut App) {
                 .and_then(|(_, s)| s.upgrade())
         {
             store.update(cx, |s, cx| {
-                for id in &panes {
+                for id in layout.iter().flatten() {
                     s.ensure_thread(id, cx);
                 }
-                s.panes = panes;
+                s.layout = layout;
                 if let Some(t) = &thread
-                    && !s.panes.contains(t)
+                    && s.pane_at(t).is_none()
                 {
-                    s.panes.push(t.clone());
+                    s.layout.push(vec![t.clone()]);
                 }
                 cx.notify();
             });

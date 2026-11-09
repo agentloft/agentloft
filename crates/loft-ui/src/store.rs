@@ -96,9 +96,13 @@ pub struct AppStore {
     pub threads: HashMap<ThreadId, Entity<ThreadState>>,
     subs: HashMap<u64, ThreadId>,
     pub selected: Option<ThreadId>,
-    /// Threads shown side by side in this window, in order; the selected
-    /// one is the focused pane.
-    pub panes: Vec<ThreadId>,
+    /// Threads shown in this window: columns side by side, each a stack of
+    /// panes top to bottom. The selected thread is the focused pane.
+    pub layout: Vec<Vec<ThreadId>>,
+    /// How many columns, and panes per column, fit (set by the window as
+    /// it measures itself).
+    pub max_cols: usize,
+    pub max_rows: usize,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
     /// Commands an agent offers in a folder, asked without a session
@@ -145,7 +149,9 @@ impl AppStore {
             threads: HashMap::new(),
             subs: HashMap::new(),
             selected: None,
-            panes: Vec::new(),
+            layout: Vec::new(),
+            max_cols: 4,
+            max_rows: 2,
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
@@ -558,19 +564,24 @@ impl AppStore {
     pub fn select_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
         self.ensure_thread(&id, cx);
         self.unread.remove(&id);
-        // Into a pane: its own if open, else a new one when asked, else the
+        // Into a pane: its own if open, else a new one when asked (beside
+        // the focused one while columns fit, else under it), else the
         // focused pane's place.
-        if !self.panes.contains(&id) {
-            let focused = self
-                .selected
-                .as_ref()
-                .and_then(|s| self.panes.iter().position(|p| p == s));
+        if self.pane_at(&id).is_none() {
+            let focused = self.selected.clone().and_then(|s| self.pane_at(&s));
+            let new_pane = std::mem::take(&mut self.next_in_new_pane);
             match focused {
-                Some(ix) if !std::mem::take(&mut self.next_in_new_pane) => {
-                    self.panes[ix] = id.clone()
+                Some((c, r)) if !new_pane => self.layout[c][r] = id.clone(),
+                Some((c, r)) => {
+                    if self.layout.len() < self.max_cols {
+                        self.layout.insert(c + 1, vec![id.clone()]);
+                    } else if self.layout[c].len() < self.max_rows {
+                        self.layout[c].insert(r + 1, id.clone());
+                    } else {
+                        self.layout[c][r] = id.clone();
+                    }
                 }
-                Some(ix) => self.panes.insert(ix + 1, id.clone()),
-                None => self.panes.push(id.clone()),
+                None => self.layout.push(vec![id.clone()]),
             }
         }
         self.next_in_new_pane = false;
@@ -608,53 +619,102 @@ impl AppStore {
         self.next_in_new_pane = true;
     }
 
+    /// Where `thread` is shown: (column, row).
+    pub fn pane_at(&self, thread: &ThreadId) -> Option<(usize, usize)> {
+        self.layout
+            .iter()
+            .enumerate()
+            .find_map(|(c, col)| col.iter().position(|t| t == thread).map(|r| (c, r)))
+    }
+
+    /// Every thread shown, column by column.
+    pub fn panes(&self) -> Vec<ThreadId> {
+        self.layout.iter().flatten().cloned().collect()
+    }
+
+    /// Take `thread` out of the layout (dropping a column left empty).
+    fn take_pane(&mut self, thread: &ThreadId) -> Option<(usize, usize)> {
+        let (c, r) = self.pane_at(thread)?;
+        self.layout[c].remove(r);
+        if self.layout[c].is_empty() {
+            self.layout.remove(c);
+        }
+        Some((c, r))
+    }
+
     /// Close a pane; the focus moves to its neighbour.
     pub fn close_pane(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
-        let Some(ix) = self.panes.iter().position(|p| p == thread) else {
-            return;
-        };
-        if self.panes.len() == 1 {
+        if self.panes().len() <= 1 {
             return;
         }
-        self.panes.remove(ix);
+        let Some((c, r)) = self.take_pane(thread) else {
+            return;
+        };
         if self.selected.as_ref() == Some(thread) {
-            let next = self.panes[ix.min(self.panes.len() - 1)].clone();
-            self.selected = Some(next);
+            let c = c.min(self.layout.len() - 1);
+            let r = r.min(self.layout[c].len() - 1);
+            self.selected = Some(self.layout[c][r].clone());
         }
         cx.notify();
     }
 
-    /// Put `thread` into the pane layout at `at` (moving it if shown),
-    /// replacing the pane there when `replace`; it gets the focus.
+    /// Drop `thread` on the pane at (`c`, `r`): beside it, above or below it,
+    /// or (`Center`) in its place, the two swapping if `thread` was shown.
+    /// It gets the focus.
     pub fn place_pane(
         &mut self,
         thread: ThreadId,
-        at: usize,
-        replace: bool,
-        max: usize,
+        (c, r): (usize, usize),
+        zone: DropZone,
+        max_panes: usize,
         cx: &mut Context<Self>,
     ) {
-        let from = self.panes.iter().position(|p| *p == thread);
-        if let Some(from) = from {
-            if replace {
-                // Dropped on another pane: they swap places.
-                if at < self.panes.len() {
-                    self.panes.swap(from, at);
+        let target = self.layout.get(c).and_then(|col| col.get(r)).cloned();
+        let Some(target) = target else {
+            return;
+        };
+        if target == thread {
+            return;
+        }
+        if zone == DropZone::Center {
+            match self.pane_at(&thread) {
+                Some((fc, fr)) => {
+                    self.layout[fc][fr] = target;
+                    self.layout[c][r] = thread.clone();
                 }
-            } else {
-                self.panes.remove(from);
-                let at = if from < at { at - 1 } else { at };
-                self.panes.insert(at.min(self.panes.len()), thread.clone());
+                None => self.layout[c][r] = thread.clone(),
             }
-        } else if replace || self.panes.len() >= max {
-            let at = at.min(self.panes.len().saturating_sub(1));
-            if self.panes.is_empty() {
-                self.panes.push(thread.clone());
-            } else {
-                self.panes[at] = thread.clone();
+            self.select_thread(thread, cx);
+            return;
+        }
+        // Move it if shown; else it's one more pane (if there's room).
+        let shown = self.take_pane(&thread).is_some();
+        if !shown && self.panes().len() >= max_panes {
+            if let Some((tc, tr)) = self.pane_at(&target) {
+                self.layout[tc][tr] = thread.clone();
             }
+            self.select_thread(thread, cx);
+            return;
+        }
+        let Some((tc, tr)) = self.pane_at(&target) else {
+            return;
+        };
+        let stack = matches!(zone, DropZone::Top | DropZone::Bottom);
+        if stack && self.layout[tc].len() < self.max_rows {
+            let at = if zone == DropZone::Top { tr } else { tr + 1 };
+            self.layout[tc].insert(at, thread.clone());
+        } else if !stack && self.layout.len() < self.max_cols {
+            let at = if zone == DropZone::Left { tc } else { tc + 1 };
+            self.layout.insert(at, vec![thread.clone()]);
         } else {
-            self.panes.insert(at.min(self.panes.len()), thread.clone());
+            // No room that way: stack it instead, or take the target's place.
+            if !stack && self.layout[tc].len() < self.max_rows {
+                self.layout[tc].insert(tr + 1, thread.clone());
+            } else if stack && self.layout.len() < self.max_cols {
+                self.layout.insert(tc + 1, vec![thread.clone()]);
+            } else {
+                self.layout[tc][tr] = thread.clone();
+            }
         }
         self.select_thread(thread, cx);
     }
@@ -991,13 +1051,13 @@ impl AppStore {
             .find(|t| &t.id != thread_id && t.status != loft_protocol::ThreadStatus::Archived)
             .map(|t| t.id.clone());
         // Its pane goes too (or shows the next thread if it was the last).
-        if self.panes.len() > 1 {
-            self.panes.retain(|p| p != thread_id);
-            self.selected = self.panes.first().cloned();
+        if self.panes().len() > 1 {
+            self.take_pane(thread_id);
+            self.selected = self.panes().first().cloned();
             cx.notify();
             return;
         }
-        self.panes.retain(|p| p != thread_id);
+        self.take_pane(thread_id);
         self.selected = None;
         if let Some(id) = next {
             self.select_thread(id, cx);
@@ -1158,6 +1218,16 @@ async fn pump(
             return;
         }
     }
+}
+
+/// Where on a pane a dragged thread is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Center,
 }
 
 /// A display row in the timeline. Consecutive tool calls fold into one

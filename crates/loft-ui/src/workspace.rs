@@ -10,7 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::message_scroller::MessageScroller;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -449,7 +449,16 @@ impl WorkspaceView {
                     for id in &others {
                         s.ensure_thread(id, cx);
                     }
-                    s.panes = std::iter::once(thread_id.clone()).chain(others).collect();
+                    // Side by side, then stacked under the first ones.
+                    let all: Vec<ThreadId> =
+                        std::iter::once(thread_id.clone()).chain(others).collect();
+                    let cols = all.len().div_ceil(2).max(1);
+                    let mut layout: Vec<Vec<ThreadId>> = vec![Vec::new(); cols.min(all.len())];
+                    for (i, id) in all.into_iter().enumerate() {
+                        let n = layout.len();
+                        layout[i % n].push(id);
+                    }
+                    s.layout = layout;
                     cx.notify();
                 });
             }
@@ -1874,20 +1883,21 @@ impl WorkspaceView {
         }
     }
 
-    /// How many panes fit the pane area (up to [`MAX_PANES`]).
-    fn pane_capacity(&self) -> usize {
+    /// How many columns, and panes per column, fit the pane area.
+    fn pane_room(&self) -> (usize, usize) {
         let (w, h) = self.pane_room.get();
         if w <= 0. {
-            return MAX_PANES;
+            return (4, 2);
         }
-        let cols = ((w / PANE_MIN_W).floor() as usize).max(1);
-        let rows = if h >= PANE_MIN_H * 2. { 2 } else { 1 };
-        (cols * rows).min(MAX_PANES)
+        let cols = ((w / PANE_MIN_W).floor() as usize).clamp(1, MAX_PANES);
+        let rows = ((h / PANE_MIN_H).floor() as usize).clamp(1, 3);
+        (cols, rows)
     }
 
-    /// The window's threads side by side: one row while they fit, then two.
-    /// Drop a thread (from the sidebar, or a pane's header) on a pane's
-    /// left or right side to place it there, or in its middle to swap.
+    /// The window's threads: columns side by side, each a stack of panes,
+    /// with dividers to drag. Drop a thread (from the sidebar, or a pane's
+    /// title bar) on a pane's left or right edge for a new column, its top
+    /// or bottom to stack it there, or its middle to swap.
     fn render_panes(
         &mut self,
         focused: Entity<ThreadState>,
@@ -1896,83 +1906,83 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let focused_id = focused.read(cx).id.clone();
-        let cap = self.pane_capacity();
-        let ids: Vec<ThreadId> = self.store.update(cx, |s, _| {
-            if !s.panes.contains(&focused_id) {
-                s.panes.push(focused_id.clone());
+        let (max_cols, max_rows) = self.pane_room();
+        let layout: Vec<Vec<ThreadId>> = self.store.update(cx, |s, _| {
+            s.max_cols = max_cols;
+            s.max_rows = max_rows;
+            if s.pane_at(&focused_id).is_none() {
+                s.layout.push(vec![focused_id.clone()]);
             }
             // The focused pane is always one that fits.
-            if let Some(ix) = s.panes.iter().position(|t| *t == focused_id)
-                && ix >= cap
-            {
-                s.panes.swap(ix, cap - 1);
+            if let Some((c, r)) = s.pane_at(&focused_id) {
+                if c >= max_cols {
+                    s.layout.swap(c, max_cols - 1);
+                }
+                let c = c.min(max_cols - 1);
+                if r >= max_rows {
+                    s.layout[c].swap(r, max_rows - 1);
+                }
             }
-            s.panes.iter().take(cap).cloned().collect()
+            s.layout
+                .iter()
+                .take(max_cols)
+                .map(|col| col.iter().take(max_rows).cloned().collect())
+                .collect()
         });
-        let threads: Vec<Entity<ThreadState>> = ids
-            .iter()
-            .map(|id| self.store.update(cx, |s, cx| s.ensure_thread(id, cx)))
-            .collect();
-        let n = threads.len();
-        let multi = n > 1;
-        let (w, _) = self.pane_room.get();
-        let per_row_fit = if w > 0. {
-            ((w / PANE_MIN_W).floor() as usize).max(1)
-        } else {
-            n
-        };
-        let rows = if n > per_row_fit { 2 } else { 1 };
-        let per_row = n.div_ceil(rows);
+        let total: usize = layout.iter().map(Vec::len).sum();
+        let multi = total > 1;
         let dragging = cx.has_active_drag();
-        let mut grid = v_flex().size_full();
-        let mut row = h_flex().flex_1().min_h_0().w_full();
-        for (ix, thread) in threads.into_iter().enumerate() {
-            if ix > 0 && ix % per_row == 0 {
-                grid = grid.child(row);
-                row = h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .border_t_1()
-                    .border_color(p.border);
+        // Resizing keeps while the arrangement stays; a new one starts even.
+        let shape: String = layout
+            .iter()
+            .map(|col| {
+                col.iter()
+                    .map(|t| t.as_str().get(..8).unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let mut columns = h_resizable(SharedString::from(format!("panes-{shape}")));
+        for (c, col) in layout.iter().enumerate() {
+            let mut stack = v_resizable(SharedString::from(format!("pane-col-{c}-{shape}")));
+            for (r, id) in col.iter().enumerate() {
+                let thread = self.store.update(cx, |s, cx| s.ensure_thread(id, cx));
+                let pane = self.render_pane(
+                    &thread,
+                    (c, r),
+                    id == &focused_id,
+                    multi,
+                    dragging,
+                    p,
+                    window,
+                    cx,
+                );
+                stack = stack.child(
+                    resizable_panel()
+                        .size_range(px(PANE_MIN_H * 0.6)..px(10_000.))
+                        .child(pane),
+                );
             }
-            let id = ids[ix].clone();
-            let is_focused = id == focused_id;
-            self.rendering_focused = is_focused;
-            let body = self.render_thread(thread.clone(), p, window, cx);
-            self.rendering_focused = true;
-            let header = multi.then(|| self.pane_header(&thread, ix, is_focused, p, cx));
-            let overlay = dragging.then(|| self.pane_drop_zones(ix, cap, p, cx));
-            let store = self.store.clone();
-            let focus_id = id.clone();
-            row = row.child(
-                v_flex()
-                    .id(SharedString::from(format!("pane-{}", id.as_str())))
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .relative()
-                    .when(ix % per_row > 0, |d| d.border_l_1().border_color(p.border))
-                    // Clicking anywhere in a pane focuses it.
-                    .capture_any_mouse_down(move |_, _, cx| {
-                        let id = focus_id.clone();
-                        store.update(cx, |s, cx| {
-                            if s.selected.as_ref() != Some(&id) {
-                                s.select_thread(id, cx);
-                            }
-                        });
-                    })
-                    .children(header)
-                    .child(div().flex_1().min_h_0().flex().flex_col().child(body))
-                    .children(overlay),
+            columns = columns.child(
+                resizable_panel()
+                    .size_range(px(PANE_MIN_W * 0.7)..px(10_000.))
+                    .child(stack),
             );
         }
-        grid = grid.child(row);
         let room = self.pane_room.clone();
         div()
             .size_full()
             .relative()
-            .child(grid)
+            .child(if multi {
+                columns.into_any_element()
+            } else {
+                // One pane: no dividers.
+                let thread = self
+                    .store
+                    .update(cx, |s, cx| s.ensure_thread(&focused_id, cx));
+                self.render_pane(&thread, (0, 0), true, false, dragging, p, window, cx)
+            })
             .child(
                 gpui_kit::canvas(
                     move |bounds, window, _| {
@@ -1987,6 +1997,47 @@ impl WorkspaceView {
                 .absolute()
                 .size_full(),
             )
+            .into_any_element()
+    }
+
+    /// One pane: its title bar (when there are several), the thread, and,
+    /// while a thread is dragged, where it can land.
+    #[allow(clippy::too_many_arguments)]
+    fn render_pane(
+        &mut self,
+        thread: &Entity<ThreadState>,
+        at: (usize, usize),
+        is_focused: bool,
+        multi: bool,
+        dragging: bool,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = thread.read(cx).id.clone();
+        self.rendering_focused = is_focused;
+        let body = self.render_thread(thread.clone(), p, window, cx);
+        self.rendering_focused = true;
+        let header = multi.then(|| self.pane_header(thread, at.0 * 10 + at.1, is_focused, p, cx));
+        let overlay = dragging.then(|| self.pane_drop_zones(at, p, cx));
+        let store = self.store.clone();
+        let focus_id = id.clone();
+        v_flex()
+            .id(SharedString::from(format!("pane-{}", id.as_str())))
+            .size_full()
+            .relative()
+            // Clicking anywhere in a pane focuses it.
+            .capture_any_mouse_down(move |_, _, cx| {
+                let id = focus_id.clone();
+                store.update(cx, |s, cx| {
+                    if s.selected.as_ref() != Some(&id) {
+                        s.select_thread(id, cx);
+                    }
+                });
+            })
+            .children(header)
+            .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .children(overlay)
             .into_any_element()
     }
 
@@ -2063,44 +2114,69 @@ impl WorkspaceView {
             .into_any_element()
     }
 
-    /// While a thread is dragged: where it can land on pane `ix`.
+    /// While a thread is dragged: where it can land on the pane at `at`.
     fn pane_drop_zones(
         &self,
-        ix: usize,
-        cap: usize,
+        at: (usize, usize),
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use crate::store::DropZone;
         let accent = p.accent;
-        let zone =
-            |name: &str, at: usize, replace: bool, label: &'static str, cx: &mut Context<Self>| {
-                div()
-                    .id(SharedString::from(format!("drop-{name}-{ix}")))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .text_color(gpui_kit::transparent_black())
-                    .drag_over::<DraggedThread>(move |s, _, _, _| {
-                        s.bg(accent.opacity(0.16))
-                            .border_2()
-                            .border_color(accent.opacity(0.7))
-                            .text_color(accent)
-                    })
-                    .child(label)
-                    .on_drop(cx.listener(move |this, d: &DraggedThread, _, cx| {
-                        let id = d.id.clone();
-                        this.store
-                            .update(cx, |s, cx| s.place_pane(id, at, replace, cap, cx));
-                    }))
-            };
+        let zone = |zone: DropZone, label: &'static str, cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(format!(
+                    "drop-{zone:?}-{}-{}",
+                    at.0, at.1
+                )))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(gpui_kit::transparent_black())
+                .drag_over::<DraggedThread>(move |s, _, _, _| {
+                    s.bg(accent.opacity(0.16))
+                        .border_2()
+                        .border_color(accent.opacity(0.7))
+                        .text_color(accent)
+                })
+                .child(label)
+                .on_drop(cx.listener(move |this, d: &DraggedThread, _, cx| {
+                    let id = d.id.clone();
+                    this.store
+                        .update(cx, |s, cx| s.place_pane(id, at, zone, MAX_PANES, cx));
+                }))
+        };
+        // Edges for placing, the middle for swapping.
         h_flex()
             .absolute()
             .inset_0()
-            .child(zone("left", ix, false, "Place here", cx).w(gpui_kit::relative(0.28)))
-            .child(zone("middle", ix, true, "Swap in", cx).flex_1())
-            .child(zone("right", ix + 1, false, "Place here", cx).w(gpui_kit::relative(0.28)))
+            .child(
+                zone(DropZone::Left, "Place left", cx)
+                    .h_full()
+                    .w(gpui_kit::relative(0.22)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .child(
+                        zone(DropZone::Top, "Stack above", cx)
+                            .w_full()
+                            .h(gpui_kit::relative(0.25)),
+                    )
+                    .child(zone(DropZone::Center, "Swap in", cx).w_full().flex_1())
+                    .child(
+                        zone(DropZone::Bottom, "Stack below", cx)
+                            .w_full()
+                            .h(gpui_kit::relative(0.25)),
+                    ),
+            )
+            .child(
+                zone(DropZone::Right, "Place right", cx)
+                    .h_full()
+                    .w(gpui_kit::relative(0.22)),
+            )
             .into_any_element()
     }
 
