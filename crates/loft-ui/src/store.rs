@@ -186,6 +186,10 @@ impl AppStore {
         cx.notify();
     }
 
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
     pub fn selected_thread(&self) -> Option<Entity<ThreadState>> {
         self.selected
             .as_ref()
@@ -286,13 +290,26 @@ async fn pump(
     }
 }
 
-/// One open thread: its mirrored model plus view-side state (scroll list,
-/// markdown documents for assistant messages).
+/// A display row in the timeline. Consecutive tool calls fold into one
+/// group row; each finished turn gets a footer row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Row {
+    Item(usize),
+    ToolGroup { start: usize, len: usize },
+    TurnFooter { turn_ix: usize },
+}
+
+/// One open thread: its mirrored model plus view-side state (display rows,
+/// scroll list, markdown documents, expansion state).
 pub struct ThreadState {
     pub id: ThreadId,
     pub model: Option<ThreadModel>,
+    pub rows: Vec<Row>,
     pub scroller: Entity<MessageScrollerState>,
     pub markdown: HashMap<ItemId, Entity<TextViewState>>,
+    /// Tool groups / reasoning items the user expanded or collapsed,
+    /// keyed by their first item id. `true` = expanded.
+    pub expanded: HashMap<ItemId, bool>,
 }
 
 impl ThreadState {
@@ -300,13 +317,99 @@ impl ThreadState {
         Self {
             id,
             model: None,
+            rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             markdown: HashMap::new(),
+            expanded: HashMap::new(),
         }
     }
 
-    pub fn row_count(&self) -> usize {
-        self.model.as_ref().map(|m| m.items.len()).unwrap_or(0)
+    pub fn toggle(&mut self, key: ItemId, default_open: bool, cx: &mut Context<Self>) {
+        let open = self.expanded.get(&key).copied().unwrap_or(default_open);
+        self.expanded.insert(key.clone(), !open);
+        if let Some(row) = self.row_of_item(&key) {
+            self.scroller.update(cx, |s, cx| {
+                s.remeasure_items(row..row + 1, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn is_expanded(&self, key: &ItemId, default_open: bool) -> bool {
+        self.expanded.get(key).copied().unwrap_or(default_open)
+    }
+
+    fn row_of_item(&self, id: &ItemId) -> Option<usize> {
+        let model = self.model.as_ref()?;
+        let ix = model.items.iter().position(|i| &i.id == id)?;
+        self.rows.iter().position(|r| match r {
+            Row::Item(i) => *i == ix,
+            Row::ToolGroup { start, len } => (*start..start + len).contains(&ix),
+            Row::TurnFooter { .. } => false,
+        })
+    }
+
+    fn rebuild_rows(&mut self) -> Vec<Row> {
+        let Some(model) = self.model.as_ref() else {
+            return std::mem::take(&mut self.rows);
+        };
+        let mut rows = Vec::with_capacity(model.items.len());
+        let items = &model.items;
+        let mut i = 0;
+        while i < items.len() {
+            if matches!(items[i].body, ItemBody::ToolCall { .. }) {
+                let start = i;
+                while i < items.len() && matches!(items[i].body, ItemBody::ToolCall { .. }) {
+                    i += 1;
+                }
+                rows.push(Row::ToolGroup {
+                    start,
+                    len: i - start,
+                });
+            } else {
+                rows.push(Row::Item(i));
+                i += 1;
+            }
+            // Footer after the last item of a finished turn.
+            let turn_id = &items[i - 1].turn_id;
+            let next_turn = items.get(i).map(|n| &n.turn_id);
+            if turn_id.is_some() && next_turn != Some(turn_id) {
+                if let Some(turn_ix) = model
+                    .turns
+                    .iter()
+                    .position(|t| Some(&t.id) == turn_id.as_ref() && t.status.is_terminal())
+                {
+                    rows.push(Row::TurnFooter { turn_ix });
+                }
+            }
+        }
+        std::mem::replace(&mut self.rows, rows)
+    }
+
+    /// Rebuild rows and tell the virtual list what changed.
+    fn sync_rows(&mut self, changed_item: Option<&ItemId>, cx: &mut Context<Self>) {
+        let old = self.rebuild_rows();
+        let new_len = self.rows.len();
+        let common = old
+            .iter()
+            .zip(&self.rows)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let changed_row = changed_item.and_then(|id| self.row_of_item(id));
+        self.scroller.update(cx, |s, cx| {
+            if common == old.len() {
+                // Pure append (the common streaming case).
+                if new_len > old.len() {
+                    s.append(new_len - old.len(), cx);
+                }
+            } else {
+                // Rows from `common` changed shape (e.g. a tool group grew).
+                s.splice(common..old.len(), new_len - common, cx);
+            }
+            if let Some(row) = changed_row {
+                s.remeasure_items(row..row + 1, cx);
+            }
+        });
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
@@ -317,8 +420,9 @@ impl ThreadState {
         for item in &model.items {
             self.sync_markdown(&item.id, &item.body, cx);
         }
-        let count = model.items.len();
         self.model = Some(model);
+        self.rebuild_rows();
+        let count = self.rows.len();
         self.scroller.update(cx, |s, cx| {
             s.reset(count, cx);
             s.scroll_to_end(cx);
@@ -330,23 +434,21 @@ impl ThreadState {
         let Some(model) = self.model.as_mut() else {
             return;
         };
-        let before = model.items.len();
         if !model.apply_event(env) {
             return;
         }
-        let after = model.items.len();
-        if let Event::ItemUpserted { item } = &env.event {
-            let ix = model.items.iter().position(|i| i.id == item.id);
-            let (id, body) = (item.id.clone(), item.body.clone());
-            self.sync_markdown(&id, &body, cx);
-            self.scroller.update(cx, |s, cx| {
-                if after > before {
-                    s.append(after - before, cx);
-                } else if let Some(ix) = ix {
-                    s.remeasure_items(ix..ix + 1, cx);
-                }
-            });
-        }
+        let changed = match &env.event {
+            Event::ItemUpserted { item } => {
+                let (id, body) = (item.id.clone(), item.body.clone());
+                self.sync_markdown(&id, &body, cx);
+                Some(id)
+            }
+            Event::RequestOpened { request } | Event::RequestUpdated { request } => {
+                request.item_id.clone()
+            }
+            _ => None,
+        };
+        self.sync_rows(changed.as_ref(), cx);
         cx.notify();
     }
 
@@ -363,9 +465,11 @@ impl ThreadState {
         let (id, body) = (model.items[ix].id.clone(), model.items[ix].body.clone());
         // `set_text` appends incrementally when the new text extends the old.
         self.sync_markdown(&id, &body, cx);
-        self.scroller.update(cx, |s, cx| {
-            s.remeasure_items(ix..ix + 1, cx);
-        });
+        if let Some(row) = self.row_of_item(&id) {
+            self.scroller.update(cx, |s, cx| {
+                s.remeasure_items(row..row + 1, cx);
+            });
+        }
         cx.notify();
     }
 

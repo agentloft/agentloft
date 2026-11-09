@@ -22,21 +22,21 @@ Infrastructure:
 - [x] CI: macOS (fmt, clippy, tests), Linux headless tests, cargo-deny
 - [x] `deny.toml` dependency policy (ADR-0009)
 - [x] CONTRIBUTING (DCO), PR and issue templates
-- [ ] Branch protection on `main` (after the first CI run is green)
+- [x] Branch protection on `main`: PR + 3 required checks, no force-push
 
-## M0.5: Design pass — "professional UI" (next)
+## M0.5: Design pass — "professional UI" (in progress, branch `m0.5/design`)
 
 Goal: visual quality on par with Codex and Claude Desktop, plus appearance customization, without regressing performance.
 
-- [ ] Design tokens: type scale, spacing, radii, elevation; light and dark themes following the system
-- [ ] Appearance settings in `config.toml` `[ui]`: theme, accent color, UI and mono fonts, font size, density; live reload
-- [ ] Integrated title bar (transparent, traffic lights inset), breadcrumb header
-- [ ] Sidebar: search, project groups, thread rows with relative time, running spinner and needs-approval badge
-- [ ] Conversation column: centered max width, assistant prose without boxes, user bubbles, grouped tool activity ("Ran 3 commands") that expands on click
-- [ ] Floating composer card: model and mode chips, round send/stop button, attachment affordance
-- [ ] Approval card styled as a first-class prompt with keyboard shortcuts
-- [ ] Empty states and onboarding (no projects, no threads, daemon connecting)
-- [ ] Performance: 10k-item thread at ≥ 60 fps while streaming; no per-row theme clones
+- [x] Design tokens: refined neutral palettes for light and dark, radii, elevation; follows the system appearance
+- [x] Appearance settings in `config.toml` `[ui]`: theme, accent, UI and mono fonts, sizes, density, content width; live reload (verified)
+- [x] Integrated title bar (transparent, traffic lights inset), breadcrumb header
+- [x] Sidebar: search, project groups, thread rows with relative time, running spinner and approve badge, collapsible (⌘B)
+- [x] Conversation column: centered max width, prose replies, user bubbles, grouped tool activity that expands on click, turn footers
+- [~] Floating composer card: model and mode chips, round send/stop button (attachments M1)
+- [~] Approval card as a first-class prompt with the exact command (keyboard shortcuts pending)
+- [x] Empty states: welcome, empty thread, reconnecting banner
+- [~] Performance: palette computed once per frame, incremental row splicing; 10k-item benchmark pending
 
 ## M1 → M9
 

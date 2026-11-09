@@ -82,20 +82,58 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 // config.toml
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    pub ui: UiConfig,
     pub harness: HarnessConfigs,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Appearance settings (`[ui]` in config.toml). Reloaded live by the app.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UiConfig {
+    /// `system` | `light` | `dark`
+    pub theme: String,
+    /// Accent color as `#rrggbb`; `None` = theme default.
+    pub accent: Option<String>,
+    /// UI font family; `None` = system UI font.
+    pub font_family: Option<String>,
+    /// Monospace font family for code and tool output.
+    pub mono_font_family: Option<String>,
+    /// Base UI font size in px.
+    pub font_size: f32,
+    /// Monospace font size in px.
+    pub mono_font_size: f32,
+    /// `comfortable` | `compact`
+    pub density: String,
+    /// Max width of the conversation column in px.
+    pub content_width: f32,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: "system".into(),
+            accent: None,
+            font_family: None,
+            mono_font_family: None,
+            font_size: 14.0,
+            mono_font_size: 12.5,
+            density: "comfortable".into(),
+            content_width: 780.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HarnessConfigs {
     pub claude: HarnessConfig,
     pub codex: HarnessConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HarnessConfig {
     /// `"auto"` = resolve from the login-shell `PATH`.
@@ -271,6 +309,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::load(&Paths::new(dir.path())).unwrap();
         assert_eq!(cfg.harness.claude.path, "auto");
+    }
+
+    #[test]
+    fn ui_config_defaults_and_overrides() {
+        let cfg: Config = toml::from_str("[ui]\ntheme = \"dark\"\naccent = \"#7c5cff\"\n").unwrap();
+        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.ui.accent.as_deref(), Some("#7c5cff"));
+        assert_eq!(cfg.ui.font_size, 14.0);
     }
 
     #[test]

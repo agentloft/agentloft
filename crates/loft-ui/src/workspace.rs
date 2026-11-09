@@ -1,35 +1,87 @@
-//! The main window: sidebar (projects → threads) and the selected thread
-//! (timeline + composer).
+//! The main window: an integrated sidebar (search, projects → threads,
+//! status), a breadcrumb header, the conversation timeline and a floating
+//! composer.
 
-use crate::items::render_item;
+use crate::items::render_row;
 use crate::store::{AppStore, ConnState, ThreadState};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use crate::theme::{self, Palette, relative_time};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::MessageScroller;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
+    IntoElement, KeyBinding, ParentElement as _, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div,
+    prelude::FluentBuilder as _, px,
 };
-use loft_protocol::{ThreadId, ThreadStatus, TurnStatus};
+use loft_protocol::{ProjectId, ThreadId, ThreadStatus};
 use std::collections::HashMap;
+
+actions!(
+    agentloft,
+    [
+        NewThread,
+        Interrupt,
+        ToggleSidebar,
+        ToggleTheme,
+        OpenSettings,
+        AddProject,
+        FocusSearch
+    ]
+);
+
+const CONTEXT: &str = "Workspace";
+const SIDEBAR_WIDTH: f32 = 272.;
+const HEADER_HEIGHT: f32 = 52.;
+/// Leaves room for the macOS traffic lights in the transparent title bar.
+const TRAFFIC_LIGHTS_INSET: f32 = 78.;
+
+pub fn bind_keys(cx: &mut gpui_kit::App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),
+        KeyBinding::new("cmd-.", Interrupt, Some(CONTEXT)),
+        KeyBinding::new("cmd-b", ToggleSidebar, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-l", ToggleTheme, Some(CONTEXT)),
+        KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
+        KeyBinding::new("cmd-o", AddProject, Some(CONTEXT)),
+        KeyBinding::new("cmd-k", FocusSearch, Some(CONTEXT)),
+    ]);
+}
 
 pub struct WorkspaceView {
     store: Entity<AppStore>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
     observed: HashMap<ThreadId, Subscription>,
+    search: Entity<InputState>,
+    query: String,
+    sidebar_open: bool,
     _subs: Vec<Subscription>,
 }
 
 impl WorkspaceView {
-    pub fn new(store: Entity<AppStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let sub = cx.observe(&store, |_, _, cx| cx.notify());
+    pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads"));
+        let subs = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&search, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.query = state.read(cx).value().to_lowercase();
+                    cx.notify();
+                }
+            }),
+            // Follow the system light/dark switch when theme = "system".
+            cx.observe_window_appearance(window, |_, _, cx| theme::apply(cx)),
+        ];
         Self {
             store,
             composers: HashMap::new(),
             observed: HashMap::new(),
-            _subs: vec![sub],
+            search,
+            query: String::new(),
+            sidebar_open: true,
+            _subs: subs,
         }
     }
 
@@ -49,9 +101,9 @@ impl WorkspaceView {
         }
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(1, 10)
+                .auto_grow(1, 12)
                 .submit_on_enter(true)
-                .placeholder("Message Claude…  (Enter to send, Shift+Enter for a newline)")
+                .placeholder("Ask Claude to build, fix or explain something…")
         });
         let thread_id = id.clone();
         let sub = cx.subscribe_in(&composer, window, move |this, state, event, window, cx| {
@@ -72,11 +124,17 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let text = composer.read(cx).value().trim().to_owned();
-        if text.is_empty() {
-            return;
+        if text.is_empty() || self.is_running(thread_id, cx) {
+            return; // queueing while running arrives in M1
         }
-        let running = self
-            .store
+        composer.update(cx, |c, cx| c.set_value("", window, cx));
+        let id = thread_id.clone();
+        self.store
+            .update(cx, |store, cx| store.send_message(id, text, cx));
+    }
+
+    fn is_running(&self, thread_id: &ThreadId, cx: &gpui_kit::App) -> bool {
+        self.store
             .read(cx)
             .threads
             .get(thread_id)
@@ -86,14 +144,7 @@ impl WorkspaceView {
                     .as_ref()
                     .map(|m| m.running_turn().is_some())
             })
-            .unwrap_or(false);
-        if running {
-            return; // M0: no queueing yet (M1).
-        }
-        composer.update(cx, |c, cx| c.set_value("", window, cx));
-        let id = thread_id.clone();
-        self.store
-            .update(cx, |store, cx| store.send_message(id, text, cx));
+            .unwrap_or(false)
     }
 
     fn add_project(&mut self, cx: &mut Context<Self>) {
@@ -116,138 +167,276 @@ impl WorkspaceView {
         .detach();
     }
 
+    fn new_thread(&mut self, project: Option<ProjectId>, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let project = project
+            .or_else(|| {
+                let selected = store.selected.as_ref()?;
+                store
+                    .workspace
+                    .thread(selected)
+                    .map(|t| t.project_id.clone())
+            })
+            .or_else(|| store.workspace.projects.first().map(|p| p.id.clone()));
+        match project {
+            Some(id) => self.store.update(cx, |s, cx| s.new_thread(id, cx)),
+            None => self.add_project(cx),
+        }
+    }
+
+    fn interrupt(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.store.read(cx).selected.clone()
+            && self.is_running(&id, cx)
+        {
+            self.store.update(cx, |s, cx| s.interrupt(id, cx));
+        }
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        let path = self.store.read(cx).paths().config_file();
+        if !path.exists() {
+            let _ = std::fs::write(&path, SETTINGS_TEMPLATE);
+        }
+        cx.open_with_system(&path);
+    }
+
     // -- sidebar ------------------------------------------------------------
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let store = self.store.read(cx);
-        let selected = store.selected.clone();
-        let mut list = v_flex().gap_3().px_2().pb_4();
+    fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let (projects, all_threads, selected, conn, error) = {
+            let store = self.store.read(cx);
+            (
+                store.workspace.projects.clone(),
+                store.workspace.threads.clone(),
+                store.selected.clone(),
+                store.conn.clone(),
+                store.last_error.clone(),
+            )
+        };
+        let query = self.query.clone();
+        let mut list = v_flex().gap_4().px_2().pb_4();
 
-        for project in &store.workspace.projects {
+        for project in &projects {
             let project_id = project.id.clone();
+            let threads: Vec<_> = all_threads
+                .iter()
+                .filter(|t| t.project_id == project.id)
+                .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
+                .collect();
+            if !query.is_empty() && threads.is_empty() {
+                continue;
+            }
             let header = h_flex()
-                .justify_between()
+                .gap_2()
                 .items_center()
                 .px_2()
+                .text_color(p.muted_foreground)
+                .child(Icon::new(IconName::Folder).xsmall())
                 .child(
                     div()
+                        .flex_1()
+                        .truncate()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.muted_foreground)
-                        .child(project.name.to_uppercase()),
+                        .child(project.name.clone()),
                 )
-                .child(
-                    Button::new(SharedString::from(format!("new-{}", project.id)))
-                        .label("+ New")
-                        .xsmall()
-                        .ghost()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let id = project_id.clone();
-                            this.store.update(cx, |s, cx| s.new_thread(id, cx));
-                        })),
-                );
-            let mut threads = v_flex().gap_0p5();
-            for thread in store.workspace.threads_for(project) {
-                let id = thread.id.clone();
-                let active = selected.as_ref() == Some(&thread.id);
-                let dot = match thread.status {
-                    ThreadStatus::Running => Some(theme.info),
-                    ThreadStatus::WaitingApproval => Some(theme.warning),
-                    ThreadStatus::Error => Some(theme.danger),
-                    _ => None,
-                };
-                threads = threads.child(
-                    h_flex()
-                        .id(SharedString::from(format!("thread-{}", thread.id)))
-                        .gap_2()
-                        .items_center()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_sm()
-                        .when(active, |d| d.bg(theme.list_active))
-                        .hover(|d| d.bg(theme.muted))
-                        .child(
-                            div()
-                                .size(px(7.))
-                                .rounded_full()
-                                .bg(dot.unwrap_or(theme.border)),
-                        )
-                        .child(div().flex_1().truncate().child(thread.title.clone()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let id = id.clone();
-                            this.store.update(cx, |s, cx| s.select_thread(id, cx));
-                        })),
-                );
+                .child(icon_button(
+                    format!("new-{}", project.id),
+                    IconName::Plus,
+                    p,
+                    cx.listener(move |this, _, _, cx| {
+                        this.new_thread(Some(project_id.clone()), cx)
+                    }),
+                ));
+            let mut rows = v_flex().gap_px();
+            for thread in threads {
+                rows = rows.child(thread_row(
+                    thread,
+                    selected.as_ref() == Some(&thread.id),
+                    p,
+                    cx,
+                ));
             }
-            list = list.child(v_flex().gap_1().child(header).child(threads));
+            list = list.child(v_flex().gap_1().child(header).child(rows));
         }
 
-        let status: SharedString = match &store.conn {
-            ConnState::Connecting => "Connecting to agentloftd…".into(),
-            ConnState::Connected => "Connected".into(),
-            ConnState::Disconnected(why) => format!("Disconnected: {why}").into(),
+        let (dot, status): (_, SharedString) = match &conn {
+            ConnState::Connecting => (p.warning, "Connecting…".into()),
+            ConnState::Connected => (p.success, "Connected".into()),
+            ConnState::Disconnected(_) => (p.danger, "Reconnecting…".into()),
         };
-        let error = store.last_error.clone();
+        let dark = p.dark;
 
         v_flex()
-            .w(px(260.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .bg(theme.sidebar)
-            .text_color(theme.sidebar_foreground)
+            .bg(p.sidebar)
             .border_r_1()
-            .border_color(theme.sidebar_border)
+            .border_color(p.border)
+            // Title-bar strip: traffic lights on the left, actions on the right.
             .child(
                 h_flex()
-                    .justify_between()
+                    .h(px(HEADER_HEIGHT))
+                    .pl(px(TRAFFIC_LIGHTS_INSET))
+                    .pr_2()
                     .items_center()
+                    .justify_end()
+                    .gap_1()
+                    .child(icon_button(
+                        "toggle-sidebar",
+                        IconName::PanelLeft,
+                        p,
+                        cx.listener(|this, _, _, cx| {
+                            this.sidebar_open = false;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(icon_button(
+                        "new-thread",
+                        IconName::SquarePen,
+                        p,
+                        cx.listener(|this, _, _, cx| this.new_thread(None, cx)),
+                    )),
+            )
+            .child(
+                div().px_3().pb_3().child(
+                    Input::new(&self.search)
+                        .small()
+                        .prefix(
+                            Icon::new(IconName::Search)
+                                .xsmall()
+                                .text_color(p.muted_foreground),
+                        )
+                        .cleanable(true),
+                ),
+            )
+            .child(
+                h_flex()
                     .px_4()
-                    .pt_8()
-                    .pb_3()
-                    .child(div().font_weight(FontWeight::BOLD).child("Agentloft"))
-                    .child(
-                        Button::new("add-project")
-                            .label("Add project")
-                            .xsmall()
-                            .outline()
-                            .on_click(cx.listener(|this, _, _, cx| this.add_project(cx))),
-                    ),
+                    .pb_2()
+                    .items_center()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(p.faint_foreground)
+                    .child("PROJECTS")
+                    .child(icon_button(
+                        "add-project",
+                        IconName::FolderPlus,
+                        p,
+                        cx.listener(|this, _, _, cx| this.add_project(cx)),
+                    )),
             )
             .child(
                 div()
                     .id("sidebar-scroll")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .child(list),
             )
+            .when_some(error, |d, e| {
+                d.child(
+                    div()
+                        .mx_3()
+                        .mb_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(px(8.))
+                        .bg(p.danger_soft)
+                        .text_xs()
+                        .text_color(p.danger)
+                        .child(e),
+                )
+            })
             .child(
-                v_flex()
-                    .px_4()
-                    .py_2()
-                    .gap_1()
+                h_flex()
+                    .px_3()
+                    .h(px(40.))
+                    .items_center()
+                    .gap_2()
                     .border_t_1()
-                    .border_color(theme.sidebar_border)
+                    .border_color(p.border)
                     .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(status)
-                    .when_some(error, |d, e| {
-                        d.child(div().text_color(theme.danger).child(e))
-                    }),
+                    .text_color(p.muted_foreground)
+                    .child(div().size(px(7.)).rounded_full().bg(dot))
+                    .child(div().flex_1().child(status))
+                    .child(icon_button(
+                        "toggle-theme",
+                        if dark { IconName::Sun } else { IconName::Moon },
+                        p,
+                        cx.listener(|_, _, _, cx| theme::toggle_mode(cx)),
+                    ))
+                    .child(icon_button(
+                        "settings",
+                        IconName::Settings,
+                        p,
+                        cx.listener(|this, _, _, cx| this.open_settings(cx)),
+                    )),
             )
+            .into_any_element()
     }
 
-    // -- thread pane --------------------------------------------------------
+    // -- main pane ----------------------------------------------------------
+
+    fn render_header(
+        &mut self,
+        title: Option<(String, String, String)>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .h(px(HEADER_HEIGHT))
+            .flex_shrink_0()
+            .px_4()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(p.border)
+            .when(!self.sidebar_open, |d| {
+                d.pl(px(TRAFFIC_LIGHTS_INSET)).child(icon_button(
+                    "show-sidebar",
+                    IconName::PanelLeft,
+                    p,
+                    cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = true;
+                        cx.notify();
+                    }),
+                ))
+            })
+            .when_some(title, |d, (project, title, chip)| {
+                d.child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1p5()
+                        .text_sm()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(p.muted_foreground)
+                                .child(project),
+                        )
+                        .child(div().text_color(p.faint_foreground).child("/"))
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
+                        ),
+                )
+                .child(chip_label(IconName::Sparkles, chip, p))
+            })
+            .into_any_element()
+    }
 
     fn render_thread(
         &mut self,
         thread: Entity<ThreadState>,
+        p: &Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme().clone();
+    ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
         let state = thread.read(cx);
         let Some(model) = state.model.as_ref() else {
@@ -255,169 +444,482 @@ impl WorkspaceView {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .text_color(theme.muted_foreground)
-                .child("Loading thread…")
+                .child(Spinner::new().color(p.muted_foreground))
                 .into_any_element();
         };
         let thread_id = model.thread.id.clone();
         let running = model.running_turn().is_some();
         let waiting = model.open_requests().next().is_some();
-        let summary = turn_summary(model);
-        let title = model.thread.title.clone();
-        let sub = format!(
-            "{} · {}{}",
-            model.thread.harness,
-            model
-                .thread
-                .model
-                .clone()
-                .unwrap_or_else(|| "default model".into()),
-            model
-                .thread
-                .permission_mode
-                .map(|m| format!(" · {m:?}"))
-                .unwrap_or_default()
-        );
+        let empty = model.items.is_empty();
+        let model_name = model
+            .thread
+            .model
+            .clone()
+            .map(|m| pretty_model(&m))
+            .unwrap_or_else(|| "Claude".into());
+        let mode = model
+            .thread
+            .permission_mode
+            .map(|m| format!("{m:?}"))
+            .unwrap_or_else(|| "Default permissions".into());
         let scroller_state = state.scroller.clone();
 
-        let rows = {
+        let timeline = if empty {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_color(p.muted_foreground)
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.foreground)
+                        .child("What should we work on?"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .child(format!("Claude will work in {}", model.thread.cwd)),
+                )
+                .into_any_element()
+        } else {
             let thread = thread.clone();
             let store = self.store.clone();
+            let palette = p.clone();
             MessageScroller::new("timeline", scroller_state, move |ix, window, cx| {
-                render_item(&thread, &store, ix, window, cx)
+                render_row(&thread, &store, &palette, ix, window, cx)
             })
+            .with_bottom_fade(p.background)
             .flex_1()
+            .into_any_element()
         };
 
         let action = if running {
             let id = thread_id.clone();
-            Button::new("stop")
-                .label("Stop")
-                .danger()
-                .small()
-                .on_click(cx.listener(move |this, _, _, cx| {
+            round_button(
+                "stop",
+                IconName::Square,
+                p.foreground,
+                p.background,
+                cx.listener(move |this, _, _, cx| {
                     let id = id.clone();
                     this.store.update(cx, |s, cx| s.interrupt(id, cx));
-                }))
+                }),
+            )
         } else {
             let id = thread_id.clone();
-            let composer = composer.clone();
-            Button::new("send")
-                .label("Send")
-                .primary()
-                .small()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.submit(&id, &composer, window, cx);
-                }))
+            let composer_h = composer.clone();
+            round_button(
+                "send",
+                IconName::ArrowUp,
+                p.accent,
+                p.accent_foreground,
+                cx.listener(move |this, _, window, cx| {
+                    this.submit(&id, &composer_h, window, cx);
+                }),
+            )
         };
 
         v_flex()
             .flex_1()
-            .h_full()
-            .min_w_0()
+            .min_h_0()
+            .child(div().flex_1().min_h_0().flex().flex_col().child(timeline))
             .child(
-                v_flex()
-                    .px_6()
-                    .pt_6()
-                    .pb_3()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(sub)
-                            .when_some(summary, |d, s| d.child(s)),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().px_4().child(rows))
-            .child(
-                v_flex()
-                    .p_4()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .when(waiting, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.warning)
-                                .child("Waiting for your approval above"),
-                        )
-                    })
-                    .child(Textarea::new(&composer))
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .when(running, |d| {
-                                d.child(
+                div().px_6().pb_5().pt_1().flex().justify_center().child(
+                    v_flex()
+                        .w_full()
+                        .max_w(p.content_width)
+                        .gap_1()
+                        .when(waiting, |d| {
+                            d.child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .px_2()
+                                    .text_xs()
+                                    .text_color(p.warning)
+                                    .child(Icon::new(IconName::ShieldCheck).xsmall())
+                                    .child("Claude is waiting for your approval"),
+                            )
+                        })
+                        .child(
+                            v_flex()
+                                .p_2()
+                                .gap_2()
+                                .rounded(px(18.))
+                                .border_1()
+                                .border_color(p.border)
+                                .bg(p.elevated)
+                                .shadow_lg()
+                                .child(
                                     div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child("Claude is working…"),
+                                        .px_2()
+                                        .pt_1()
+                                        .child(Textarea::new(&composer).appearance(false)),
                                 )
-                            })
-                            .child(action),
-                    ),
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(chip_label(IconName::Bot, model_name, p))
+                                                .child(chip_label(IconName::ShieldCheck, mode, p)),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .when(running, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.faint_foreground)
+                                                            .child("⌘. to stop"),
+                                                    )
+                                                })
+                                                .child(action),
+                                        ),
+                                ),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_welcome(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let has_projects = !self.store.read(cx).workspace.projects.is_empty();
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                div()
+                    .size(px(48.))
+                    .rounded(px(14.))
+                    .bg(p.accent_soft)
+                    .text_color(p.accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::Sparkles).large()),
+            )
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Welcome to Agentloft"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(p.muted_foreground)
+                    .child(if has_projects {
+                        "Pick a thread on the left, or start a new one."
+                    } else {
+                        "Add a project folder to start working with Claude."
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .pt_2()
+                    .child(pill_button(
+                        "welcome-add",
+                        IconName::FolderPlus,
+                        "Add project",
+                        "⌘O",
+                        p,
+                        cx.listener(|this, _, _, cx| this.add_project(cx)),
+                    ))
+                    .when(has_projects, |d| {
+                        d.child(pill_button(
+                            "welcome-new",
+                            IconName::SquarePen,
+                            "New thread",
+                            "⌘N",
+                            p,
+                            cx.listener(|this, _, _, cx| this.new_thread(None, cx)),
+                        ))
+                    }),
             )
             .into_any_element()
     }
 }
 
-fn turn_summary(model: &loft_client::model::ThreadModel) -> Option<String> {
-    let turn = model.last_turn()?;
-    let status = match turn.status {
-        TurnStatus::Running => return Some("running…".into()),
-        TurnStatus::Completed => "completed",
-        TurnStatus::Interrupted => "interrupted",
-        TurnStatus::Failed => "failed",
-    };
-    let mut parts = vec![format!("last turn {status}")];
-    if let Some(u) = &turn.usage {
-        if let Some(cost) = u.cost_usd {
-            parts.push(format!("${cost:.4}"));
-        }
-        if let Some(ms) = u.duration_ms {
-            parts.push(format!("{:.1}s", ms as f64 / 1000.0));
-        }
-        parts.push(format!(
-            "{} in / {} out",
-            u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
-            u.output_tokens
-        ));
-    }
-    Some(parts.join(" · "))
-}
-
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+        let p = Palette::of(cx);
         let selected = self.store.read(cx).selected_thread();
-        let has_projects = !self.store.read(cx).workspace.projects.is_empty();
-        let main = match selected {
-            Some(thread) => self.render_thread(thread, window, cx).into_any_element(),
-            None => v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .text_color(theme.muted_foreground)
-                .child(div().text_lg().child("Agentloft"))
-                .child(if has_projects {
-                    "Pick a thread, or start one with “+ New” next to a project."
-                } else {
-                    "Add a project folder to get started."
-                })
-                .into_any_element(),
+        let disconnected = matches!(self.store.read(cx).conn, ConnState::Disconnected(_));
+
+        let header_title = selected.as_ref().and_then(|t| {
+            let model = t.read(cx).model.as_ref()?;
+            let store = self.store.read(cx);
+            let project = store
+                .workspace
+                .projects
+                .iter()
+                .find(|p| p.id == model.thread.project_id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            Some((
+                project,
+                model.thread.title.clone(),
+                model.thread.harness.to_string(),
+            ))
+        });
+
+        let body = match selected {
+            Some(thread) => self.render_thread(thread, &p, window, cx),
+            None => self.render_welcome(&p, cx),
         };
+        let header = self.render_header(header_title, &p, cx);
+        let sidebar = self.sidebar_open.then(|| self.render_sidebar(&p, cx));
+
         h_flex()
+            .key_context(CONTEXT)
+            .on_action(cx.listener(|this, _: &NewThread, _, cx| this.new_thread(None, cx)))
+            .on_action(cx.listener(|this, _: &Interrupt, _, cx| this.interrupt(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| theme::toggle_mode(cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
+            .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.sidebar_open = true;
+                this.search.update(cx, |s, cx| s.focus(window, cx));
+            }))
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.render_sidebar(cx))
-            .child(main)
+            .bg(p.background)
+            .text_color(p.foreground)
+            .children(sidebar)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(header)
+                    .when(disconnected, |d| {
+                        d.child(
+                            h_flex()
+                                .justify_center()
+                                .gap_2()
+                                .py_1p5()
+                                .bg(p.warning_soft)
+                                .text_xs()
+                                .text_color(p.warning)
+                                .child(Spinner::new().xsmall().color(p.warning))
+                                .child("Lost connection to agentloftd — reconnecting…"),
+                        )
+                    })
+                    .child(body),
+            )
+    }
+}
+
+// -- small building blocks -------------------------------------------------------
+
+type ClickHandler = Box<dyn Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static>;
+
+fn icon_button(
+    id: impl Into<SharedString>,
+    icon: IconName,
+    p: &Palette,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    let handler: ClickHandler = Box::new(on_click);
+    div()
+        .id(ElementId::Name(id.into()))
+        .size(px(26.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(7.))
+        .text_color(p.muted_foreground)
+        .cursor_pointer()
+        .hover(|d| d.bg(p.hover).text_color(p.foreground))
+        .child(Icon::new(icon).small())
+        .on_click(move |e, w, cx| handler(e, w, cx))
+        .into_any_element()
+}
+
+fn round_button(
+    id: &'static str,
+    icon: IconName,
+    bg: gpui_kit::Hsla,
+    fg: gpui_kit::Hsla,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(30.))
+        .rounded_full()
+        .bg(bg)
+        .text_color(fg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|d| d.opacity(0.85))
+        .child(Icon::new(icon).small())
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn pill_button(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    shortcut: &'static str,
+    p: &Palette,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    h_flex()
+        .id(id)
+        .gap_2()
+        .items_center()
+        .px_3()
+        .py_1p5()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.elevated)
+        .text_sm()
+        .cursor_pointer()
+        .hover(|d| d.bg(p.hover))
+        .child(Icon::new(icon).small().text_color(p.muted_foreground))
+        .child(label)
+        .child(
+            div()
+                .text_xs()
+                .text_color(p.faint_foreground)
+                .child(shortcut),
+        )
+        .on_click(on_click)
+        .into_any_element()
+}
+
+fn chip_label(icon: IconName, label: impl Into<SharedString>, p: &Palette) -> AnyElement {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .px_2()
+        .py(px(3.))
+        .rounded(px(7.))
+        .text_xs()
+        .text_color(p.muted_foreground)
+        .hover(|d| d.bg(p.hover))
+        .child(Icon::new(icon).xsmall())
+        .child(label.into())
+        .into_any_element()
+}
+
+fn thread_row(
+    thread: &loft_protocol::Thread,
+    active: bool,
+    p: &Palette,
+    cx: &mut Context<WorkspaceView>,
+) -> AnyElement {
+    let id = thread.id.clone();
+    let trailing: AnyElement = match thread.status {
+        ThreadStatus::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
+        ThreadStatus::WaitingApproval => div()
+            .px_1p5()
+            .rounded(px(5.))
+            .bg(p.warning_soft)
+            .text_xs()
+            .text_color(p.warning)
+            .child("Approve")
+            .into_any_element(),
+        ThreadStatus::Error => Icon::new(IconName::CircleAlert)
+            .xsmall()
+            .text_color(p.danger)
+            .into_any_element(),
+        _ => div()
+            .text_xs()
+            .text_color(p.faint_foreground)
+            .child(relative_time(thread.updated_at_ms))
+            .into_any_element(),
+    };
+    h_flex()
+        .id(SharedString::from(format!("thread-{}", thread.id)))
+        .gap_2()
+        .items_center()
+        .pl(px(26.))
+        .pr_2()
+        .py(px(6.))
+        .rounded(px(7.))
+        .cursor_pointer()
+        .text_sm()
+        .text_color(if active {
+            p.foreground
+        } else {
+            p.foreground.opacity(0.82)
+        })
+        .when(active, |d| d.bg(p.selected))
+        .when(!active, |d| d.hover(|d| d.bg(p.hover)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(thread.title.clone()),
+        )
+        .child(trailing)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let id = id.clone();
+            this.store.update(cx, |s, cx| s.select_thread(id, cx));
+        }))
+        .into_any_element()
+}
+
+/// `claude-opus-5-5` → `Opus 5.5`.
+fn pretty_model(id: &str) -> String {
+    let rest = id.strip_prefix("claude-").unwrap_or(id);
+    let mut parts = rest.split('-');
+    let Some(family) = parts.next() else {
+        return id.to_owned();
+    };
+    let version: Vec<&str> = parts.take_while(|s| s.len() <= 2).collect();
+    let mut name = family[..1].to_uppercase() + &family[1..];
+    if !version.is_empty() {
+        name.push(' ');
+        name.push_str(&version.join("."));
+    }
+    name
+}
+
+const SETTINGS_TEMPLATE: &str = r##"# Agentloft settings — changes apply live.
+
+[ui]
+# theme = "system"          # system | light | dark
+# accent = "#6e5bff"        # any #rrggbb
+# font_family = "Inter"     # default: system UI font
+# mono_font_family = "JetBrains Mono"
+# font_size = 14
+# mono_font_size = 12.5
+# density = "comfortable"   # comfortable | compact
+# content_width = 780       # conversation column width (px)
+
+[harness.claude]
+# path = "auto"
+# default_permission_mode = "harness-default"
+"##;
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_model;
+
+    #[test]
+    fn model_names() {
+        assert_eq!(pretty_model("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(pretty_model("claude-sonnet-5-5-20261001"), "Sonnet 5.5");
+        assert_eq!(pretty_model("gpt-5"), "Gpt 5");
     }
 }

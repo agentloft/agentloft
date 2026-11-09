@@ -1,0 +1,52 @@
+//! Asset source: the Lucide icons Agentloft uses, layered over gpui-kit's
+//! default component assets. Only listed icons are embedded in the binary.
+
+use gpui_kit::{AssetSource, Result, SharedString};
+use std::borrow::Cow;
+
+gpui_kit::assets::icon_assets!(
+    AppIcons,
+    [
+        ArrowUp,
+        Ban,
+        Bot,
+        Brain,
+        Check,
+        ChevronDown,
+        ChevronRight,
+        CircleAlert,
+        CircleCheck,
+        CircleStop,
+        CircleX,
+        Folder,
+        FolderPlus,
+        Moon,
+        PanelLeft,
+        Plus,
+        Search,
+        Settings,
+        ShieldCheck,
+        Sparkles,
+        Square,
+        SquarePen,
+        Sun,
+    ]
+);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        match AppIcons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut out = AppIcons.list(path)?;
+        out.extend(gpui_kit::assets::Assets.list(path)?);
+        Ok(out)
+    }
+}
