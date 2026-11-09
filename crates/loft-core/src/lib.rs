@@ -639,6 +639,7 @@ impl Core {
                 self.revert_turn(&thread_id, &turn_id).await
             }
             Request::DeleteThread { thread_id } => self.delete_thread(&thread_id).await,
+            Request::AskOnce { prompt } => self.ask_once(prompt).await,
             Request::SetDraft { thread_id, text } => {
                 let draft = (!text.trim().is_empty()).then_some(text);
                 self.thread_call(&thread_id, |reply| ThreadCmd::SetDraft { draft, reply })
@@ -830,6 +831,52 @@ impl Core {
 }
 
 /// `[harness.<id>]` settings for a harness (defaults when unknown).
+impl Core {
+    /// `claude -p` with no tools, hooks or session: a one-off answer.
+    async fn ask_once(&self, prompt: String) -> CoreResult<Response> {
+        let hcfg = harness_config(&self.config(), &HarnessId::claude());
+        let env = self.opts.env.clone();
+        let binary = match (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path)) {
+            Some(b) => b,
+            None => loft_config::which("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .ok_or_else(|| ErrorBody::new(ErrorCode::Harness, "Claude Code isn't installed"))?,
+        };
+        let run = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            use anyhow::Context as _;
+            let out = std::process::Command::new(&binary)
+                .args([
+                    "-p",
+                    &prompt,
+                    "--output-format",
+                    "text",
+                    "--model",
+                    "sonnet",
+                ])
+                // A user default of high effort would take minutes here.
+                .args(["--effort", "low"])
+                .args(["--tools", "", "--settings", r#"{"disableAllHooks":true}"#])
+                .current_dir(std::env::temp_dir())
+                .env_clear()
+                .envs(env.iter())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("run {}", binary.display()))?;
+            anyhow::ensure!(
+                out.status.success(),
+                "claude failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        });
+        let text = tokio::time::timeout(std::time::Duration::from_secs(180), run)
+            .await
+            .map_err(|_| ErrorBody::new(ErrorCode::Harness, "Claude took too long"))?
+            .map_err(internal)?
+            .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
+        Ok(Response::Text { text })
+    }
+}
+
 pub(crate) fn harness_config(
     config: &loft_config::Config,
     harness: &HarnessId,

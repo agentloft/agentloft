@@ -157,6 +157,12 @@ impl Default for WorktreeConfig {
 pub struct UiConfig {
     /// `system` | `light` | `dark`
     pub theme: String,
+    /// Colour theme: a built-in id (`loft`, `fjord`, …) or `custom:<file>`
+    /// for one in `~/.agentloft/themes/`.
+    pub palette: String,
+    /// `soft` | `normal` | `high`: how strongly borders and secondary text
+    /// stand out.
+    pub contrast: String,
     /// Accent color as `#rrggbb`; `None` = theme default.
     pub accent: Option<String>,
     /// UI font family; `None` = system UI font.
@@ -177,6 +183,8 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "system".into(),
+            palette: "loft".into(),
+            contrast: "normal".into(),
             accent: None,
             font_family: None,
             mono_font_family: None,

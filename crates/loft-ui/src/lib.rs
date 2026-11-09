@@ -16,6 +16,7 @@ pub mod panel;
 pub mod settings;
 pub mod store;
 pub mod theme;
+pub mod themes;
 pub mod windows;
 pub mod workspace;
 

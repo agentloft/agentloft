@@ -17,6 +17,8 @@ use gpui_kit::{
 use loft_config::{Config, SettingValue};
 use loft_protocol::{HarnessId, PermissionMode, Request};
 
+mod appearance;
+
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
 impl Global for SettingsWindow {}
 
@@ -204,6 +206,7 @@ pub struct SettingsView {
     config: Config,
     inputs: Vec<(Field, Entity<InputState>)>,
     error: Option<String>,
+    studio: appearance::Studio,
     _subs: Vec<Subscription>,
 }
 
@@ -259,12 +262,14 @@ impl SettingsView {
             );
             inputs.push((field, input));
         }
+        let studio = appearance::Studio::new(&paths.home);
         Self {
             store,
             section: Section::Appearance,
             config,
             inputs,
             error,
+            studio,
             _subs: subs,
         }
     }
@@ -329,124 +334,6 @@ impl SettingsView {
     }
 
     // -- sections -----------------------------------------------------------
-
-    fn appearance(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let ui = self.config.ui.clone();
-        let theme = segmented(
-            "theme",
-            &[("system", "System"), ("light", "Light"), ("dark", "Dark")],
-            &ui.theme,
-            p,
-            cx.listener(|this, value: &&str, _, cx| {
-                this.set_str(&["ui", "theme"], value, false, cx)
-            }),
-        );
-        let mut swatches = h_flex().gap_2().flex_wrap();
-        for (ix, (name, hex)) in ACCENTS.iter().enumerate() {
-            let selected = ui.accent.as_deref().map(str::to_lowercase) == hex.map(str::to_owned);
-            let color = hex.and_then(theme::parse_hex).unwrap_or(p.accent);
-            let value = hex.map(str::to_owned);
-            swatches = swatches.child(
-                div()
-                    .id(("accent", ix))
-                    .size(px(24.))
-                    .rounded_full()
-                    .p(px(3.))
-                    .border_2()
-                    .border_color(if selected {
-                        p.foreground
-                    } else {
-                        gpui_kit::transparent_black()
-                    })
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .size_full()
-                            .rounded_full()
-                            .bg(color)
-                            // "Default" shows the theme accent, dimmed ring.
-                            .when(hex.is_none(), |d| d.opacity(0.6)),
-                    )
-                    .tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(*name).build(window, cx)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let v = match &value {
-                            Some(h) => SettingValue::Str(h.clone()),
-                            None => SettingValue::Unset,
-                        };
-                        this.write(&["ui", "accent"], v, false, cx);
-                    })),
-            );
-        }
-        let density = segmented(
-            "density",
-            &[("comfortable", "Comfortable"), ("compact", "Compact")],
-            &ui.density,
-            p,
-            cx.listener(|this, value: &&str, _, cx| {
-                this.set_str(&["ui", "density"], value, false, cx)
-            }),
-        );
-        v_flex()
-            .child(row("Theme", "Follow the system, or pick one.", theme, p))
-            .child(row(
-                "Accent color",
-                "Used for highlights, the send button and links.",
-                swatches.into_any_element(),
-                p,
-            ))
-            .child(row(
-                "Text size",
-                "Base size of the interface and conversation.",
-                self.stepper("font_size", ui.font_size, 11., 20., 1., "px", p, cx),
-                p,
-            ))
-            .child(row(
-                "Code text size",
-                "Code blocks, tool output, diffs and the terminal.",
-                self.stepper(
-                    "mono_font_size",
-                    ui.mono_font_size,
-                    10.,
-                    18.,
-                    0.5,
-                    "px",
-                    p,
-                    cx,
-                ),
-                p,
-            ))
-            .child(row("Density", "Spacing in the conversation.", density, p))
-            .child(row(
-                "Conversation width",
-                "Maximum width of the conversation column.",
-                self.stepper(
-                    "content_width",
-                    ui.content_width,
-                    560.,
-                    1200.,
-                    40.,
-                    "px",
-                    p,
-                    cx,
-                ),
-                p,
-            ))
-            .child(row(
-                "Interface font",
-                "Any installed font family.",
-                text_input(&self.input(Field::UiFont)),
-                p,
-            ))
-            .child(row(
-                "Monospace font",
-                "For code, diffs and the terminal.",
-                text_input(&self.input(Field::MonoFont)),
-                p,
-            ))
-            .into_any_element()
-    }
 
     #[allow(clippy::too_many_arguments)]
     fn stepper(
@@ -683,7 +570,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         let mut nav = v_flex().gap_0p5().px_2();
         for section in Section::ALL {
@@ -712,7 +599,7 @@ impl Render for SettingsView {
             );
         }
         let body = match self.section {
-            Section::Appearance => self.appearance(&p, cx),
+            Section::Appearance => self.appearance(&p, window, cx),
             Section::Agents => self.agents(&p, cx),
             Section::Worktrees => self.worktrees(&p, cx),
             Section::About => self.about(&p, cx),

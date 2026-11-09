@@ -164,6 +164,11 @@ pub enum Request {
         thread_id: ThreadId,
         title: String,
     },
+    /// One self-contained question to Claude, without tools or a thread
+    /// (e.g. "design a colour theme"). Answers `Response::Text`.
+    AskOnce {
+        prompt: String,
+    },
     /// Save the composer's unsent text (empty clears it).
     SetDraft {
         thread_id: ThreadId,
