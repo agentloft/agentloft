@@ -111,6 +111,10 @@ pub struct AppStore {
     /// Each project's branches (`ListBranches`), for worktree bases.
     pub branches: HashMap<ProjectId, loft_protocol::BranchList>,
     branches_loading: std::collections::HashSet<ProjectId>,
+    /// Agents switched off in Settings (hidden from pickers).
+    pub disabled_agents: std::collections::HashSet<String>,
+    /// Models left out of the pickers, per agent.
+    pub hidden_models: HashMap<String, Vec<String>>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
@@ -140,10 +144,13 @@ impl AppStore {
             harness_status: HashMap::new(),
             branches: HashMap::new(),
             branches_loading: Default::default(),
+            disabled_agents: Default::default(),
+            hidden_models: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
             daemon_pid: None,
         };
+        this.reload_agent_prefs(cx);
         this.connect(cx);
         this
     }
@@ -248,6 +255,30 @@ impl AppStore {
 
     /// Agents to offer: Claude Code and Codex always, ACP agents (OpenCode,
     /// Gemini) once their CLI is found.
+    /// Re-read the per-agent picker settings (on/off, hidden models).
+    pub fn reload_agent_prefs(&mut self, cx: &mut Context<Self>) {
+        let Ok(config) = loft_config::Config::load(&self.paths) else {
+            return;
+        };
+        self.disabled_agents.clear();
+        self.hidden_models.clear();
+        for (id, h) in [
+            (HarnessId::CLAUDE, &config.harness.claude),
+            (HarnessId::CODEX, &config.harness.codex),
+            (HarnessId::OPENCODE, &config.harness.opencode),
+            (HarnessId::GEMINI, &config.harness.gemini),
+        ] {
+            if !h.enabled {
+                self.disabled_agents.insert(id.to_owned());
+            }
+            if !h.hidden_models.is_empty() {
+                self.hidden_models
+                    .insert(id.to_owned(), h.hidden_models.clone());
+            }
+        }
+        cx.notify();
+    }
+
     pub fn available_harnesses(&self) -> Vec<(&'static str, &'static str)> {
         let mut out = vec![
             (HarnessId::CLAUDE, "Claude Code"),
@@ -265,6 +296,7 @@ impl AppStore {
                 out.push((id, name));
             }
         }
+        out.retain(|(id, _)| !self.disabled_agents.contains(*id));
         out
     }
 

@@ -339,7 +339,7 @@ impl Core {
         })?;
         let hcfg = harness_config(&self.config(), harness);
         let binary = (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path));
-        let env = self.opts.env.clone();
+        let env = agent_env(&self.opts.env, &hcfg);
         let models = tokio::task::spawn_blocking(move || h.list_models(&env, binary))
             .await
             .map_err(internal)?
@@ -723,11 +723,11 @@ impl Core {
         }
         // Drop any idle actor holding the old thread state.
         lock(&self.threads).remove(id);
-        let (model, mode) = thread_defaults(&self.config(), &harness);
+        let (model, mode, effort) = thread_defaults(&self.config(), &harness);
         thread.harness = harness;
         thread.native_session_id = None;
         thread.model = model;
-        thread.effort = None;
+        thread.effort = effort;
         thread.permission_mode = mode;
         thread.updated_at_ms = now_ms();
         self.commit(vec![Event::ThreadUpdated {
@@ -753,7 +753,7 @@ impl Core {
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let now = now_ms();
         let workspace = self.default_workspace(&project.root_path);
-        let (model, permission_mode) = thread_defaults(&self.config(), &harness);
+        let (model, permission_mode, effort) = thread_defaults(&self.config(), &harness);
         let thread = Thread {
             id: ThreadId::new(),
             project_id,
@@ -762,7 +762,7 @@ impl Core {
             cwd: project.root_path,
             model,
             permission_mode,
-            effort: None,
+            effort,
             native_session_id: None,
             status: ThreadStatus::Idle,
             created_at_ms: now,
@@ -848,7 +848,7 @@ impl Core {
         model: Option<String>,
     ) -> CoreResult<Response> {
         let hcfg = harness_config(&self.config(), &harness);
-        let env = self.opts.env.clone();
+        let env = agent_env(&self.opts.env, &hcfg);
         let name = match harness.as_str() {
             HarnessId::CLAUDE => "claude",
             HarnessId::CODEX => "codex",
@@ -982,12 +982,25 @@ pub(crate) fn harness_config(
 pub(crate) fn thread_defaults(
     config: &loft_config::Config,
     harness: &HarnessId,
-) -> (Option<String>, Option<loft_protocol::PermissionMode>) {
+) -> (
+    Option<String>,
+    Option<loft_protocol::PermissionMode>,
+    Option<String>,
+) {
     let h = harness_config(config, harness);
-    let model =
-        (h.default_model != "auto" && !h.default_model.is_empty()).then(|| h.default_model.clone());
+    let set = |v: &str| (v != "auto" && !v.is_empty()).then(|| v.to_owned());
     let mode = serde_json::from_value(serde_json::json!(h.default_permission_mode)).ok();
-    (model, mode)
+    (set(&h.default_model), mode, set(&h.default_effort))
+}
+
+/// The login environment plus the agent's own `env` from its settings.
+pub(crate) fn agent_env(
+    base: &std::collections::HashMap<String, String>,
+    hcfg: &loft_config::HarnessConfig,
+) -> std::collections::HashMap<String, String> {
+    let mut env = base.clone();
+    env.extend(hcfg.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
 }
 
 fn expand_tilde(path: &str) -> PathBuf {

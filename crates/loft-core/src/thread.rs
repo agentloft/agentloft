@@ -626,7 +626,7 @@ impl ThreadActor {
             new_session_id: new_session_id.clone(),
             fork_from,
             fork_at,
-            env: opts.env.clone(),
+            env: std::sync::Arc::new(crate::agent_env(&opts.env, &hcfg)),
             binary: (hcfg.path != "auto").then(|| hcfg.path.clone().into()),
             extra_args: hcfg.extra_args.clone(),
             mcp_servers: opts

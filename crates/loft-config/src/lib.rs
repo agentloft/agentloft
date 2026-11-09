@@ -214,8 +214,16 @@ pub struct HarnessConfig {
     pub default_model: String,
     /// `"harness-default"` or one of the canonical modes.
     pub default_permission_mode: String,
+    /// Reasoning effort for new threads; `"auto"` = the model's default.
+    pub default_effort: String,
     pub idle_timeout_minutes: u64,
     pub extra_args: Vec<String>,
+    /// Off: the agent is hidden from pickers (its threads keep working).
+    pub enabled: bool,
+    /// Extra environment variables for the agent's processes.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Models left out of the pickers.
+    pub hidden_models: Vec<String>,
 }
 
 impl Default for HarnessConfig {
@@ -224,8 +232,12 @@ impl Default for HarnessConfig {
             path: "auto".into(),
             default_model: "auto".into(),
             default_permission_mode: "harness-default".into(),
+            default_effort: "auto".into(),
             idle_timeout_minutes: 15,
             extra_args: Vec::new(),
+            enabled: true,
+            env: Default::default(),
+            hidden_models: Vec::new(),
         }
     }
 }
@@ -294,6 +306,10 @@ impl ProjectConfig {
 pub enum SettingValue {
     Str(String),
     Float(f64),
+    Bool(bool),
+    List(Vec<String>),
+    /// A table of strings (e.g. environment variables).
+    Map(Vec<(String, String)>),
     /// Remove the key (back to the default).
     Unset,
 }
@@ -326,6 +342,23 @@ pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result
         SettingValue::Float(f) => {
             // Whole numbers stay floats (`14.0`) so serde reads them as f32.
             table.insert(last, v(f));
+        }
+        SettingValue::Bool(b) => {
+            table.insert(last, v(b));
+        }
+        SettingValue::List(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(item);
+            }
+            table.insert(last, v(array));
+        }
+        SettingValue::Map(pairs) => {
+            let mut inline = toml_edit::InlineTable::new();
+            for (k, val) in pairs {
+                inline.insert(&k, val.into());
+            }
+            table.insert(last, v(inline));
         }
         SettingValue::Unset => {
             table.remove(last);
@@ -566,6 +599,28 @@ mod tests {
         assert_eq!(cfg.ui.accent.as_deref(), Some("#3b82f6"));
         assert_eq!(cfg.harness.codex.default_model, "gpt-5");
         write_setting(&paths, &["ui", "accent"], SettingValue::Unset).unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "enabled"],
+            SettingValue::Bool(false),
+        )
+        .unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "extra_args"],
+            SettingValue::List(vec!["--foo".into(), "bar".into()]),
+        )
+        .unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "env"],
+            SettingValue::Map(vec![("OPENAI_BASE_URL".into(), "http://x".into())]),
+        )
+        .unwrap();
+        let c = Config::load(&paths).unwrap();
+        assert!(!c.harness.codex.enabled);
+        assert_eq!(c.harness.codex.extra_args, ["--foo", "bar"]);
+        assert_eq!(c.harness.codex.env["OPENAI_BASE_URL"], "http://x");
         assert_eq!(Config::load(&paths).unwrap().ui.accent, None);
     }
 

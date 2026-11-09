@@ -2872,6 +2872,11 @@ fn take_dev_tab() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// [`tilde`] for a path string.
+pub(crate) fn tilde_path_str(path: &str) -> String {
+    tilde(path)
+}
+
 /// [`tilde`] for a path.
 pub(crate) fn tilde_path(path: &std::path::Path) -> String {
     tilde(&path.to_string_lossy())

@@ -15,8 +15,9 @@ use gpui_kit::{
     WindowBounds, WindowOptions, div, point, prelude::FluentBuilder as _, px, size,
 };
 use loft_config::{Config, SettingValue};
-use loft_protocol::{HarnessId, PermissionMode, Request};
+use loft_protocol::Request;
 
+mod agents;
 mod appearance;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
@@ -115,14 +116,6 @@ impl Section {
 enum Field {
     UiFont,
     MonoFont,
-    ClaudePath,
-    ClaudeModel,
-    CodexPath,
-    CodexModel,
-    OpencodePath,
-    OpencodeModel,
-    GeminiPath,
-    GeminiModel,
     BranchPrefix,
 }
 
@@ -131,14 +124,6 @@ impl Field {
         match self {
             Field::UiFont => &["ui", "font_family"],
             Field::MonoFont => &["ui", "mono_font_family"],
-            Field::ClaudePath => &["harness", "claude", "path"],
-            Field::ClaudeModel => &["harness", "claude", "default_model"],
-            Field::CodexPath => &["harness", "codex", "path"],
-            Field::CodexModel => &["harness", "codex", "default_model"],
-            Field::OpencodePath => &["harness", "opencode", "path"],
-            Field::OpencodeModel => &["harness", "opencode", "default_model"],
-            Field::GeminiPath => &["harness", "gemini", "path"],
-            Field::GeminiModel => &["harness", "gemini", "default_model"],
             Field::BranchPrefix => &["worktrees", "branch_prefix"],
         }
     }
@@ -147,14 +132,6 @@ impl Field {
         match self {
             Field::UiFont => c.ui.font_family.clone().unwrap_or_default(),
             Field::MonoFont => c.ui.mono_font_family.clone().unwrap_or_default(),
-            Field::ClaudePath => c.harness.claude.path.clone(),
-            Field::ClaudeModel => c.harness.claude.default_model.clone(),
-            Field::CodexPath => c.harness.codex.path.clone(),
-            Field::CodexModel => c.harness.codex.default_model.clone(),
-            Field::OpencodePath => c.harness.opencode.path.clone(),
-            Field::OpencodeModel => c.harness.opencode.default_model.clone(),
-            Field::GeminiPath => c.harness.gemini.path.clone(),
-            Field::GeminiModel => c.harness.gemini.default_model.clone(),
             Field::BranchPrefix => c.worktrees.branch_prefix.clone(),
         }
     }
@@ -163,12 +140,6 @@ impl Field {
         match self {
             Field::UiFont => "System font",
             Field::MonoFont => "Theme monospace font",
-            Field::ClaudePath | Field::CodexPath | Field::OpencodePath | Field::GeminiPath => {
-                "auto (login-shell PATH)"
-            }
-            Field::ClaudeModel | Field::CodexModel | Field::OpencodeModel | Field::GeminiModel => {
-                "auto (the agent's default)"
-            }
             Field::BranchPrefix => "agentloft",
         }
     }
@@ -178,17 +149,6 @@ impl Field {
         let text = text.trim();
         match (self, text.is_empty()) {
             (Field::UiFont | Field::MonoFont, true) => SettingValue::Unset,
-            (
-                Field::ClaudePath
-                | Field::CodexPath
-                | Field::OpencodePath
-                | Field::GeminiPath
-                | Field::ClaudeModel
-                | Field::CodexModel
-                | Field::OpencodeModel
-                | Field::GeminiModel,
-                true,
-            ) => SettingValue::Str("auto".into()),
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
             _ => SettingValue::Str(text.to_owned()),
         }
@@ -207,6 +167,7 @@ pub struct SettingsView {
     inputs: Vec<(Field, Entity<InputState>)>,
     error: Option<String>,
     studio: appearance::Studio,
+    agents: agents::AgentsPage,
     _subs: Vec<Subscription>,
 }
 
@@ -230,19 +191,7 @@ impl SettingsView {
         };
         let mut inputs = Vec::new();
         let mut subs = Vec::new();
-        for field in [
-            Field::UiFont,
-            Field::MonoFont,
-            Field::ClaudePath,
-            Field::ClaudeModel,
-            Field::CodexPath,
-            Field::CodexModel,
-            Field::OpencodePath,
-            Field::OpencodeModel,
-            Field::GeminiPath,
-            Field::GeminiModel,
-            Field::BranchPrefix,
-        ] {
+        for field in [Field::UiFont, Field::MonoFont, Field::BranchPrefix] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
                 let mut s = InputState::new(window, cx).placeholder(field.placeholder());
@@ -270,6 +219,7 @@ impl SettingsView {
             inputs,
             error,
             studio,
+            agents: agents::AgentsPage::new(),
             _subs: subs,
         }
     }
@@ -287,7 +237,7 @@ impl SettingsView {
         let unchanged = match &value {
             SettingValue::Str(s) => *s == field.current(&self.config),
             SettingValue::Unset => field.current(&self.config).is_empty(),
-            SettingValue::Float(_) => false,
+            _ => false,
         };
         if !unchanged {
             self.write(field.key(), value, field.is_daemon(), cx);
@@ -306,6 +256,7 @@ impl SettingsView {
             Ok(c) => {
                 self.config = c;
                 self.error = None;
+                self.store.update(cx, |s, cx| s.reload_agent_prefs(cx));
             }
             Err(err) => self.error = Some(format!("{err:#}")),
         }
@@ -383,103 +334,6 @@ impl SettingsView {
             .child(div().min_w(px(64.)).text_center().text_sm().child(shown))
             .child(button("inc", IconName::Plus, step, value < max))
             .into_any_element()
-    }
-
-    fn agents(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let mut col = v_flex();
-        for (id, name, path, model) in [
-            (
-                HarnessId::CLAUDE,
-                "Claude Code",
-                Field::ClaudePath,
-                Field::ClaudeModel,
-            ),
-            (
-                HarnessId::CODEX,
-                "Codex",
-                Field::CodexPath,
-                Field::CodexModel,
-            ),
-            (
-                HarnessId::OPENCODE,
-                "OpenCode (ACP)",
-                Field::OpencodePath,
-                Field::OpencodeModel,
-            ),
-            (
-                HarnessId::GEMINI,
-                "Gemini CLI (ACP)",
-                Field::GeminiPath,
-                Field::GeminiModel,
-            ),
-        ] {
-            let h = match id {
-                HarnessId::CODEX => self.config.harness.codex.clone(),
-                HarnessId::OPENCODE => self.config.harness.opencode.clone(),
-                HarnessId::GEMINI => self.config.harness.gemini.clone(),
-                _ => self.config.harness.claude.clone(),
-            };
-            let status = self
-                .store
-                .read(cx)
-                .harness_status
-                .get(&HarnessId(id.into()))
-                .cloned();
-            let (status_text, status_hint, ok) = match &status {
-                None => ("Checking…".to_owned(), String::new(), true),
-                Some(s) if s.installed => (
-                    s.version.clone().unwrap_or_else(|| "Installed".into()),
-                    s.path.clone().unwrap_or_default(),
-                    s.error.is_none(),
-                ),
-                Some(s) => (
-                    "Not found".to_owned(),
-                    s.error.clone().unwrap_or_default(),
-                    false,
-                ),
-            };
-            col = col
-                .child(group_title(name, p))
-                .child(row(
-                    "Status",
-                    &status_hint,
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .text_sm()
-                        .text_color(if ok { p.success } else { p.warning })
-                        .child(
-                            Icon::new(if ok {
-                                IconName::CircleCheck
-                            } else {
-                                IconName::CircleAlert
-                            })
-                            .small(),
-                        )
-                        .child(status_text)
-                        .into_any_element(),
-                    p,
-                ))
-                .child(row(
-                    "Binary",
-                    "Path to the CLI. Leave empty to find it on your login shell's PATH.",
-                    text_input(&self.input(path)),
-                    p,
-                ))
-                .child(row(
-                    "Default model",
-                    "Used for new threads; empty means the agent's own default.",
-                    text_input(&self.input(model)),
-                    p,
-                ))
-                .child(row(
-                    "Default permissions",
-                    "How much the agent may do without asking, for new threads.",
-                    permission_menu(id, &h.default_permission_mode, cx),
-                    p,
-                ));
-        }
-        col.into_any_element()
     }
 
     fn worktrees(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -600,7 +454,7 @@ impl Render for SettingsView {
         }
         let body = match self.section {
             Section::Appearance => self.appearance(&p, window, cx),
-            Section::Agents => self.agents(&p, cx),
+            Section::Agents => self.agents_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
             Section::About => self.about(&p, cx),
         };
@@ -692,16 +546,6 @@ fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoEl
         .child(div().flex_shrink_0().child(control))
 }
 
-fn group_title(title: &str, p: &Palette) -> impl IntoElement {
-    div()
-        .pt_5()
-        .pb_1()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(p.muted_foreground)
-        .child(title.to_uppercase())
-}
-
 fn text_input(state: &Entity<InputState>) -> AnyElement {
     div()
         .w(px(260.))
@@ -784,62 +628,4 @@ fn segmented(
         );
     }
     row.into_any_element()
-}
-
-fn permission_menu(
-    harness: &'static str,
-    current: &str,
-    cx: &mut Context<SettingsView>,
-) -> AnyElement {
-    use PermissionMode::*;
-    use gpui_kit::component::button::Button;
-    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-    let current_mode: Option<PermissionMode> =
-        serde_json::from_value(serde_json::json!(current)).ok();
-    let label = crate::workspace::mode_label(current_mode);
-    let view = cx.entity().downgrade();
-    Button::new(SharedString::from(format!("perm-{harness}")))
-        .label(label)
-        .icon(IconName::ShieldCheck)
-        .outline()
-        .small()
-        .dropdown_menu(move |mut menu, _, _| {
-            for mode in [
-                None,
-                Some(ReadOnly),
-                Some(AskAll),
-                Some(AcceptEdits),
-                Some(Auto),
-                Some(FullAccess),
-            ] {
-                let view = view.clone();
-                let value = match mode {
-                    None => "harness-default".to_owned(),
-                    Some(m) => serde_json::to_value(m)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_default(),
-                };
-                menu = menu.item(
-                    PopupMenuItem::new(crate::workspace::mode_label(mode))
-                        .checked(mode == current_mode)
-                        .on_click(move |_, _, cx| {
-                            let value = value.clone();
-                            let _ = view.update(cx, |this, cx| {
-                                this.set_str(
-                                    &["harness", harness, "default_permission_mode"],
-                                    &value,
-                                    true,
-                                    cx,
-                                )
-                            });
-                        }),
-                );
-                if mode.is_none() {
-                    menu = menu.separator();
-                }
-            }
-            menu
-        })
-        .into_any_element()
 }

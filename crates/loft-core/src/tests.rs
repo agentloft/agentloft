@@ -970,3 +970,26 @@ fn ansi_codes_are_stripped() {
         "name = 1"
     );
 }
+
+#[test]
+fn agent_defaults_for_new_threads() {
+    let mut config = loft_config::Config::default();
+    config.harness.claude.default_model = "opus".into();
+    config.harness.claude.default_effort = "high".into();
+    config.harness.claude.default_permission_mode = "accept-edits".into();
+    config
+        .harness
+        .claude
+        .env
+        .insert("ANTHROPIC_BASE_URL".into(), "http://proxy".into());
+    let (model, mode, effort) = crate::thread_defaults(&config, &HarnessId::claude());
+    assert_eq!(model.as_deref(), Some("opus"));
+    assert_eq!(effort.as_deref(), Some("high"));
+    assert_eq!(mode, Some(loft_protocol::PermissionMode::AcceptEdits));
+    let (_, _, effort) = crate::thread_defaults(&config, &HarnessId(HarnessId::CODEX.into()));
+    assert_eq!(effort, None, "auto");
+    let base = std::collections::HashMap::from([("PATH".to_owned(), "/bin".to_owned())]);
+    let env = crate::agent_env(&base, &config.harness.claude);
+    assert_eq!(env["ANTHROPIC_BASE_URL"], "http://proxy");
+    assert_eq!(env["PATH"], "/bin");
+}

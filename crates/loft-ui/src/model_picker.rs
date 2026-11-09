@@ -117,8 +117,15 @@ impl ModelPicker {
             None => (HarnessId::claude(), false, None, None, None),
         };
         let all = store.models.get(&harness).cloned().unwrap_or_default();
+        let hidden = store
+            .hidden_models
+            .get(harness.as_str())
+            .cloned()
+            .unwrap_or_default();
         let models = all
             .into_iter()
+            // Hidden in Settings, unless it's the one in use.
+            .filter(|m| !hidden.contains(&m.id) || is_current(m, current_model.as_deref()))
             .filter(|m| {
                 self.query.is_empty()
                     || m.display_name.to_lowercase().contains(&self.query)
@@ -586,7 +593,7 @@ impl ModelPicker {
 }
 
 /// Every permission mode, `None` (the agent's default) first.
-const MODES: [Option<PermissionMode>; 6] = [
+pub const MODES: [Option<PermissionMode>; 6] = [
     None,
     Some(PermissionMode::ReadOnly),
     Some(PermissionMode::AskAll),
