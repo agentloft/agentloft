@@ -361,6 +361,8 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
@@ -480,6 +482,8 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
@@ -559,6 +563,8 @@ async fn config_reload_applies_to_new_threads() {
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
     let config = dir.path().join("config.toml");
     let core = Core::new(
         Store::open(&dir.path().join("db.sqlite")).unwrap(),
@@ -591,6 +597,8 @@ async fn pull_request_pushes_branch_and_calls_gh() {
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
@@ -684,6 +692,8 @@ async fn revert_turn_restores_files_and_tells_the_agent() {
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
