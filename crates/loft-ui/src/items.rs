@@ -650,6 +650,7 @@ fn approval_card(
             DecisionKind::DenyAndStop => "",
         };
         let button = Button::new(SharedString::from(format!("{}-{decision:?}", req.id)))
+            .cursor_pointer()
             .label(format!("{}{hint}", decision.label()))
             .small();
         let button = match decision {
@@ -766,6 +767,7 @@ fn render_turn_footer(
         let (store, thread_id, turn_id) = (store.clone(), model.thread.id.clone(), turn.id.clone());
         let current = model.thread.harness.clone();
         Button::new(SharedString::from(format!("fork-turn-{}", turn.id)))
+            .cursor_pointer()
             .icon(IconName::GitFork)
             .ghost()
             .xsmall()
@@ -794,6 +796,7 @@ fn render_turn_footer(
         let (store, thread_id, turn_id) = (store.clone(), model.thread.id.clone(), turn.id.clone());
         let later = model.turns.len().saturating_sub(turn_ix + 1);
         Button::new(SharedString::from(format!("undo-{}", turn.id)))
+            .cursor_pointer()
             .icon(IconName::RotateCw)
             .ghost()
             .xsmall()
@@ -851,6 +854,7 @@ fn copy_button(
     let copied = just_copied(&id);
     let key = id.clone();
     Button::new(SharedString::from(id))
+        .cursor_pointer()
         .icon(if copied {
             IconName::Check
         } else {
@@ -900,8 +904,10 @@ pub(crate) fn confirm_revert(
             ))
             .footer(
                 DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
-                    .child(DialogAction::new().child(Button::new("ok").danger().label("Undo changes"))),
+                    .child(DialogClose::new().child(Button::new("cancel")
+.cursor_pointer().label("Cancel")))
+                    .child(DialogAction::new().child(Button::new("ok")
+.cursor_pointer().danger().label("Undo changes"))),
             )
             .on_ok(move |_, _, cx| {
                 let (t, u) = (thread_id.clone(), turn_id.clone());

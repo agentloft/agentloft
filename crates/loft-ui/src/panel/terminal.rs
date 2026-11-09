@@ -447,6 +447,7 @@ impl Render for TerminalTabs {
                     .child(
                         div()
                             .id(SharedString::from(format!("term-tab-x-{ix}")))
+                            .cursor_pointer()
                             .p(px(1.))
                             .rounded(px(4.))
                             .invisible()

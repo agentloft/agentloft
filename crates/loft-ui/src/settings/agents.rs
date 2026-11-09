@@ -792,6 +792,7 @@ impl SettingsView {
         let id = self.agents.selected;
         let _ = p;
         Button::new("default-model")
+            .cursor_pointer()
             .outline()
             .small()
             .label(label)

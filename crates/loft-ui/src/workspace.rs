@@ -791,6 +791,7 @@ impl WorkspaceView {
                         .child(
                             div()
                                 .id(SharedString::from(format!("paste-remove-{ix}")))
+                                .cursor_pointer()
                                 .p(px(3.))
                                 .rounded(px(5.))
                                 .text_color(p.muted_foreground)
@@ -1135,6 +1136,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .id(SharedString::from(format!("win-tab-x-{ix}")))
+                            .cursor_pointer()
                             .p(px(2.))
                             .rounded(px(4.))
                             .invisible()
@@ -2122,24 +2124,28 @@ impl WorkspaceView {
         let focus = picker.read(cx).search_focus(cx);
         let open = self.branch_picker_open;
         let branch = base.as_ref().map(|b| b.branch.clone());
-        let trigger = Button::new("worktree-base").ghost().xsmall().child(
-            h_flex()
-                .gap_1()
-                .items_center()
-                .child(Icon::new(IconName::GitBranch).xsmall().text_color(p.accent))
-                .child(
-                    div()
-                        .max_w(px(220.))
-                        .truncate()
-                        .text_color(p.foreground)
-                        .child(branch.clone().unwrap_or_else(|| "Choose a branch".into())),
-                )
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .xsmall()
-                        .text_color(p.faint_foreground),
-                ),
-        );
+        let trigger = Button::new("worktree-base")
+            .cursor_pointer()
+            .ghost()
+            .xsmall()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(IconName::GitBranch).xsmall().text_color(p.accent))
+                    .child(
+                        div()
+                            .max_w(px(220.))
+                            .truncate()
+                            .text_color(p.foreground)
+                            .child(branch.clone().unwrap_or_else(|| "Choose a branch".into())),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .xsmall()
+                            .text_color(p.faint_foreground),
+                    ),
+            );
         let branch_popover = Popover::new("worktree-base-popover")
             .anchor(gpui_kit::Anchor::TopCenter)
             .offset(px(6.))
@@ -2379,39 +2385,43 @@ impl WorkspaceView {
         let picker = self.model_picker_for(thread_id, window, cx);
         let focus = picker.read(cx).search_focus(cx);
         let open = self.picker_open;
-        let trigger = Button::new("model-picker").ghost().xsmall().child(
-            h_flex()
-                .gap_1p5()
-                .items_center()
-                .child(crate::brand::agent_logo(harness.as_str(), px(13.), p))
-                .child(div().text_color(p.foreground).child(model_name))
-                .when_some(effort_name, |d, effort| {
-                    d.child(div().text_color(p.faint_foreground).child("·"))
-                        .child(div().text_color(p.muted_foreground).child(effort))
-                })
-                // The permission mode, when one is chosen.
-                .when(mode.is_some(), |d| {
-                    let full = mode == Some(loft_protocol::PermissionMode::FullAccess);
-                    d.child(div().text_color(p.faint_foreground).child("·"))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .text_color(if full { p.warning } else { p.muted_foreground })
-                                .child(Icon::new(crate::model_picker::mode_icon(mode)).xsmall())
-                                .child(crate::model_picker::mode_short(mode)),
-                        )
-                })
-                .child(
-                    Icon::new(if open {
-                        IconName::ChevronUp
-                    } else {
-                        IconName::ChevronDown
+        let trigger = Button::new("model-picker")
+            .cursor_pointer()
+            .ghost()
+            .xsmall()
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(crate::brand::agent_logo(harness.as_str(), px(13.), p))
+                    .child(div().text_color(p.foreground).child(model_name))
+                    .when_some(effort_name, |d, effort| {
+                        d.child(div().text_color(p.faint_foreground).child("·"))
+                            .child(div().text_color(p.muted_foreground).child(effort))
                     })
-                    .xsmall()
-                    .text_color(p.faint_foreground),
-                ),
-        );
+                    // The permission mode, when one is chosen.
+                    .when(mode.is_some(), |d| {
+                        let full = mode == Some(loft_protocol::PermissionMode::FullAccess);
+                        d.child(div().text_color(p.faint_foreground).child("·"))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .text_color(if full { p.warning } else { p.muted_foreground })
+                                    .child(Icon::new(crate::model_picker::mode_icon(mode)).xsmall())
+                                    .child(crate::model_picker::mode_short(mode)),
+                            )
+                    })
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .xsmall()
+                        .text_color(p.faint_foreground),
+                    ),
+            );
         Popover::new("model-picker-popover")
             .anchor(gpui_kit::Anchor::BottomLeft)
             .offset(px(8.))
@@ -3108,8 +3118,14 @@ fn rename_dialog(
             .child(Input::new(&input))
             .footer(
                 DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
-                    .child(DialogAction::new().child(Button::new("ok").primary().label("Rename"))),
+                    .child(
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").cursor_pointer().primary().label("Rename")),
+                    ),
             )
             .on_ok(move |_, _, cx| {
                 let title = input.read(cx).value().trim().to_owned();
@@ -3203,6 +3219,7 @@ fn show_pasted(text: String, window: &mut Window, cx: &mut gpui_kit::App) {
                         .gap_2()
                         .child(
                             Button::new("pasted-copy")
+                                .cursor_pointer()
                                 .label("Copy")
                                 .icon(IconName::Copy)
                                 .ghost()
@@ -3213,8 +3230,12 @@ fn show_pasted(text: String, window: &mut Window, cx: &mut gpui_kit::App) {
                                 }),
                         )
                         .child(
-                            DialogClose::new()
-                                .child(Button::new("pasted-close").label("Close").outline()),
+                            DialogClose::new().child(
+                                Button::new("pasted-close")
+                                    .cursor_pointer()
+                                    .label("Close")
+                                    .outline(),
+                            ),
                         ),
                 ),
             )
@@ -3261,6 +3282,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
         ThreadStatus::Running | ThreadStatus::WaitingApproval
     );
     Button::new("thread-menu")
+        .cursor_pointer()
         .icon(IconName::Ellipsis)
         .ghost()
         .xsmall()
@@ -3409,8 +3431,14 @@ fn confirm_delete(
             .child(text)
             .footer(
                 DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
-                    .child(DialogAction::new().child(Button::new("ok").danger().label("Delete"))),
+                    .child(
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").cursor_pointer().danger().label("Delete")),
+                    ),
             )
             .on_ok(move |_, _, cx| {
                 let t = thread_id.clone();
@@ -3439,10 +3467,17 @@ fn confirm_archive(
             ))
             .footer(
                 DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
                     .child(
-                        DialogAction::new()
-                            .child(Button::new("ok").danger().label("Archive anyway")),
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new().child(
+                            Button::new("ok")
+                                .cursor_pointer()
+                                .danger()
+                                .label("Archive anyway"),
+                        ),
                     ),
             )
             .on_ok(move |_, _, cx| {

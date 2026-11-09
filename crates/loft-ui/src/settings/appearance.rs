@@ -472,7 +472,13 @@ impl SettingsView {
                     this.studio.choice_open = *open;
                     cx.notify();
                 }))
-                .trigger(Button::new("theme-agent-chip").ghost().small().child(chip))
+                .trigger(
+                    Button::new("theme-agent-chip")
+                        .cursor_pointer()
+                        .ghost()
+                        .small()
+                        .child(chip),
+                )
                 .content(move |_, _, _| choice.clone())
         });
         let describe = self.studio.describe.clone().map(|input| {
@@ -989,6 +995,7 @@ fn icon_action(
         .id(SharedString::from(id.to_owned()))
         .p(px(4.))
         .rounded(px(6.))
+        .cursor_pointer()
         .text_color(p.muted_foreground)
         .hover(|d| d.bg(p.selected).text_color(p.foreground))
         .child(Icon::new(icon).xsmall())

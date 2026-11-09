@@ -392,6 +392,7 @@ impl Render for WorkbenchPanel {
                 chip = chip.child(
                     div()
                         .id(SharedString::from(format!("panel-close-{ix}")))
+                        .cursor_pointer()
                         .p(px(2.))
                         .rounded(px(4.))
                         .hover(|d| d.bg(p.border))

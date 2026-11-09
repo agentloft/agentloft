@@ -802,6 +802,7 @@ impl Render for BrowserView {
             .border_color(border)
             .child(
                 Button::new("loft-browser-back")
+                    .cursor_pointer()
                     .ghost()
                     .small()
                     .icon(IconName::ArrowLeft)
@@ -811,6 +812,7 @@ impl Render for BrowserView {
             )
             .child(
                 Button::new("loft-browser-forward")
+                    .cursor_pointer()
                     .ghost()
                     .small()
                     .icon(IconName::ArrowRight)
@@ -820,6 +822,7 @@ impl Render for BrowserView {
             )
             .child(
                 Button::new("loft-browser-reload")
+                    .cursor_pointer()
                     .ghost()
                     .small()
                     .icon(if loading {
@@ -842,6 +845,7 @@ impl Render for BrowserView {
             .child(self.device_menu(cx))
             .child(
                 Button::new("loft-browser-annotate")
+                    .cursor_pointer()
                     .small()
                     .icon(IconName::MessageSquarePlus)
                     .when(self.annotating, |b| b.primary())
@@ -884,6 +888,7 @@ impl Render for BrowserView {
                 .child(div().flex_1().min_w_0().truncate().child(notice))
                 .child(
                     Button::new("loft-browser-dismiss")
+                        .cursor_pointer()
                         .ghost()
                         .xsmall()
                         .icon(IconName::Close)
@@ -940,6 +945,7 @@ impl Render for BrowserView {
                 ))
                 .child(
                     Button::new("loft-browser-annotate-done")
+                        .cursor_pointer()
                         .ghost()
                         .xsmall()
                         .label("Done")
@@ -986,6 +992,7 @@ impl BrowserView {
             Some(d) => (device_icon(d.kind), d.name.to_owned()),
         };
         Button::new("loft-browser-device")
+            .cursor_pointer()
             .small()
             .icon(icon)
             .when(self.devices_open || self.device.is_some(), |b| b.primary())
@@ -1071,6 +1078,7 @@ impl BrowserView {
             .when(self.device.is_some(), |d| {
                 d.child(
                     Button::new("loft-browser-rotate")
+                        .cursor_pointer()
                         .ghost()
                         .xsmall()
                         .icon(IconName::RotateCwSquare)
