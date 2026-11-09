@@ -35,6 +35,19 @@ impl Harness for CodexHarness {
         }
     }
 
+    fn list_models(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        binary: Option<PathBuf>,
+    ) -> Result<Vec<loft_protocol::ModelInfo>> {
+        let binary = match binary {
+            Some(b) => b,
+            None => loft_config::which("codex", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .context("`codex` not found on PATH")?,
+        };
+        probe_models(&binary, env)
+    }
+
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
         let binary = resolve_binary(&cfg)?;
         let mut cmd = Command::new(&binary);
@@ -171,6 +184,74 @@ async fn write_json(stdin: &mut ChildStdin, v: &serde_json::Value) -> std::io::R
     line.push(b'\n');
     stdin.write_all(&line).await?;
     stdin.flush().await
+}
+
+/// Ask a short-lived `codex app-server` for `model/list`.
+fn probe_models(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<Vec<loft_protocol::ModelInfo>> {
+    use std::io::{BufRead as _, Write as _};
+    let mut child = std::process::Command::new(binary)
+        .arg("app-server")
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let stdout = child.stdout.take().context("stdout")?;
+    // Read on a thread so a stuck CLI can't hang us past the deadline.
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let wait_for = |id: u64| -> Result<serde_json::Value> {
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx
+                .recv_timeout(left)
+                .context("codex app-server didn't answer")?;
+            if v["id"] == id {
+                return Ok(v);
+            }
+        }
+    };
+    let mut send = |v: serde_json::Value| -> Result<()> {
+        writeln!(stdin, "{v}")?;
+        Ok(stdin.flush()?)
+    };
+    let result = (|| {
+        send(
+            serde_json::json!({"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "agentloft", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"experimentalApi": true}
+            }}),
+        )?;
+        wait_for(1)?;
+        send(serde_json::json!({"method": "initialized"}))?;
+        send(serde_json::json!({"id": 2, "method": "model/list", "params": {}}))?;
+        let reply = wait_for(2)?;
+        if let Some(err) = reply.get("error") {
+            anyhow::bail!("model/list: {err}");
+        }
+        Ok(translate::models(&reply["result"]))
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 /// `codex app-server` plus config overrides attaching MCP servers.

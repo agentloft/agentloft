@@ -102,6 +102,8 @@ pub struct AppStore {
     pub drafts: HashMap<ThreadId, String>,
     /// Threads that finished a turn while not selected (sidebar dot).
     pub unread: std::collections::HashSet<ThreadId>,
+    /// Model pickers' options per harness (`ListModels`).
+    pub models: HashMap<HarnessId, Vec<loft_protocol::ModelInfo>>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
@@ -127,6 +129,7 @@ impl AppStore {
             last_error: None,
             drafts: HashMap::new(),
             unread: Default::default(),
+            models: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
             daemon_pid: None,
@@ -193,6 +196,18 @@ impl AppStore {
         self.terminals.retain(|_, pane| pane.upgrade().is_some());
         let terminals = std::mem::take(&mut self.terminals);
         self.client = Some(client);
+        // Model pickers (Codex asks its CLI; answers are cached daemon-side).
+        for harness in [HarnessId::claude(), HarnessId(HarnessId::CODEX.into())] {
+            let body = Request::ListModels {
+                harness: harness.clone(),
+            };
+            self.request_result(body, cx, move |store, result, cx| {
+                if let Ok(Response::Models { models }) = result {
+                    store.models.insert(harness, models);
+                    cx.notify();
+                }
+            });
+        }
         for (id, pane) in terminals {
             if restarted {
                 // The old PTY died with the daemon; the pane opens a new one.

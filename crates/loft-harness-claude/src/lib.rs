@@ -42,6 +42,27 @@ impl Harness for ClaudeHarness {
         }
     }
 
+    fn list_models(
+        &self,
+        _env: &std::collections::HashMap<String, String>,
+        _binary: Option<PathBuf>,
+    ) -> Result<Vec<loft_protocol::ModelInfo>> {
+        // Claude Code resolves these aliases to the latest of each family.
+        Ok([
+            ("opus", "Opus", "Most capable, for complex work"),
+            ("sonnet", "Sonnet", "Fast and capable, for everyday work"),
+            ("haiku", "Haiku", "Fastest, for simple tasks"),
+        ]
+        .into_iter()
+        .map(|(id, name, description)| loft_protocol::ModelInfo {
+            id: id.into(),
+            display_name: name.into(),
+            description: Some(description.into()),
+            is_default: false,
+        })
+        .collect())
+    }
+
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
         let binary = resolve_binary(&cfg)?;
         let mut cmd = Command::new(&binary);

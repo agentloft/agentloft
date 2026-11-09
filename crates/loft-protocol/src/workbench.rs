@@ -142,6 +142,18 @@ mod tests {
     }
 }
 
+/// A model a harness offers (Codex `model/list`, Claude's aliases).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelInfo {
+    /// What to pass as the thread's model.
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
 /// An image uploaded with a message (stored by the daemon).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attachment {

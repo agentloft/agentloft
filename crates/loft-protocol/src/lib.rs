@@ -158,6 +158,10 @@ pub enum Request {
     },
     /// Re-read `config.toml` (harness and worktree settings changed).
     ReloadConfig,
+    /// The models a harness offers (cached by the daemon).
+    ListModels {
+        harness: HarnessId,
+    },
     /// Ask the daemon to exit (graceful shutdown or upgrade).
     Shutdown {
         reason: ShutdownReason,
@@ -326,6 +330,9 @@ pub enum Response {
     },
     Text {
         text: String,
+    },
+    Models {
+        models: Vec<ModelInfo>,
     },
     /// A new fork, plus the handoff digest to offer as its first message.
     Forked {

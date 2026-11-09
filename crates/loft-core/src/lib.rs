@@ -95,6 +95,8 @@ pub struct Core {
     worktree_lock: tokio::sync::Mutex<()>,
     /// Live config (starts as `opts.config`; replaced on reload).
     config: std::sync::RwLock<loft_config::Config>,
+    /// `ListModels` answers per harness (probing Codex starts its CLI).
+    models: Mutex<HashMap<String, Vec<loft_protocol::ModelInfo>>>,
     opts: CoreOptions,
 }
 
@@ -121,6 +123,7 @@ impl Core {
             clients: ClientRegistry::default(),
             worktree_lock: tokio::sync::Mutex::new(()),
             config: std::sync::RwLock::new(opts.config.clone()),
+            models: Mutex::new(HashMap::new()),
             opts,
         })
     }
@@ -219,6 +222,29 @@ impl Core {
         Ok(stored)
     }
 
+    async fn list_models(&self, harness: &HarnessId) -> CoreResult<Response> {
+        if let Some(models) = lock(&self.models).get(harness.as_str()) {
+            return Ok(Response::Models {
+                models: models.clone(),
+            });
+        }
+        let h = self.harness(harness).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::BadRequest,
+                format!("unknown harness `{harness}`"),
+            )
+        })?;
+        let hcfg = harness_config(&self.config(), harness);
+        let binary = (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path));
+        let env = self.opts.env.clone();
+        let models = tokio::task::spawn_blocking(move || h.list_models(&env, binary))
+            .await
+            .map_err(internal)?
+            .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
+        lock(&self.models).insert(harness.as_str().to_owned(), models.clone());
+        Ok(Response::Models { models })
+    }
+
     fn reload_config(&self) -> CoreResult<Response> {
         let Some(file) = &self.opts.config_file else {
             return Ok(Response::Ok);
@@ -226,6 +252,8 @@ impl Core {
         let config = loft_config::Config::load_file(file)
             .map_err(|e| ErrorBody::new(ErrorCode::BadRequest, format!("{e:#}")))?;
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+        // Binary paths may have changed.
+        lock(&self.models).clear();
         tracing::info!("config reloaded");
         Ok(Response::Ok)
     }
@@ -477,6 +505,7 @@ impl Core {
                 share_workspace,
             } => self.fork_thread(&thread_id, harness, share_workspace).await,
             Request::ReloadConfig => self.reload_config(),
+            Request::ListModels { harness } => self.list_models(&harness).await,
             Request::CreatePullRequest { thread_id } => self.create_pull_request(&thread_id).await,
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await

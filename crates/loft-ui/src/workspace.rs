@@ -1089,11 +1089,24 @@ impl WorkspaceView {
         let running = model.running_turn().is_some();
         let waiting = model.open_requests().next().is_some();
         let empty = model.items.is_empty();
+        let known_models = self
+            .store
+            .read(cx)
+            .models
+            .get(&model.thread.harness)
+            .cloned()
+            .unwrap_or_default();
         let model_name = model
             .thread
             .model
             .clone()
-            .map(|m| pretty_model(&m))
+            .map(|m| {
+                known_models
+                    .iter()
+                    .find(|k| k.id == m)
+                    .map(|k| k.display_name.clone())
+                    .unwrap_or_else(|| pretty_model(&m))
+            })
             .unwrap_or_else(|| harness_name(&model.thread.harness).into());
         let mode = mode_label(model.thread.permission_mode).to_owned();
         let current_mode = model.thread.permission_mode;
@@ -1345,6 +1358,7 @@ impl WorkspaceView {
                                                     &harness,
                                                     current_model.as_deref(),
                                                     model_name,
+                                                    known_models,
                                                     &self.store,
                                                 ))
                                                 .child(mode_menu(
@@ -1833,25 +1847,39 @@ fn mode_menu(
         .into_any_element()
 }
 
-/// Model dropdown: harness default plus well-known models.
+/// Model dropdown: the harness default plus what the harness offers
+/// (`ListModels`; a built-in list until that arrives).
 fn model_menu(
     thread_id: &ThreadId,
     harness: &HarnessId,
     current: Option<&str>,
     label: String,
+    known: Vec<loft_protocol::ModelInfo>,
     store: &Entity<AppStore>,
 ) -> AnyElement {
     use gpui_kit::component::button::{Button, ButtonVariants as _};
     use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-    let options: &[(&str, &str)] = match harness.as_str() {
+    let fallback: &[(&str, &str)] = match harness.as_str() {
         HarnessId::CLAUDE => &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")],
-        HarnessId::CODEX => &[
-            ("gpt-6.1-sol", "GPT-6.1 Sol"),
-            ("gpt-6-astra", "GPT-6 Astra"),
-            ("gpt-6.1-terra", "GPT-6.1 Terra"),
-            ("gpt-6-luna", "GPT-6 Luna"),
-        ],
         _ => &[],
+    };
+    let options: Vec<(String, String)> = if known.is_empty() {
+        fallback
+            .iter()
+            .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+            .collect()
+    } else {
+        known
+            .iter()
+            .map(|m| {
+                let name = if m.is_default {
+                    format!("{} (default)", m.display_name)
+                } else {
+                    m.display_name.clone()
+                };
+                (m.id.clone(), name)
+            })
+            .collect()
     };
     let current = current.map(str::to_owned);
     let store = store.clone();
@@ -1871,14 +1899,14 @@ fn model_menu(
                     }),
                 )
                 .separator();
-            for (id, name) in options {
-                let (s, t, id) = (store.clone(), thread_id.clone(), (*id).to_owned());
+            for (id, name) in &options {
+                let (s, t, id) = (store.clone(), thread_id.clone(), id.clone());
                 let checked = current.as_deref().is_some_and(|c| {
                     c == id
                         || c.contains(&format!("-{id}-"))
                         || c.starts_with(&format!("claude-{id}"))
                 });
-                menu = menu.item(PopupMenuItem::new(*name).checked(checked).on_click(
+                menu = menu.item(PopupMenuItem::new(name.clone()).checked(checked).on_click(
                     move |_, _, cx| {
                         let (t, m) = (t.clone(), Some(id.clone()));
                         s.update(cx, |s, cx| s.set_model(t, m, cx));

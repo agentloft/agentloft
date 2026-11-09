@@ -932,6 +932,25 @@ fn turn_policy(mode: PermissionMode) -> (Value, Value) {
     (json!(approval), policy)
 }
 
+/// `model/list` result → picker entries (hidden models left out).
+pub fn models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
+    result["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| !m["hidden"].as_bool().unwrap_or(false))
+        .filter_map(|m| {
+            let id = m["id"].as_str().or_else(|| m["model"].as_str())?;
+            Some(loft_protocol::ModelInfo {
+                id: id.to_owned(),
+                display_name: m["displayName"].as_str().unwrap_or(id).to_owned(),
+                description: m["description"].as_str().map(str::to_owned),
+                is_default: m["isDefault"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +962,19 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn model_list_skips_hidden() {
+        let result = serde_json::json!({"data": [
+            {"id": "gpt-6.1-sol", "displayName": "GPT-6.1-Sol", "isDefault": true, "hidden": false,
+             "description": "Latest workhorse model for coding and everyday work."},
+            {"id": "internal", "displayName": "Internal", "hidden": true},
+        ]});
+        let models = models(&result);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].display_name, "GPT-6.1-Sol");
+        assert!(models[0].is_default);
     }
 
     #[test]

@@ -193,4 +193,13 @@ pub trait Harness: Send + Sync + 'static {
     fn capabilities(&self) -> Capabilities;
     /// Spawn the session. Must be called within a tokio runtime.
     fn open_session(&self, cfg: SessionConfig) -> anyhow::Result<SessionHandle>;
+    /// Models to offer in the picker. Blocking (may start the CLI briefly);
+    /// call off the async runtime. `env` is the login environment.
+    fn list_models(
+        &self,
+        _env: &HashMap<String, String>,
+        _binary: Option<PathBuf>,
+    ) -> anyhow::Result<Vec<loft_protocol::ModelInfo>> {
+        Ok(Vec::new())
+    }
 }
