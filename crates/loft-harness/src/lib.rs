@@ -75,6 +75,11 @@ pub enum SessionCommand {
     /// Stop the subagent started by the tool call `native_id` (agents that
     /// can't stop one subagent ignore it).
     StopSubagent(String),
+    /// Ask the agent for a report; agents that can't answer drop `reply`.
+    Query {
+        kind: loft_protocol::AgentInfoKind,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
     Respond {
         native_request_id: String,
         decision: DecisionKind,

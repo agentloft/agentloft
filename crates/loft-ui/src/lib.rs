@@ -13,6 +13,7 @@ mod details;
 mod file_icons;
 mod folder_picker;
 mod image_preview;
+mod info_cards;
 mod items;
 mod model_picker;
 mod palette;

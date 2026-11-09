@@ -4327,6 +4327,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
+ "chrono",
  "gpui-kit",
  "imagesize 0.14.0",
  "loft-browser",

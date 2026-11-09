@@ -424,6 +424,16 @@ impl WorkspaceView {
                     });
                 }
             }
+            Some(("card", which)) => {
+                self.panel_open = false;
+                let kind = if which == "usage" {
+                    loft_protocol::AgentInfoKind::Usage
+                } else {
+                    loft_protocol::AgentInfoKind::Context
+                };
+                let client = self.store.read(cx).client();
+                thread.update(cx, |t, cx| t.add_card(kind, client, cx));
+            }
             Some(("peek", n)) => {
                 self.panel_open = false;
                 self.peek = n.parse().ok();
@@ -1059,6 +1069,24 @@ impl WorkspaceView {
             .is_some_and(|a| !a.is_empty());
         let pasted = self.pasted.get(thread_id).cloned().unwrap_or_default();
         let notes = self.page_notes.get(thread_id).cloned().unwrap_or_default();
+        // `/context` and `/usage` to Claude: shown as cards, not sent.
+        let report = match typed.as_str() {
+            "/context" => Some(loft_protocol::AgentInfoKind::Context),
+            "/usage" | "/cost" => Some(loft_protocol::AgentInfoKind::Usage),
+            _ => None,
+        };
+        let claude =
+            self.store.read(cx).workspace.threads.iter().any(|t| {
+                &t.id == thread_id && t.harness.as_str() == loft_protocol::HarnessId::CLAUDE
+            });
+        if let Some(kind) = report.filter(|_| claude && pasted.is_empty() && notes.is_empty())
+            && let Some(thread) = self.store.read(cx).threads.get(thread_id).cloned()
+        {
+            composer.update(cx, |c, cx| c.set_value("", window, cx));
+            let client = self.store.read(cx).client();
+            thread.update(cx, |t, cx| t.add_card(kind, client, cx));
+            return;
+        }
         if typed.is_empty() && !has_images && pasted.is_empty() && notes.is_empty() {
             return;
         }

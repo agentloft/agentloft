@@ -11,6 +11,8 @@ gpui_kit::assets::icon_assets!(
         ArrowRight,
         ArrowUp,
         Bug,
+        ChartPie,
+        Gauge,
         FileDiff,
         ScrollText,
         Camera,

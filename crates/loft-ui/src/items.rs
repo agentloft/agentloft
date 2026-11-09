@@ -341,6 +341,7 @@ pub fn render_row(
             steps,
         } => render_work_header(thread, model, *turn_ix, *open, *steps, p),
         Row::Pending => render_pending(p),
+        Row::Card(ix) => crate::info_cards::render(thread, store, state, *ix, p),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
             render_turn_footer(store, model, *turn_ix, agents, p)

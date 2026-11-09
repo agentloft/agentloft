@@ -29,6 +29,10 @@ pub(crate) enum ThreadCmd {
         item_id: ItemId,
         reply: Reply,
     },
+    AgentInfo {
+        kind: loft_protocol::AgentInfoKind,
+        reply: Reply,
+    },
     Respond {
         request_id: RequestId,
         decision: DecisionKind,
@@ -221,6 +225,32 @@ impl ThreadActor {
                     _ => Err(ErrorBody::new(ErrorCode::Conflict, "no running turn")),
                 };
                 let _ = reply.send(res);
+            }
+            ThreadCmd::AgentInfo { kind, reply } => {
+                // Starts the agent if it isn't running (it answers at once).
+                if let Err(err) = self.ensure_session() {
+                    let _ = reply.send(Err(err));
+                } else if let Some(s) = &self.session {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = s.commands.send(SessionCommand::Query { kind, reply: tx });
+                    tokio::spawn(async move {
+                        let res = match tokio::time::timeout(std::time::Duration::from_secs(20), rx)
+                            .await
+                        {
+                            Ok(Ok(Ok(info))) => Ok(Response::AgentInfo { info }),
+                            Ok(Ok(Err(msg))) => Err(ErrorBody::new(ErrorCode::Harness, msg)),
+                            Ok(Err(_)) => Err(ErrorBody::new(
+                                ErrorCode::Unsupported,
+                                "this agent doesn't report that",
+                            )),
+                            Err(_) => Err(ErrorBody::new(
+                                ErrorCode::Harness,
+                                "the agent didn't answer",
+                            )),
+                        };
+                        let _ = reply.send(res);
+                    });
+                }
             }
             ThreadCmd::StopSubagent { item_id, reply } => {
                 let native = self

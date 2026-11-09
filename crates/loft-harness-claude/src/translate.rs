@@ -16,6 +16,11 @@ use std::collections::{HashMap, HashSet};
 pub enum Out {
     Event(HarnessEvent),
     Send(Value),
+    /// The answer to a query sent with [`Translator::query`].
+    Reply {
+        request_id: String,
+        result: Result<Value, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +42,8 @@ pub struct Translator {
     /// Tool calls the user denied (their error result becomes `Declined`).
     denied_tools: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
+    /// Control requests whose answer someone is waiting for.
+    queries: HashSet<String>,
     /// Agent tool call id → the task id Claude runs it as (to stop it).
     tasks: HashMap<String, String>,
     interrupt_requested: bool,
@@ -103,6 +110,22 @@ impl Translator {
         vec![Out::Send(json!({
             "type": "control_request", "request_id": id, "request": {"subtype": "interrupt"}
         }))]
+    }
+
+    /// Ask Claude for a report; the answer comes back as `Out::Reply`
+    /// with the returned request id.
+    pub fn query(&mut self, kind: loft_protocol::AgentInfoKind) -> (String, Value) {
+        let id = self.next_request_id();
+        self.queries.insert(id.clone());
+        let subtype = match kind {
+            loft_protocol::AgentInfoKind::Context => "get_context_usage",
+            loft_protocol::AgentInfoKind::Usage => "get_usage",
+        };
+        let v = json!({
+            "type": "control_request", "request_id": id,
+            "request": {"subtype": subtype}
+        });
+        (id, v)
     }
 
     /// Stop the subagent started by tool call `tool_id`.
@@ -482,6 +505,26 @@ impl Translator {
     }
 
     fn on_control_response(&mut self, v: &Value) -> Vec<Out> {
+        if let Some(id) = v.pointer("/response/request_id").and_then(Value::as_str)
+            && self.queries.remove(id)
+        {
+            let result = if v.pointer("/response/subtype").and_then(Value::as_str) == Some("error")
+            {
+                Err(v
+                    .pointer("/response/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Claude couldn't answer")
+                    .to_owned())
+            } else {
+                Ok(v.pointer("/response/response")
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            };
+            return vec![Out::Reply {
+                request_id: id.to_owned(),
+                result,
+            }];
+        }
         if let Some(list) = v
             .pointer("/response/response/commands")
             .and_then(Value::as_array)

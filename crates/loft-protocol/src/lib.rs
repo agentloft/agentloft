@@ -90,6 +90,12 @@ pub enum Request {
     Interrupt {
         thread_id: ThreadId,
     },
+    /// Ask the thread's agent for a report (`Response::AgentInfo`): its
+    /// context window, or plan usage and limits.
+    AgentInfo {
+        thread_id: ThreadId,
+        kind: AgentInfoKind,
+    },
     /// Stop one running subagent (its Agent tool call item), leaving the
     /// rest of the turn alone.
     StopSubagent {
@@ -379,6 +385,10 @@ pub fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
 pub enum Response {
     Pong,
     Ok,
+    /// The agent's own report, as it gave it (shape depends on the kind).
+    AgentInfo {
+        info: serde_json::Value,
+    },
     Project {
         project: Project,
     },
@@ -618,4 +628,14 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
     }
+}
+
+/// A report an agent can give about itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInfoKind {
+    /// What fills the context window.
+    Context,
+    /// Plan limits, session cost and tips.
+    Usage,
 }

@@ -1055,6 +1055,8 @@ pub enum Row {
     },
     /// The agent is between steps (or hasn't answered yet).
     Pending,
+    /// A report asked for with `/context` or `/usage` (index into `cards`).
+    Card(usize),
     TurnFooter {
         turn_ix: usize,
     },
@@ -1071,6 +1073,8 @@ pub struct ThreadState {
     /// Tool groups / reasoning items the user expanded or collapsed,
     /// keyed by their first item id. `true` = expanded.
     pub expanded: HashMap<ItemId, bool>,
+    /// Reports asked for in this window (`/context`, `/usage`); not saved.
+    pub cards: Vec<InfoCard>,
     /// Repaints while a turn runs (its elapsed time).
     ticker: Option<gpui_kit::Task<()>>,
 }
@@ -1085,6 +1089,7 @@ impl ThreadState {
             markdown: HashMap::new(),
             expanded: HashMap::new(),
             ticker: None,
+            cards: Vec::new(),
         }
     }
 
@@ -1121,7 +1126,7 @@ impl ThreadState {
         self.rows.iter().position(|r| match r {
             Row::Item(i) => *i == ix,
             Row::ToolGroup { members } => members.contains(&ix),
-            Row::Work { .. } | Row::Pending | Row::TurnFooter { .. } => false,
+            Row::Work { .. } | Row::Pending | Row::TurnFooter { .. } | Row::Card(_) => false,
         })
     }
 
@@ -1214,7 +1219,103 @@ impl ThreadState {
             push_runs(&mut rows, items, &visible);
             rows.push(Row::TurnFooter { turn_ix });
         }
+        // Reports sit where they were asked: before the first row holding a
+        // later item.
+        for (ix, card) in self.cards.iter().enumerate() {
+            let at = rows
+                .iter()
+                .position(|r| match r {
+                    Row::Item(i) => *i >= card.after,
+                    Row::ToolGroup { members } => members.first().is_some_and(|i| *i >= card.after),
+                    _ => false,
+                })
+                .unwrap_or(rows.len());
+            rows.insert(at, Row::Card(ix));
+        }
         std::mem::replace(&mut self.rows, rows)
+    }
+
+    /// Ask the agent for a report and show it as a card here.
+    pub fn add_card(
+        &mut self,
+        kind: loft_protocol::AgentInfoKind,
+        client: Option<loft_client::Client>,
+        cx: &mut Context<Self>,
+    ) {
+        let after = self.model.as_ref().map_or(0, |m| m.items.len());
+        self.cards.push(InfoCard {
+            kind,
+            after,
+            state: CardState::Loading,
+            open: true,
+        });
+        let ix = self.cards.len() - 1;
+        self.sync_rows(None, cx);
+        self.load_card(ix, client, cx);
+        self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
+    }
+
+    /// (Re)load card `ix` from the agent.
+    pub fn load_card(
+        &mut self,
+        ix: usize,
+        client: Option<loft_client::Client>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(card) = self.cards.get_mut(ix) else {
+            return;
+        };
+        let Some(client) = client else {
+            card.state = CardState::Failed("not connected to agentloftd".into());
+            cx.notify();
+            return;
+        };
+        card.state = CardState::Loading;
+        let body = Request::AgentInfo {
+            thread_id: self.id.clone(),
+            kind: card.kind,
+        };
+        cx.spawn(async move |this, cx| {
+            let state = match client.request(body).await {
+                Ok(Response::AgentInfo { info }) => CardState::Ready(info),
+                Ok(_) => CardState::Failed("unexpected answer".into()),
+                Err(err) => CardState::Failed(err.message),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(card) = this.cards.get_mut(ix) {
+                    card.state = state;
+                }
+                if let Some(row) = this.rows.iter().position(|r| *r == Row::Card(ix)) {
+                    this.scroller.update(cx, |s, cx| {
+                        s.remeasure_items(row..row + 1, cx);
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn remove_card(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.cards.len() {
+            self.cards.remove(ix);
+            self.sync_rows(None, cx);
+            cx.notify();
+        }
+    }
+
+    /// Fold or unfold a card's details.
+    pub fn toggle_card(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(card) = self.cards.get_mut(ix) {
+            card.open = !card.open;
+            if let Some(row) = self.rows.iter().position(|r| *r == Row::Card(ix)) {
+                self.scroller.update(cx, |s, cx| {
+                    s.remeasure_items(row..row + 1, cx);
+                });
+            }
+            cx.notify();
+        }
     }
 
     /// Fold or unfold a finished turn's work.
@@ -1356,6 +1457,22 @@ impl ThreadState {
             }
         }
     }
+}
+
+/// A report from the agent shown in the timeline.
+pub struct InfoCard {
+    pub kind: loft_protocol::AgentInfoKind,
+    /// Shown after the first `after` items.
+    pub after: usize,
+    pub state: CardState,
+    /// Details unfolded.
+    pub open: bool,
+}
+
+pub enum CardState {
+    Loading,
+    Ready(serde_json::Value),
+    Failed(String),
 }
 
 /// Rows for a list of top-level items: consecutive tool calls fold into

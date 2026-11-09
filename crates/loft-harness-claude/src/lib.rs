@@ -125,6 +125,10 @@ async fn run(
 ) -> RunEnd {
     let events = ends.events.clone();
     let mut t = Translator::new();
+    let mut waiting: std::collections::HashMap<
+        String,
+        tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    > = std::collections::HashMap::new();
     let mut lines = BufReader::new(stdout).lines();
 
     let init = t.initialize();
@@ -142,7 +146,7 @@ async fn run(
                 if line.trim().is_empty() {
                     continue;
                 }
-                if dispatch(&events, &mut stdin, t.on_line(&line)).await.is_err() {
+                if dispatch(&events, &mut stdin, &mut waiting, t.on_line(&line)).await.is_err() {
                     return RunEnd::Eof;
                 }
             }
@@ -154,6 +158,11 @@ async fn run(
                     }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::StopSubagent(native)) => t.stop_subagent(&native),
+                    Some(SessionCommand::Query { kind, reply }) => {
+                        let (id, v) = t.query(kind);
+                        waiting.insert(id, reply);
+                        vec![translate::Out::Send(v)]
+                    }
                     Some(SessionCommand::Respond { native_request_id, decision }) => {
                         t.respond(&native_request_id, decision)
                     }
@@ -163,7 +172,7 @@ async fn run(
                     Some(SessionCommand::SetPermissionMode(mode)) => t.set_permission_mode(mode),
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 };
-                if dispatch(&events, &mut stdin, outs).await.is_err() {
+                if dispatch(&events, &mut stdin, &mut waiting, outs).await.is_err() {
                     return RunEnd::Eof;
                 }
             }
@@ -174,6 +183,10 @@ async fn run(
 async fn dispatch(
     events: &tokio::sync::mpsc::UnboundedSender<HarnessEvent>,
     stdin: &mut ChildStdin,
+    waiting: &mut std::collections::HashMap<
+        String,
+        tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    >,
     outs: Vec<Out>,
 ) -> std::io::Result<()> {
     for out in outs {
@@ -182,6 +195,11 @@ async fn dispatch(
                 let _ = events.send(e);
             }
             Out::Send(v) => write_json(stdin, &v).await?,
+            Out::Reply { request_id, result } => {
+                if let Some(reply) = waiting.remove(&request_id) {
+                    let _ = reply.send(result);
+                }
+            }
         }
     }
     Ok(())
