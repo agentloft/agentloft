@@ -14,7 +14,7 @@ A native desktop app for running coding agents side by side: **Claude Code**, **
 
 ## What it does
 
-**Agents, driven natively.** Claude Code runs through its stream-json control protocol and Codex through `codex app-server`. Neither terminal UI is scraped, so you get exact streaming, tool calls, approvals, interrupts and resume.
+**Agents, driven natively.** Claude Code runs through its stream-json control protocol, Codex through `codex app-server`, and OpenCode and Gemini CLI through the Agent Client Protocol. Neither terminal UI is scraped, so you get exact streaming, tool calls, approvals, interrupts and resume.
 - Pick the model and permission mode per thread, from what each agent actually offers.
 - Attach images by paste, drag-and-drop or the paperclip.
 - Complete `/` slash commands and `@` file mentions as you type.
@@ -74,7 +74,7 @@ cargo xtask ci             # fmt, clippy and tests, as CI runs them
 | `loft-core` | Threads, turns, approvals, worktrees, forks, terminals |
 | `loft-store` | SQLite event log and projections |
 | `loft-protocol` | Wire types |
-| `loft-harness*` | The agent adapters (Claude, Codex) |
+| `loft-harness*` | The agent adapters (Claude, Codex, ACP) |
 | `loft-git` | Checkpoints, diffs, worktrees |
 | `loft-terminal` | Terminal widget on libghostty-vt |
 | `loft-browser` | Embedded browser |
