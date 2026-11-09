@@ -242,6 +242,7 @@ impl Render for AgentView {
             .child(
                 v_flex()
                     .p_4()
+                    .pb_10()
                     .gap_3()
                     .child(header)
                     .children(prompt_block)

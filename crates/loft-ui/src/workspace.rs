@@ -367,7 +367,7 @@ impl WorkspaceView {
         let (thread_id, agent) = {
             let state = thread.read(cx);
             let model = state.model.as_ref().expect("checked");
-            let agent = model.items.iter().find(|i| {
+            let agent = model.items.iter().rev().find(|i| {
                 matches!(&i.body, loft_protocol::ItemBody::ToolCall { tool_kind, .. }
                     if *tool_kind == loft_protocol::ToolKind::Subagent)
             });
@@ -3476,35 +3476,41 @@ impl Render for WorkspaceView {
                             )
                         })
                         .when(!maximized && !panel_sliding, |d| {
+                            // A box holding exactly the room under the header:
+                            // the group is "100% tall", and would otherwise
+                            // count the header too (and grow with tall content),
+                            // pushing the bottom of the panel off the window.
                             d.child(
-                                h_resizable("workbench")
-                                    .child(resizable_panel().children(body_slot.take()))
-                                    .child(
-                                        resizable_panel()
-                                            .size(px(560.))
-                                            .size_range(px(340.)..px(1600.))
-                                            .visible(show_panel)
-                                            .child(
-                                                div()
-                                                    .size_full()
-                                                    .relative()
-                                                    .border_l_1()
-                                                    .border_color(p.border)
-                                                    .child(self.panel.clone())
-                                                    .child(
-                                                        gpui_kit::canvas(
-                                                            move |bounds, _, _| {
-                                                                panel_width.set(f32::from(
-                                                                    bounds.size.width,
-                                                                ))
-                                                            },
-                                                            |_, _, _, _| {},
-                                                        )
-                                                        .absolute()
-                                                        .size_full(),
-                                                    ),
-                                            ),
-                                    ),
+                                div().flex_1().min_h_0().w_full().child(
+                                    h_resizable("workbench")
+                                        .child(resizable_panel().children(body_slot.take()))
+                                        .child(
+                                            resizable_panel()
+                                                .size(px(560.))
+                                                .size_range(px(340.)..px(1600.))
+                                                .visible(show_panel)
+                                                .child(
+                                                    div()
+                                                        .size_full()
+                                                        .relative()
+                                                        .border_l_1()
+                                                        .border_color(p.border)
+                                                        .child(self.panel.clone())
+                                                        .child(
+                                                            gpui_kit::canvas(
+                                                                move |bounds, _, _| {
+                                                                    panel_width.set(f32::from(
+                                                                        bounds.size.width,
+                                                                    ))
+                                                                },
+                                                                |_, _, _, _| {},
+                                                            )
+                                                            .absolute()
+                                                            .size_full(),
+                                                        ),
+                                                ),
+                                        ),
+                                ),
                             )
                         }),
                 ),
