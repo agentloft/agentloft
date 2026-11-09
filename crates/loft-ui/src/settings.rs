@@ -117,6 +117,10 @@ enum Field {
     ClaudeModel,
     CodexPath,
     CodexModel,
+    OpencodePath,
+    OpencodeModel,
+    GeminiPath,
+    GeminiModel,
     BranchPrefix,
 }
 
@@ -129,6 +133,10 @@ impl Field {
             Field::ClaudeModel => &["harness", "claude", "default_model"],
             Field::CodexPath => &["harness", "codex", "path"],
             Field::CodexModel => &["harness", "codex", "default_model"],
+            Field::OpencodePath => &["harness", "opencode", "path"],
+            Field::OpencodeModel => &["harness", "opencode", "default_model"],
+            Field::GeminiPath => &["harness", "gemini", "path"],
+            Field::GeminiModel => &["harness", "gemini", "default_model"],
             Field::BranchPrefix => &["worktrees", "branch_prefix"],
         }
     }
@@ -141,6 +149,10 @@ impl Field {
             Field::ClaudeModel => c.harness.claude.default_model.clone(),
             Field::CodexPath => c.harness.codex.path.clone(),
             Field::CodexModel => c.harness.codex.default_model.clone(),
+            Field::OpencodePath => c.harness.opencode.path.clone(),
+            Field::OpencodeModel => c.harness.opencode.default_model.clone(),
+            Field::GeminiPath => c.harness.gemini.path.clone(),
+            Field::GeminiModel => c.harness.gemini.default_model.clone(),
             Field::BranchPrefix => c.worktrees.branch_prefix.clone(),
         }
     }
@@ -149,8 +161,12 @@ impl Field {
         match self {
             Field::UiFont => "System font",
             Field::MonoFont => "Theme monospace font",
-            Field::ClaudePath | Field::CodexPath => "auto (login-shell PATH)",
-            Field::ClaudeModel | Field::CodexModel => "auto (the agent's default)",
+            Field::ClaudePath | Field::CodexPath | Field::OpencodePath | Field::GeminiPath => {
+                "auto (login-shell PATH)"
+            }
+            Field::ClaudeModel | Field::CodexModel | Field::OpencodeModel | Field::GeminiModel => {
+                "auto (the agent's default)"
+            }
             Field::BranchPrefix => "agentloft",
         }
     }
@@ -160,8 +176,17 @@ impl Field {
         let text = text.trim();
         match (self, text.is_empty()) {
             (Field::UiFont | Field::MonoFont, true) => SettingValue::Unset,
-            (Field::ClaudePath | Field::CodexPath, true) => SettingValue::Str("auto".into()),
-            (Field::ClaudeModel | Field::CodexModel, true) => SettingValue::Str("auto".into()),
+            (
+                Field::ClaudePath
+                | Field::CodexPath
+                | Field::OpencodePath
+                | Field::GeminiPath
+                | Field::ClaudeModel
+                | Field::CodexModel
+                | Field::OpencodeModel
+                | Field::GeminiModel,
+                true,
+            ) => SettingValue::Str("auto".into()),
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
             _ => SettingValue::Str(text.to_owned()),
         }
@@ -209,6 +234,10 @@ impl SettingsView {
             Field::ClaudeModel,
             Field::CodexPath,
             Field::CodexModel,
+            Field::OpencodePath,
+            Field::OpencodeModel,
+            Field::GeminiPath,
+            Field::GeminiModel,
             Field::BranchPrefix,
         ] {
             let current = field.current(&config);
@@ -484,11 +513,24 @@ impl SettingsView {
                 Field::CodexPath,
                 Field::CodexModel,
             ),
+            (
+                HarnessId::OPENCODE,
+                "OpenCode (ACP)",
+                Field::OpencodePath,
+                Field::OpencodeModel,
+            ),
+            (
+                HarnessId::GEMINI,
+                "Gemini CLI (ACP)",
+                Field::GeminiPath,
+                Field::GeminiModel,
+            ),
         ] {
-            let h = if id == HarnessId::CODEX {
-                self.config.harness.codex.clone()
-            } else {
-                self.config.harness.claude.clone()
+            let h = match id {
+                HarnessId::CODEX => self.config.harness.codex.clone(),
+                HarnessId::OPENCODE => self.config.harness.opencode.clone(),
+                HarnessId::GEMINI => self.config.harness.gemini.clone(),
+                _ => self.config.harness.claude.clone(),
             };
             let status = self
                 .store

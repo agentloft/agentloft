@@ -56,6 +56,8 @@ pub struct HarnessId(pub String);
 impl HarnessId {
     pub const CLAUDE: &'static str = "claude";
     pub const CODEX: &'static str = "codex";
+    pub const OPENCODE: &'static str = "opencode";
+    pub const GEMINI: &'static str = "gemini";
     pub const FAKE: &'static str = "fake";
 
     pub fn claude() -> Self {

@@ -1344,6 +1344,7 @@ impl WorkspaceView {
         let running = model.running_turn().is_some();
         let waiting = model.open_requests().next().is_some();
         let empty = model.items.is_empty();
+        let harness_choices = self.store.read(cx).available_harnesses();
         let known_models = self
             .store
             .read(cx)
@@ -1443,6 +1444,7 @@ impl WorkspaceView {
                     d.child(harness_picker(
                         &model.thread.id,
                         &model.thread.harness,
+                        harness_choices.clone(),
                         &self.store,
                         p,
                     ))
@@ -1716,10 +1718,16 @@ impl WorkspaceView {
                 "npm i -g @anthropic-ai/claude-code",
             ),
             (HarnessId::CODEX, "Codex", "npm i -g @openai/codex"),
+            (HarnessId::OPENCODE, "OpenCode", ""),
+            (HarnessId::GEMINI, "Gemini CLI", ""),
         ] {
             let Some(status) = statuses.get(&HarnessId(id.into())) else {
                 continue;
             };
+            // Optional ACP agents are listed only when present.
+            if install.is_empty() && !status.installed {
+                continue;
+            }
             let ok = status.installed && status.error.is_none();
             agents = agents.child(
                 h_flex()
@@ -2400,7 +2408,7 @@ fn thread_row(
             let store = store.clone();
             let id = thread.id.clone();
             let title = thread.title.clone();
-            move |menu, _, _| {
+            move |menu, _, cx| {
                 use gpui_kit::component::menu::PopupMenuItem;
                 let (s1, i1, t1) = (store.clone(), id.clone(), title.clone());
                 let i2 = id.clone();
@@ -2421,10 +2429,7 @@ fn thread_row(
                             }),
                     )
                     .separator();
-                for (h, name) in [
-                    (HarnessId::CLAUDE, "Claude Code"),
-                    (HarnessId::CODEX, "Codex"),
-                ] {
+                for (h, name) in store.read(cx).available_harnesses() {
                     let (s, i) = (store.clone(), id.clone());
                     menu = menu.item(
                         PopupMenuItem::new(format!("Fork with {name}"))
@@ -2494,6 +2499,8 @@ pub fn harness_name(h: &HarnessId) -> &'static str {
     match h.as_str() {
         HarnessId::CLAUDE => "Claude",
         HarnessId::CODEX => "Codex",
+        HarnessId::OPENCODE => "OpenCode",
+        HarnessId::GEMINI => "Gemini",
         HarnessId::FAKE => "Echo",
         _ => "Agent",
     }
@@ -2550,7 +2557,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
         .icon(IconName::Ellipsis)
         .ghost()
         .xsmall()
-        .dropdown_menu(move |mut menu, _, _| {
+        .dropdown_menu(move |mut menu, _, cx| {
             if let Some((path, branch, base)) = &worktree {
                 let (s, t) = (store.clone(), id.clone());
                 menu = menu
@@ -2604,12 +2611,10 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                         }),
                 )
                 .separator();
-            for (h, name) in [
-                (HarnessId::CLAUDE, "Claude Code"),
-                (HarnessId::CODEX, "Codex"),
-            ] {
+            for (h, name) in store.read(cx).available_harnesses() {
                 let (s, t) = (store.clone(), id.clone());
-                let label = if h == harness.as_str() {
+                let native = matches!(h, HarnessId::CLAUDE | HarnessId::CODEX);
+                let label = if h == harness.as_str() && native {
                     format!("Fork with {name} (full context)")
                 } else {
                     format!("Fork with {name} (handoff)")
@@ -2721,6 +2726,7 @@ fn workspace_picker(
 fn harness_picker(
     thread_id: &ThreadId,
     current: &HarnessId,
+    choices: Vec<(&'static str, &'static str)>,
     store: &Entity<AppStore>,
     p: &Palette,
 ) -> AnyElement {
@@ -2730,10 +2736,12 @@ fn harness_picker(
         .gap(px(3.))
         .rounded(px(10.))
         .bg(p.muted);
-    for (id, label, icon) in [
-        (HarnessId::CLAUDE, "Claude Code", IconName::Sparkles),
-        (HarnessId::CODEX, "Codex", IconName::SquareTerminal),
-    ] {
+    for (id, label) in choices {
+        let icon = match id {
+            HarnessId::CLAUDE => IconName::Sparkles,
+            HarnessId::CODEX => IconName::SquareTerminal,
+            _ => IconName::Bot,
+        };
         let active = current.as_str() == id;
         let store = store.clone();
         let thread_id = thread_id.clone();
@@ -2771,6 +2779,10 @@ fn harness_picker(
 }
 
 fn pretty_model(id: &str) -> String {
+    // Provider-qualified ids (ACP agents): `opencode/iceman-free` → `iceman-free`.
+    if let Some((_, name)) = id.rsplit_once('/') {
+        return name.to_owned();
+    }
     if let Some(rest) = id.strip_prefix("gpt-") {
         // gpt-5.1-codex → GPT-5.1 Codex
         let mut parts = rest.split('-');

@@ -808,6 +808,8 @@ pub(crate) fn harness_config(
     match harness.as_str() {
         HarnessId::CODEX => config.harness.codex.clone(),
         HarnessId::CLAUDE => config.harness.claude.clone(),
+        HarnessId::OPENCODE => config.harness.opencode.clone(),
+        HarnessId::GEMINI => config.harness.gemini.clone(),
         _ => loft_config::HarnessConfig::default(),
     }
 }

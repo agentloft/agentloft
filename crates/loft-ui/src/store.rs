@@ -225,9 +225,38 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Agents to offer: Claude Code and Codex always, ACP agents (OpenCode,
+    /// Gemini) once their CLI is found.
+    pub fn available_harnesses(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = vec![
+            (HarnessId::CLAUDE, "Claude Code"),
+            (HarnessId::CODEX, "Codex"),
+        ];
+        for (id, name) in [
+            (HarnessId::OPENCODE, "OpenCode"),
+            (HarnessId::GEMINI, "Gemini"),
+        ] {
+            if self
+                .harness_status
+                .get(&HarnessId(id.into()))
+                .is_some_and(|s| s.installed)
+            {
+                out.push((id, name));
+            }
+        }
+        out
+    }
+
     /// Refresh which agent CLIs are installed (also after settings change).
     pub fn probe_harnesses(&mut self, cx: &mut Context<Self>) {
-        for harness in [HarnessId::claude(), HarnessId(HarnessId::CODEX.into())] {
+        for harness in [
+            HarnessId::CLAUDE,
+            HarnessId::CODEX,
+            HarnessId::OPENCODE,
+            HarnessId::GEMINI,
+        ]
+        .map(|h| HarnessId(h.into()))
+        {
             let body = Request::ProbeHarness {
                 harness: harness.clone(),
             };

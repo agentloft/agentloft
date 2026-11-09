@@ -193,6 +193,8 @@ impl Default for UiConfig {
 pub struct HarnessConfigs {
     pub claude: HarnessConfig,
     pub codex: HarnessConfig,
+    pub opencode: HarnessConfig,
+    pub gemini: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

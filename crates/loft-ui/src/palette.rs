@@ -142,10 +142,7 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
                 |v, _, cx| v.interrupt(cx),
             ));
         }
-        for (h, name) in [
-            (HarnessId::CLAUDE, "Claude Code"),
-            (HarnessId::CODEX, "Codex"),
-        ] {
+        for (h, name) in store.available_harnesses() {
             let id = t.id.clone();
             items.push(entry(
                 format!("Fork with {name}"),
