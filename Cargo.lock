@@ -4311,6 +4311,7 @@ name = "loft-ui"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "gpui-kit",
  "loft-browser",
  "loft-client",
@@ -4321,7 +4322,9 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-user-notifications",
  "raw-window-handle",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

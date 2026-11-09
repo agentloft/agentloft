@@ -23,7 +23,9 @@ serde.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = ["NSApplication", "NSDockTile"] }
-objc2-foundation.workspace = true
+objc2-foundation = { workspace = true, features = ["NSBundle", "NSString", "NSError"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
+block2 = "0.6"
 raw-window-handle = "0.6"
 
 [dev-dependencies]

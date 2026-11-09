@@ -392,7 +392,19 @@ impl AppStore {
             self.unread.insert(id.clone());
         }
         if finished || needs_you {
-            crate::attention::request(cx);
+            let thread = self.workspace.threads.iter().find(|t| &t.id == id);
+            let title = thread.map(|t| t.title.clone()).unwrap_or_default();
+            let agent = thread
+                .map(|t| crate::workspace::harness_name(&t.harness))
+                .unwrap_or("The agent");
+            let headline = if needs_you {
+                format!("{agent} needs your approval")
+            } else if after == Error {
+                format!("{agent} stopped with an error")
+            } else {
+                format!("{agent} finished")
+            };
+            crate::attention::request(cx, &headline, &title, id.as_str());
         }
         self.refresh_badge();
     }
