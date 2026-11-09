@@ -85,6 +85,53 @@ pub(crate) fn digest(
     out
 }
 
+/// Pull request body for a worktree thread: outcome, requests, files.
+pub(crate) fn pr_body(
+    thread: &Thread,
+    harness_name: &str,
+    items: &[Item],
+    files: &[DiffFileStat],
+) -> String {
+    let mut out = String::new();
+    if let Some(text) = items.iter().rev().find_map(|i| match &i.body {
+        ItemBody::AssistantMessage { text } if !text.trim().is_empty() => Some(text.trim()),
+        _ => None,
+    }) {
+        out.push_str("## Summary\n\n");
+        out.push_str(&clip(text, 4_000));
+        out.push_str("\n\n");
+    }
+    let requests: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::UserMessage { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+            _ => None,
+        })
+        .collect();
+    if !requests.is_empty() {
+        out.push_str("## Requests\n\n");
+        for r in requests.iter().take(MAX_REQUESTS) {
+            out.push_str(&format!("- {}\n", one_line(r, 300)));
+        }
+        out.push('\n');
+    }
+    if !files.is_empty() {
+        out.push_str("## Files changed\n\n");
+        for f in files.iter().take(MAX_FILES) {
+            out.push_str(&format!("- `{}` (+{} −{})\n", f.path, f.added, f.removed));
+        }
+        if files.len() > MAX_FILES {
+            out.push_str(&format!("- … and {} more\n", files.len() - MAX_FILES));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "---\nCreated with Agentloft from a {harness_name} thread (`{}`).\n",
+        thread.id
+    ));
+    out
+}
+
 /// Unfinished entries of the latest todo list (Claude `TodoWrite`).
 fn open_todos(items: &[Item]) -> Vec<String> {
     let Some(input) = items.iter().rev().find_map(|i| match &i.body {

@@ -137,6 +137,11 @@ pub enum Request {
         #[serde(default)]
         share_workspace: bool,
     },
+    /// Push a worktree thread's branch and open a GitHub pull request into
+    /// its base with `gh`. Answers `Response::Text` with the PR URL.
+    CreatePullRequest {
+        thread_id: ThreadId,
+    },
     /// Stop the thread's agent and terminal and remove its worktree (the
     /// branch is kept). A dirty worktree needs `force`.
     ArchiveThread {

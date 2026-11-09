@@ -583,3 +583,97 @@ async fn config_reload_applies_to_new_threads() {
     let t = new_thread(&core, &repo).await;
     assert_eq!(t.workspace, ThreadWorkspace::NewWorktree);
 }
+
+#[tokio::test]
+async fn pull_request_pushes_branch_and_calls_gh() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let remote = dir.path().join("remote.git");
+    git(
+        dir.path(),
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    // A stand-in `gh` that records its arguments and the PR body.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    let log = dir.path().join("gh.log");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$@\" > '{log}'\ncat >> '{log}'\necho https://github.com/acme/repo/pull/7\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env.get("PATH").cloned().unwrap_or_default()
+    );
+    env.insert("PATH".into(), path);
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            env: Arc::new(env),
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, &repo).await;
+    core.handle(Request::SetThreadWorkspace {
+        thread_id: thread.id.clone(),
+        worktree: true,
+    })
+    .await
+    .unwrap();
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "Add a changelog".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    let (thread, ..) = thread_snapshot(&core, &thread.id);
+    std::fs::write(PathBuf::from(&thread.cwd).join("CHANGELOG.md"), "# 1.0\n").unwrap();
+
+    let Response::Text { text: url } = core
+        .handle(Request::CreatePullRequest {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(url, "https://github.com/acme/repo/pull/7");
+    let branch = thread.workspace.branch().unwrap().to_owned();
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%s", &branch]),
+        "Add a changelog",
+        "the agent's work was committed and pushed"
+    );
+    let gh_log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        gh_log.starts_with(&format!(
+            "pr create --base main --head {branch} --title Add a changelog --body-file -"
+        )),
+        "{gh_log}"
+    );
+    assert!(gh_log.contains("## Requests") && gh_log.contains("- Add a changelog"));
+}

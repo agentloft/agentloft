@@ -2058,6 +2058,16 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                             }),
                     )
                     .item({
+                        let (s, t) = (store.clone(), id.clone());
+                        PopupMenuItem::new("Create pull request")
+                            .icon(IconName::GitPullRequest)
+                            .disabled(running)
+                            .on_click(move |_, _, cx| {
+                                let t = t.clone();
+                                s.update(cx, |s, cx| s.create_pull_request(t, cx));
+                            })
+                    })
+                    .item({
                         let path = path.clone();
                         PopupMenuItem::new("Reveal worktree in Finder")
                             .icon(IconName::FolderOpen)

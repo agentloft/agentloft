@@ -181,6 +181,62 @@ impl Core {
         })
     }
 
+    /// Commit + push the branch, then `gh pr create` (PLAN §5.2).
+    pub(crate) async fn create_pull_request(
+        self: &Arc<Self>,
+        id: &ThreadId,
+    ) -> CoreResult<Response> {
+        let thread = self.load_thread(id)?;
+        let ThreadWorkspace::Worktree { path, branch, base } = thread.workspace.clone() else {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "only worktree threads can open a pull request",
+            ));
+        };
+        if matches!(
+            thread.status,
+            ThreadStatus::Running | ThreadStatus::WaitingApproval
+        ) {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "wait for the turn to finish before opening a pull request",
+            ));
+        }
+        let env = self.opts().env.clone();
+        let gh = loft_config::which("gh", env.get("PATH").map(String::as_str).unwrap_or(""))
+            .ok_or_else(|| {
+                ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    "GitHub CLI (`gh`) not found — install it and run `gh auth login`",
+                )
+            })?;
+        let items = self.with_store(|s| s.items(id))?;
+        let first_prompt = items.iter().find_map(|i| match &i.body {
+            ItemBody::UserMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        let message = commit_message(first_prompt.as_deref(), &thread.title);
+        let title = message.lines().next().unwrap_or(&thread.title).to_owned();
+        let files = self
+            .diff(id, loft_protocol::DiffScope::Thread)
+            .await
+            .map(|d| d.files)
+            .unwrap_or_default();
+        let body = crate::handoff::pr_body(
+            &thread,
+            &crate::forks::harness_display(&thread.harness),
+            &items,
+            &files,
+        );
+        blocking(move || {
+            let dir = Path::new(&path);
+            wt::commit_and_push(dir, &branch, &base, &message, &env)?;
+            gh_pr_create(&gh, dir, &branch, &base, &title, &body, &env)
+        })
+        .await
+        .map(|url| Response::Text { text: url })
+    }
+
     pub(crate) async fn archive_thread(
         self: &Arc<Self>,
         id: &ThreadId,
@@ -235,6 +291,53 @@ impl Core {
         self.save_thread(&thread)?;
         Ok(Response::Thread { thread })
     }
+}
+
+/// `gh pr create`; an already-open PR for the branch is returned instead.
+fn gh_pr_create(
+    gh: &Path,
+    dir: &Path,
+    branch: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<String> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new(gh)
+        .current_dir(dir)
+        .env_clear()
+        .envs(env)
+        .env("GH_PROMPT_DISABLED", "1")
+        .args([
+            "pr", "create", "--base", base, "--head", branch, "--title", title,
+        ])
+        .args(["--body-file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let url = |text: &str| {
+        text.split_whitespace()
+            .find(|w| w.starts_with("https://"))
+            .map(str::to_owned)
+    };
+    if out.status.success() {
+        return url(&stdout).ok_or_else(|| anyhow::anyhow!("gh printed no URL: {stdout}"));
+    }
+    // "a pull request for branch … already exists: https://…"
+    if stderr.contains("already exists")
+        && let Some(existing) = url(&stderr)
+    {
+        return Ok(existing);
+    }
+    anyhow::bail!("gh pr create failed: {}", stderr.trim())
 }
 
 /// Squash commit message: the first prompt's first line as the subject

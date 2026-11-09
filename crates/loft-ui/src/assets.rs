@@ -40,6 +40,7 @@ gpui_kit::assets::icon_assets!(
         FolderTree,
         GitBranch,
         GitMerge,
+        GitPullRequest,
         Laptop,
         GitCompare,
         GitFork,

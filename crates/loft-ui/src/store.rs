@@ -511,6 +511,27 @@ impl AppStore {
         });
     }
 
+    /// Push the worktree branch and open a PR with `gh`; opens it in the
+    /// browser when done.
+    pub fn create_pull_request(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        cx.emit(StoreEvent::Notify {
+            message: "Pushing and opening a pull request…".into(),
+            error: false,
+        });
+        self.request_result(
+            Request::CreatePullRequest { thread_id },
+            cx,
+            |store, result, cx| match result {
+                Ok(Response::Text { text: url }) => {
+                    cx.open_url(&url);
+                    store.notify_result(Ok(format!("Pull request: {url}")), cx);
+                }
+                Ok(_) => {}
+                Err(err) => store.notify_result(Err(err), cx),
+            },
+        );
+    }
+
     pub fn archive_thread(&mut self, thread_id: ThreadId, force: bool, cx: &mut Context<Self>) {
         let body = Request::ArchiveThread {
             thread_id: thread_id.clone(),

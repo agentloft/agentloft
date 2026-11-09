@@ -135,6 +135,39 @@ pub fn merge_conflicts(repo: &Path, base: &str, branch: &str) -> Result<Vec<Stri
     }
 }
 
+/// Commit pending work on the worktree's branch (if any), then push it to
+/// the base branch's remote (default `origin`) with upstream tracking.
+/// `env` is the user's login environment (credential helpers, SSH agent).
+/// Returns the remote name.
+pub fn commit_and_push(
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+    message: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    if is_dirty(worktree)? {
+        run(git(worktree).args(["add", "-A"]))?;
+        run(git(worktree).args(["commit", "-q", "--no-verify", "-m", message]))?;
+    }
+    let remotes = run(git(worktree).arg("remote"))?;
+    let configured = run(git(worktree).args(["config", &format!("branch.{base}.remote")]))
+        .ok()
+        .map(|r| r.trim().to_owned())
+        .filter(|r| !r.is_empty());
+    let remote = configured
+        .or_else(|| remotes.lines().find(|r| *r == "origin").map(str::to_owned))
+        .or_else(|| remotes.lines().next().map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("this repository has no remote to push to"))?;
+    let mut cmd = git(worktree);
+    cmd.envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .args(["push", "-q", "-u", &remote, &format!("{branch}:{branch}")]);
+    run(&mut cmd)?;
+    Ok(remote)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeOutcome {
     pub commit: String,
@@ -214,6 +247,29 @@ mod tests {
         std::fs::write(d.join(".gitignore"), ".env*\n").unwrap();
         commit_all(d, "init");
         dir
+    }
+
+    #[test]
+    fn commit_and_push_to_bare_remote() {
+        let dir = repo();
+        let root = dir.path();
+        let remote = tempfile::tempdir().unwrap();
+        run(git(remote.path()).args(["init", "-q", "--bare"])).unwrap();
+        let url = remote.path().to_string_lossy().into_owned();
+        run(git(root).args(["remote", "add", "origin", &url])).unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        add(root, &wt, "agentloft/pr", "main").unwrap();
+        std::fs::write(wt.join("new.txt"), "x\n").unwrap();
+        let env = std::env::vars().collect();
+        assert_eq!(
+            commit_and_push(&wt, "agentloft/pr", "main", "Add new", &env).unwrap(),
+            "origin"
+        );
+        let log =
+            run(git(remote.path()).args(["log", "--format=%s", "agentloft/pr", "-1"])).unwrap();
+        assert_eq!(log.trim(), "Add new");
+        assert!(!is_dirty(&wt).unwrap());
     }
 
     #[test]
