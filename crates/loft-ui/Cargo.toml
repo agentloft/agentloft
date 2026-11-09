@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Image dimensions from file headers (reply images keep their proportions).
+imagesize = "0.14"
 loft-protocol.workspace = true
 loft-client.workspace = true
 loft-config.workspace = true

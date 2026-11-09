@@ -48,6 +48,24 @@ pub(crate) fn local_images(
     }
 }
 
+/// Width ÷ height of the image file at `path`, read from its header
+/// (cached).
+fn image_ratio(path: &std::path::Path) -> Option<f32> {
+    thread_local! {
+        static RATIOS: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, Option<f32>>> =
+            Default::default();
+    }
+    RATIOS.with(|cache| {
+        *cache
+            .borrow_mut()
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                let size = imagesize::size(path).ok()?;
+                (size.width > 0 && size.height > 0).then(|| size.width as f32 / size.height as f32)
+            })
+    })
+}
+
 /// An image that stands as a block of its own in a reply.
 struct ReplyImage {
     src: String,
@@ -134,12 +152,22 @@ pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
                 .border_1()
                 .border_color(p.border)
                 .cursor_pointer()
-                .child(
+                .child({
+                    use gpui_kit::StyledImage as _;
+                    // An explicit size in its own proportions: the image
+                    // element otherwise takes the picture's pixel height and
+                    // leaves it floating in a tall box.
+                    let ratio = local_image_path(&image.src, &render_cwd)
+                        .and_then(|path| image_ratio(&path))
+                        .unwrap_or(1.);
+                    let w = REPLY_IMAGE_WIDTH as f32;
                     gpui_kit::img(local_images(render_cwd.clone())(
                         &gpui_kit::SharedUri::from(image.src.clone()),
                     ))
-                    .w_full(),
-                );
+                    .w(px(w))
+                    .h(px(w / ratio))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                });
             match local_image_path(&image.src, &render_cwd) {
                 Some(path) => {
                     let pic = crate::image_preview::Pic::file(path);
