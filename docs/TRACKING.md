@@ -15,7 +15,7 @@ Legend: `[x]` done and verified · `[~]` partial · `[ ]` not started.
 | 6 | Stop interrupts within 2 s | [x] | `live_claude`: interrupt took 14 ms |
 | 7 | Quitting the UI mid-turn keeps the turn running; reopening catches up | [x] | Scripted check 2026-11-09: UI `kill -9` mid-turn; the turn completed in the daemon; reconnect gets a full snapshot (e2e) |
 | 8 | `kill -9` of the daemon: UI respawns it, turn shows interrupted, the next message resumes the same session | [x] | Scripted check 2026-11-09: daemon `kill -9` mid-turn; the UI respawned it within seconds; the turn showed interrupted; the next message completed on the same session. Also `live_claude` (restart) and `loft-core` tests |
-| 9 | No orphan `claude` processes after shutdown; reaper | [x] | Process groups, graceful stop and the startup reaper are in place. Scripted check: after a daemon `kill -9`, the agent child (`opencode acp`) exited at once on stdin EOF. A dedicated reaper test is still missing |
+| 9 | No orphan `claude` processes after shutdown; reaper | [x] | Process groups, graceful stop and the startup reaper are in place. Scripted check: after a daemon `kill -9`, the agent child (`opencode acp`) exited at once on stdin EOF. The reaper test (`loftd` reaper) kills a recorded orphan group and spares a reused pid |
 | 10 | Tests: decider/core, protocol round-trip, Claude fixtures (2.1.319), headless e2e | [x] | 27 tests across crates (plus the ignored `live_claude`); fixtures in `crates/loft-harness-claude/fixtures/` |
 
 Infrastructure:
