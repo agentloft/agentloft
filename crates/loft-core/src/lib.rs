@@ -33,12 +33,12 @@ pub enum BusMsg {
     /// Shared: the bus clones each message per subscriber.
     Event(Arc<EventEnvelope>),
     Delta(Delta),
-    /// Terminal output; `offset` is the byte position of `data` in the
-    /// terminal's output stream (for de-duplication against replays).
+    /// A terminal's output stream now ends at byte `end`. Carries no data:
+    /// subscribers read what's new from the terminal's ring buffer, so a
+    /// burst costs no memory beyond the ring and coalesces naturally.
     TerminalOutput {
         id: loft_protocol::TerminalId,
-        offset: u64,
-        data: Arc<Vec<u8>>,
+        end: u64,
     },
     TerminalExited {
         id: loft_protocol::TerminalId,
@@ -166,6 +166,16 @@ impl Core {
 
     pub(crate) fn take_pending_setup(&self, thread: &ThreadId) -> Option<String> {
         lock(&self.pending_setup).remove(thread)
+    }
+
+    /// Terminal output from stream offset `from` to its current end.
+    /// `None` when `from` has already scrolled out of the ring (re-snapshot).
+    pub fn terminal_read_since(
+        &self,
+        id: &loft_protocol::TerminalId,
+        from: u64,
+    ) -> CoreResult<Option<(Vec<u8>, u64)>> {
+        self.terminals.read_since(id, from)
     }
 
     /// The current config (reloaded by the settings window).

@@ -252,27 +252,29 @@ async fn forward(
                         return;
                     }
                 }
-                Ok(BusMsg::TerminalOutput { id, offset, data }) => {
-                    if topic != Topic::Terminal(id.clone()) {
+                Ok(BusMsg::TerminalOutput { id, end }) => {
+                    // `seq` is the stream offset already delivered.
+                    if topic != Topic::Terminal(id.clone()) || end <= seq {
                         continue;
                     }
-                    // `seq` is the stream offset already delivered; trim overlap.
-                    let end = offset + data.len() as u64;
-                    if end <= seq {
-                        continue;
-                    }
-                    let skip = seq.saturating_sub(offset) as usize;
-                    seq = end;
-                    let chunk = data[skip..].to_vec();
-                    if out
-                        .send(ServerMsg::TerminalOutput {
-                            sub_id,
-                            id,
-                            data: chunk.into(),
-                        })
-                        .is_err()
-                    {
-                        return;
+                    match core.terminal_read_since(&id, seq) {
+                        Ok(Some((data, new_end))) => {
+                            seq = new_end;
+                            if !data.is_empty()
+                                && out
+                                    .send(ServerMsg::TerminalOutput {
+                                        sub_id,
+                                        id,
+                                        data: data.into(),
+                                    })
+                                    .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        // Fell behind the ring (or the terminal closed): resend
+                        // the replay snapshot.
+                        Ok(None) | Err(_) => break,
                     }
                 }
                 Ok(BusMsg::TerminalExited { id, code }) => {

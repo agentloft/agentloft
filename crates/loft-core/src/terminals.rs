@@ -197,6 +197,28 @@ impl Terminals {
         }
     }
 
+    /// Bytes from stream offset `from` to the end, and that end. `None` if
+    /// `from` is older than the ring's start (the reader fell behind).
+    pub fn read_since(
+        &self,
+        id: &TerminalId,
+        from: u64,
+    ) -> Result<Option<(Vec<u8>, u64)>, ErrorBody> {
+        let term = self.get(id)?;
+        let ring = lock(&term.ring);
+        let start = ring.end - ring.data.len() as u64;
+        if from < start {
+            return Ok(None);
+        }
+        let skip = (from - start) as usize;
+        let bytes = ring
+            .data
+            .range(skip.min(ring.data.len())..)
+            .copied()
+            .collect();
+        Ok(Some((bytes, ring.end)))
+    }
+
     /// Info plus the replay buffer and the byte offset where it ends.
     pub fn snapshot(&self, id: &TerminalId) -> Result<(TerminalInfo, Vec<u8>, u64), ErrorBody> {
         let term = self.get(id)?;
@@ -225,20 +247,17 @@ fn pump(
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        let chunk = buf[..n].to_vec();
-        let offset = {
+        let end = {
             let mut ring = lock(&term.ring);
-            let offset = ring.end;
-            ring.data.extend(&chunk);
+            ring.data.extend(&buf[..n]);
             let excess = ring.data.len().saturating_sub(RING_CAP);
             ring.data.drain(..excess);
             ring.end += n as u64;
-            offset
+            ring.end
         };
         let _ = bus.send(BusMsg::TerminalOutput {
             id: id.clone(),
-            offset,
-            data: Arc::new(chunk),
+            end,
         });
     }
 }
