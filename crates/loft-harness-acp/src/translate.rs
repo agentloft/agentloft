@@ -632,6 +632,7 @@ impl Translator {
                 self.cost_now = (kind == Pending::NewSession).then_some(0.0);
                 self.read_settings(result);
                 let mut out = vec![Out::Event(HarnessEvent::SessionReady {
+                    models: offered_models(result),
                     native_session_id: session,
                     model: self
                         .model_setting
@@ -1663,6 +1664,62 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
     }
 }
 
+/// The models a session offers: a `configOptions` model select (flat or
+/// grouped options) or the legacy `models.availableModels` list.
+fn offered_models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
+    let info = |id: &str, name: Option<&str>, current: Option<&str>| loft_protocol::ModelInfo {
+        id: id.to_owned(),
+        display_name: name.unwrap_or(id).to_owned(),
+        description: None,
+        is_default: current == Some(id),
+    };
+    if let Some(select) = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|opts| {
+            opts.iter().find(|o| {
+                o.get("category").and_then(Value::as_str) == Some("model")
+                    || o.get("id").and_then(Value::as_str) == Some("model")
+            })
+        })
+    {
+        let current = select.get("currentValue").and_then(Value::as_str);
+        let mut out = Vec::new();
+        for opt in select
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            // Grouped options carry their own `options` list.
+            let inner = opt.get("options").and_then(Value::as_array);
+            for o in inner
+                .map(|v| v.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![opt])
+            {
+                if let Some(id) = o.get("value").and_then(Value::as_str) {
+                    out.push(info(id, o.get("name").and_then(Value::as_str), current));
+                }
+            }
+        }
+        return out;
+    }
+    let Some(models) = result.get("models") else {
+        return Vec::new();
+    };
+    let current = models.get("currentModelId").and_then(Value::as_str);
+    models
+        .get("availableModels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m.get("modelId").and_then(Value::as_str)?;
+            Some(info(id, m.get("name").and_then(Value::as_str), current))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,6 +1788,22 @@ mod tests {
                     { "optionId": "reject", "kind": "reject_once", "name": "Reject" },
                 ] } })
         .to_string()
+    }
+
+    #[test]
+    fn offered_models_from_config_options_and_legacy_state() {
+        let line = FIXTURE.lines().nth(1).unwrap();
+        let v: Value = serde_json::from_str(line).unwrap();
+        let models = offered_models(&v["result"]);
+        assert!(models.len() >= 4, "{models:?}");
+        let default: Vec<_> = models.iter().filter(|m| m.is_default).collect();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].id, "opencode/iceman-free");
+        let legacy = json!({"models": {"currentModelId": "b", "availableModels": [
+            {"modelId": "a", "name": "Model A"}, {"modelId": "b", "name": "Model B"}]}});
+        let models = offered_models(&legacy);
+        assert_eq!(models[1].display_name, "Model B");
+        assert!(models[1].is_default && !models[0].is_default);
     }
 
     #[test]

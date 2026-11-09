@@ -320,6 +320,11 @@ impl Core {
         Ok(Response::HarnessStatus { status })
     }
 
+    /// Models a live session reported (ACP agents list theirs at start).
+    pub(crate) fn set_models(&self, harness: &HarnessId, models: Vec<loft_protocol::ModelInfo>) {
+        lock(&self.models).insert(harness.as_str().to_owned(), models);
+    }
+
     async fn list_models(&self, harness: &HarnessId) -> CoreResult<Response> {
         if let Some(models) = lock(&self.models).get(harness.as_str()) {
             return Ok(Response::Models {
@@ -339,7 +344,11 @@ impl Core {
             .await
             .map_err(internal)?
             .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
-        lock(&self.models).insert(harness.as_str().to_owned(), models.clone());
+        // An empty answer isn't cached: ACP agents report theirs once a
+        // session starts.
+        if !models.is_empty() {
+            lock(&self.models).insert(harness.as_str().to_owned(), models.clone());
+        }
         Ok(Response::Models { models })
     }
 

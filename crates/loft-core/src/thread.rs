@@ -628,7 +628,11 @@ impl ThreadActor {
                 native_session_id,
                 model,
                 slash_commands,
+                models,
             } => {
+                if !models.is_empty() {
+                    self.core.set_models(&self.thread.harness, models);
+                }
                 let mut changed = false;
                 if !slash_commands.is_empty() && self.thread.slash_commands != slash_commands {
                     self.thread.slash_commands = slash_commands;

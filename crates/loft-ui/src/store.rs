@@ -203,16 +203,13 @@ impl AppStore {
         self.client = Some(client);
         self.probe_harnesses(cx);
         // Model pickers (Codex asks its CLI; answers are cached daemon-side).
-        for harness in [HarnessId::claude(), HarnessId(HarnessId::CODEX.into())] {
-            let body = Request::ListModels {
-                harness: harness.clone(),
-            };
-            self.request_result(body, cx, move |store, result, cx| {
-                if let Ok(Response::Models { models }) = result {
-                    store.models.insert(harness, models);
-                    cx.notify();
-                }
-            });
+        for harness in [
+            HarnessId::CLAUDE,
+            HarnessId::CODEX,
+            HarnessId::OPENCODE,
+            HarnessId::GEMINI,
+        ] {
+            self.fetch_models(HarnessId(harness.into()), cx);
         }
         for (id, pane) in terminals {
             if restarted {
@@ -223,6 +220,18 @@ impl AppStore {
             }
         }
         cx.notify();
+    }
+
+    fn fetch_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let body = Request::ListModels {
+            harness: harness.clone(),
+        };
+        self.request_result(body, cx, move |store, result, cx| {
+            if let Ok(Response::Models { models }) = result {
+                store.models.insert(harness, models);
+                cx.notify();
+            }
+        });
     }
 
     /// Agents to offer: Claude Code and Codex always, ACP agents (OpenCode,
@@ -362,9 +371,29 @@ impl AppStore {
                             .map(|t| t.status),
                         _ => None,
                     };
+                    let had_session = match &event.event {
+                        Event::ThreadUpdated { thread } => self
+                            .workspace
+                            .threads
+                            .iter()
+                            .find(|t| t.id == thread.id)
+                            .is_some_and(|t| t.native_session_id.is_some()),
+                        _ => true,
+                    };
                     if self.workspace.apply_event(&event) {
                         if let Event::ThreadUpdated { thread } = &event.event {
                             self.on_status_change(&thread.id, before, thread.status, cx);
+                            // A first session may have told the daemon which
+                            // models this agent offers (ACP).
+                            let session_started =
+                                !had_session && thread.native_session_id.is_some();
+                            let turn_ended = before == Some(loft_protocol::ThreadStatus::Running)
+                                && thread.status != loft_protocol::ThreadStatus::Running;
+                            if (session_started || turn_ended)
+                                && self.models.get(&thread.harness).is_none_or(Vec::is_empty)
+                            {
+                                self.fetch_models(thread.harness.clone(), cx);
+                            }
                         }
                         cx.notify();
                     }

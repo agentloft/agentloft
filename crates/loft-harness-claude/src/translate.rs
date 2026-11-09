@@ -190,6 +190,7 @@ impl Translator {
     fn on_system(&mut self, v: &Value) -> Vec<Out> {
         match str_at(v, "subtype") {
             Some("init") => vec![Out::Event(HarnessEvent::SessionReady {
+                models: vec![],
                 native_session_id: str_at(v, "session_id").unwrap_or_default().to_owned(),
                 model: str_at(v, "model").map(str::to_owned),
                 slash_commands: v

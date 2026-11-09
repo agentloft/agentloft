@@ -90,6 +90,9 @@ pub enum HarnessEvent {
         native_session_id: String,
         model: Option<String>,
         slash_commands: Vec<String>,
+        /// Models the agent offers, when it says so at session start (ACP
+        /// `configOptions`); feeds the model picker.
+        models: Vec<loft_protocol::ModelInfo>,
     },
     TurnStarted,
     ItemStarted {

@@ -304,6 +304,7 @@ impl Translator {
                     .to_owned();
                 self.thread_id = Some(thread.clone());
                 let mut out = vec![Out::Event(HarnessEvent::SessionReady {
+                    models: vec![],
                     native_session_id: thread.clone(),
                     model: result
                         .get("model")

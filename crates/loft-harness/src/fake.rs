@@ -47,6 +47,7 @@ impl Harness for FakeHarness {
 
 async fn run(mut ends: SessionEnds, session_id: String) {
     ends.emit(HarnessEvent::SessionReady {
+        models: vec![],
         native_session_id: session_id,
         model: Some("fake-model".into()),
         slash_commands: vec!["help".into()],
