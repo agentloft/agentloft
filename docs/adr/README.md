@@ -10,7 +10,7 @@ Each ADR records one significant decision: its context, the decision, the conseq
 | [0004](0004-codex-app-server-generated-types.md) | Codex via `app-server` JSON-RPC with schema-generated types | Proposed |
 | [0005](0005-gpui-pinning-and-staying-current.md) | GPUI pinning via gpui-kit's `gpui-pre`, and staying current | Proposed |
 | [0006](0006-storage-sqlite-event-log-toml.md) | SQLite with CRUD tables plus an event-sourced thread log; TOML config | Proposed |
-| [0007](0007-terminal-architecture.md) | Daemon-owned PTYs, `alacritty_terminal` rendering in GPUI | Proposed |
+| [0007](0007-terminal-architecture.md) | Daemon-owned PTYs, rendered in GPUI (amended: libghostty-vt) | Accepted |
 | [0008](0008-git-worktrees-checkpoints.md) | Git CLI, per-thread worktrees, hidden-ref checkpoints | Proposed |
 | [0009](0009-license-and-dependency-policy.md) | Apache-2.0 and a no-copyleft dependency policy | Accepted |
 | [0010](0010-async-runtimes.md) | Tokio in the daemon, the GPUI executor in the UI | Proposed |
