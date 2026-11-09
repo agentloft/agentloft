@@ -115,6 +115,7 @@ impl Render for AgentView {
 
         let state = thread.read(cx);
         let model = state.model.as_ref().expect("checked above");
+        let cwd = model.thread.cwd.clone();
         let mut activity = v_flex().gap_2();
         let mut count = 0;
         for item in model
@@ -225,7 +226,7 @@ impl Render for AgentView {
                         .text_color(p.muted_foreground)
                         .child("REPORT"),
                 )
-                .child(TextView::new(md))
+                .child(TextView::new(md).image_source(crate::items::local_images(cwd.clone())))
         });
 
         let _ = window;

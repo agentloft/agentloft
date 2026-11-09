@@ -23,6 +23,95 @@ const OUTPUT_PREVIEW_LINES: usize = 14;
 /// Long messages fold to this height until "Show more".
 const FOLDED_HEIGHT: f32 = 220.;
 
+/// Where Markdown images in a reply come from: files on this Mac
+/// (`/abs`, `~/…`, `file://…`, or relative to the thread's folder) load
+/// from disk; web addresses load as usual.
+pub(crate) fn local_images(
+    cwd: String,
+) -> impl Fn(&gpui_kit::SharedUri) -> gpui_kit::ImageSource + Send + Sync + 'static {
+    move |uri: &gpui_kit::SharedUri| {
+        let raw = uri.as_ref();
+        if raw.contains("://") && !raw.starts_with("file://") || raw.starts_with("data:") {
+            return gpui_kit::ImageSource::from(uri.clone());
+        }
+        let path = raw.strip_prefix("file://").unwrap_or(raw);
+        let path = match path.strip_prefix("~/") {
+            Some(rest) => std::env::home_dir().unwrap_or_default().join(rest),
+            None => std::path::Path::new(&cwd).join(path),
+        };
+        gpui_kit::ImageSource::from(path)
+    }
+}
+
+/// Width images in replies are shown at (the Markdown view draws images
+/// without a size at text height).
+const REPLY_IMAGE_WIDTH: u32 = 360;
+
+/// Give each Markdown image in a reply a line of its own and a width, so
+/// it shows as a picture rather than a text-sized glyph. Code is left alone.
+pub(crate) fn sized_images(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("![") {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence || !line.contains("![") {
+            out.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        let mut in_code = false;
+        while !rest.is_empty() {
+            if rest.starts_with('`') {
+                in_code = !in_code;
+                out.push('`');
+                rest = &rest[1..];
+                continue;
+            }
+            if !in_code
+                && rest.starts_with("![")
+                && let Some(close) = rest.find("](")
+                && let Some(end) = rest[close + 2..].find(')')
+            {
+                let alt = &rest[2..close];
+                let url = rest[close + 2..close + 2 + end]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if !alt.contains(']') && !url.is_empty() {
+                    let before = out.trim_end_matches([' ', '\t']);
+                    if !before.is_empty() && !before.ends_with('\n') {
+                        let len = before.len();
+                        out.truncate(len);
+                        out.push_str("  \n");
+                    }
+                    let alt = alt.replace('"', "&quot;");
+                    let url = url.replace('"', "%22");
+                    out.push_str(&format!(
+                        "<img src=\"{url}\" alt=\"{alt}\" width=\"{REPLY_IMAGE_WIDTH}\">"
+                    ));
+                    rest = &rest[close + 2 + end + 1..];
+                    if !rest.trim().is_empty() {
+                        out.push_str("  \n");
+                        rest = rest.trim_start_matches([' ', '\t']);
+                    }
+                    continue;
+                }
+            }
+            let ch = rest.chars().next().expect("non-empty");
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out.into()
+}
+
 /// Long enough to fold: many lines, or a lot of text.
 pub(crate) fn is_long_message(text: &str) -> bool {
     text.lines().count() > 10 || text.len() > 900
@@ -245,11 +334,24 @@ pub(crate) fn render_item(
                 .into_any_element()
         }
 
-        ItemBody::AssistantMessage { text } => match state.markdown.get(&item.id) {
-            Some(md) => TextView::new(md).stream_fade(true).into_any_element(),
-            None => TextView::markdown(SharedString::from(format!("md-{}", item.id)), text.clone())
-                .into_any_element(),
-        },
+        ItemBody::AssistantMessage { text } => {
+            let cwd = state
+                .model
+                .as_ref()
+                .map(|m| m.thread.cwd.clone())
+                .unwrap_or_default();
+            match state.markdown.get(&item.id) {
+                Some(md) => TextView::new(md)
+                    .stream_fade(true)
+                    .image_source(local_images(cwd))
+                    .into_any_element(),
+                None => {
+                    TextView::markdown(SharedString::from(format!("md-{}", item.id)), text.clone())
+                        .image_source(local_images(cwd))
+                        .into_any_element()
+                }
+            }
+        }
 
         ItemBody::Reasoning { text } => {
             let thinking = item.status == ItemStatus::InProgress;
@@ -1206,6 +1308,18 @@ fn compact_count(n: u64) -> String {
 mod tests {
     use super::*;
     use loft_protocol::*;
+
+    #[test]
+    fn reply_images_get_a_line_and_a_width() {
+        let out = sized_images("Here: ![Loft](/tmp/a.png) nice");
+        assert_eq!(
+            out,
+            "Here:  \n<img src=\"/tmp/a.png\" alt=\"Loft\" width=\"360\">  \nnice"
+        );
+        assert_eq!(sized_images("`![x](y)`"), "`![x](y)`");
+        assert_eq!(sized_images("```\n![x](y)\n```\n"), "```\n![x](y)\n```\n");
+        assert_eq!(sized_images("no images"), "no images");
+    }
 
     fn tool(kind: ToolKind) -> Item {
         Item {

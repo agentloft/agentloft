@@ -1331,6 +1331,7 @@ impl ThreadState {
         let ItemBody::AssistantMessage { text } = body else {
             return;
         };
+        let text = &*crate::items::sized_images(text);
         match self.markdown.get(id) {
             Some(md) => md.update(cx, |md, cx| md.set_text(text, cx)),
             None => {

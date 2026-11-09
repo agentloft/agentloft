@@ -416,6 +416,13 @@ impl WorkspaceView {
                 self.panel_open = false;
                 self.peek = n.parse().ok();
             }
+            Some(("send", text)) => {
+                self.panel_open = false;
+                let id = thread_id.clone();
+                let text = text.to_owned();
+                self.store
+                    .update(cx, |s, cx| s.send_message(id, text, Vec::new(), cx));
+            }
             Some(("queue", text)) => {
                 self.panel_open = false;
                 let queued = crate::store::Queued {
