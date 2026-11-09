@@ -1,0 +1,21 @@
+[package]
+name = "loft-docs"
+description = "Pure-Rust parsing of office documents (docx, xlsx/ods/csv, pptx) into a simple renderable model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+calamine.workspace = true
+csv.workspace = true
+
+[dev-dependencies]
+zip.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -47,6 +47,12 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 tempfile = "3"
 
+# documents (loft-docs)
+zip = { version = "9.5", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+calamine = { version = "0.38", default-features = false }
+csv = "1.4"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
