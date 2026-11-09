@@ -1387,7 +1387,7 @@ fn render_turn_footer(
 static COPIED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
-fn just_copied(id: &str) -> bool {
+pub(crate) fn just_copied(id: &str) -> bool {
     COPIED
         .lock()
         .ok()
@@ -1417,17 +1417,22 @@ fn copy_button(
         .tooltip(if copied { "Copied" } else { tooltip })
         .on_click(move |_, window, cx| {
             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
-            if let Ok(mut c) = COPIED.lock() {
-                *c = Some((key.clone(), std::time::Instant::now()));
-            }
-            window.refresh();
-            // Back to the copy icon afterwards.
-            cx.spawn(async move |cx| {
-                cx.background_executor().timer(COPIED_FOR).await;
-                cx.update(|cx| cx.refresh_windows());
-            })
-            .detach();
+            mark_copied(key.clone(), window, cx);
         })
+}
+
+/// Remember that copy button `id` was just used (it shows ✓ for a moment).
+pub(crate) fn mark_copied(id: String, window: &mut Window, cx: &mut App) {
+    if let Ok(mut c) = COPIED.lock() {
+        *c = Some((id, std::time::Instant::now()));
+    }
+    window.refresh();
+    // Back to the copy icon afterwards.
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(COPIED_FOR).await;
+        cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
 }
 
 pub(crate) fn confirm_revert(

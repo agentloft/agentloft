@@ -4436,12 +4436,15 @@ fn show_pasted(text: String, window: &mut Window, cx: &mut gpui_kit::App) {
                                     ));
                                 }),
                         )
+                        .child(div().flex_1())
                         .child(
-                            DialogClose::new().child(
-                                Button::new("pasted-close")
-                                    .cursor_pointer()
-                                    .label("Close")
-                                    .outline(),
+                            div().flex_none().child(
+                                DialogClose::new().child(
+                                    Button::new("pasted-close")
+                                        .cursor_pointer()
+                                        .label("Close")
+                                        .outline(),
+                                ),
                             ),
                         ),
                 ),

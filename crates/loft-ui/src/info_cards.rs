@@ -1349,15 +1349,28 @@ pub(crate) fn render(
                             })
                         })
                         .when_some(ready, |d, info| {
-                            d.child(
-                                icon_button(format!("card-copy-{ix}"), IconName::Copy, "Copy", p)
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                                            card_text(kind, &info),
-                                        ));
-                                    }),
-                            )
+                            d.child({
+                                let id = format!("card-copy-{ix}");
+                                let copied = crate::items::just_copied(&id);
+                                icon_button(
+                                    id.clone(),
+                                    if copied {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Copy
+                                    },
+                                    if copied { "Copied" } else { "Copy" },
+                                    p,
+                                )
+                                .when(copied, |d| d.text_color(p.success))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                                        card_text(kind, &info),
+                                    ));
+                                    crate::items::mark_copied(id.clone(), window, cx);
+                                })
+                            })
                         })
                         .child(
                             icon_button(

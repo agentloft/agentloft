@@ -103,7 +103,18 @@ pub fn menu(
             .item(
                 PopupMenuItem::new("Copy Image")
                     .icon(IconName::Copy)
-                    .on_click(move |_, _, cx| copy(&b, cx)),
+                    .on_click(move |_, window, cx| {
+                        copy(&b, cx);
+                        // The menu closes at once: say so in a toast.
+                        use gpui_kit::component::WindowExt as _;
+                        use gpui_kit::component::notification::{Notification, NotificationType};
+                        window.push_notification(
+                            Notification::new()
+                                .message("Image copied")
+                                .with_type(NotificationType::Success),
+                            cx,
+                        );
+                    }),
             )
             .item(
                 PopupMenuItem::new("Save Image As…")
@@ -159,15 +170,23 @@ pub fn open(pic: Pic, window: &mut Window, cx: &mut App) {
                         .w_full()
                         .justify_end()
                         .gap_2()
-                        .child(
+                        .child({
+                            let copied = crate::items::just_copied("image-copy");
                             Button::new("image-copy")
                                 .cursor_pointer()
                                 .small()
-                                .label("Copy")
-                                .icon(IconName::Copy)
+                                .label(if copied { "Copied" } else { "Copy" })
+                                .icon(if copied {
+                                    IconName::Check
+                                } else {
+                                    IconName::Copy
+                                })
                                 .ghost()
-                                .on_click(move |_, _, cx| copy(&copy_pic, cx)),
-                        )
+                                .on_click(move |_, window, cx| {
+                                    copy(&copy_pic, cx);
+                                    crate::items::mark_copied("image-copy".into(), window, cx);
+                                })
+                        })
                         .child(
                             Button::new("image-save")
                                 .cursor_pointer()
@@ -177,13 +196,16 @@ pub fn open(pic: Pic, window: &mut Window, cx: &mut App) {
                                 .ghost()
                                 .on_click(move |_, _, cx| save_as(save_pic.clone(), cx)),
                         )
+                        .child(div().flex_1())
                         .child(
-                            DialogClose::new().child(
-                                Button::new("image-close")
-                                    .cursor_pointer()
-                                    .small()
-                                    .label("Close")
-                                    .outline(),
+                            div().flex_none().child(
+                                DialogClose::new().child(
+                                    Button::new("image-close")
+                                        .cursor_pointer()
+                                        .small()
+                                        .label("Close")
+                                        .outline(),
+                                ),
                             ),
                         ),
                 ),
