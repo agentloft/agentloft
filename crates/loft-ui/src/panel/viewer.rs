@@ -10,6 +10,7 @@ use gpui_kit::base::input::{
 };
 use gpui_kit::component::highlighter::SyntaxHighlighter;
 use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
@@ -562,6 +563,19 @@ impl Render for FileViewer {
                     .into_any_element(),
             },
             Content::Image(image) => div()
+                .id("viewer-image")
+                .context_menu(crate::image_preview::menu(match &self.abs_path {
+                    Some(path) => crate::image_preview::Pic::file(path.into()),
+                    None => crate::image_preview::Pic::Loaded {
+                        image: image.clone(),
+                        name: self
+                            .rel_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("image")
+                            .to_owned(),
+                    },
+                }))
                 .flex_1()
                 .min_h_0()
                 .p_4()

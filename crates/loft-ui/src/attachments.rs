@@ -66,7 +66,7 @@ fn mime_for(format: ImageFormat) -> Option<&'static str> {
     })
 }
 
-fn format_for_path(path: &Path) -> Option<ImageFormat> {
+pub(crate) fn format_for_path(path: &Path) -> Option<ImageFormat> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
         "png" => ImageFormat::Png,
@@ -121,11 +121,20 @@ pub fn strip(
     }
     let mut row = h_flex().gap_2().px_2().pt_1().flex_wrap();
     for (ix, image) in images.iter().enumerate() {
+        use gpui_kit::component::menu::ContextMenuExt as _;
         let on_remove = on_remove.clone();
+        let pic = crate::image_preview::Pic::Loaded {
+            image: image.preview.clone(),
+            name: image.name.clone(),
+        };
+        let open_pic = pic.clone();
         row = row.child(
             div()
                 .id(SharedString::from(format!("attachment-{ix}")))
-                .relative()
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    crate::image_preview::open(open_pic.clone(), window, cx)
+                })
                 .size(px(56.))
                 .rounded(px(10.))
                 .overflow_hidden()
@@ -162,7 +171,8 @@ pub fn strip(
                     move |window, cx| {
                         gpui_kit::component::tooltip::Tooltip::new(name.clone()).build(window, cx)
                     }
-                }),
+                })
+                .context_menu(crate::image_preview::menu(pic)),
         );
     }
     Some(row.into_any_element())

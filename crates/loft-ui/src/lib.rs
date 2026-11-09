@@ -10,6 +10,7 @@ pub mod brand;
 mod completion;
 mod file_icons;
 mod folder_picker;
+mod image_preview;
 mod items;
 mod model_picker;
 mod palette;

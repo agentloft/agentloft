@@ -118,6 +118,7 @@ pub(crate) fn render_item(
     match &item.body {
         ItemBody::UserMessage { text, attachments } => {
             use gpui_kit::StyledImage as _;
+            use gpui_kit::component::menu::ContextMenuExt as _;
             let mut images = h_flex().gap_2().justify_end().flex_wrap();
             for (ix, a) in attachments.iter().enumerate() {
                 let path = std::path::PathBuf::from(&a.path);
@@ -135,7 +136,19 @@ pub(crate) fn render_item(
                                 .size_full()
                                 .object_fit(gpui_kit::ObjectFit::Cover),
                         )
-                        .on_click(move |_, _, cx| cx.open_with_system(&path)),
+                        .on_click({
+                            let pic = crate::image_preview::Pic::File {
+                                path: path.clone(),
+                                name: a.name.clone(),
+                            };
+                            move |_, window, cx| crate::image_preview::open(pic.clone(), window, cx)
+                        })
+                        .context_menu(crate::image_preview::menu(
+                            crate::image_preview::Pic::File {
+                                path: path.clone(),
+                                name: a.name.clone(),
+                            },
+                        )),
                 );
             }
             v_flex()
