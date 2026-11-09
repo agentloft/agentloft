@@ -44,6 +44,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Built-in colour themes
+
+The built-in themes in `crates/loft-ui/src/themes.rs` are our own, with
+palettes modelled on these MIT-licensed editor themes (no code is used):
+GitHub Primer (Studio), Catppuccin (Lavender), Nord (Glacier), Rosé Pine
+(Dusk), Gruvbox (Harvest), Everforest (Evergreen), Tokyo Night (Neon),
+Atom One (Slate) and Dracula (Nightshade). Thanks to their authors.
+
 ## Simple Icons
 
 - Project: Simple Icons, https://simpleicons.org (`simple-icons` 15.0.0)

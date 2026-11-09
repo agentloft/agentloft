@@ -218,12 +218,38 @@ const FALLBACK_LIGHT: Swatch = Swatch {
     input: 0xe2e2e6,
 };
 
-fn spec(bg: &str, fg: &str, accent: &str) -> SwatchSpec {
+/// A fully specified side: background, text, accent, then sidebar,
+/// surface (menus), border, subtle fill, secondary text, hover, selected,
+/// message bubble and input.
+#[allow(clippy::too_many_arguments)]
+fn full(
+    background: &str,
+    foreground: &str,
+    accent: &str,
+    sidebar: &str,
+    surface: &str,
+    border: &str,
+    muted: &str,
+    muted_text: &str,
+    hover: &str,
+    selected: &str,
+    bubble: &str,
+    input: &str,
+) -> SwatchSpec {
+    let o = |v: &str| Some(v.to_owned());
     SwatchSpec {
-        background: bg.into(),
-        foreground: fg.into(),
+        background: background.into(),
+        foreground: foreground.into(),
         accent: accent.into(),
-        ..Default::default()
+        sidebar: o(sidebar),
+        surface: o(surface),
+        border: o(border),
+        muted: o(muted),
+        muted_text: o(muted_text),
+        hover: o(hover),
+        selected: o(selected),
+        bubble: o(bubble),
+        input: o(input),
     }
 }
 
@@ -244,7 +270,9 @@ fn spec_from(s: &Swatch) -> SwatchSpec {
     }
 }
 
-/// The themes that ship with the app.
+/// The themes that ship with the app. Every colour is set by hand; the
+/// palettes are modelled on well-loved editor themes (see
+/// THIRD_PARTY_NOTICES.md).
 pub fn builtins() -> Vec<Theme> {
     let t = |id: &str, name: &str, description: &str, dark: SwatchSpec, light: SwatchSpec| Theme {
         id: id.into(),
@@ -266,67 +294,121 @@ pub fn builtins() -> Vec<Theme> {
             spec_from(&FALLBACK_LIGHT),
         ),
         t(
-            "graphite",
-            "Graphite",
-            "Cool greys, slate accent",
-            spec("#121417", "#e8eaed", "#64748b"),
-            spec("#fbfbfc", "#1c1f24", "#475569"),
+            "studio",
+            "Studio",
+            "Crisp and familiar, with a clear blue",
+            full(
+                "#0d1117", "#e6edf3", "#2f81f7", "#010409", "#161b22", "#30363d", "#161b22",
+                "#8b949e", "#151b23", "#1f2630", "#21262d", "#30363d",
+            ),
+            full(
+                "#ffffff", "#1f2328", "#0969da", "#f6f8fa", "#ffffff", "#d1d9e0", "#f6f8fa",
+                "#59636e", "#f3f5f7", "#e9edf1", "#eef1f4", "#d1d9e0",
+            ),
         ),
         t(
-            "paper",
-            "Paper",
-            "Black and white, nothing else",
-            spec("#141414", "#f5f5f5", "#f5f5f5"),
-            spec("#ffffff", "#141414", "#141414"),
+            "lavender",
+            "Lavender",
+            "Soft pastels on a plum-grey base",
+            full(
+                "#1e1e2e", "#cdd6f4", "#cba6f7", "#181825", "#24243a", "#313244", "#232334",
+                "#9399b2", "#25253a", "#313244", "#2b2b40", "#45475a",
+            ),
+            full(
+                "#eff1f5", "#4c4f69", "#8839ef", "#e6e9ef", "#f5f6f9", "#ccd0da", "#e6e9ef",
+                "#6c6f85", "#e3e6ee", "#dce0e8", "#e3e6ed", "#ccd0da",
+            ),
         ),
         t(
-            "sandstone",
-            "Sandstone",
-            "Warm stone with a copper accent",
-            spec("#17130f", "#efe7db", "#d9822b"),
-            spec("#fbf8f3", "#2b241c", "#c2410c"),
+            "glacier",
+            "Glacier",
+            "Arctic blues and snow",
+            full(
+                "#2e3440", "#eceff4", "#88c0d0", "#272c36", "#353c4a", "#434c5e", "#323946",
+                "#a3adbf", "#353c4a", "#3b4252", "#3b4252", "#4c566a",
+            ),
+            full(
+                "#f3f5f8", "#2e3440", "#5e81ac", "#e5e9f0", "#ffffff", "#d3d9e3", "#e9edf2",
+                "#5b6576", "#e7ebf1", "#dde3ec", "#e5e9f0", "#d3d9e3",
+            ),
         ),
         t(
-            "fjord",
-            "Fjord",
-            "Deep sea blues",
-            spec("#0c1218", "#e3eaf2", "#3b82f6"),
-            spec("#f6f9fc", "#132131", "#2563eb"),
+            "dusk",
+            "Dusk",
+            "Muted rose and iris at nightfall",
+            full(
+                "#191724", "#e0def4", "#c4a7e7", "#141220", "#1f1d2e", "#2a273f", "#1f1d2e",
+                "#908caa", "#21202f", "#26233a", "#26233a", "#393552",
+            ),
+            full(
+                "#faf4ed", "#464261", "#907aa9", "#f2e9e1", "#fffaf3", "#e4dad0", "#f4ede4",
+                "#6e6a86", "#f2ebe2", "#ebe2d8", "#f2e9e1", "#dfd6cc",
+            ),
         ),
         t(
-            "moss",
-            "Moss",
-            "Forest greens",
-            spec("#0f1411", "#e4ece6", "#2fb36b"),
-            spec("#f6faf7", "#16241b", "#15803d"),
+            "harvest",
+            "Harvest",
+            "Retro warm browns and gold",
+            full(
+                "#282828", "#ebdbb2", "#d79921", "#1d2021", "#32302f", "#3c3836", "#2f2d2c",
+                "#a89984", "#32302f", "#3c3836", "#3c3836", "#504945",
+            ),
+            full(
+                "#fbf1c7", "#3c3836", "#af3a03", "#f2e5bc", "#fdf6d8", "#d5c4a1", "#f2e5bc",
+                "#665c54", "#f4e8be", "#ebdbb2", "#efe1b4", "#d5c4a1",
+            ),
         ),
         t(
-            "orchid",
-            "Orchid",
-            "Plum with a magenta accent",
-            spec("#150f18", "#f0e6f3", "#c84fd8"),
-            spec("#fcf7fd", "#2a1730", "#a21caf"),
+            "evergreen",
+            "Evergreen",
+            "Calm forest greens, easy on the eyes",
+            full(
+                "#2d353b", "#d3c6aa", "#a7c080", "#272e33", "#343f44", "#3d484d", "#323c41",
+                "#9da9a0", "#343f44", "#3d484d", "#3d484d", "#475258",
+            ),
+            full(
+                "#fdf6e3", "#3f4b51", "#8da101", "#f4f0d9", "#fffbef", "#e0dcc7", "#f4f0d9",
+                "#708089", "#f2eed6", "#e9e5cf", "#efebd4", "#e0dcc7",
+            ),
         ),
         t(
-            "rosewood",
-            "Rosewood",
-            "Dusky rose",
-            spec("#171012", "#f2e4e7", "#f0476b"),
-            spec("#fdf6f7", "#2d1418", "#e11d48"),
+            "neon",
+            "Neon",
+            "Night-time city blues and violets",
+            full(
+                "#1a1b26", "#c0caf5", "#7aa2f7", "#16161e", "#1f2335", "#292e42", "#1e2030",
+                "#7982a9", "#1f2335", "#292e42", "#24283b", "#3b4261",
+            ),
+            full(
+                "#e9ebf2", "#343b58", "#2e7de9", "#dfe2ec", "#f5f6fa", "#c8cde0", "#e2e5ee",
+                "#5c6488", "#e0e3ec", "#d5d9e7", "#dde1ec", "#c8cde0",
+            ),
         ),
         t(
-            "nocturne",
-            "Nocturne",
-            "Ink blue, crisp contrast",
-            spec("#090b12", "#f4f5fb", "#818cf8"),
-            spec("#ffffff", "#0b0d17", "#4f46e5"),
+            "slate",
+            "Slate",
+            "Balanced greys with a sky-blue accent",
+            full(
+                "#282c34", "#dcdfe4", "#61afef", "#21252b", "#2c313a", "#3e4451", "#2c313a",
+                "#8b919c", "#2c313a", "#333842", "#333842", "#454b57",
+            ),
+            full(
+                "#fafafa", "#383a42", "#4078f2", "#f0f0f1", "#ffffff", "#dbdbdc", "#f0f0f1",
+                "#6b6d75", "#efeff0", "#e5e5e6", "#ebebec", "#dbdbdc",
+            ),
         ),
         t(
-            "amber-crt",
-            "Amber CRT",
-            "Phosphor amber on charcoal",
-            spec("#0d0b08", "#ffcf87", "#ffb000"),
-            spec("#fff8ec", "#3a2a10", "#b45309"),
+            "nightshade",
+            "Nightshade",
+            "Bold purple on deep violet-grey",
+            full(
+                "#282a36", "#f8f8f2", "#bd93f9", "#21222c", "#2f3141", "#44475a", "#2d2f3d",
+                "#a0a8cd", "#30323f", "#3a3c4e", "#383a4a", "#4d5066",
+            ),
+            full(
+                "#fbf8f0", "#1f1f1f", "#644ac9", "#f2eee3", "#fffdf8", "#dcd6c8", "#f2eee3",
+                "#5f5b54", "#f0ece1", "#e8e3d6", "#ece8dc", "#dcd6c8",
+            ),
         ),
     ]
 }
@@ -513,9 +595,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = builtins()[3].file.clone();
         let id = save(dir.path(), &file, None).unwrap();
-        assert_eq!(id, "custom:sandstone");
+        assert_eq!(id, "custom:glacier");
         let again = save(dir.path(), &file, None).unwrap();
-        assert_eq!(again, "custom:sandstone-2");
+        assert_eq!(again, "custom:glacier-2");
         let loaded = load_custom(&themes_dir(dir.path()));
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].file, file);
