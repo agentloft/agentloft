@@ -1592,7 +1592,6 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_thread = title.is_some();
-        let active_tab = self.panel.read(cx).active_tab(cx);
         h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_shrink_0()
@@ -1667,26 +1666,7 @@ impl WorkspaceView {
                 .child(thread_menu(&thread, &self.store))
             })
             .when(has_thread, |d| {
-                let active = if self.panel_open { active_tab } else { None };
-                let mut tools = h_flex().gap_0p5().pl_2();
-                for (tab, icon, id) in [
-                    (Tab::Files, IconName::FolderTree, "hdr-files"),
-                    (Tab::Changes, IconName::GitCompare, "hdr-changes"),
-                    (Tab::Terminal, IconName::SquareTerminal, "hdr-terminal"),
-                    (Tab::Browser, IconName::Globe, "hdr-browser"),
-                ] {
-                    let on = active.as_ref() == Some(&tab);
-                    tools = tools.child(toggle_button(
-                        id,
-                        icon,
-                        on,
-                        p,
-                        cx.listener(move |this, _, window, cx| {
-                            this.show_tab(tab.clone(), window, cx)
-                        }),
-                    ));
-                }
-                d.child(tools).child(toggle_button(
+                d.child(toggle_button(
                     "hdr-panel",
                     IconName::PanelRight,
                     self.panel_open,

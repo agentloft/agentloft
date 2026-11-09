@@ -35,6 +35,8 @@ pub enum Entry {
         icon: IconName,
         checked: bool,
         disabled: bool,
+        /// A letter that picks the item while the menu is open.
+        shortcut: Option<char>,
         action: Action,
     },
     Separator,
@@ -51,6 +53,7 @@ impl Entry {
             icon,
             checked: false,
             disabled: false,
+            shortcut: None,
             action: Rc::new(action),
         }
     }
@@ -58,6 +61,13 @@ impl Entry {
     pub fn checked(mut self, on: bool) -> Self {
         if let Entry::Item { checked, .. } = &mut self {
             *checked = on;
+        }
+        self
+    }
+
+    pub fn shortcut(mut self, key: char) -> Self {
+        if let Entry::Item { shortcut, .. } = &mut self {
+            *shortcut = Some(key.to_ascii_lowercase());
         }
         self
     }
@@ -171,6 +181,7 @@ impl Render for PopupMenu {
                     icon,
                     checked,
                     disabled,
+                    shortcut,
                     action,
                 } => {
                     let action = action.clone();
@@ -209,6 +220,14 @@ impl Render for PopupMenu {
                             .when(checked, |d| {
                                 d.child(Icon::new(IconName::Check).small().text_color(accent))
                             })
+                            .when_some(*shortcut, |d, key| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(key.to_ascii_uppercase().to_string()),
+                                )
+                            })
                             .when(!disabled, |d| {
                                 d.on_click(move |_, window, cx| {
                                     window.remove_window();
@@ -222,11 +241,28 @@ impl Render for PopupMenu {
         div()
             .size_full()
             .track_focus(&self.focus)
-            .on_key_down(|event, window, _| {
-                if event.keystroke.key == "escape" {
-                    window.remove_window();
-                }
-            })
+            .on_key_down(
+                cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    if key == "escape" {
+                        window.remove_window();
+                        return;
+                    }
+                    let picked = this.entries.iter().find_map(|e| match e {
+                        Entry::Item {
+                            shortcut: Some(k),
+                            disabled: false,
+                            action,
+                            ..
+                        } if key.len() == 1 && key.starts_with(*k) => Some(action.clone()),
+                        _ => None,
+                    });
+                    if let Some(action) = picked {
+                        window.remove_window();
+                        action(cx);
+                    }
+                }),
+            )
             .child(
                 list.size_full()
                     .bg(bg)

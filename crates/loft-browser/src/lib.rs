@@ -63,7 +63,7 @@
 
 mod address;
 mod command;
-mod menu;
+pub mod menu;
 mod native;
 mod script;
 mod snapshot;
