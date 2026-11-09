@@ -422,7 +422,7 @@ mod tests {
     fn lists_commands_without_a_session() {
         use loft_harness::Harness as _;
         let env: HashMap<String, String> = std::env::vars().collect();
-        let cmds = ClaudeHarness::default()
+        let cmds = ClaudeHarness
             .list_commands(&env, None, &std::env::temp_dir().to_string_lossy())
             .unwrap();
         assert!(
