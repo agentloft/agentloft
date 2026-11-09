@@ -54,26 +54,14 @@ impl FolderPicker {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter, or type a path…"));
-        let subs =
-            vec![cx.subscribe_in(
-                &search,
-                window,
-                |this, state, event, window, cx| match event {
-                    InputEvent::Change => {
-                        this.query = state.read(cx).value().to_string();
-                        this.highlighted = 0;
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter { secondary, .. } => {
-                        if *secondary {
-                            this.add_current(cx);
-                        } else {
-                            this.open_highlighted(window, cx);
-                        }
-                    }
-                    _ => {}
-                },
-            )];
+        let subs = vec![
+            cx.subscribe_in(&search, window, |this, state, event, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = state.read(cx).value().to_string();
+                    this.on_query(text, window, cx);
+                }
+            }),
+        ];
         // Start where projects already live, else home.
         let start = common_parent(&store, cx).unwrap_or_else(home);
         let mut this = Self {
@@ -91,6 +79,11 @@ impl FolderPicker {
         };
         this.navigate(start, window, cx);
         this
+    }
+
+    /// Type into the filter (dev hook / tests).
+    pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_query(text.to_owned(), window, cx);
     }
 
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -119,6 +112,31 @@ impl FolderPicker {
                 cx.notify();
             });
         }));
+        cx.notify();
+    }
+
+    /// Typing a path walks it like a shell: each `/` moves into that
+    /// folder, and what follows the last one filters the list.
+    fn on_query(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.highlighted = 0;
+        if let Some((dir, partial)) = split_path_query(&text)
+            && dir.is_dir()
+        {
+            if dir != self.dir {
+                self.navigate(dir, window, cx);
+            }
+            // What was typed after the slash stays, as the filter.
+            self.query = partial.clone();
+            let end = partial.len();
+            self.search.update(cx, |s, cx| {
+                s.set_value(partial, window, cx);
+                s.set_selected_range(end..end, cx);
+            });
+            self.error = None;
+            cx.notify();
+            return;
+        }
+        self.query = text;
         cx.notify();
     }
 
@@ -329,7 +347,7 @@ impl FolderPicker {
 
 impl Render for FolderPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::input::{Backspace, Escape, MoveDown, MoveUp};
+        use gpui_kit::component::input::{Backspace, Enter, Escape, MoveDown, MoveUp};
         let p = Palette::of(cx);
         let added: Vec<PathBuf> = self
             .store
@@ -474,6 +492,15 @@ impl Render for FolderPicker {
             .capture_action(cx.listener(|_, _: &Escape, _, cx| {
                 cx.stop_propagation();
                 cx.emit(FolderPickerEvent::Close);
+            }))
+            // Ahead of the dialog, which would take Enter as "OK" and close.
+            .capture_action(cx.listener(|this, e: &Enter, window, cx| {
+                cx.stop_propagation();
+                if e.secondary {
+                    this.add_current(cx);
+                } else {
+                    this.open_highlighted(window, cx);
+                }
             }))
             // Header: up, where you are, add.
             .child(
@@ -625,6 +652,18 @@ fn common_parent(store: &Entity<AppStore>, cx: &App) -> Option<PathBuf> {
     (common.is_dir() && common != Path::new("/")).then_some(common)
 }
 
+/// `~/Desktop/de` → (`/Users/me/Desktop/`, `de`): the folder typed so far
+/// and the partial name after the last slash.
+fn split_path_query(text: &str) -> Option<(PathBuf, String)> {
+    if !looks_like_path(text) {
+        return None;
+    }
+    let text = text.trim_start();
+    let slash = text.rfind('/')?;
+    let (dir, partial) = text.split_at(slash + 1);
+    Some((expand(dir), partial.to_owned()))
+}
+
 fn looks_like_path(query: &str) -> bool {
     let q = query.trim();
     q.starts_with('/') || q.starts_with('~')
@@ -708,5 +747,16 @@ mod tests {
         assert!(!looks_like_path("dev"));
         assert_eq!(expand("~/dev"), home().join("dev"));
         assert_eq!(expand("~"), home());
+        assert_eq!(split_path_query("~/"), Some((home(), String::new())));
+        assert_eq!(
+            split_path_query("~/Desktop/de"),
+            Some((home().join("Desktop/"), "de".into()))
+        );
+        assert_eq!(
+            split_path_query("/opt"),
+            Some((PathBuf::from("/"), "opt".into()))
+        );
+        assert_eq!(split_path_query("~"), None, "no slash yet: keep typing");
+        assert_eq!(split_path_query("dev"), None);
     }
 }

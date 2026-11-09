@@ -231,7 +231,9 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
             "Add project…",
             IconName::FolderPlus,
             Some(Box::new(AddProject)),
-            |v, window, cx| v.add_project(window, cx),
+            |v, window, cx| {
+                v.add_project(window, cx);
+            },
         ),
         entry(
             "Show files",

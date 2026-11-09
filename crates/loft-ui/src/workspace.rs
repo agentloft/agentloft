@@ -327,6 +327,13 @@ impl WorkspaceView {
                 });
                 self.refresh_completion(&thread_id, &composer, cx);
             }
+            Some(("addproject", text)) => {
+                let text = text.to_owned();
+                cx.defer_in(window, move |this, window, cx| {
+                    let picker = this.add_project(window, cx);
+                    picker.update(cx, |p, cx| p.type_text(&text, window, cx));
+                });
+            }
             Some(("settings", section)) => {
                 let section = crate::settings::Section::parse(section);
                 crate::settings::open(self.store.clone(), section, cx);
@@ -348,7 +355,9 @@ impl WorkspaceView {
                 "branches" => self.branch_picker_open = true,
                 "addproject" => {
                     self.panel_open = false;
-                    cx.defer_in(window, |this, window, cx| this.add_project(window, cx));
+                    cx.defer_in(window, |this, window, cx| {
+                        this.add_project(window, cx);
+                    });
                 }
                 "models" => {
                     self.panel_open = false;
@@ -677,7 +686,11 @@ impl WorkspaceView {
     }
 
     /// Add Project: the built-in folder browser.
-    pub(crate) fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn add_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::folder_picker::FolderPicker> {
         use crate::folder_picker::{FolderPicker, FolderPickerEvent};
         use gpui_kit::component::WindowExt as _;
         let store = self.store.clone();
@@ -691,15 +704,17 @@ impl WorkspaceView {
         });
         self._subs.push(sub);
         let focus = picker.read(cx).focus_handle(cx);
+        let content = picker.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
                 .w(px(620.))
                 .p_0()
                 .margin_top(px(80.))
                 .close_button(false)
-                .child(picker.clone())
+                .child(content.clone())
         });
         focus.focus(window, cx);
+        picker
     }
 
     /// Recompute the `/` or `@` completion for the composer's cursor.
@@ -1193,7 +1208,9 @@ impl WorkspaceView {
                         "add-project",
                         IconName::FolderPlus,
                         p,
-                        cx.listener(|this, _, window, cx| this.add_project(window, cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.add_project(window, cx);
+                        }),
                     )),
             )
             .child(
@@ -2218,7 +2235,9 @@ impl WorkspaceView {
                         "Add project",
                         "⌘O",
                         p,
-                        cx.listener(|this, _, window, cx| this.add_project(window, cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.add_project(window, cx);
+                        }),
                     ))
                     .when(has_projects, |d| {
                         d.child(pill_button(
@@ -2240,7 +2259,9 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         if std::mem::take(&mut self.pending_add_project) {
-            cx.defer_in(window, |this, window, cx| this.add_project(window, cx));
+            cx.defer_in(window, |this, window, cx| {
+                this.add_project(window, cx);
+            });
         }
         let selected = self.store.read(cx).selected_thread();
         if let Some(thread) = &selected
@@ -2287,7 +2308,9 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| theme::toggle_mode(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
-            .on_action(cx.listener(|this, _: &AddProject, window, cx| this.add_project(window, cx)))
+            .on_action(cx.listener(|this, _: &AddProject, window, cx| {
+                this.add_project(window, cx);
+            }))
             .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 crate::palette::open(cx.entity(), &this.store, window, cx)
