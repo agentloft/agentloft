@@ -20,6 +20,40 @@ use loft_protocol::{
 };
 
 const OUTPUT_PREVIEW_LINES: usize = 14;
+/// Long messages fold to this height until "Show more".
+const FOLDED_HEIGHT: f32 = 220.;
+
+/// Long enough to fold: many lines, or a lot of text.
+pub(crate) fn is_long_message(text: &str) -> bool {
+    text.lines().count() > 10 || text.len() > 900
+}
+
+/// Text that renders as itself in the Markdown view: punctuation escaped,
+/// line breaks kept.
+pub(crate) fn plain_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let mut prev_blank = true;
+    for (i, line) in text.split('\n').enumerate() {
+        let blank = line.trim().is_empty();
+        if i > 0 {
+            // Around a blank line: a paragraph break; else a hard break.
+            out.push_str(if blank || prev_blank { "\n" } else { "  \n" });
+        }
+        prev_blank = blank;
+        let indent = line.len() - line.trim_start().len();
+        // Leading spaces would turn into a code block; keep them visible.
+        for _ in 0..indent {
+            out.push('\u{a0}');
+        }
+        for c in line.trim_start().chars() {
+            if c.is_ascii_punctuation() {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
+}
 
 pub fn render_row(
     thread: &Entity<ThreadState>,
@@ -107,6 +141,34 @@ pub(crate) fn render_item(
                     let group = SharedString::from(format!("user-{}", item.id));
                     let copy_id = format!("copy-user-{}", item.id);
                     let pinned = just_copied(&copy_id);
+                    let long = is_long_message(text);
+                    let fold_key = loft_protocol::ItemId(format!("fold:{}", item.id.0));
+                    let open = state.is_expanded(&fold_key, false);
+                    let folded = long && !open;
+                    // Selectable: the text goes through the Markdown view,
+                    // escaped so it shows exactly as typed.
+                    let body = TextView::markdown(
+                        SharedString::from(format!("user-md-{}", item.id)),
+                        plain_markdown(text),
+                    )
+                    .selectable(true);
+                    let toggle = long.then(|| {
+                        let (thread, key) = (thread.clone(), fold_key.clone());
+                        div()
+                            .id(SharedString::from(format!("fold-{}", item.id)))
+                            .px_1p5()
+                            .py(px(2.))
+                            .rounded(px(5.))
+                            .text_xs()
+                            .cursor_pointer()
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                            .child(if open { "Show less" } else { "Show more" })
+                            .on_click(move |_, _, cx| {
+                                let key = key.clone();
+                                thread.update(cx, |t, cx| t.toggle(key, false, cx));
+                            })
+                    });
                     d.child(
                         v_flex()
                             .group(group.clone())
@@ -115,20 +177,49 @@ pub(crate) fn render_item(
                             .gap_0p5()
                             .child(
                                 div()
+                                    .relative()
                                     .max_w(relative(0.82))
                                     .px_4()
                                     .py(px(9.))
                                     .rounded(px(18.))
                                     .bg(p.bubble)
                                     .text_color(p.foreground)
-                                    .child(text.clone()),
+                                    .when(folded, |d| d.max_h(px(FOLDED_HEIGHT)).overflow_hidden())
+                                    .child(body)
+                                    // Fade the cut-off edge into the bubble.
+                                    .when(folded, |d| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .right_0()
+                                                .bottom_0()
+                                                .h(px(48.))
+                                                .bg(gpui_kit::linear_gradient(
+                                                    180.,
+                                                    gpui_kit::linear_color_stop(
+                                                        p.bubble.opacity(0.),
+                                                        0.,
+                                                    ),
+                                                    gpui_kit::linear_color_stop(p.bubble, 1.),
+                                                )),
+                                        )
+                                    }),
                             )
-                            // Under the bubble, on hover (and while it shows ✓).
+                            // Under the bubble: show more, and copy on hover
+                            // (or while it shows ✓).
                             .child(
-                                div()
-                                    .when(!pinned, |d| d.invisible())
-                                    .group_hover(group, |d| d.visible())
-                                    .child(copy_button(copy_id, text.clone(), "Copy message", p)),
+                                h_flex().gap_1().items_center().children(toggle).child(
+                                    div()
+                                        .when(!pinned, |d| d.invisible())
+                                        .group_hover(group, |d| d.visible())
+                                        .child(copy_button(
+                                            copy_id,
+                                            text.clone(),
+                                            "Copy message",
+                                            p,
+                                        )),
+                                ),
                             ),
                     )
                 })
@@ -944,6 +1035,16 @@ mod tests {
             updated_at_ms: 0,
             parent_id: None,
         }
+    }
+
+    #[test]
+    fn plain_text_survives_markdown() {
+        assert_eq!(plain_markdown("a*b*"), "a\\*b\\*");
+        assert_eq!(plain_markdown("# hi\nnext"), "\\# hi  \nnext");
+        assert_eq!(plain_markdown("p1\n\np2"), "p1\n\np2");
+        assert!(plain_markdown("    code").starts_with('\u{a0}'));
+        assert!(is_long_message(&"line\n".repeat(20)));
+        assert!(!is_long_message("short"));
     }
 
     #[test]

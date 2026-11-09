@@ -1054,8 +1054,11 @@ impl ThreadState {
 
     fn row_of_item(&self, id: &ItemId) -> Option<usize> {
         let model = self.model.as_ref()?;
-        // A tool group's key is its first item's id, prefixed.
-        let id = id.0.strip_prefix("group:").unwrap_or(&id.0);
+        // Group and fold keys are an item's id, prefixed.
+        let id =
+            id.0.strip_prefix("group:")
+                .or_else(|| id.0.strip_prefix("fold:"))
+                .unwrap_or(&id.0);
         let ix = model.items.iter().position(|i| i.id.0 == id)?;
         self.rows.iter().position(|r| match r {
             Row::Item(i) => *i == ix,

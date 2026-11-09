@@ -133,6 +133,8 @@ pub struct WorkspaceView {
     composers: HashMap<ThreadId, Entity<TextareaState>>,
     /// Images waiting in each thread's composer.
     attachments: HashMap<ThreadId, Vec<crate::attachments::PendingImage>>,
+    /// Large pastes held as chips until sent, per thread.
+    pasted: HashMap<ThreadId, Vec<String>>,
     composer_harness: HashMap<ThreadId, HarnessId>,
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
@@ -203,6 +205,7 @@ impl WorkspaceView {
             store,
             composers: HashMap::new(),
             attachments: HashMap::new(),
+            pasted: HashMap::new(),
             composer_harness: HashMap::new(),
             observed: HashMap::new(),
             search,
@@ -692,14 +695,23 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = composer.read(cx).value().trim().to_owned();
+        let typed = composer.read(cx).value().trim().to_owned();
         let has_images = self
             .attachments
             .get(thread_id)
             .is_some_and(|a| !a.is_empty());
-        if text.is_empty() && !has_images {
+        let pasted = self.pasted.get(thread_id).cloned().unwrap_or_default();
+        if typed.is_empty() && !has_images && pasted.is_empty() {
             return;
         }
+        self.pasted.remove(thread_id);
+        // Pasted blocks follow what was typed.
+        let mut parts = Vec::new();
+        if !typed.is_empty() {
+            parts.push(typed);
+        }
+        parts.extend(pasted.into_iter().map(|p| p.trim_end().to_owned()));
+        let text = parts.join("\n\n");
         composer.update(cx, |c, cx| c.set_value("", window, cx));
         let attachments: Vec<loft_protocol::Attachment> = self
             .attachments
@@ -719,6 +731,85 @@ impl WorkspaceView {
                 store.send_message(id, text, attachments, cx)
             });
         }
+    }
+
+    /// Chips for large pastes waiting in the composer.
+    fn paste_chips(
+        &self,
+        thread_id: &ThreadId,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let pasted = self.pasted.get(thread_id).filter(|v| !v.is_empty())?;
+        let mut row = h_flex().gap_2().flex_wrap().px_3().pt_2();
+        for (ix, text) in pasted.iter().enumerate() {
+            let lines = text.lines().count();
+            let preview: String = text
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(40)
+                .collect();
+            let (open_text, tid) = (text.clone(), thread_id.clone());
+            row =
+                row.child(
+                    h_flex()
+                        .id(SharedString::from(format!("paste-{ix}")))
+                        .gap_2()
+                        .items_center()
+                        .max_w(px(320.))
+                        .pl_2()
+                        .pr_1()
+                        .py_1()
+                        .rounded(px(9.))
+                        .border_1()
+                        .border_color(p.border)
+                        .bg(p.muted)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(p.hover))
+                        .child(Icon::new(IconName::FileText).small().text_color(p.accent))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(
+                                    format!(
+                                        "Pasted text · {lines} line{} · {}",
+                                        if lines == 1 { "" } else { "s" },
+                                        human_bytes(text.len())
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(p.faint_foreground)
+                                        .child(preview),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("paste-remove-{ix}")))
+                                .p(px(3.))
+                                .rounded(px(5.))
+                                .text_color(p.muted_foreground)
+                                .hover(|d| d.bg(p.selected).text_color(p.foreground))
+                                .child(Icon::new(IconName::X).xsmall())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(list) = this.pasted.get_mut(&tid)
+                                        && ix < list.len()
+                                    {
+                                        list.remove(ix);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .on_click(move |_, window, cx| show_pasted(open_text.clone(), window, cx)),
+                );
+        }
+        Some(row.into_any_element())
     }
 
     fn is_running(&self, thread_id: &ThreadId, cx: &gpui_kit::App) -> bool {
@@ -1905,6 +1996,16 @@ impl WorkspaceView {
                                             if !images.is_empty() {
                                                 cx.stop_propagation();
                                                 this.add_images(&id, images, cx);
+                                            } else if let Some(text) = item.text()
+                                                && is_large_paste(&text)
+                                            {
+                                                // A chip, not a wall of text.
+                                                cx.stop_propagation();
+                                                this.pasted
+                                                    .entry(id.clone())
+                                                    .or_default()
+                                                    .push(text);
+                                                cx.notify();
                                             }
                                         },
                                     )
@@ -1925,6 +2026,7 @@ impl WorkspaceView {
                                     )
                                 })
                                 .children(strip)
+                                .children(self.paste_chips(&thread_id, p, cx))
                                 .child(
                                     div()
                                         .px_2()
@@ -3051,6 +3153,72 @@ fn take_dev_tab() -> Option<String> {
     std::env::var("AGENTLOFT_DEV_TAB")
         .ok()
         .filter(|v| !v.is_empty())
+}
+
+/// Big enough to show as a chip rather than inline text.
+fn is_large_paste(text: &str) -> bool {
+    text.lines().count() > 20 || text.len() > 1500
+}
+
+fn human_bytes(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else {
+        format!("{:.1} KB", n as f64 / 1024.)
+    }
+}
+
+/// The full pasted text, in a dialog.
+fn show_pasted(text: String, window: &mut Window, cx: &mut gpui_kit::App) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogClose, DialogFooter};
+    use gpui_kit::component::text::TextView;
+    let lines = text.lines().count();
+    let size = human_bytes(text.len());
+    let body = crate::items::plain_markdown(&text);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let p = Palette::of(cx);
+        let copy_text = text.clone();
+        dialog
+            .w(px(760.))
+            .title(format!("Pasted text · {lines} lines · {size}"))
+            .child(
+                div()
+                    .id("pasted-body")
+                    .max_h(px(520.))
+                    .overflow_y_scroll()
+                    .p_3()
+                    .rounded(px(10.))
+                    .bg(p.muted)
+                    .font_family(p.mono.clone())
+                    .text_sm()
+                    .child(TextView::markdown("pasted-text", body.clone()).selectable(true)),
+            )
+            .footer(
+                DialogFooter::new().child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("pasted-copy")
+                                .label("Copy")
+                                .icon(IconName::Copy)
+                                .ghost()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                                        copy_text.clone(),
+                                    ));
+                                }),
+                        )
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("pasted-close").label("Close").outline()),
+                        ),
+                ),
+            )
+    });
 }
 
 /// [`tilde`] for a path string.
