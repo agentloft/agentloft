@@ -60,6 +60,21 @@ impl Harness for ClaudeHarness {
         })
     }
 
+    fn list_commands(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        binary: Option<PathBuf>,
+        cwd: &str,
+    ) -> Result<Vec<loft_protocol::SlashCommandInfo>> {
+        let binary = match binary {
+            Some(b) => b,
+            None => loft_config::which("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .context("`claude` not found on PATH")?,
+        };
+        let v = probe_initialize(&binary, env, std::path::Path::new(cwd))?;
+        Ok(translate::commands(&v))
+    }
+
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
         let binary = resolve_binary(&cfg)?;
         let mut cmd = Command::new(&binary);
@@ -324,6 +339,19 @@ fn probe_models(
     binary: &std::path::Path,
     env: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<loft_protocol::ModelInfo>> {
+    let v = probe_initialize(binary, env, &std::env::temp_dir())?;
+    let models = translate::models(&v);
+    anyhow::ensure!(!models.is_empty(), "no models in the initialize response");
+    Ok(models)
+}
+
+/// Claude's answer to `initialize` (models, commands, …), from a
+/// short-lived CLI started in `cwd`.
+fn probe_initialize(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+    cwd: &std::path::Path,
+) -> Result<serde_json::Value> {
     use std::io::{BufRead as _, Write as _};
     let mut child = std::process::Command::new(binary)
         .args([
@@ -336,7 +364,7 @@ fn probe_models(
             "--settings",
             r#"{"disableAllHooks":true}"#,
         ])
-        .current_dir(std::env::temp_dir())
+        .current_dir(cwd)
         .env_clear()
         .envs(
             env.iter()
@@ -371,9 +399,7 @@ fn probe_models(
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let v = rx.recv_timeout(left).context("claude didn't answer")?;
             if v["type"] == "control_response" {
-                let models = translate::models(&v);
-                anyhow::ensure!(!models.is_empty(), "no models in the initialize response");
-                return Ok(models);
+                return Ok(v);
             }
         }
     })();
@@ -390,6 +416,22 @@ pub fn new_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Talks to the real `claude` (run with `--ignored`).
+    #[test]
+    #[ignore]
+    fn lists_commands_without_a_session() {
+        use loft_harness::Harness as _;
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let cmds = ClaudeHarness::default()
+            .list_commands(&env, None, &std::env::temp_dir().to_string_lossy())
+            .unwrap();
+        assert!(
+            cmds.iter().any(|c| c.name == "compact"),
+            "{} commands",
+            cmds.len()
+        );
+    }
+
     use super::*;
     use loft_protocol::PermissionMode;
     use std::collections::HashMap;

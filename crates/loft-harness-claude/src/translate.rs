@@ -527,23 +527,8 @@ impl Translator {
                 result,
             }];
         }
-        if let Some(list) = v
-            .pointer("/response/response/commands")
-            .and_then(Value::as_array)
-        {
-            let commands: Vec<loft_protocol::SlashCommandInfo> = list
-                .iter()
-                .filter_map(|c| {
-                    let name = str_at(c, "name")?.to_owned();
-                    Some(loft_protocol::SlashCommandInfo {
-                        name,
-                        description: str_at(c, "description").unwrap_or_default().to_owned(),
-                        argument_hint: str_at(c, "argumentHint").unwrap_or_default().to_owned(),
-                        builtin: c.get("builtin").and_then(Value::as_bool).unwrap_or(false),
-                        insert: String::new(),
-                    })
-                })
-                .collect();
+        if v.pointer("/response/response/commands").is_some() {
+            let commands = commands(v);
             if !commands.is_empty() {
                 return vec![Out::Event(HarnessEvent::CommandsAvailable(commands))];
             }
@@ -707,6 +692,25 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// The slash commands in an `initialize` response.
+pub fn commands(v: &Value) -> Vec<loft_protocol::SlashCommandInfo> {
+    v.pointer("/response/response/commands")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = str_at(c, "name")?.to_owned();
+            Some(loft_protocol::SlashCommandInfo {
+                name,
+                description: str_at(c, "description").unwrap_or_default().to_owned(),
+                argument_hint: str_at(c, "argumentHint").unwrap_or_default().to_owned(),
+                builtin: c.get("builtin").and_then(Value::as_bool).unwrap_or(false),
+                insert: String::new(),
+            })
+        })
+        .collect()
 }
 
 /// The model catalog in an `initialize` control response. Claude's

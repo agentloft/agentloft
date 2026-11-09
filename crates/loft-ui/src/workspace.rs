@@ -1700,16 +1700,16 @@ impl WorkspaceView {
                 let has = |t: &&loft_protocol::Thread| {
                     !t.command_info.is_empty() || !t.slash_commands.is_empty()
                 };
+                let asked = thread.and_then(|t| {
+                    store
+                        .commands
+                        .get(&(t.harness.as_str().to_owned(), t.cwd.clone()))
+                        .cloned()
+                        .flatten()
+                        .filter(|l| !l.is_empty())
+                });
                 let commands = thread
                     .filter(has)
-                    .or_else(|| {
-                        let harness = &thread?.harness;
-                        store
-                            .workspace
-                            .threads
-                            .iter()
-                            .find(|t| &t.harness == harness && has(t))
-                    })
                     .map(|t| {
                         if t.command_info.is_empty() {
                             bare_commands(&t.slash_commands)
@@ -1717,24 +1717,28 @@ impl WorkspaceView {
                             t.command_info.clone()
                         }
                     })
-                    .unwrap_or_else(|| {
-                        // Before its session reports them: what the agent
-                        // said when asked directly (Codex's skills), else
-                        // the commands Agentloft runs for it.
-                        let asked = thread.and_then(|t| {
-                            store
-                                .commands
-                                .get(&(t.harness.as_str().to_owned(), t.cwd.clone()))
-                                .cloned()
-                                .flatten()
-                        });
-                        match (asked, thread.map(|t| t.harness.as_str())) {
-                            (Some(list), _) if !list.is_empty() => list,
-                            (_, Some(loft_protocol::HarnessId::CODEX)) => {
-                                loft_protocol::codex_builtin_commands()
-                            }
-                            _ => Vec::new(),
+                    .or(asked)
+                    .or_else(|| {
+                        let harness = &thread?.harness;
+                        store
+                            .workspace
+                            .threads
+                            .iter()
+                            .find(|t| &t.harness == harness && has(t))
+                            .map(|t| {
+                                if t.command_info.is_empty() {
+                                    bare_commands(&t.slash_commands)
+                                } else {
+                                    t.command_info.clone()
+                                }
+                            })
+                    })
+                    .unwrap_or_else(|| match thread.map(|t| t.harness.as_str()) {
+                        // Known before Codex answers.
+                        Some(loft_protocol::HarnessId::CODEX) => {
+                            loft_protocol::codex_builtin_commands()
                         }
+                        _ => Vec::new(),
                     });
                 let info = match_commands(&commands, &query);
                 let items: Vec<String> = info.iter().map(|c| c.name.clone()).collect();
@@ -2673,11 +2677,14 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
-        // Codex's skills, asked up front so `/` lists them at once.
+        // The agent's commands and skills, asked up front so `/` lists them
+        // before the thread's session has started.
         if self.rendering_focused {
             let ask = thread.read(cx).model.as_ref().and_then(|m| {
-                (m.thread.harness.as_str() == loft_protocol::HarnessId::CODEX
-                    && m.thread.command_info.is_empty())
+                (matches!(
+                    m.thread.harness.as_str(),
+                    loft_protocol::HarnessId::CODEX | loft_protocol::HarnessId::CLAUDE
+                ) && m.thread.command_info.is_empty())
                 .then(|| (m.thread.harness.as_str().to_owned(), m.thread.cwd.clone()))
             });
             if let Some((harness, cwd)) = ask {
