@@ -8,6 +8,7 @@ mod attention;
 mod branch_picker;
 pub mod brand;
 mod completion;
+mod details;
 mod file_icons;
 mod folder_picker;
 mod image_preview;

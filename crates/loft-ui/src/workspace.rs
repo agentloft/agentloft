@@ -167,6 +167,8 @@ pub struct WorkspaceView {
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
+    /// Where the details button is (its card opens under it).
+    details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>`
     /// opens a panel tab once the first thread has loaded.
     dev_tab: Option<String>,
@@ -239,6 +241,7 @@ impl WorkspaceView {
             sidebar_open: true,
             panel,
             panel_open: false,
+            details_anchor: Default::default(),
             window_title: String::new(),
             tabs_shown: false,
             dev_tab: take_dev_tab(),
@@ -693,6 +696,14 @@ impl WorkspaceView {
             client.respond_call(call_id, result);
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Show a panel tab (never closes the panel, unlike [`Self::show_tab`]).
+    pub(crate) fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel_open = true;
+        self.panel
+            .update(cx, |panel, cx| panel.show(tab, window, cx));
         cx.notify();
     }
 
@@ -1666,7 +1677,43 @@ impl WorkspaceView {
                 .child(thread_menu(&thread, &self.store))
             })
             .when(has_thread, |d| {
-                d.child(toggle_button(
+                let anchor = self.details_anchor.clone();
+                let measure = anchor.clone();
+                let (workspace, store) = (cx.weak_entity(), self.store.clone());
+                d.child(
+                    div()
+                        .relative()
+                        .child(toggle_button(
+                            "hdr-details",
+                            IconName::ScrollText,
+                            false,
+                            p,
+                            move |_, window, cx| {
+                                let Some(id) = store.read(cx).selected.clone() else {
+                                    return;
+                                };
+                                if let Some(at) = anchor.get() {
+                                    crate::details::open(
+                                        window,
+                                        at,
+                                        workspace.clone(),
+                                        store.clone(),
+                                        id,
+                                        cx,
+                                    );
+                                }
+                            },
+                        ))
+                        .child(
+                            gpui_kit::canvas(
+                                move |bounds, _, _| measure.set(Some(bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        ),
+                )
+                .child(toggle_button(
                     "hdr-panel",
                     IconName::PanelRight,
                     self.panel_open,
