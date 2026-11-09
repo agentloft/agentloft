@@ -72,6 +72,9 @@ pub struct ImageInput {
 pub enum SessionCommand {
     StartTurn(TurnInput),
     Interrupt,
+    /// Stop the subagent started by the tool call `native_id` (agents that
+    /// can't stop one subagent ignore it).
+    StopSubagent(String),
     Respond {
         native_request_id: String,
         decision: DecisionKind,

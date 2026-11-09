@@ -90,6 +90,12 @@ pub enum Request {
     Interrupt {
         thread_id: ThreadId,
     },
+    /// Stop one running subagent (its Agent tool call item), leaving the
+    /// rest of the turn alone.
+    StopSubagent {
+        thread_id: ThreadId,
+        item_id: ItemId,
+    },
     RespondRequest {
         thread_id: ThreadId,
         request_id: RequestId,

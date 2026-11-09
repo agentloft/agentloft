@@ -23,24 +23,142 @@ const OUTPUT_PREVIEW_LINES: usize = 14;
 /// Long messages fold to this height until "Show more".
 const FOLDED_HEIGHT: f32 = 220.;
 
-/// Where Markdown images in a reply come from: files on this Mac
-/// (`/abs`, `~/…`, `file://…`, or relative to the thread's folder) load
-/// from disk; web addresses load as usual.
+/// The file on this Mac a reply image points at: `/abs`, `~/…`,
+/// `file://…`, or a path relative to the thread's folder. `None` for web
+/// addresses and data URLs.
+pub(crate) fn local_image_path(raw: &str, cwd: &str) -> Option<std::path::PathBuf> {
+    if raw.contains("://") && !raw.starts_with("file://") || raw.starts_with("data:") {
+        return None;
+    }
+    let path = raw.strip_prefix("file://").unwrap_or(raw);
+    Some(match path.strip_prefix("~/") {
+        Some(rest) => std::env::home_dir().unwrap_or_default().join(rest),
+        None => std::path::Path::new(cwd).join(path),
+    })
+}
+
+/// Where Markdown images in a reply come from: files on this Mac load
+/// from disk (see [`local_image_path`]); web addresses load as usual.
 pub(crate) fn local_images(
     cwd: String,
 ) -> impl Fn(&gpui_kit::SharedUri) -> gpui_kit::ImageSource + Send + Sync + 'static {
-    move |uri: &gpui_kit::SharedUri| {
-        let raw = uri.as_ref();
-        if raw.contains("://") && !raw.starts_with("file://") || raw.starts_with("data:") {
-            return gpui_kit::ImageSource::from(uri.clone());
-        }
-        let path = raw.strip_prefix("file://").unwrap_or(raw);
-        let path = match path.strip_prefix("~/") {
-            Some(rest) => std::env::home_dir().unwrap_or_default().join(rest),
-            None => std::path::Path::new(&cwd).join(path),
-        };
-        gpui_kit::ImageSource::from(path)
+    move |uri: &gpui_kit::SharedUri| match local_image_path(uri.as_ref(), &cwd) {
+        Some(path) => gpui_kit::ImageSource::from(path),
+        None => gpui_kit::ImageSource::from(uri.clone()),
     }
+}
+
+/// An image that stands as a block of its own in a reply.
+struct ReplyImage {
+    src: String,
+    alt: String,
+}
+
+const REPLY_IMAGE_NODE: &str = "reply-image";
+
+/// The `src` and `alt` of a lone `<img …>` tag.
+fn parse_img_tag(html: &str) -> Option<ReplyImage> {
+    let tag = html.trim();
+    let lower = tag.to_ascii_lowercase();
+    if !lower.starts_with("<img") || !tag.ends_with('>') || tag[1..].contains('<') {
+        return None;
+    }
+    let attr = |name: &str| -> Option<String> {
+        let at = lower.find(&format!(" {name}="))? + name.len() + 2;
+        let rest = &tag[at..];
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let end = rest[1..].find(quote)?;
+        Some(rest[1..1 + end].to_string())
+    };
+    let src = attr("src").filter(|s| !s.is_empty())?;
+    let alt = attr("alt").unwrap_or_default().replace("&quot;", "\"");
+    Some(ReplyImage { src, alt })
+}
+
+/// A block that is just one image: an HTML block holding an `<img>`, or a
+/// paragraph whose only content is one.
+fn reply_image_block(node: &gpui_kit::component::text::markdown_ast::Node) -> Option<ReplyImage> {
+    use gpui_kit::component::text::markdown_ast::Node;
+    match node {
+        Node::Html(html) => parse_img_tag(&html.value),
+        Node::Paragraph(para) => {
+            let mut found = None;
+            for child in &para.children {
+                match child {
+                    Node::Html(html) if found.is_none() => {
+                        found = Some(parse_img_tag(&html.value)?)
+                    }
+                    Node::Break(_) => {}
+                    Node::Text(t) if t.value.trim().is_empty() => {}
+                    _ => return None,
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+/// A reply's Markdown view: local images load from disk, and an image on
+/// its own is drawn by us so it can be clicked for a large preview and
+/// right-clicked to copy or save.
+pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
+    use gpui_kit::component::menu::ContextMenuExt as _;
+    use gpui_kit::component::text::MarkdownNode;
+    let render_cwd = cwd.clone();
+    view.image_source(local_images(cwd))
+        .markdown_block_parser(|node, _| {
+            let image = reply_image_block(node)?;
+            let markdown = format!("![{}]({})", image.alt, image.src);
+            Some(
+                MarkdownNode::new(REPLY_IMAGE_NODE, image)
+                    .text(markdown.clone())
+                    .markdown(markdown),
+            )
+        })
+        .markdown_block_renderer(REPLY_IMAGE_NODE, move |node, _, cx| {
+            let Some(image) = node.data::<ReplyImage>() else {
+                return div().into_any_element();
+            };
+            let p = Palette::of(cx);
+            let id = SharedString::from(format!(
+                "reply-image-{}",
+                node.source_range().map(|r| r.start).unwrap_or_default()
+            ));
+            let frame = div()
+                .id(id)
+                .w(px(REPLY_IMAGE_WIDTH as f32))
+                .max_w_full()
+                .rounded(px(10.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(p.border)
+                .cursor_pointer()
+                .child(
+                    gpui_kit::img(local_images(render_cwd.clone())(
+                        &gpui_kit::SharedUri::from(image.src.clone()),
+                    ))
+                    .w_full(),
+                );
+            match local_image_path(&image.src, &render_cwd) {
+                Some(path) => {
+                    let pic = crate::image_preview::Pic::file(path);
+                    let open = pic.clone();
+                    frame
+                        .on_click(move |_, window, cx| {
+                            crate::image_preview::open(open.clone(), window, cx)
+                        })
+                        .context_menu(crate::image_preview::menu(pic))
+                        .into_any_element()
+                }
+                None => {
+                    let url = image.src.clone();
+                    frame
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element()
+                }
+            }
+        })
 }
 
 /// Width images in replies are shown at (the Markdown view draws images
@@ -65,6 +183,10 @@ pub(crate) fn sized_images(text: &str) -> std::borrow::Cow<'_, str> {
             out.push_str(line);
             continue;
         }
+        // Outside lists and quotes an image becomes a block of its own,
+        // which the reply view draws as a clickable picture. Inside them it
+        // stays in the item's text, on a line of its own.
+        let block = !nested_line(line);
         let mut rest = line;
         let mut in_code = false;
         while !rest.is_empty() {
@@ -85,10 +207,16 @@ pub(crate) fn sized_images(text: &str) -> std::borrow::Cow<'_, str> {
                     .next()
                     .unwrap_or("");
                 if !alt.contains(']') && !url.is_empty() {
-                    let before = out.trim_end_matches([' ', '\t']);
-                    if !before.is_empty() && !before.ends_with('\n') {
-                        let len = before.len();
-                        out.truncate(len);
+                    let len = out.trim_end_matches([' ', '\t']).len();
+                    out.truncate(len);
+                    if block {
+                        // A blank line before and after: an HTML block
+                        // can't interrupt a paragraph, and runs on until
+                        // a blank line.
+                        if !out.is_empty() && !out.ends_with("\n\n") {
+                            out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+                        }
+                    } else if !out.is_empty() && !out.ends_with('\n') {
                         out.push_str("  \n");
                     }
                     let alt = alt.replace('"', "&quot;");
@@ -97,7 +225,10 @@ pub(crate) fn sized_images(text: &str) -> std::borrow::Cow<'_, str> {
                         "<img src=\"{url}\" alt=\"{alt}\" width=\"{REPLY_IMAGE_WIDTH}\">"
                     ));
                     rest = &rest[close + 2 + end + 1..];
-                    if !rest.trim().is_empty() {
+                    if block {
+                        out.push_str("\n\n");
+                        rest = rest.trim_start_matches([' ', '\t']);
+                    } else if !rest.trim().is_empty() {
                         out.push_str("  \n");
                         rest = rest.trim_start_matches([' ', '\t']);
                     }
@@ -110,6 +241,20 @@ pub(crate) fn sized_images(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     out.into()
+}
+
+/// A line inside a list item or a quote (indented, or starting with a
+/// marker), where a blank line would break the container.
+fn nested_line(line: &str) -> bool {
+    if line.starts_with([' ', '\t']) {
+        return true;
+    }
+    let t = line.trim_end();
+    if t.starts_with('>') || ["- ", "* ", "+ "].iter().any(|m| t.starts_with(m)) {
+        return true;
+    }
+    let digits = t.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && (t[digits..].starts_with(". ") || t[digits..].starts_with(") "))
 }
 
 /// Long enough to fold: many lines, or a lot of text.
@@ -341,15 +486,17 @@ pub(crate) fn render_item(
                 .map(|m| m.thread.cwd.clone())
                 .unwrap_or_default();
             match state.markdown.get(&item.id) {
-                Some(md) => TextView::new(md)
-                    .stream_fade(true)
-                    .image_source(local_images(cwd))
-                    .into_any_element(),
-                None => {
-                    TextView::markdown(SharedString::from(format!("md-{}", item.id)), text.clone())
-                        .image_source(local_images(cwd))
-                        .into_any_element()
+                Some(md) => {
+                    reply_text_view(TextView::new(md).stream_fade(true), cwd).into_any_element()
                 }
+                None => reply_text_view(
+                    TextView::markdown(
+                        SharedString::from(format!("md-{}", item.id)),
+                        sized_images(text).into_owned(),
+                    ),
+                    cwd,
+                )
+                .into_any_element(),
             }
         }
 
@@ -750,13 +897,16 @@ pub(crate) fn tool_line(
 }
 
 /// A subagent (Task/Agent tool call): description, live progress, open button.
-fn agent_card(
-    store: &Entity<AppStore>,
-    model: &ThreadModel,
-    item: &Item,
-    title: &str,
-    p: &Palette,
-) -> AnyElement {
+/// How a subagent (its Agent tool call `item`) is doing.
+pub(crate) struct SubagentStatus {
+    pub running: bool,
+    pub failed: bool,
+    /// What it is doing now, else its answer.
+    pub subtitle: String,
+    pub elapsed: Option<String>,
+}
+
+pub(crate) fn subagent_status(model: &ThreadModel, item: &Item) -> SubagentStatus {
     let children: Vec<&Item> = model
         .items
         .iter()
@@ -766,8 +916,10 @@ fn agent_card(
     // the agent's own steps tell how it is going.
     let background = matches!(&item.body, ItemBody::ToolCall { output: Some(out), .. }
         if out.trim_start().starts_with("Async agent launched"));
-    let running = item.status == ItemStatus::InProgress
-        || (background && children.iter().any(|c| c.status == ItemStatus::InProgress));
+    let stopped = item.status == ItemStatus::Declined;
+    let running = !stopped
+        && (item.status == ItemStatus::InProgress
+            || (background && children.iter().any(|c| c.status == ItemStatus::InProgress)));
     let failed = matches!(item.status, ItemStatus::Failed | ItemStatus::Declined)
         || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. });
     // Under the title: what it is doing now, else what it answered.
@@ -791,6 +943,8 @@ fn agent_card(
     };
     let subtitle = if running {
         latest.unwrap_or_else(|| "Working…".into())
+    } else if stopped {
+        "Stopped".into()
     } else {
         answer.unwrap_or_else(|| {
             if failed {
@@ -814,6 +968,27 @@ fn agent_card(
         };
         human_duration(end - start)
     });
+    SubagentStatus {
+        running,
+        failed,
+        subtitle,
+        elapsed,
+    }
+}
+
+fn agent_card(
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    item: &Item,
+    title: &str,
+    p: &Palette,
+) -> AnyElement {
+    let SubagentStatus {
+        running,
+        failed,
+        subtitle,
+        elapsed,
+    } = subagent_status(model, item);
     let dot = if running {
         p.accent
     } else if failed {
@@ -1333,11 +1508,38 @@ mod tests {
         let out = sized_images("Here: ![Loft](/tmp/a.png) nice");
         assert_eq!(
             out,
-            "Here:  \n<img src=\"/tmp/a.png\" alt=\"Loft\" width=\"360\">  \nnice"
+            "Here:\n\n<img src=\"/tmp/a.png\" alt=\"Loft\" width=\"360\">\n\nnice"
+        );
+        assert_eq!(
+            sized_images("**1. Loft**\n![Loft](/tmp/a.png)\n\n**2.**"),
+            "**1. Loft**\n\n<img src=\"/tmp/a.png\" alt=\"Loft\" width=\"360\">\n\n\n\n**2.**"
+        );
+        // In a list it stays in the item.
+        assert_eq!(
+            sized_images("- see ![x](/a.png)"),
+            "- see  \n<img src=\"/a.png\" alt=\"x\" width=\"360\">"
         );
         assert_eq!(sized_images("`![x](y)`"), "`![x](y)`");
         assert_eq!(sized_images("```\n![x](y)\n```\n"), "```\n![x](y)\n```\n");
         assert_eq!(sized_images("no images"), "no images");
+    }
+
+    #[test]
+    fn lone_img_tags_parse() {
+        let img = parse_img_tag("<img src=\"/tmp/a.png\" alt=\"A &quot;b&quot;\" width=\"360\">")
+            .unwrap();
+        assert_eq!(
+            (img.src.as_str(), img.alt.as_str()),
+            ("/tmp/a.png", "A \"b\"")
+        );
+        assert!(parse_img_tag("<img alt=\"x\">").is_none());
+        assert!(parse_img_tag("<img src=\"a\"> <b>").is_none());
+        assert!(parse_img_tag("<p>hi</p>").is_none());
+        assert_eq!(local_image_path("https://x.dev/a.png", "/w"), None);
+        assert_eq!(
+            local_image_path("a.png", "/w"),
+            Some(std::path::PathBuf::from("/w/a.png"))
+        );
     }
 
     fn tool(kind: ToolKind) -> Item {

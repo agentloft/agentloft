@@ -268,6 +268,7 @@ async fn run(
                         t.start_turn_with(&input.text, images)
                     }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
+                    Some(SessionCommand::StopSubagent(_)) => vec![],
                     Some(SessionCommand::Respond { native_request_id, decision }) => {
                         t.respond(&native_request_id, decision)
                     }

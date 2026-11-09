@@ -826,6 +826,14 @@ impl BrowserView {
         }
     }
 
+    /// Reload the page.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(native) = &self.native {
+            native.reload();
+            cx.notify();
+        }
+    }
+
     fn reload_or_stop(&mut self, cx: &mut Context<Self>) {
         if let Some(native) = &self.native {
             if self.page.loading {

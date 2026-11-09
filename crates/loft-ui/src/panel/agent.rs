@@ -93,7 +93,9 @@ impl Render for AgentView {
         if let Some(text) = report_text {
             let stale = self.report.as_ref().is_none_or(|(t, _)| *t != text);
             if stale {
-                let md = cx.new(|cx| TextViewState::markdown(&text, cx).selectable(true));
+                let md = cx.new(|cx| {
+                    TextViewState::markdown(&crate::items::sized_images(&text), cx).selectable(true)
+                });
                 self.report = Some((text, md));
             }
         }
@@ -226,7 +228,10 @@ impl Render for AgentView {
                         .text_color(p.muted_foreground)
                         .child("REPORT"),
                 )
-                .child(TextView::new(md).image_source(crate::items::local_images(cwd.clone())))
+                .child(crate::items::reply_text_view(
+                    TextView::new(md),
+                    cwd.clone(),
+                ))
         });
 
         let _ = window;

@@ -93,6 +93,24 @@ impl Entry {
 /// Open `entries` under `anchor` (bounds in `window`'s coordinates), right
 /// edges aligned. The menu closes on a pick, Escape, or clicking elsewhere.
 pub fn open(window: &Window, anchor: Bounds<Pixels>, entries: Vec<Entry>, cx: &mut App) {
+    let x = f32::from(anchor.origin.x + anchor.size.width) - WIDTH;
+    let y = f32::from(anchor.origin.y + anchor.size.height) + 4.;
+    open_at_xy(window, x, y, entries, cx);
+}
+
+/// Open `entries` with the menu's top-left corner at `at` (in `window`),
+/// e.g. where the user right-clicked.
+pub fn open_at(window: &Window, at: gpui_kit::Point<Pixels>, entries: Vec<Entry>, cx: &mut App) {
+    open_at_xy(
+        window,
+        f32::from(at.x) + 2.,
+        f32::from(at.y) + 2.,
+        entries,
+        cx,
+    );
+}
+
+fn open_at_xy(window: &Window, x: f32, y: f32, entries: Vec<Entry>, cx: &mut App) {
     if CLOSED_AT
         .get()
         .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
@@ -108,8 +126,8 @@ pub fn open(window: &Window, anchor: Bounds<Pixels>, entries: Vec<Entry>, cx: &m
             })
             .sum::<f32>();
     let win = window.bounds();
-    let x = f32::from(win.origin.x + anchor.origin.x + anchor.size.width) - WIDTH;
-    let y = f32::from(win.origin.y + anchor.origin.y + anchor.size.height) + 4.;
+    let x = f32::from(win.origin.x) + x;
+    let y = f32::from(win.origin.y) + y;
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
             point(px(x.max(0.)), px(y)),

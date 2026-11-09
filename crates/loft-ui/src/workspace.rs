@@ -176,6 +176,8 @@ pub struct WorkspaceView {
     details_slide: Slide,
     /// The side panel's width as last laid out (it slides at this width).
     panel_width: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The conversation's width as last laid out (the turn map needs a margin).
+    timeline_width: std::rc::Rc<std::cell::Cell<f32>>,
     /// The turn-map tick being hovered (its peek card shows).
     peek: Option<usize>,
     /// The details card is docked open (shown while the window is wide).
@@ -259,6 +261,7 @@ impl WorkspaceView {
             details_anchor: Default::default(),
             details_open: false,
             peek: None,
+            timeline_width: Default::default(),
             sidebar_slide: Slide::default(),
             sidebar_amount: 1.,
             panel_slide: Slide::default(),
@@ -415,6 +418,43 @@ impl WorkspaceView {
             Some(("peek", n)) => {
                 self.panel_open = false;
                 self.peek = n.parse().ok();
+            }
+            Some(("sendstop", text)) => {
+                // Send, then stop whatever subagents are running (tests).
+                self.panel_open = false;
+                let id = thread_id.clone();
+                let text = text.to_owned();
+                self.store
+                    .update(cx, |s, cx| s.send_message(id.clone(), text, Vec::new(), cx));
+                let (store, th) = (self.store.clone(), thread.clone());
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(25))
+                        .await;
+                    cx.update(|cx| {
+                        let running: Vec<_> = th
+                            .read(cx)
+                            .model
+                            .as_ref()
+                            .map(|m| {
+                                m.items
+                                    .iter()
+                                    .filter(|i| {
+                                        i.parent_id.is_none()
+                                            && crate::items::subagent_status(m, i).running
+                                            && matches!(&i.body, loft_protocol::ItemBody::ToolCall { tool_kind, .. }
+                                                if *tool_kind == loft_protocol::ToolKind::Subagent)
+                                    })
+                                    .map(|i| i.id.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for item in running {
+                            store.update(cx, |s, cx| s.stop_subagent(id.clone(), item, cx));
+                        }
+                    });
+                })
+                .detach();
             }
             Some(("send", text)) => {
                 self.panel_open = false;
@@ -1101,6 +1141,13 @@ impl WorkspaceView {
             marks.push((row_ix, title, reply));
         }
         if marks.len() < 2 {
+            return None;
+        }
+        // Only in the margin beside the text, never over it.
+        let width = self.timeline_width.get();
+        let content = f32::from(p.content_width).min(width);
+        let margin = (width - content) / 2. + 24.;
+        if width <= 0. || margin < 40. {
             return None;
         }
         // Where the reader is: the last message at or above the top row.
@@ -2532,7 +2579,22 @@ impl WorkspaceView {
                     .flex_col()
                     .relative()
                     .child(timeline)
-                    .children(turn_map),
+                    .children(turn_map)
+                    .child({
+                        let width = self.timeline_width.clone();
+                        gpui_kit::canvas(
+                            move |bounds, window, _| {
+                                let w = f32::from(bounds.size.width);
+                                if (width.get() - w).abs() > 0.5 {
+                                    width.set(w);
+                                    window.refresh();
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full()
+                    }),
             )
             .child(
                 div().px_6().pb_5().pt_1().flex().justify_center().child(

@@ -24,6 +24,33 @@ const WIDTH: f32 = 340.;
 const ROW: f32 = 34.;
 const PAD: f32 = 6.;
 const DIVIDER: f32 = 13.;
+/// A section heading ("Subagents").
+const SECTION: f32 = 24.;
+/// Subagents listed (the most recent).
+const MAX_AGENTS: usize = 8;
+
+/// The thread's subagents, most recent last.
+fn subagents(store: &AppStore, thread_id: &ThreadId, cx: &App) -> Vec<loft_protocol::Item> {
+    let Some(thread) = store.threads.get(thread_id) else {
+        return Vec::new();
+    };
+    let Some(model) = thread.read(cx).model.as_ref() else {
+        return Vec::new();
+    };
+    let all: Vec<_> = model
+        .items
+        .iter()
+        .filter(|i| {
+            i.parent_id.is_none()
+                && matches!(&i.body, loft_protocol::ItemBody::ToolCall { tool_kind, .. }
+                    if *tool_kind == loft_protocol::ToolKind::Subagent)
+        })
+        .cloned()
+        .collect();
+    let skip = all.len().saturating_sub(MAX_AGENTS);
+    all.into_iter().skip(skip).collect()
+}
+
 /// The computer row has two lines (name, folder).
 const TALL_ROW: f32 = 48.;
 
@@ -111,9 +138,13 @@ pub fn open(
     let Some(info) = thread_info(store.read(cx), &thread_id) else {
         return;
     };
-    let rows = 3. + if info.parent.is_some() { 1. } else { 0. };
-    let dividers = 1. + if info.parent.is_some() { 1. } else { 0. };
-    let height = PAD * 2. + TALL_ROW + rows * ROW + dividers * DIVIDER + 4.;
+    let agents = subagents(store.read(cx), &thread_id, cx)
+        .len()
+        .min(MAX_AGENTS) as f32;
+    let rows = 3. + if info.parent.is_some() { 1. } else { 0. } + agents;
+    let dividers = 1. + if info.parent.is_some() { 1. } else { 0. } + agents.min(1.);
+    let heading = if agents > 0. { SECTION } else { 0. };
+    let height = PAD * 2. + TALL_ROW + rows * ROW + dividers * DIVIDER + heading + 4.;
     let win = window.bounds();
     let x = f32::from(win.origin.x + anchor.origin.x + anchor.size.width) - WIDTH;
     let y = f32::from(win.origin.y + anchor.origin.y + anchor.size.height) + 4.;
@@ -187,6 +218,10 @@ impl DetailsCard {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        // Subagents come and go: keep their list current.
+        if let Some(thread) = store.read(cx).threads.get(&thread_id).cloned() {
+            cx.observe(&thread, |_, _, cx| cx.notify()).detach();
+        }
         if floating {
             window.focus(&focus, cx);
             cx.observe_window_activation(window, |_, window, _| {
@@ -569,6 +604,120 @@ impl Render for DetailsCard {
                     });
                 })),
         );
+
+        // Subagents: open one, or stop it while it runs.
+        let (agents, harness) = {
+            let store = self.store.read(cx);
+            let agents = subagents(store, &self.thread_id, cx);
+            let harness = store
+                .threads
+                .get(&self.thread_id)
+                .and_then(|t| t.read(cx).model.as_ref().map(|m| m.thread.harness.clone()));
+            (agents, harness)
+        };
+        if !agents.is_empty() {
+            let model_state = self.store.read(cx).threads.get(&self.thread_id).cloned();
+            list = list.child(divider(&p)).child(
+                div()
+                    .h(px(SECTION))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_xs()
+                    .text_color(p.faint_foreground)
+                    .child("Subagents"),
+            );
+            let can_stop = harness.as_ref().is_some_and(|h| h.as_str() == "claude");
+            for agent in agents {
+                let Some(thread) = model_state.as_ref() else {
+                    break;
+                };
+                let status = {
+                    let state = thread.read(cx);
+                    let Some(model) = state.model.as_ref() else {
+                        break;
+                    };
+                    crate::items::subagent_status(model, &agent)
+                };
+                let title = match &agent.body {
+                    loft_protocol::ItemBody::ToolCall { title, .. } => title.clone(),
+                    _ => String::new(),
+                };
+                let dot = if status.running {
+                    p.accent
+                } else if status.failed {
+                    p.danger
+                } else {
+                    p.success
+                };
+                let (open_id, stop_id) = (agent.id.clone(), agent.id.clone());
+                list = list.child(
+                    row(&format!("details-agent-{}", agent.id), &p)
+                        .group("details-agent")
+                        .cursor_pointer()
+                        .hover(|d| d.bg(p.hover))
+                        .child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .child(crate::brand::agent_logo(
+                                    harness.as_ref().map(|h| h.as_str()).unwrap_or("claude"),
+                                    px(15.),
+                                    &p,
+                                ))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-3.))
+                                        .bottom(px(-3.))
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(p.elevated)
+                                        .bg(dot),
+                                ),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(title))
+                        .children(
+                            status
+                                .elapsed
+                                .map(|e| div().text_xs().text_color(p.faint_foreground).child(e)),
+                        )
+                        .when(status.running && can_stop, |d| {
+                            d.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "details-agent-stop-{}",
+                                        stop_id
+                                    )))
+                                    .p(px(3.))
+                                    .rounded(px(5.))
+                                    .text_color(p.muted_foreground)
+                                    .hover(|d| d.bg(p.danger_soft).text_color(p.danger))
+                                    .child(Icon::new(IconName::CircleStop).small())
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            "Stop this subagent",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        let (t, i) = (this.thread_id.clone(), stop_id.clone());
+                                        this.store.update(cx, |s, cx| s.stop_subagent(t, i, cx));
+                                    })),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let (store, t, i) =
+                                (this.store.clone(), this.thread_id.clone(), open_id.clone());
+                            this.in_main(window, cx, move |_, _, cx| {
+                                store.update(cx, |s, cx| s.open_agent(t, i, cx));
+                            });
+                        })),
+                );
+            }
+        }
 
         // Lineage.
         if let Some((parent, title)) = self.info.parent.clone() {

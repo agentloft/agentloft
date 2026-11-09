@@ -25,6 +25,10 @@ pub(crate) enum ThreadCmd {
     Interrupt {
         reply: Reply,
     },
+    StopSubagent {
+        item_id: ItemId,
+        reply: Reply,
+    },
     Respond {
         request_id: RequestId,
         decision: DecisionKind,
@@ -215,6 +219,34 @@ impl ThreadActor {
                         Ok(Response::Ok)
                     }
                     _ => Err(ErrorBody::new(ErrorCode::Conflict, "no running turn")),
+                };
+                let _ = reply.send(res);
+            }
+            ThreadCmd::StopSubagent { item_id, reply } => {
+                let native = self
+                    .subagents
+                    .iter()
+                    .find(|(_, id)| **id == item_id)
+                    .map(|(n, _)| n.clone());
+                let res = match (&self.session, native) {
+                    (Some(s), Some(native)) => {
+                        let _ = s.commands.send(SessionCommand::StopSubagent(native));
+                        // Mark it stopped (shown as such, never as done).
+                        let item = match self.core.live().remove(&item_id) {
+                            Some(item) => Some(item),
+                            None => self.load_item(&item_id).ok().flatten(),
+                        };
+                        if let Some(mut item) = item {
+                            item.status = ItemStatus::Declined;
+                            item.updated_at_ms = now_ms();
+                            let _ = self.core.commit(vec![Event::ItemUpserted { item }]);
+                        }
+                        Ok(Response::Ok)
+                    }
+                    _ => Err(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        "that subagent isn't running",
+                    )),
                 };
                 let _ = reply.send(res);
             }

@@ -37,6 +37,8 @@ pub struct Translator {
     /// Tool calls the user denied (their error result becomes `Declined`).
     denied_tools: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
+    /// Agent tool call id → the task id Claude runs it as (to stop it).
+    tasks: HashMap<String, String>,
     interrupt_requested: bool,
     turn_active: bool,
     next_request: u64,
@@ -100,6 +102,18 @@ impl Translator {
         let id = self.next_request_id();
         vec![Out::Send(json!({
             "type": "control_request", "request_id": id, "request": {"subtype": "interrupt"}
+        }))]
+    }
+
+    /// Stop the subagent started by tool call `tool_id`.
+    pub fn stop_subagent(&mut self, tool_id: &str) -> Vec<Out> {
+        let Some(task) = self.tasks.get(tool_id).cloned() else {
+            return vec![];
+        };
+        let id = self.next_request_id();
+        vec![Out::Send(json!({
+            "type": "control_request", "request_id": id,
+            "request": {"subtype": "stop_task", "task_id": task}
         }))]
     }
 
@@ -204,6 +218,12 @@ impl Translator {
                     })
                     .unwrap_or_default(),
             })],
+            Some("task_started") => {
+                if let (Some(task), Some(tool)) = (str_at(v, "task_id"), str_at(v, "tool_use_id")) {
+                    self.tasks.insert(tool.to_owned(), task.to_owned());
+                }
+                vec![]
+            }
             Some("api_retry") => vec![Out::Event(HarnessEvent::Notice {
                 level: NoticeLevel::Warning,
                 text: "Claude API error — retrying…".into(),
@@ -832,6 +852,21 @@ mod tests {
         }
         let agent_id = agent_id.expect("an Agent tool call");
         assert_eq!(child_parent.as_deref(), Some(agent_id.as_str()));
+    }
+
+    #[test]
+    fn stopping_a_subagent_sends_stop_task() {
+        let mut t = Translator::new();
+        assert!(t.stop_subagent("toolu_1").is_empty());
+        t.on_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"t9","tool_use_id":"toolu_1"}"#,
+        );
+        let out = t.stop_subagent("toolu_1");
+        let [Out::Send(v)] = out.as_slice() else {
+            panic!("expected one control request");
+        };
+        assert_eq!(v["request"]["subtype"], "stop_task");
+        assert_eq!(v["request"]["task_id"], "t9");
     }
 
     #[test]

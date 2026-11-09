@@ -512,6 +512,13 @@ impl Core {
                 self.thread_call(&thread_id, |reply| ThreadCmd::Interrupt { reply })
                     .await
             }
+            Request::StopSubagent { thread_id, item_id } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::StopSubagent {
+                    item_id,
+                    reply,
+                })
+                .await
+            }
             Request::RespondRequest {
                 thread_id,
                 request_id,

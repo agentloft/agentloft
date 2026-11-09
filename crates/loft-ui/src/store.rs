@@ -985,6 +985,15 @@ impl AppStore {
         self.request(Request::SetDraft { thread_id, text }, cx, |_, _, _| {});
     }
 
+    /// Stop one running subagent.
+    pub fn stop_subagent(&mut self, thread_id: ThreadId, item_id: ItemId, cx: &mut Context<Self>) {
+        self.request(
+            Request::StopSubagent { thread_id, item_id },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
     pub fn interrupt(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         self.request(Request::Interrupt { thread_id }, cx, |_, _, _| {});
     }

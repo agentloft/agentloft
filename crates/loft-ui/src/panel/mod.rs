@@ -588,6 +588,63 @@ impl WorkbenchPanel {
         self.threads.get(&id)?.active_tab().map(Open::kind)
     }
 
+    /// Close every tab of `thread_id` for which `pred(index)` holds.
+    fn close_where(
+        &mut self,
+        thread_id: &ThreadId,
+        pred: impl Fn(usize) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.threads.get(thread_id).map_or(0, |p| p.tabs.len());
+        for ix in (0..count).rev() {
+            if pred(ix) {
+                self.close(thread_id, ix, cx);
+            }
+        }
+    }
+
+    /// Right-click on a tab: close it, the others, those to its right, or all.
+    fn tab_menu(
+        &mut self,
+        thread_id: &ThreadId,
+        ix: usize,
+        at: gpui_kit::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use loft_browser::menu::{self, Entry};
+        let count = self.threads.get(thread_id).map_or(0, |p| p.tabs.len());
+        let panel = cx.weak_entity();
+        let item = |label: &str, icon: IconName, pred: fn(usize, usize) -> bool| {
+            let (panel, id) = (panel.clone(), thread_id.clone());
+            Entry::item(label.to_owned(), icon, move |cx| {
+                _ = panel.update(cx, |p, cx| p.close_where(&id, |i| pred(i, ix), cx));
+            })
+        };
+        let mut entries = vec![
+            item("Close", IconName::X, |i, ix| i == ix),
+            item("Close Others", IconName::Minus, |i, ix| i != ix).disabled(count < 2),
+            item("Close to the Right", IconName::ArrowRight, |i, ix| i > ix)
+                .disabled(ix + 1 >= count),
+            Entry::Separator,
+            item("Close All", IconName::Trash, |_, _| true),
+        ];
+        // A page tab also offers a reload.
+        if let Some(Open::Browser { view }) =
+            self.threads.get(thread_id).and_then(|p| p.tabs.get(ix))
+        {
+            let view = view.downgrade();
+            entries.insert(
+                0,
+                Entry::item("Reload Page".to_owned(), IconName::RotateCw, move |cx| {
+                    _ = view.update(cx, |b, cx| b.reload(cx));
+                }),
+            );
+            entries.insert(1, Entry::Separator);
+        }
+        menu::open_at(window, at, entries, cx);
+    }
+
     /// The + menu: open a new tab of any kind.
     fn add_menu(&self, thread_id: &ThreadId, window: &Window, cx: &mut Context<Self>) {
         use loft_browser::menu::{self, Entry};
@@ -712,7 +769,7 @@ impl Render for WorkbenchPanel {
         for (ix, tab) in panel.tabs.iter().enumerate() {
             let is_active = ix == active;
             let (icon, label) = tab_face(tab, &p, cx);
-            let (tid, cid) = (thread_id.clone(), thread_id.clone());
+            let (tid, cid, mid) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
             tabs = tabs.child(
                 h_flex()
                     .id(SharedString::from(format!("panel-tab-{ix}")))
@@ -760,6 +817,13 @@ impl Render for WorkbenchPanel {
                     )
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.activate(&tid, ix, window, cx)),
+                    )
+                    .on_mouse_down(
+                        gpui_kit::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui_kit::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.tab_menu(&mid, ix, event.position, window, cx);
+                        }),
                     ),
             );
         }
