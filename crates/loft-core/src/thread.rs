@@ -180,7 +180,12 @@ impl ThreadActor {
                     Ok(Response::Ok)
                 } else {
                     self.thread.draft = draft;
-                    self.save_thread().map(|_| Response::Ok)
+                    // Keep `updated_at_ms`: typing mustn't re-sort the sidebar.
+                    self.core
+                        .commit(vec![Event::ThreadUpdated {
+                            thread: self.thread.clone(),
+                        }])
+                        .map(|_| Response::Ok)
                 };
                 let _ = reply.send(res);
             }
