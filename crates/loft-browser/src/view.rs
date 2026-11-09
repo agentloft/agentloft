@@ -19,8 +19,8 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _
 use gpui_kit::{
     AnyElement, App, AppContext as _, BackgroundExecutor, Context, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    actions, canvas, div, prelude::FluentBuilder as _, px, relative,
+    Render, SharedString, Styled as _, Subscription, Task, Window, actions, canvas, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 use serde_json::{Value, json};
 use std::cell::Cell;
@@ -184,8 +184,8 @@ pub struct BrowserView {
     area: Rc<Cell<Option<(f32, f32)>>>,
     /// Annotation mode: clicks leave notes instead of acting on the page.
     annotating: bool,
-    /// The device bar under the toolbar is showing.
-    devices_open: bool,
+    /// The screen-size menu is open (the native page is hidden meanwhile).
+    device_menu_open: bool,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -266,7 +266,7 @@ impl BrowserView {
             rotated: false,
             area: Rc::new(Cell::new(None)),
             annotating: false,
-            devices_open: false,
+            device_menu_open: false,
             _tasks: tasks,
             _subscriptions: subscriptions,
         }
@@ -365,6 +365,11 @@ impl BrowserView {
 
     pub fn is_annotating(&self) -> bool {
         self.annotating
+    }
+
+    /// The page in the panel shows unless hidden or under the device menu.
+    fn page_shown(&self) -> bool {
+        self.visible && !self.device_menu_open
     }
 
     /// The live page, small, for a floating preview `width` points wide:
@@ -907,7 +912,7 @@ impl Render for BrowserView {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(Surface::new(native.clone(), self.visible))
+                    .child(Surface::new(native.clone(), self.page_shown()))
                     .into_any_element(),
                 Some(ix) => self.device_frame(native.clone(), DEVICES[ix], cx),
             },
@@ -976,7 +981,6 @@ impl Render for BrowserView {
                 this.focus_address_bar(window, cx)
             }))
             .child(toolbar)
-            .when(self.devices_open, |d| d.child(self.device_bar(cx)))
             .children(notice)
             .children(annotate_bar)
             .child(content)
@@ -984,107 +988,64 @@ impl Render for BrowserView {
 }
 
 impl BrowserView {
-    /// The toolbar button: shows the current screen, toggles the device
-    /// bar (a bar, not a menu: menus would open under the native page).
+    /// The toolbar button: shows the current screen and opens a menu of
+    /// screens. The native page draws above GPUI, so it is hidden while the
+    /// menu is open (otherwise the menu would open under it).
     fn device_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let (icon, label) = match self.device.map(|i| DEVICES[i]) {
             None => (IconName::Expand, "Responsive".to_owned()),
             Some(d) => (device_icon(d.kind), d.name.to_owned()),
         };
+        let (device, rotated) = (self.device, self.rotated);
+        let view = cx.weak_entity();
+        let on_open = view.clone();
         Button::new("loft-browser-device")
             .cursor_pointer()
             .small()
             .icon(icon)
-            .when(self.devices_open || self.device.is_some(), |b| b.primary())
-            .when(!(self.devices_open || self.device.is_some()), |b| b.ghost())
+            .when(self.device_menu_open || device.is_some(), |b| b.primary())
+            .when(!(self.device_menu_open || device.is_some()), |b| b.ghost())
             .tooltip(format!("Screen size: {label}"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.devices_open = !this.devices_open;
-                cx.notify();
-            }))
-            .into_any_element()
-    }
-
-    /// Responsive plus every device, as chips; rotate on the right.
-    fn device_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let (border, muted, foreground, muted_foreground, primary) = (
-            theme.border,
-            theme.muted,
-            theme.foreground,
-            theme.muted_foreground,
-            theme.primary,
-        );
-        let chip = |id: SharedString,
-                    icon: IconName,
-                    label: String,
-                    active: bool,
-                    pick: Option<usize>,
-                    cx: &mut Context<Self>| {
-            h_flex()
-                .id(id)
-                .flex_none()
-                .gap_1()
-                .items_center()
-                .px_2()
-                .py(px(3.))
-                .rounded(px(6.))
-                .text_xs()
-                .cursor_pointer()
-                .when(active, |d| {
-                    d.bg(primary.opacity(0.16)).text_color(foreground)
-                })
-                .when(!active, |d| {
-                    d.text_color(muted_foreground)
-                        .hover(|d| d.bg(muted).text_color(foreground))
-                })
-                .child(Icon::new(icon).xsmall())
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_device(pick, cx)))
-        };
-        let mut row = h_flex()
-            .id("loft-browser-devices")
-            .flex_1()
-            .min_w_0()
-            .gap_1()
-            .overflow_x_scroll()
-            .child(chip(
-                "device-responsive".into(),
-                IconName::Expand,
-                "Responsive".into(),
-                self.device.is_none(),
-                None,
-                cx,
-            ));
-        for (ix, d) in DEVICES.iter().enumerate() {
-            row = row.child(chip(
-                SharedString::from(format!("device-{ix}")),
-                device_icon(d.kind),
-                d.name.to_owned(),
-                self.device == Some(ix),
-                Some(ix),
-                cx,
-            ));
-        }
-        h_flex()
-            .flex_shrink_0()
-            .h(px(34.))
-            .px_2()
-            .gap_1()
-            .items_center()
-            .border_b_1()
-            .border_color(border)
-            .child(row)
-            .when(self.device.is_some(), |d| {
-                d.child(
-                    Button::new("loft-browser-rotate")
-                        .cursor_pointer()
-                        .ghost()
-                        .xsmall()
+            .disabled(self.native.is_none())
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
+                let pick = |name: String, icon: IconName, ix: Option<usize>| {
+                    let v = view.clone();
+                    PopupMenuItem::new(name)
+                        .icon(icon)
+                        .checked(device == ix)
+                        .on_click(move |_, _, cx| {
+                            _ = v.update(cx, |this, cx| this.set_device(ix, cx));
+                        })
+                };
+                menu = menu
+                    .item(pick("Responsive".into(), IconName::Expand, None))
+                    .separator();
+                let mut last = None;
+                for (ix, d) in DEVICES.iter().enumerate() {
+                    if last.is_some_and(|k| k != d.kind) {
+                        menu = menu.separator();
+                    }
+                    last = Some(d.kind);
+                    menu = menu.item(pick(d.name.to_owned(), device_icon(d.kind), Some(ix)));
+                }
+                let v = view.clone();
+                menu.separator().item(
+                    PopupMenuItem::new("Rotate")
                         .icon(IconName::RotateCwSquare)
-                        .tooltip("Rotate")
-                        .on_click(cx.listener(|this, _, _, cx| this.rotate(cx))),
+                        .checked(rotated)
+                        .disabled(device.is_none())
+                        .on_click(move |_, _, cx| {
+                            _ = v.update(cx, |this, cx| this.rotate(cx));
+                        }),
                 )
+            })
+            .on_open_change(move |open, _, cx| {
+                let open = *open;
+                _ = on_open.update(cx, |this, cx| {
+                    this.device_menu_open = open;
+                    cx.notify();
+                });
             })
             .into_any_element()
     }
@@ -1146,7 +1107,7 @@ impl BrowserView {
                             .shadow_lg()
                             .flex()
                             .flex_col()
-                            .child(Surface::new(native, self.visible).zoom(f64::from(scale))),
+                            .child(Surface::new(native, self.page_shown()).zoom(f64::from(scale))),
                     )
                     .child(div().text_xs().text_color(muted_foreground).child(format!(
                         "{} · {} × {} · {:.0}%",
