@@ -169,6 +169,11 @@ pub struct WorkspaceView {
     pub(crate) panel_open: bool,
     /// Where the details button is (its card opens under it).
     details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    /// The details card is docked open (shown while the window is wide).
+    details_open: bool,
+    details_card: Option<Entity<crate::details::DetailsCard>>,
+    /// Width of the conversation area (with the dock), to decide docking.
+    details_room: std::rc::Rc<std::cell::Cell<f32>>,
     /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>`
     /// opens a panel tab once the first thread has loaded.
     dev_tab: Option<String>,
@@ -242,6 +247,9 @@ impl WorkspaceView {
             panel,
             panel_open: false,
             details_anchor: Default::default(),
+            details_open: false,
+            details_card: None,
+            details_room: Default::default(),
             window_title: String::new(),
             tabs_shown: false,
             dev_tab: take_dev_tab(),
@@ -395,6 +403,10 @@ impl WorkspaceView {
             }
             _ => match dev {
                 "branches" => self.branch_picker_open = true,
+                "details" => {
+                    self.panel_open = false;
+                    self.details_open = true;
+                }
                 "addproject" => {
                     self.panel_open = false;
                     cx.defer_in(window, |this, window, cx| {
@@ -697,6 +709,81 @@ impl WorkspaceView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Whether the conversation area is wide enough to dock the details card.
+    fn can_dock(&self) -> bool {
+        self.details_room.get() >= DOCK_MIN
+    }
+
+    /// The conversation, with the details card docked beside it when open
+    /// and there is room.
+    fn with_details_dock(
+        &mut self,
+        body: AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.store.read(cx).selected.clone();
+        let dock = match (&selected, self.details_open && self.can_dock()) {
+            (Some(id), true) => {
+                if self
+                    .details_card
+                    .as_ref()
+                    .is_none_or(|c| c.read(cx).thread_id() != id)
+                {
+                    self.details_card = crate::details::docked(
+                        window,
+                        cx.weak_entity(),
+                        self.store.clone(),
+                        id.clone(),
+                        cx,
+                    );
+                }
+                self.details_card.clone()
+            }
+            _ => None,
+        };
+        let room = self.details_room.clone();
+        h_flex()
+            .size_full()
+            .relative()
+            .child(
+                gpui_kit::canvas(
+                    move |bounds, window, _| {
+                        let width = f32::from(bounds.size.width);
+                        let before = room.get();
+                        room.set(width);
+                        // Crossing the line docks or undocks the card.
+                        if (before >= DOCK_MIN) != (width >= DOCK_MIN) {
+                            window.refresh();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(body),
+            )
+            .children(dock.map(|card| {
+                div()
+                    .flex_none()
+                    .w(px(DOCK_WIDTH))
+                    .h_full()
+                    .pt_3()
+                    .pr_3()
+                    .child(card)
+                    .into_any_element()
+            }))
+            .into_any_element()
     }
 
     /// Show a panel tab (never closes the panel, unlike [`Self::show_tab`]).
@@ -1679,30 +1766,30 @@ impl WorkspaceView {
             .when(has_thread, |d| {
                 let anchor = self.details_anchor.clone();
                 let measure = anchor.clone();
-                let (workspace, store) = (cx.weak_entity(), self.store.clone());
+                let docked = self.details_open && self.can_dock();
                 d.child(
                     div()
                         .relative()
                         .child(toggle_button(
                             "hdr-details",
                             IconName::ScrollText,
-                            false,
+                            docked,
                             p,
-                            move |_, window, cx| {
-                                let Some(id) = store.read(cx).selected.clone() else {
+                            cx.listener(move |this, _, window, cx| {
+                                // Wide enough: dock it (and keep it); else a popover.
+                                if this.can_dock() {
+                                    this.details_open = !this.details_open;
+                                    cx.notify();
+                                    return;
+                                }
+                                let Some(id) = this.store.read(cx).selected.clone() else {
                                     return;
                                 };
                                 if let Some(at) = anchor.get() {
-                                    crate::details::open(
-                                        window,
-                                        at,
-                                        workspace.clone(),
-                                        store.clone(),
-                                        id,
-                                        cx,
-                                    );
+                                    let (workspace, store) = (cx.weak_entity(), this.store.clone());
+                                    crate::details::open(window, at, workspace, store, id, cx);
                                 }
-                            },
+                            }),
                         ))
                         .child(
                             gpui_kit::canvas(
@@ -2761,6 +2848,7 @@ impl Render for WorkspaceView {
             Some(thread) => self.render_thread(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
         };
+        let body = self.with_details_dock(body, window, cx);
         let show_panel = self.panel_open && header_title.is_some();
         let header = self.render_header(header_title, &p, cx);
         // Native tab group (⌘T): GPUI doesn't draw macOS's tab bar under our
@@ -3362,6 +3450,11 @@ fn human_bytes(n: usize) -> String {
         format!("{:.1} KB", n as f64 / 1024.)
     }
 }
+
+/// The docked details card's width, and the conversation width (with it)
+/// needed to dock rather than float.
+const DOCK_WIDTH: f32 = 320.;
+const DOCK_MIN: f32 = 900.;
 
 /// The picture attached with page notes (replaced as notes are added).
 const PAGE_NOTES_IMAGE: &str = "page-notes.png";

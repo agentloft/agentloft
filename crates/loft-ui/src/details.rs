@@ -1,6 +1,7 @@
 //! The thread's details card (title-bar button): where it runs, open in
-//! an editor, its branch and changes, where it was forked from. It opens
-//! in a small floating window so it shows over the browser panel too.
+//! an editor, its branch and changes, where it was forked from. On a wide
+//! window it docks beside the conversation; on a narrow one it floats in a
+//! small window (so it shows over the browser panel too).
 
 use crate::panel::Tab;
 use crate::store::AppStore;
@@ -129,15 +130,33 @@ pub fn open(
         ..Default::default()
     };
     let _ = cx.open_window(options, move |window, cx| {
-        cx.new(|cx| DetailsCard::new(store, workspace, main, thread_id, info, window, cx))
+        cx.new(|cx| DetailsCard::new(store, workspace, main, thread_id, info, true, window, cx))
     });
 }
 
-struct DetailsCard {
+/// The card for docking beside the conversation in `window`.
+pub fn docked(
+    window: &mut Window,
+    workspace: WeakEntity<WorkspaceView>,
+    store: gpui_kit::Entity<AppStore>,
+    thread_id: ThreadId,
+    cx: &mut App,
+) -> Option<gpui_kit::Entity<DetailsCard>> {
+    let info = thread_info(store.read(cx), &thread_id)?;
+    let main = window.window_handle();
+    Some(cx.new(|cx| DetailsCard::new(store, workspace, main, thread_id, info, false, window, cx)))
+}
+
+pub struct DetailsCard {
     store: gpui_kit::Entity<AppStore>,
     workspace: WeakEntity<WorkspaceView>,
     main: AnyWindowHandle,
+    thread_id: ThreadId,
     info: Info,
+    /// In its own pop-up window (else docked in the main window).
+    floating: bool,
+    /// The last finished turn whose changes are counted.
+    counted_turn: Option<loft_protocol::TurnId>,
     focus: FocusHandle,
     computer: Option<String>,
     /// The checkout's branch (for a thread working in the project itself).
@@ -151,23 +170,43 @@ struct DetailsCard {
 }
 
 impl DetailsCard {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         store: gpui_kit::Entity<AppStore>,
         workspace: WeakEntity<WorkspaceView>,
         main: AnyWindowHandle,
         thread_id: ThreadId,
         info: Info,
+        floating: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        window.focus(&focus, cx);
-        cx.observe_window_activation(window, |_, window, _| {
-            if !window.is_window_active() {
-                window.remove_window();
-            }
-        })
-        .detach();
+        if floating {
+            window.focus(&focus, cx);
+            cx.observe_window_activation(window, |_, window, _| {
+                if !window.is_window_active() {
+                    window.remove_window();
+                }
+            })
+            .detach();
+        } else if let Some(thread) = store.read(cx).threads.get(&thread_id).cloned() {
+            // Docked, it stays open: recount changes after each turn.
+            cx.observe(&thread, |this, thread, cx| {
+                let done = thread
+                    .read(cx)
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.last_turn())
+                    .filter(|t| t.status.is_terminal())
+                    .map(|t| t.id.clone());
+                if done.is_some() && done != this.counted_turn {
+                    this.counted_turn = done;
+                    this.count_changes(cx);
+                }
+            })
+            .detach();
+        }
         let cwd = info.cwd.clone();
         let local = matches!(info.workspace, ThreadWorkspace::Local);
         cx.spawn(async move |this, cx| {
@@ -197,28 +236,19 @@ impl DetailsCard {
             });
         })
         .detach();
-        if let Some(client) = store.read(cx).client() {
-            let body = Request::GetDiff {
-                thread_id: thread_id.clone(),
-                scope: DiffScope::Thread,
-            };
-            cx.spawn(async move |this, cx| {
-                if let Ok(Response::Diff { diff }) = client.request(body).await {
-                    let added = diff.files.iter().map(|f| f.added).sum();
-                    let removed = diff.files.iter().map(|f| f.removed).sum();
-                    let _ = this.update(cx, |this, cx| {
-                        this.changes = Some((diff.files.len(), added, removed));
-                        cx.notify();
-                    });
-                }
-            })
-            .detach();
-        }
-        Self {
+        let counted_turn = store
+            .read(cx)
+            .threads
+            .get(&thread_id)
+            .and_then(|t| t.read(cx).model.as_ref()?.last_turn().map(|t| t.id.clone()));
+        let mut this = Self {
             store,
             workspace,
             main,
+            thread_id,
             info,
+            floating,
+            counted_turn,
             focus,
             computer: None,
             local_branch: None,
@@ -226,6 +256,40 @@ impl DetailsCard {
             editors: installed_editors(),
             editor_anchor: Default::default(),
             copied: false,
+        };
+        this.count_changes(cx);
+        this
+    }
+
+    fn count_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.store.read(cx).client() else {
+            return;
+        };
+        let body = Request::GetDiff {
+            thread_id: self.thread_id.clone(),
+            scope: DiffScope::Thread,
+        };
+        cx.spawn(async move |this, cx| {
+            if let Ok(Response::Diff { diff }) = client.request(body).await {
+                let added = diff.files.iter().map(|f| f.added).sum();
+                let removed = diff.files.iter().map(|f| f.removed).sum();
+                let _ = this.update(cx, |this, cx| {
+                    this.changes = Some((diff.files.len(), added, removed));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn thread_id(&self) -> &ThreadId {
+        &self.thread_id
+    }
+
+    /// Close the card if it is the floating one.
+    fn dismiss(floating: bool, window: &mut Window) {
+        if floating {
+            window.remove_window();
         }
     }
 
@@ -237,6 +301,11 @@ impl DetailsCard {
         f: impl FnOnce(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>) + 'static,
     ) {
         let workspace = self.workspace.clone();
+        if !self.floating {
+            // Docked: we are in the main window already.
+            _ = workspace.update(cx, |w, cx| f(w, window, cx));
+            return;
+        }
         window.remove_window();
         let _ = self.main.update(cx, move |_, window, cx| {
             _ = workspace.update(cx, |w, cx| f(w, window, cx));
@@ -289,6 +358,7 @@ impl Render for DetailsCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         let cwd = self.info.cwd.clone();
+        let floating = self.floating;
         let mut list = v_flex().p(px(PAD));
 
         // Where it runs.
@@ -325,7 +395,7 @@ impl Render for DetailsCard {
                         .child(Icon::new(IconName::FolderOpen).small())
                         .on_click(move |_, window, cx| {
                             cx.open_with_system(std::path::Path::new(&folder));
-                            window.remove_window();
+                            Self::dismiss(floating, window);
                         }),
                 ),
         );
@@ -342,7 +412,7 @@ impl Render for DetailsCard {
                     .child(div().flex_1().child(format!("Open in {}", EDITORS[ed].1)))
                     .on_click(move |_, window, _| {
                         open_in(ed, &folder);
-                        window.remove_window();
+                        Self::dismiss(floating, window);
                     })
                     .when(self.editors.len() > 1, |d| {
                         let (anchor, editors, folder) = (
@@ -513,6 +583,15 @@ impl Render for DetailsCard {
             );
         }
 
+        let card = list
+            .bg(p.elevated)
+            .border_1()
+            .border_color(p.border)
+            .rounded(px(12.))
+            .font_weight(FontWeight::NORMAL);
+        if !floating {
+            return card.w_full().into_any_element();
+        }
         div()
             .size_full()
             .track_focus(&self.focus)
@@ -521,14 +600,7 @@ impl Render for DetailsCard {
                     window.remove_window();
                 }
             })
-            .child(
-                list.size_full()
-                    .bg(p.elevated)
-                    .border_1()
-                    .border_color(p.border)
-                    .rounded(px(12.))
-                    .shadow_lg()
-                    .font_weight(FontWeight::NORMAL),
-            )
+            .child(card.size_full().shadow_lg())
+            .into_any_element()
     }
 }
