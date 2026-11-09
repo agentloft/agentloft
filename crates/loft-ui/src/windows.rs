@@ -46,11 +46,16 @@ pub fn refresh_all(cx: &mut App) {
     }
 }
 
-/// One window in the saved session: its thread and native tab group.
+/// One window in the saved session: its focused thread and its panes.
+/// (`group` is from when windows were native tabs: a group's threads now
+/// open as panes of one window.)
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedWindow {
     thread: Option<ThreadId>,
+    #[serde(default)]
     group: usize,
+    #[serde(default)]
+    panes: Vec<ThreadId>,
 }
 
 fn session_file(paths: &Paths) -> std::path::PathBuf {
@@ -63,29 +68,16 @@ fn save_session(cx: &mut App) {
     };
     let file = session_file(&env.paths);
     let open = env.open.clone();
-    let mut groups: Vec<Vec<gpui_kit::WindowId>> = Vec::new();
     let mut saved = Vec::new();
-    for (handle, store) in open {
+    for (ix, (_, store)) in open.into_iter().enumerate() {
         let Some(store) = store.upgrade() else {
             continue;
         };
-        // Windows sharing a native tab group share a group number.
-        let tabs = handle
-            .update(cx, |_, window, _| window.tabbed_windows())
-            .ok()
-            .flatten()
-            .map(|t| t.iter().map(|t| t.id).collect::<Vec<_>>())
-            .unwrap_or_else(|| vec![handle.window_id()]);
-        let group = match groups.iter().position(|g| g.contains(&handle.window_id())) {
-            Some(ix) => ix,
-            None => {
-                groups.push(tabs);
-                groups.len() - 1
-            }
-        };
+        let store = store.read(cx);
         saved.push(SavedWindow {
-            thread: store.read(cx).selected.clone(),
-            group,
+            thread: store.selected.clone(),
+            group: ix,
+            panes: store.panes.clone(),
         });
     }
     if let Ok(json) = serde_json::to_vec_pretty(&saved) {
@@ -104,27 +96,53 @@ pub fn restore(cx: &mut App) {
         open(None, Placement::Window, cx);
         return;
     }
-    let mut leaders: std::collections::HashMap<usize, AnyWindowHandle> = Default::default();
+    // Windows that were tabs of one group come back as panes of one window.
+    let mut windows: Vec<(usize, Option<ThreadId>, Vec<ThreadId>)> = Vec::new();
     for w in saved {
-        let placement = match leaders.get(&w.group) {
-            Some(leader) => Placement::TabOf(*leader),
-            None => Placement::Window,
-        };
-        if let Some(handle) = open(w.thread, placement, cx) {
-            leaders.entry(w.group).or_insert(handle);
+        let mut panes = w.panes;
+        if panes.is_empty() {
+            panes.extend(w.thread.clone());
+        }
+        match windows.iter_mut().find(|(g, ..)| *g == w.group) {
+            Some((_, _, existing)) => {
+                for id in panes {
+                    if !existing.contains(&id) {
+                        existing.push(id);
+                    }
+                }
+            }
+            None => windows.push((w.group, w.thread, panes)),
+        }
+    }
+    for (_, thread, panes) in windows {
+        if let Some(handle) = open(thread.clone(), Placement::Window, cx)
+            && let Some(env) = cx.try_global::<AppEnv>()
+            && let Some(store) = env
+                .open
+                .iter()
+                .find(|(h, _)| *h == handle)
+                .and_then(|(_, s)| s.upgrade())
+        {
+            store.update(cx, |s, cx| {
+                for id in &panes {
+                    s.ensure_thread(id, cx);
+                }
+                s.panes = panes;
+                if let Some(t) = &thread
+                    && !s.panes.contains(t)
+                {
+                    s.panes.push(t.clone());
+                }
+                cx.notify();
+            });
         }
     }
 }
-
-/// Windows with this identifier can merge into one tabbed window.
-const TAB_GROUP: &str = "agentloft-workspace";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Placement {
     /// A separate window.
     Window,
-    /// A new tab in this window's group.
-    TabOf(AnyWindowHandle),
 }
 
 /// Open a workspace window, optionally showing `thread`.
@@ -152,7 +170,6 @@ pub fn open(
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.), px(18.))),
             }),
-            tabbing_identifier: Some(TAB_GROUP.into()),
             ..Default::default()
         },
         cx,
@@ -163,11 +180,7 @@ pub fn open(
     );
     match opened {
         Ok((handle, _)) => {
-            // The parent may be mid-update (we're often called from its
-            // event handlers), so merge the tab once that's done.
-            if let Placement::TabOf(parent) = placement {
-                cx.defer(move |cx| add_as_tab(parent, handle, cx));
-            }
+            let Placement::Window = placement;
             let weak = store.downgrade();
             let env = cx.global_mut::<AppEnv>();
             env.open.retain(|(_, s)| s.upgrade().is_some());
@@ -180,40 +193,3 @@ pub fn open(
         }
     }
 }
-
-/// Put `child` into `parent`'s native tab group (⌘T semantics), whatever
-/// the user's "prefer tabs" setting is.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn add_as_tab(parent: AnyWindowHandle, child: AnyWindowHandle, cx: &mut App) {
-    use objc2_app_kit::{NSView, NSWindowOrderingMode};
-    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
-
-    fn ns_window(
-        handle: AnyWindowHandle,
-        cx: &mut App,
-    ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
-        handle
-            .update(cx, |_, window, _| {
-                let raw = window.window_handle().ok()?.as_raw();
-                let RawWindowHandle::AppKit(h) = raw else {
-                    return None;
-                };
-                // SAFETY: GPUI's AppKit handle is its live content NSView.
-                let view: &NSView = unsafe { h.ns_view.cast().as_ref() };
-                view.window()
-            })
-            .ok()
-            .flatten()
-    }
-    let (Some(p), Some(c)) = (ns_window(parent, cx), ns_window(child, cx)) else {
-        return;
-    };
-    if p != c {
-        p.addTabbedWindow_ordered(&c, NSWindowOrderingMode::Above);
-        c.makeKeyAndOrderFront(None);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn add_as_tab(_: AnyWindowHandle, _: AnyWindowHandle, _: &mut App) {}

@@ -96,6 +96,11 @@ pub struct AppStore {
     pub threads: HashMap<ThreadId, Entity<ThreadState>>,
     subs: HashMap<u64, ThreadId>,
     pub selected: Option<ThreadId>,
+    /// Threads shown side by side in this window, in order; the selected
+    /// one is the focused pane.
+    pub panes: Vec<ThreadId>,
+    /// The next thread selected goes into a new pane (not the focused one).
+    next_in_new_pane: bool,
     /// Harness for new threads (the last one the user picked).
     pub default_harness: HarnessId,
     /// Messages typed while a turn was running, sent when it ends.
@@ -137,6 +142,8 @@ impl AppStore {
             threads: HashMap::new(),
             subs: HashMap::new(),
             selected: None,
+            panes: Vec::new(),
+            next_in_new_pane: false,
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
             last_error: None,
@@ -530,18 +537,103 @@ impl AppStore {
 
     // -- actions ------------------------------------------------------------
 
+    /// A thread's live state, loading it if needed (without selecting it).
+    pub fn ensure_thread(&mut self, id: &ThreadId, cx: &mut Context<Self>) -> Entity<ThreadState> {
+        if let Some(entity) = self.threads.get(id) {
+            return entity.clone();
+        }
+        let entity = cx.new(|cx| ThreadState::new(id.clone(), cx));
+        self.threads.insert(id.clone(), entity.clone());
+        if let Some(client) = &self.client {
+            let sub = client.subscribe(Topic::Thread(id.clone()));
+            self.subs.insert(sub, id.clone());
+        }
+        entity
+    }
+
     pub fn select_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
-        if !self.threads.contains_key(&id) {
-            let entity = cx.new(|cx| ThreadState::new(id.clone(), cx));
-            self.threads.insert(id.clone(), entity);
-            if let Some(client) = &self.client {
-                let sub = client.subscribe(Topic::Thread(id.clone()));
-                self.subs.insert(sub, id.clone());
+        self.ensure_thread(&id, cx);
+        self.unread.remove(&id);
+        // Into a pane: its own if open, else a new one when asked, else the
+        // focused pane's place.
+        if !self.panes.contains(&id) {
+            let focused = self
+                .selected
+                .as_ref()
+                .and_then(|s| self.panes.iter().position(|p| p == s));
+            match focused {
+                Some(ix) if !std::mem::take(&mut self.next_in_new_pane) => {
+                    self.panes[ix] = id.clone()
+                }
+                Some(ix) => self.panes.insert(ix + 1, id.clone()),
+                None => self.panes.push(id.clone()),
             }
         }
-        self.unread.remove(&id);
+        self.next_in_new_pane = false;
         self.selected = Some(id);
         cx.notify();
+    }
+
+    /// Show `thread` in a pane of its own beside the focused one.
+    pub fn open_pane(&mut self, thread: ThreadId, cx: &mut Context<Self>) {
+        self.next_in_new_pane = true;
+        self.select_thread(thread, cx);
+    }
+
+    /// The next thread selected (e.g. one being created) gets a new pane.
+    pub fn expect_new_pane(&mut self) {
+        self.next_in_new_pane = true;
+    }
+
+    /// Close a pane; the focus moves to its neighbour.
+    pub fn close_pane(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
+        let Some(ix) = self.panes.iter().position(|p| p == thread) else {
+            return;
+        };
+        if self.panes.len() == 1 {
+            return;
+        }
+        self.panes.remove(ix);
+        if self.selected.as_ref() == Some(thread) {
+            let next = self.panes[ix.min(self.panes.len() - 1)].clone();
+            self.selected = Some(next);
+        }
+        cx.notify();
+    }
+
+    /// Put `thread` into the pane layout at `at` (moving it if shown),
+    /// replacing the pane there when `replace`; it gets the focus.
+    pub fn place_pane(
+        &mut self,
+        thread: ThreadId,
+        at: usize,
+        replace: bool,
+        max: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self.panes.iter().position(|p| *p == thread);
+        if let Some(from) = from {
+            if replace {
+                // Dropped on another pane: they swap places.
+                if at < self.panes.len() {
+                    self.panes.swap(from, at);
+                }
+            } else {
+                self.panes.remove(from);
+                let at = if from < at { at - 1 } else { at };
+                self.panes.insert(at.min(self.panes.len()), thread.clone());
+            }
+        } else if replace || self.panes.len() >= max {
+            let at = at.min(self.panes.len().saturating_sub(1));
+            if self.panes.is_empty() {
+                self.panes.push(thread.clone());
+            } else {
+                self.panes[at] = thread.clone();
+            }
+        } else {
+            self.panes.insert(at.min(self.panes.len()), thread.clone());
+        }
+        self.select_thread(thread, cx);
     }
 
     pub fn paths(&self) -> &Paths {
@@ -875,6 +967,14 @@ impl AppStore {
             .iter()
             .find(|t| &t.id != thread_id && t.status != loft_protocol::ThreadStatus::Archived)
             .map(|t| t.id.clone());
+        // Its pane goes too (or shows the next thread if it was the last).
+        if self.panes.len() > 1 {
+            self.panes.retain(|p| p != thread_id);
+            self.selected = self.panes.first().cloned();
+            cx.notify();
+            return;
+        }
+        self.panes.retain(|p| p != thread_id);
         self.selected = None;
         if let Some(id) = next {
             self.select_thread(id, cx);

@@ -96,7 +96,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
         ]),
         Menu::new("File").items([
             MenuItem::action("New Thread", NewThread),
-            MenuItem::action("New Tab", NewTab),
+            MenuItem::action("New Pane", NewTab),
             MenuItem::action("New Window", NewWindow),
             MenuItem::separator(),
             MenuItem::action("Add Project…", AddProject),
@@ -177,9 +177,15 @@ pub struct WorkspaceView {
     /// The side panel's width as last laid out (it slides at this width).
     panel_width: std::rc::Rc<std::cell::Cell<f32>>,
     /// The conversation's width as last laid out (the turn map needs a margin).
-    timeline_width: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Each pane's conversation width (the turn map needs a margin).
+    timeline_widths: HashMap<ThreadId, std::rc::Rc<std::cell::Cell<f32>>>,
+    /// The pane area's size, measured: how many panes fit.
+    pane_room: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
+    /// While drawing a pane: whether it is the focused one (popovers and
+    /// the mini browser show only there).
+    rendering_focused: bool,
     /// The turn-map tick being hovered (its peek card shows).
-    peek: Option<usize>,
+    peek: Option<(ThreadId, usize)>,
     /// The details card is docked open (shown while the window is wide).
     details_open: bool,
     details_card: Option<Entity<crate::details::DetailsCard>>,
@@ -190,8 +196,6 @@ pub struct WorkspaceView {
     dev_tab: Option<String>,
     /// Last window title set (the native tab label).
     window_title: String,
-    /// This window is one of several native tabs (we draw the tab strip).
-    tabs_shown: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -261,7 +265,9 @@ impl WorkspaceView {
             details_anchor: Default::default(),
             details_open: false,
             peek: None,
-            timeline_width: Default::default(),
+            timeline_widths: Default::default(),
+            pane_room: Default::default(),
+            rendering_focused: true,
             sidebar_slide: Slide::default(),
             sidebar_amount: 1.,
             panel_slide: Slide::default(),
@@ -270,7 +276,6 @@ impl WorkspaceView {
             details_card: None,
             details_room: Default::default(),
             window_title: String::new(),
-            tabs_shown: false,
             dev_tab: take_dev_tab(),
             _subs: subs,
         }
@@ -424,6 +429,30 @@ impl WorkspaceView {
                     });
                 }
             }
+            Some(("panes", n)) => {
+                // The n most recent threads, side by side (tests).
+                self.panel_open = false;
+                let n: usize = n.parse().unwrap_or(2);
+                let others: Vec<ThreadId> = self
+                    .store
+                    .read(cx)
+                    .workspace
+                    .threads
+                    .iter()
+                    .filter(|t| {
+                        t.id != thread_id && t.status != ThreadStatus::Archived && t.is_started()
+                    })
+                    .take(n.saturating_sub(1))
+                    .map(|t| t.id.clone())
+                    .collect();
+                self.store.update(cx, |s, cx| {
+                    for id in &others {
+                        s.ensure_thread(id, cx);
+                    }
+                    s.panes = std::iter::once(thread_id.clone()).chain(others).collect();
+                    cx.notify();
+                });
+            }
             Some(("card", which)) => {
                 self.panel_open = false;
                 let kind = if which == "usage" {
@@ -436,7 +465,7 @@ impl WorkspaceView {
             }
             Some(("peek", n)) => {
                 self.panel_open = false;
-                self.peek = n.parse().ok();
+                self.peek = n.parse().ok().map(|n| (thread_id.clone(), n));
             }
             Some(("sendstop", text)) => {
                 // Send, then stop whatever subagents are running (tests).
@@ -607,8 +636,9 @@ impl WorkspaceView {
                         .filter(|t| t.id != thread_id && t.status != ThreadStatus::Archived)
                         .map(|t| t.id.clone())
                         .next();
-                    let tab = crate::windows::Placement::TabOf(window.window_handle());
-                    crate::windows::open(other, tab, cx);
+                    if let Some(other) = other {
+                        self.store.update(cx, |s, cx| s.open_pane(other, cx));
+                    }
                 }
                 "agent" => {
                     if let Some(item) = agent {
@@ -1138,6 +1168,7 @@ impl WorkspaceView {
     ) -> Option<AnyElement> {
         let state = thread.read(cx);
         let model = state.model.as_ref()?;
+        let tid = state.id.clone();
         let items = &model.items;
         let mut marks: Vec<(usize, String, String)> = Vec::new();
         for (row_ix, row) in state.rows.iter().enumerate() {
@@ -1182,7 +1213,7 @@ impl WorkspaceView {
             return None;
         }
         // Only in the margin beside the text, never over it.
-        let width = self.timeline_width.get();
+        let width = self.timeline_widths.get(&tid).map_or(0., |w| w.get());
         let content = f32::from(p.content_width).min(width);
         let margin = (width - content) / 2. + 24.;
         if width <= 0. || margin < 40. {
@@ -1199,7 +1230,7 @@ impl WorkspaceView {
         let scroller = state.scroller.clone();
         let mut rail = v_flex().w(px(34.)).items_start();
         for (ix, (row, title, reply)) in marks.into_iter().enumerate() {
-            let hovered = self.peek == Some(ix);
+            let hovered = self.peek.as_ref() == Some(&(tid.clone(), ix));
             let is_current = ix == current;
             let scroller = scroller.clone();
             let card = hovered.then(|| {
@@ -1261,13 +1292,16 @@ impl WorkspaceView {
                             }),
                     )
                     .children(card)
-                    .on_hover(cx.listener(move |this, on: &bool, _, cx| {
-                        if *on {
-                            this.peek = Some(ix);
-                        } else if this.peek == Some(ix) {
-                            this.peek = None;
+                    .on_hover(cx.listener({
+                        let peek_id = tid.clone();
+                        move |this, on: &bool, _, cx| {
+                            if *on {
+                                this.peek = Some((peek_id.clone(), ix));
+                            } else if this.peek.as_ref() == Some(&(peek_id.clone(), ix)) {
+                                this.peek = None;
+                            }
+                            cx.notify();
                         }
-                        cx.notify();
                     }))
                     .on_click(move |_, _, cx| {
                         scroller.update(cx, |s, cx| {
@@ -1774,6 +1808,242 @@ impl WorkspaceView {
         }
     }
 
+    /// How many panes fit the pane area (up to [`MAX_PANES`]).
+    fn pane_capacity(&self) -> usize {
+        let (w, h) = self.pane_room.get();
+        if w <= 0. {
+            return MAX_PANES;
+        }
+        let cols = ((w / PANE_MIN_W).floor() as usize).max(1);
+        let rows = if h >= PANE_MIN_H * 2. { 2 } else { 1 };
+        (cols * rows).min(MAX_PANES)
+    }
+
+    /// The window's threads side by side: one row while they fit, then two.
+    /// Drop a thread (from the sidebar, or a pane's header) on a pane's
+    /// left or right side to place it there, or in its middle to swap.
+    fn render_panes(
+        &mut self,
+        focused: Entity<ThreadState>,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focused_id = focused.read(cx).id.clone();
+        let cap = self.pane_capacity();
+        let ids: Vec<ThreadId> = self.store.update(cx, |s, _| {
+            if !s.panes.contains(&focused_id) {
+                s.panes.push(focused_id.clone());
+            }
+            // The focused pane is always one that fits.
+            if let Some(ix) = s.panes.iter().position(|t| *t == focused_id)
+                && ix >= cap
+            {
+                s.panes.swap(ix, cap - 1);
+            }
+            s.panes.iter().take(cap).cloned().collect()
+        });
+        let threads: Vec<Entity<ThreadState>> = ids
+            .iter()
+            .map(|id| self.store.update(cx, |s, cx| s.ensure_thread(id, cx)))
+            .collect();
+        let n = threads.len();
+        let multi = n > 1;
+        let (w, _) = self.pane_room.get();
+        let per_row_fit = if w > 0. {
+            ((w / PANE_MIN_W).floor() as usize).max(1)
+        } else {
+            n
+        };
+        let rows = if n > per_row_fit { 2 } else { 1 };
+        let per_row = n.div_ceil(rows);
+        let dragging = cx.has_active_drag();
+        let mut grid = v_flex().size_full();
+        let mut row = h_flex().flex_1().min_h_0().w_full();
+        for (ix, thread) in threads.into_iter().enumerate() {
+            if ix > 0 && ix % per_row == 0 {
+                grid = grid.child(row);
+                row = h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(p.border);
+            }
+            let id = ids[ix].clone();
+            let is_focused = id == focused_id;
+            self.rendering_focused = is_focused;
+            let body = self.render_thread(thread.clone(), p, window, cx);
+            self.rendering_focused = true;
+            let header = multi.then(|| self.pane_header(&thread, ix, is_focused, p, cx));
+            let overlay = dragging.then(|| self.pane_drop_zones(ix, cap, p, cx));
+            let store = self.store.clone();
+            let focus_id = id.clone();
+            row = row.child(
+                v_flex()
+                    .id(SharedString::from(format!("pane-{}", id.as_str())))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .relative()
+                    .when(ix % per_row > 0, |d| d.border_l_1().border_color(p.border))
+                    // Clicking anywhere in a pane focuses it.
+                    .capture_any_mouse_down(move |_, _, cx| {
+                        let id = focus_id.clone();
+                        store.update(cx, |s, cx| {
+                            if s.selected.as_ref() != Some(&id) {
+                                s.select_thread(id, cx);
+                            }
+                        });
+                    })
+                    .children(header)
+                    .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+                    .children(overlay),
+            );
+        }
+        grid = grid.child(row);
+        let room = self.pane_room.clone();
+        div()
+            .size_full()
+            .relative()
+            .child(grid)
+            .child(
+                gpui_kit::canvas(
+                    move |bounds, window, _| {
+                        let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                        if room.get() != size {
+                            room.set(size);
+                            window.refresh();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    /// A pane's title bar: agent, title, close; drag it to move the pane.
+    fn pane_header(
+        &self,
+        thread: &Entity<ThreadState>,
+        ix: usize,
+        focused: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let state = thread.read(cx);
+        let (title, harness, running) = match state.model.as_ref() {
+            Some(m) => (
+                m.thread.title.clone(),
+                m.thread.harness.as_str().to_owned(),
+                m.running_turn().is_some(),
+            ),
+            None => ("Loading…".to_owned(), String::new(), false),
+        };
+        let id = state.id.clone();
+        let drag = DraggedThread {
+            id: id.clone(),
+            title: title.clone(),
+        };
+        let store = self.store.clone();
+        h_flex()
+            .id(SharedString::from(format!("pane-head-{ix}")))
+            .group("pane-head")
+            .h(px(34.))
+            .flex_shrink_0()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(p.border)
+            .text_sm()
+            .cursor_grab()
+            .when(focused, |d| d.bg(p.background).text_color(p.foreground))
+            .when(!focused, |d| d.bg(p.sidebar).text_color(p.muted_foreground))
+            .child(crate::brand::agent_logo(&harness, px(13.), p))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(focused, |d| d.font_weight(FontWeight::MEDIUM))
+                    .child(title),
+            )
+            .when(running, |d| {
+                d.child(Spinner::new().xsmall().color(p.accent))
+            })
+            .child(
+                div()
+                    .id(SharedString::from(format!("pane-close-{ix}")))
+                    .flex_none()
+                    .p(px(3.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .text_color(p.muted_foreground)
+                    .when(!focused, |d| {
+                        d.invisible().group_hover("pane-head", |d| d.visible())
+                    })
+                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    .child(Icon::new(IconName::X).xsmall())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let id = id.clone();
+                        store.update(cx, |s, cx| s.close_pane(&id, cx));
+                    }),
+            )
+            .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+            .into_any_element()
+    }
+
+    /// While a thread is dragged: where it can land on pane `ix`.
+    fn pane_drop_zones(
+        &self,
+        ix: usize,
+        cap: usize,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let accent = p.accent;
+        let zone =
+            |name: &str, at: usize, replace: bool, label: &'static str, cx: &mut Context<Self>| {
+                div()
+                    .id(SharedString::from(format!("drop-{name}-{ix}")))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(gpui_kit::transparent_black())
+                    .drag_over::<DraggedThread>(move |s, _, _, _| {
+                        s.bg(accent.opacity(0.16))
+                            .border_2()
+                            .border_color(accent.opacity(0.7))
+                            .text_color(accent)
+                    })
+                    .child(label)
+                    .on_drop(cx.listener(move |this, d: &DraggedThread, _, cx| {
+                        let id = d.id.clone();
+                        this.store
+                            .update(cx, |s, cx| s.place_pane(id, at, replace, cap, cx));
+                    }))
+            };
+        h_flex()
+            .absolute()
+            .inset_0()
+            .child(zone("left", ix, false, "Place here", cx).w(gpui_kit::relative(0.28)))
+            .child(zone("middle", ix, true, "Swap in", cx).flex_1())
+            .child(zone("right", ix + 1, false, "Place here", cx).w(gpui_kit::relative(0.28)))
+            .into_any_element()
+    }
+
+    /// A new thread in a pane of its own (⌘T).
+    pub(crate) fn new_pane(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, _| s.expect_new_pane());
+        self.new_thread(None, cx);
+    }
+
     pub(crate) fn interrupt(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.store.read(cx).selected.clone()
             && self.is_running(&id, cx)
@@ -1791,92 +2061,6 @@ impl WorkspaceView {
     }
 
     // -- sidebar ------------------------------------------------------------
-
-    fn render_tab_strip(
-        &mut self,
-        tabs: Vec<gpui_kit::SystemWindowTab>,
-        window: &mut Window,
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let current = window.window_handle().window_id();
-        let mut strip = h_flex()
-            .h(px(38.))
-            .flex_shrink_0()
-            .pl(px(TRAFFIC_LIGHTS_INSET))
-            .pr_2()
-            .gap_1()
-            .items_center()
-            .bg(p.sidebar)
-            .border_b_1()
-            .border_color(p.border);
-        for (ix, tab) in tabs.into_iter().enumerate() {
-            let active = tab.id == current;
-            let handle = tab.handle;
-            let title = tab
-                .title
-                .split(" — ")
-                .next()
-                .unwrap_or("Agentloft")
-                .to_owned();
-            strip = strip.child(
-                h_flex()
-                    .id(SharedString::from(format!("win-tab-{ix}")))
-                    .group("win-tab")
-                    .flex_1()
-                    .min_w_0()
-                    .max_w(px(260.))
-                    .h(px(28.))
-                    .px_2()
-                    .gap_1()
-                    .items_center()
-                    .rounded(px(7.))
-                    .text_xs()
-                    .cursor_pointer()
-                    .when(active, |d| {
-                        d.bg(p.background)
-                            .text_color(p.foreground)
-                            .border_1()
-                            .border_color(p.border)
-                    })
-                    .when(!active, |d| {
-                        d.text_color(p.muted_foreground)
-                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                    })
-                    .child(div().flex_1().min_w_0().truncate().child(title))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("win-tab-x-{ix}")))
-                            .cursor_pointer()
-                            .p(px(2.))
-                            .rounded(px(4.))
-                            .invisible()
-                            .when(active, |d| d.visible())
-                            .group_hover("win-tab", |d| d.visible())
-                            .hover(|d| d.bg(p.border))
-                            .child(Icon::new(IconName::X).xsmall())
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                let _ = handle.update(cx, |_, window, _| window.remove_window());
-                            }),
-                    )
-                    .on_click(move |_, _, cx| {
-                        let _ = handle.update(cx, |_, window, _| window.activate_window());
-                    }),
-            );
-        }
-        strip
-            .child(icon_button(
-                "win-tab-new",
-                IconName::Plus,
-                p,
-                cx.listener(|_, _, window, cx| {
-                    let tab = crate::windows::Placement::TabOf(window.window_handle());
-                    crate::windows::open(None, tab, cx);
-                }),
-            ))
-            .into_any_element()
-    }
 
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (projects, all_threads, selected, conn, error, unread) = {
@@ -2038,11 +2222,7 @@ impl WorkspaceView {
                     .id("sidebar-titlebar")
                     .on_click(titlebar_double_click)
                     .h(px(HEADER_HEIGHT))
-                    .pl(px(if self.tabs_shown {
-                        8.
-                    } else {
-                        TRAFFIC_LIGHTS_INSET
-                    }))
+                    .pl(px(TRAFFIC_LIGHTS_INSET))
                     .pr_2()
                     .items_center()
                     .justify_end()
@@ -2165,7 +2345,7 @@ impl WorkspaceView {
             .border_b_1()
             .border_color(p.border)
             // Room for the traffic lights, growing as the sidebar slides shut.
-            .when(!self.tabs_shown && self.sidebar_amount < 1., |d| {
+            .when(self.sidebar_amount < 1., |d| {
                 d.pl(px(
                     16. + (TRAFFIC_LIGHTS_INSET - 16.) * (1. - self.sidebar_amount)
                 ))
@@ -2351,7 +2531,16 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
-        let preview = self.browser_preview_card(p, window, cx);
+        let tl_width = self
+            .timeline_widths
+            .entry(thread.read(cx).id.clone())
+            .or_default()
+            .clone();
+        let preview = if self.rendering_focused {
+            self.browser_preview_card(p, window, cx)
+        } else {
+            None
+        };
         // Put a saved draft back, once, when the thread first loads.
         let saved = thread.read(cx).model.as_ref().map(|m| {
             (
@@ -2697,7 +2886,7 @@ impl WorkspaceView {
                     .child(timeline)
                     .children(turn_map)
                     .child({
-                        let width = self.timeline_width.clone();
+                        let width = tl_width.clone();
                         gpui_kit::canvas(
                             move |bounds, window, _| {
                                 let w = f32::from(bounds.size.width);
@@ -2947,7 +3136,7 @@ impl WorkspaceView {
             }
         };
         let focus = picker.read(cx).search_focus(cx);
-        let open = self.branch_picker_open;
+        let open = self.branch_picker_open && self.rendering_focused;
         let branch = base.as_ref().map(|b| b.branch.clone());
         let trigger = Button::new("worktree-base")
             .cursor_pointer()
@@ -3209,7 +3398,7 @@ impl WorkspaceView {
         use gpui_kit::component::popover::Popover;
         let picker = self.model_picker_for(thread_id, window, cx);
         let focus = picker.read(cx).search_focus(cx);
-        let open = self.picker_open;
+        let open = self.picker_open && self.rendering_focused;
         let trigger = Button::new("model-picker")
             .cursor_pointer()
             .ghost()
@@ -3404,7 +3593,7 @@ impl Render for WorkspaceView {
         });
 
         let body = match selected {
-            Some(thread) => self.render_thread(thread, &p, window, cx),
+            Some(thread) => self.render_panes(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
         };
         let body = self.with_details_dock(body, window, cx);
@@ -3414,11 +3603,6 @@ impl Render for WorkspaceView {
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
         let header = self.render_header(header_title, &p, cx);
-        // Native tab group (⌘T): GPUI doesn't draw macOS's tab bar under our
-        // transparent title bar, so we draw the tabs ourselves.
-        let window_tabs = window.tabbed_windows().filter(|tabs| tabs.len() > 1);
-        self.tabs_shown = window_tabs.is_some();
-        let tab_strip = window_tabs.map(|tabs| self.render_tab_strip(tabs, window, &p, cx));
         let sidebar = (side > 0.).then(|| {
             div()
                 .flex_none()
@@ -3451,10 +3635,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|_, _: &NewWindow, _, cx| {
                 crate::windows::open(None, crate::windows::Placement::Window, cx);
             }))
-            .on_action(cx.listener(|_, _: &NewTab, window, cx| {
-                let tab = crate::windows::Placement::TabOf(window.window_handle());
-                crate::windows::open(None, tab, cx);
-            }))
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_pane(cx)))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
                 this.search.update(cx, |s, cx| s.focus(window, cx));
@@ -3485,7 +3666,6 @@ impl Render for WorkspaceView {
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
-            .children(tab_strip)
             .child(
                 h_flex().flex_1().min_h_0().children(sidebar).child(
                     v_flex()
@@ -3875,10 +4055,24 @@ fn thread_row(
             )
         })
         .child(trailing)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            let id = id.clone();
-            this.store.update(cx, |s, cx| s.select_thread(id, cx));
-        }))
+        .on_click(
+            cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
+                let id = id.clone();
+                // ⌘-click: beside the current one, in a pane of its own.
+                if event.modifiers().platform {
+                    this.store.update(cx, |s, cx| s.open_pane(id, cx));
+                } else {
+                    this.store.update(cx, |s, cx| s.select_thread(id, cx));
+                }
+            }),
+        )
+        .on_drag(
+            DraggedThread {
+                id: thread.id.clone(),
+                title: thread.title.clone(),
+            },
+            |d, _, _, cx| cx.new(|_| d.clone()),
+        )
         .context_menu({
             let store = store.clone();
             let id = thread.id.clone();
@@ -3897,11 +4091,14 @@ fn thread_row(
                             }),
                     )
                     .item(
-                        PopupMenuItem::new("Open in New Tab")
-                            .icon(IconName::Plus)
-                            .on_click(move |_, window, cx| {
-                                let tab = crate::windows::Placement::TabOf(window.window_handle());
-                                crate::windows::open(Some(i2.clone()), tab, cx);
+                        PopupMenuItem::new("Open in New Pane")
+                            .icon(IconName::Columns2)
+                            .on_click({
+                                let store = store.clone();
+                                move |_, _, cx| {
+                                    let id = i2.clone();
+                                    store.update(cx, |s, cx| s.open_pane(id, cx));
+                                }
                             }),
                     )
                     .separator();
@@ -4065,6 +4262,39 @@ impl Slide {
     fn linear(&self) -> f32 {
         let t = self.linear_progress();
         if self.open { t } else { 1. - t }
+    }
+}
+
+/// Narrowest and shortest a pane may be: how many fit decides the grid.
+const PANE_MIN_W: f32 = 340.;
+const PANE_MIN_H: f32 = 320.;
+/// Most panes a window shows.
+const MAX_PANES: usize = 8;
+
+/// A thread being dragged (from the sidebar, or a pane's title bar).
+#[derive(Clone)]
+pub(crate) struct DraggedThread {
+    pub id: ThreadId,
+    pub title: String,
+}
+
+impl Render for DraggedThread {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .max_w(px(260.))
+            .px_3()
+            .py_1p5()
+            .rounded(px(9.))
+            .bg(p.elevated)
+            .border_1()
+            .border_color(p.accent.opacity(0.6))
+            .shadow_lg()
+            .text_sm()
+            .child(Icon::new(IconName::Columns2).xsmall().text_color(p.accent))
+            .child(div().truncate().child(self.title.clone()))
     }
 }
 
@@ -4290,11 +4520,14 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
             let t = id.clone();
             menu = menu
                 .item(
-                    PopupMenuItem::new("Open in New Tab")
-                        .icon(IconName::SquarePen)
-                        .on_click(move |_, window, cx| {
-                            let tab = crate::windows::Placement::TabOf(window.window_handle());
-                            crate::windows::open(Some(t.clone()), tab, cx);
+                    PopupMenuItem::new("Open in New Pane")
+                        .icon(IconName::Columns2)
+                        .on_click({
+                            let store = store.clone();
+                            move |_, _, cx| {
+                                let id = t.clone();
+                                store.update(cx, |s, cx| s.open_pane(id, cx));
+                            }
                         }),
                 )
                 .separator();

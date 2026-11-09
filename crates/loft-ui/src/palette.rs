@@ -158,12 +158,12 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
         }
         let id = t.id.clone();
         items.push(entry(
-            "Open in new tab",
-            IconName::SquarePen,
+            "Open in new pane",
+            IconName::Columns2,
             None,
-            move |_, window, cx| {
-                let tab = crate::windows::Placement::TabOf(window.window_handle());
-                crate::windows::open(Some(id.clone()), tab, cx);
+            move |v, _, cx| {
+                let id = id.clone();
+                v.store.update(cx, |s, cx| s.open_pane(id, cx));
             },
         ));
         if let ThreadWorkspace::Worktree { base, .. } = &t.workspace
@@ -211,13 +211,10 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
             |v, _, cx| v.new_thread(None, cx),
         ),
         entry(
-            "New tab",
-            IconName::Plus,
+            "New pane",
+            IconName::Columns2,
             Some(Box::new(NewTab)),
-            |_, window, cx| {
-                let tab = crate::windows::Placement::TabOf(window.window_handle());
-                crate::windows::open(None, tab, cx);
-            },
+            |v, _, cx| v.new_pane(cx),
         ),
         entry(
             "New window",
