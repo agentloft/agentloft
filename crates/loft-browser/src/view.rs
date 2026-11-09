@@ -4,6 +4,7 @@ use crate::address::{DEFAULT_SEARCH_TEMPLATE, SchemePolicy, normalize_address, s
 use crate::command::{
     BrowserCommand, BrowserError, EVAL_TIMEOUT, NAVIGATION_TIMEOUT, SCRIPT_TIMEOUT,
 };
+use crate::menu::{self, Entry};
 use crate::native::{JsWorld, LoadMark, NativeEvent, NativeWebView, PageState};
 use crate::script::{self, Helper};
 use crate::snapshot::{MAX_SNAPSHOT_CHARS, PageSnapshot, format_snapshot};
@@ -22,12 +23,12 @@ use gpui_kit::{
     Render, SharedString, Styled as _, Subscription, Task, Window, actions, canvas, div,
     prelude::FluentBuilder as _, px, relative,
 };
+use gpui_kit::{Bounds, Pixels};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 actions!(
@@ -235,10 +236,9 @@ pub struct BrowserView {
     /// Annotation mode: clicks leave notes instead of acting on the page.
     annotating: bool,
     /// The screen-size menu is open (the native page is hidden meanwhile).
-    device_menu_open: bool,
-    /// A picture of the page shown in its place while the device menu is
-    /// open (the native view would cover the menu).
-    frozen: Option<Arc<gpui_kit::Image>>,
+    /// Where the device and ⋮ buttons are (menus open under them).
+    device_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    more_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The user's page zoom (1.0 = 100%), on top of any device scaling.
     user_zoom: f32,
     _tasks: Vec<Task<()>>,
@@ -321,8 +321,8 @@ impl BrowserView {
             rotated: false,
             area: Rc::new(Cell::new(None)),
             annotating: false,
-            device_menu_open: false,
-            frozen: None,
+            device_anchor: Rc::default(),
+            more_anchor: Rc::default(),
             user_zoom: 1.0,
             _tasks: tasks,
             _subscriptions: subscriptions,
@@ -428,68 +428,20 @@ impl BrowserView {
         self.annotating
     }
 
-    /// The live page shows unless hidden or swapped for its picture.
     fn page_shown(&self) -> bool {
-        self.visible && self.frozen.is_none()
+        self.visible
     }
 
-    /// The page: live, or its picture while a menu covers it.
-    fn page(&self, native: Rc<NativeWebView>) -> AnyElement {
-        self.page_zoomed(native, 1.)
-    }
-
+    /// The page, at `zoom` times the user's zoom.
     fn page_zoomed(&self, native: Rc<NativeWebView>, zoom: f32) -> AnyElement {
-        use gpui_kit::StyledImage as _;
         div()
             .flex_1()
             .min_h_0()
             .size_full()
-            .relative()
             .flex()
             .flex_col()
             .child(Surface::new(native, self.page_shown()).zoom(f64::from(zoom * self.user_zoom)))
-            .when_some(self.frozen.clone(), |d, image| {
-                d.child(
-                    gpui_kit::img(image)
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .object_fit(gpui_kit::ObjectFit::Fill),
-                )
-            })
             .into_any_element()
-    }
-
-    /// Freeze the page into a picture (so a menu can open over it), or
-    /// bring the live page back.
-    fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.device_menu_open = open;
-        if !open {
-            self.frozen = None;
-            cx.notify();
-            return;
-        }
-        let Some(native) = self.native.clone() else {
-            return;
-        };
-        let rx = native.screenshot();
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(shot)) = rx.await else {
-                return;
-            };
-            let image = Arc::new(gpui_kit::Image::from_bytes(
-                gpui_kit::ImageFormat::Png,
-                shot.png,
-            ));
-            let _ = this.update(cx, |this, cx| {
-                if this.device_menu_open {
-                    this.frozen = Some(image);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     /// A PNG of the page as shown (pins included), for attaching.
@@ -528,82 +480,74 @@ impl BrowserView {
 
     /// The ⋮ menu: reloads, inspector, zoom, site data.
     fn more_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let view = cx.weak_entity();
-        let on_open = view.clone();
         let zoom = self.user_zoom;
-        Button::new("loft-browser-more")
+        let anchor = self.more_anchor.clone();
+        let button = Button::new("loft-browser-more")
             .cursor_pointer()
             .small()
             .ghost()
             .icon(IconName::EllipsisVertical)
             .tooltip("More")
             .disabled(self.native.is_none())
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+            .on_click(move |_, window, cx| {
                 let act =
                     |label: String,
                      icon: IconName,
                      f: fn(&mut BrowserView, &mut Context<BrowserView>)| {
                         let v = view.clone();
-                        PopupMenuItem::new(label)
-                            .icon(icon)
-                            .on_click(move |_, _, cx| {
-                                _ = v.update(cx, f);
-                            })
+                        Entry::item(label, icon, move |cx| {
+                            _ = v.update(cx, f);
+                        })
                     };
-                menu.item(act("Hard Reload".into(), IconName::RotateCw, |this, cx| {
-                    if let Some(native) = &this.native {
-                        native.hard_reload();
-                        cx.notify();
-                    }
-                }))
-                .item(act(
-                    "Open Web Inspector".into(),
-                    IconName::Bug,
-                    |this, _| {
+                let entries = vec![
+                    act("Hard Reload".into(), IconName::RotateCw, |this, cx| {
+                        if let Some(native) = &this.native {
+                            native.hard_reload();
+                            cx.notify();
+                        }
+                    }),
+                    act("Open Web Inspector".into(), IconName::Bug, |this, _| {
                         if let Some(native) = &this.native {
                             native.open_devtools();
                         }
-                    },
-                ))
-                .separator()
-                .item(act("Zoom In".into(), IconName::ZoomIn, |this, cx| {
-                    this.zoom_step(1, cx)
-                }))
-                .item(act("Zoom Out".into(), IconName::ZoomOut, |this, cx| {
-                    this.zoom_step(-1, cx)
-                }))
-                .item(
+                    }),
+                    Entry::Separator,
+                    act("Zoom In".into(), IconName::ZoomIn, |this, cx| {
+                        this.zoom_step(1, cx)
+                    }),
+                    act("Zoom Out".into(), IconName::ZoomOut, |this, cx| {
+                        this.zoom_step(-1, cx)
+                    }),
                     act(
                         format!("Actual Size · {:.0}%", zoom * 100.),
                         IconName::Expand,
                         |this, cx| this.zoom_step(0, cx),
                     )
                     .disabled((zoom - 1.0).abs() < 0.01),
-                )
-                .separator()
-                .item(act(
-                    "Clear Cookies & Site Data".into(),
-                    IconName::Cookie,
-                    |this, cx| {
+                    Entry::Separator,
+                    act(
+                        "Clear Cookies & Site Data".into(),
+                        IconName::Cookie,
+                        |this, cx| {
+                            if let Some(native) = &this.native {
+                                native.clear_data(crate::native::SiteData::Cookies);
+                                native.reload();
+                                cx.notify();
+                            }
+                        },
+                    ),
+                    act("Clear Cache".into(), IconName::Eraser, |this, _| {
                         if let Some(native) = &this.native {
-                            native.clear_data(crate::native::SiteData::Cookies);
-                            native.reload();
-                            cx.notify();
+                            native.clear_data(crate::native::SiteData::Cache);
                         }
-                    },
-                ))
-                .item(act("Clear Cache".into(), IconName::Eraser, |this, _| {
-                    if let Some(native) = &this.native {
-                        native.clear_data(crate::native::SiteData::Cache);
-                    }
-                }))
-            })
-            .on_open_change(move |open, _, cx| {
-                let open = *open;
-                _ = on_open.update(cx, |this, cx| this.set_menu_open(open, cx));
-            })
-            .into_any_element()
+                    }),
+                ];
+                if let Some(at) = anchor.get() {
+                    menu::open(window, at, entries, cx);
+                }
+            });
+        anchored(button, self.more_anchor.clone())
     }
 
     /// Remove the numbered pins from the page (after the notes were sent).
@@ -1167,7 +1111,7 @@ impl Render for BrowserView {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(self.page(native.clone()))
+                    .child(self.page_zoomed(native.clone(), 1.))
                     .into_any_element(),
                 Some(ix) => self.device_frame(native.clone(), DEVICES[ix], cx),
             },
@@ -1244,18 +1188,16 @@ impl Render for BrowserView {
 
 impl BrowserView {
     /// The toolbar button: shows the current screen and opens a menu of
-    /// screens. The native page draws above GPUI, so it is hidden while the
-    /// menu is open (otherwise the menu would open under it).
+    /// screens.
     fn device_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let (icon, label) = match self.device.map(|i| DEVICES[i]) {
             None => (IconName::Expand, "Responsive".to_owned()),
             Some(d) => (device_icon(d.kind), d.name.to_owned()),
         };
         let (device, rotated) = (self.device, self.rotated);
         let view = cx.weak_entity();
-        let on_open = view.clone();
-        Button::new("loft-browser-device")
+        let anchor = self.device_anchor.clone();
+        let button = Button::new("loft-browser-device")
             .cursor_pointer()
             .small()
             .icon(icon)
@@ -1263,43 +1205,38 @@ impl BrowserView {
             .when(device.is_none(), |b| b.ghost())
             .tooltip(format!("Screen size: {label}"))
             .disabled(self.native.is_none())
-            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {
-                let pick = |name: String, icon: IconName, ix: Option<usize>| {
+            .on_click(move |_, window, cx| {
+                let pick = |name: &str, icon: IconName, ix: Option<usize>| {
                     let v = view.clone();
-                    PopupMenuItem::new(name)
-                        .icon(icon)
-                        .checked(device == ix)
-                        .on_click(move |_, _, cx| {
-                            _ = v.update(cx, |this, cx| this.set_device(ix, cx));
-                        })
+                    Entry::item(name.to_owned(), icon, move |cx| {
+                        _ = v.update(cx, |this, cx| this.set_device(ix, cx));
+                    })
+                    .checked(device == ix)
                 };
-                menu = menu
-                    .item(pick("Responsive".into(), IconName::Expand, None))
-                    .separator();
+                let mut entries =
+                    vec![pick("Responsive", IconName::Expand, None), Entry::Separator];
                 let mut last = None;
                 for (ix, d) in DEVICES.iter().enumerate() {
                     if last.is_some_and(|k| k != d.kind) {
-                        menu = menu.separator();
+                        entries.push(Entry::Separator);
                     }
                     last = Some(d.kind);
-                    menu = menu.item(pick(d.name.to_owned(), device_icon(d.kind), Some(ix)));
+                    entries.push(pick(d.name, device_icon(d.kind), Some(ix)));
                 }
                 let v = view.clone();
-                menu.separator().item(
-                    PopupMenuItem::new("Rotate")
-                        .icon(IconName::RotateCwSquare)
-                        .checked(rotated)
-                        .disabled(device.is_none())
-                        .on_click(move |_, _, cx| {
-                            _ = v.update(cx, |this, cx| this.rotate(cx));
-                        }),
-                )
-            })
-            .on_open_change(move |open, _, cx| {
-                let open = *open;
-                _ = on_open.update(cx, |this, cx| this.set_menu_open(open, cx));
-            })
-            .into_any_element()
+                entries.push(Entry::Separator);
+                entries.push(
+                    Entry::item("Rotate", IconName::RotateCwSquare, move |cx| {
+                        _ = v.update(cx, |this, cx| this.rotate(cx));
+                    })
+                    .checked(rotated)
+                    .disabled(device.is_none()),
+                );
+                if let Some(at) = anchor.get() {
+                    menu::open(window, at, entries, cx);
+                }
+            });
+        anchored(button, self.device_anchor.clone())
     }
 
     /// The page at the device's size, scaled down to fit the panel.
@@ -1578,6 +1515,19 @@ async fn eval(
     }
     serde_json::from_str(&reply)
         .map_err(|e| BrowserError::Script(format!("the result is not valid JSON: {e}")))
+}
+
+/// `button`, recording where it is so a menu can open under it.
+fn anchored(button: Button, at: Rc<Cell<Option<Bounds<Pixels>>>>) -> AnyElement {
+    div()
+        .relative()
+        .child(button)
+        .child(
+            canvas(move |bounds, _, _| at.set(Some(bounds)), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+        .into_any_element()
 }
 
 fn device_icon(kind: DeviceKind) -> IconName {
