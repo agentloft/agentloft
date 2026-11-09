@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
             cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
-                    cx.update(|cx| theme::reload_if_changed(cx));
+                    cx.update(theme::reload_if_changed);
                 }
             })
             .detach();

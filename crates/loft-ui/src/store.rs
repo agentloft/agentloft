@@ -373,14 +373,14 @@ impl ThreadState {
             // Footer after the last item of a finished turn.
             let turn_id = &items[i - 1].turn_id;
             let next_turn = items.get(i).map(|n| &n.turn_id);
-            if turn_id.is_some() && next_turn != Some(turn_id) {
-                if let Some(turn_ix) = model
+            if turn_id.is_some()
+                && next_turn != Some(turn_id)
+                && let Some(turn_ix) = model
                     .turns
                     .iter()
                     .position(|t| Some(&t.id) == turn_id.as_ref() && t.status.is_terminal())
-                {
-                    rows.push(Row::TurnFooter { turn_ix });
-                }
+            {
+                rows.push(Row::TurnFooter { turn_ix });
             }
         }
         std::mem::replace(&mut self.rows, rows)
