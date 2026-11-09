@@ -42,6 +42,7 @@ gpui_kit::assets::icon_assets!(
         GitMerge,
         Laptop,
         GitCompare,
+        GitFork,
         Globe,
         Loader,
         Moon,

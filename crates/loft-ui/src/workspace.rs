@@ -230,6 +230,10 @@ impl WorkspaceView {
         };
         self.panel_open = true;
         match dev.split_once(':') {
+            Some(("fork", harness)) => {
+                let (t, h) = (thread_id.clone(), HarnessId(harness.into()));
+                self.store.update(cx, |s, cx| s.fork_thread(t, h, cx));
+            }
             Some(("file", path)) => {
                 let path = path.to_owned();
                 self.panel
@@ -385,6 +389,13 @@ impl WorkspaceView {
             }
         });
         self._subs.push(sub);
+        // A fork's handoff digest, for the user to review and send.
+        if let Some(draft) = self.store.update(cx, |s, _| s.drafts.remove(&id)) {
+            composer.update(cx, |c, cx| {
+                c.set_value(draft, window, cx);
+                c.focus(window, cx);
+            });
+        }
         self.composer_harness.insert(id.clone(), thread_harness);
         self.composers.insert(id, composer.clone());
         composer
@@ -553,9 +564,10 @@ impl WorkspaceView {
                     }),
                 ));
             let mut rows = v_flex().gap_px();
-            for thread in threads {
+            for (thread, depth) in nest_forks(threads) {
                 rows = rows.child(thread_row(
                     thread,
+                    depth,
                     selected.as_ref() == Some(&thread.id),
                     p,
                     cx,
@@ -784,6 +796,64 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    /// "Forked from …" marker above a fork's timeline (ADR-0011).
+    fn fork_bar(
+        &self,
+        parent: loft_protocol::ThreadParent,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title = self
+            .store
+            .read(cx)
+            .workspace
+            .threads
+            .iter()
+            .find(|t| t.id == parent.thread_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "another thread".into());
+        let how = match parent.kind {
+            loft_protocol::ForkKind::Native => "full context",
+            loft_protocol::ForkKind::Handoff => "handoff",
+        };
+        let id = parent.thread_id.clone();
+        h_flex()
+            .justify_center()
+            .py_1p5()
+            .child(
+                h_flex()
+                    .id("fork-bar")
+                    .gap_1p5()
+                    .items_center()
+                    .px_2p5()
+                    .py_1()
+                    .rounded(px(999.))
+                    .border_1()
+                    .border_color(p.border)
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(p.foreground).bg(p.hover))
+                    .child(Icon::new(IconName::GitFork).xsmall())
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .truncate()
+                            .child(format!("Forked from “{title}”")),
+                    )
+                    .child(
+                        div()
+                            .text_color(p.faint_foreground)
+                            .child(format!("· {how}")),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let id = id.clone();
+                        this.store.update(cx, |s, cx| s.select_thread(id, cx));
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_thread(
         &mut self,
         thread: Entity<ThreadState>,
@@ -792,6 +862,12 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
+        let fork_parent = thread
+            .read(cx)
+            .model
+            .as_ref()
+            .and_then(|m| m.thread.parent.clone());
+        let fork_bar = fork_parent.map(|parent| self.fork_bar(parent, p, cx));
         let state = thread.read(cx);
         let Some(model) = state.model.as_ref() else {
             return v_flex()
@@ -838,18 +914,50 @@ impl WorkspaceView {
                         .text_color(p.foreground)
                         .child("What should we work on?"),
                 )
-                .child(harness_picker(
-                    &model.thread.id,
-                    &model.thread.harness,
-                    &self.store,
-                    p,
-                ))
-                .child(workspace_picker(
-                    &model.thread.id,
-                    &model.thread.workspace,
-                    &self.store,
-                    p,
-                ))
+                .when_some(model.thread.parent.clone(), |d, parent| {
+                    let title = self
+                        .store
+                        .read(cx)
+                        .workspace
+                        .threads
+                        .iter()
+                        .find(|t| t.id == parent.thread_id)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| "another thread".into());
+                    let how = match parent.kind {
+                        loft_protocol::ForkKind::Native => format!(
+                            "{} continues with the full conversation.",
+                            harness_name(&model.thread.harness)
+                        ),
+                        loft_protocol::ForkKind::Handoff => {
+                            "It starts from a handoff summary. Review it below, then send.".into()
+                        }
+                    };
+                    d.child(
+                        h_flex()
+                            .mt_2()
+                            .gap_1p5()
+                            .items_center()
+                            .text_sm()
+                            .child(Icon::new(IconName::GitFork).small())
+                            .child(format!("Forked from “{title}”")),
+                    )
+                    .child(div().text_xs().child(how))
+                })
+                .when(model.thread.parent.is_none(), |d| {
+                    d.child(harness_picker(
+                        &model.thread.id,
+                        &model.thread.harness,
+                        &self.store,
+                        p,
+                    ))
+                    .child(workspace_picker(
+                        &model.thread.id,
+                        &model.thread.workspace,
+                        &self.store,
+                        p,
+                    ))
+                })
                 .child(
                     div()
                         .max_w(px(520.))
@@ -869,12 +977,18 @@ impl WorkspaceView {
             let thread = thread.clone();
             let store = self.store.clone();
             let palette = p.clone();
-            MessageScroller::new("timeline", scroller_state, move |ix, window, cx| {
-                render_row(&thread, &store, &palette, ix, window, cx)
-            })
-            .with_bottom_fade(p.background)
-            .flex_1()
-            .into_any_element()
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .children(fork_bar)
+                .child(
+                    MessageScroller::new("timeline", scroller_state, move |ix, window, cx| {
+                        render_row(&thread, &store, &palette, ix, window, cx)
+                    })
+                    .with_bottom_fade(p.background)
+                    .flex_1(),
+                )
+                .into_any_element()
         };
 
         let action = if running {
@@ -1484,8 +1598,39 @@ fn chip_label(icon: IconName, label: impl Into<SharedString>, p: &Palette) -> An
         .into_any_element()
 }
 
+/// Forks listed under their parent (ADR-0011), keeping the recency order
+/// among siblings. Returns `(thread, depth)`.
+fn nest_forks(threads: Vec<&loft_protocol::Thread>) -> Vec<(&loft_protocol::Thread, usize)> {
+    let present: std::collections::HashSet<&ThreadId> = threads.iter().map(|t| &t.id).collect();
+    let parent_of = |t: &loft_protocol::Thread| {
+        t.parent
+            .as_ref()
+            .map(|p| &p.thread_id)
+            .filter(|id| present.contains(id))
+            .cloned()
+    };
+    fn push<'a>(
+        t: &'a loft_protocol::Thread,
+        depth: usize,
+        all: &[&'a loft_protocol::Thread],
+        parent_of: &dyn Fn(&loft_protocol::Thread) -> Option<ThreadId>,
+        out: &mut Vec<(&'a loft_protocol::Thread, usize)>,
+    ) {
+        out.push((t, depth));
+        for child in all.iter().filter(|c| parent_of(c).as_ref() == Some(&t.id)) {
+            push(child, depth + 1, all, parent_of, out);
+        }
+    }
+    let mut out = Vec::with_capacity(threads.len());
+    for root in threads.iter().filter(|t| parent_of(t).is_none()) {
+        push(root, 0, &threads, &parent_of, &mut out);
+    }
+    out
+}
+
 fn thread_row(
     thread: &loft_protocol::Thread,
+    depth: usize,
     active: bool,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
@@ -1515,7 +1660,7 @@ fn thread_row(
         .id(SharedString::from(format!("thread-{}", thread.id)))
         .gap_2()
         .items_center()
-        .pl(px(26.))
+        .pl(px(26. + 14. * depth.min(4) as f32))
         .pr_2()
         .py(px(6.))
         .rounded(px(7.))
@@ -1528,6 +1673,13 @@ fn thread_row(
         })
         .when(active, |d| d.bg(p.selected))
         .when(!active, |d| d.hover(|d| d.bg(p.hover)))
+        .when(thread.parent.is_some(), |d| {
+            d.child(
+                Icon::new(IconName::GitFork)
+                    .xsmall()
+                    .text_color(p.faint_foreground),
+            )
+        })
         .child(
             div()
                 .flex_1()
@@ -1584,6 +1736,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
     use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
     let store = store.clone();
     let id = thread.id.clone();
+    let harness = thread.harness.clone();
     let worktree = match &thread.workspace {
         ThreadWorkspace::Worktree { path, branch, base } => {
             Some((path.clone(), branch.clone(), base.clone()))
@@ -1631,6 +1784,24 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                     })
                     .separator();
             }
+            for (h, name) in [
+                (HarnessId::CLAUDE, "Claude Code"),
+                (HarnessId::CODEX, "Codex"),
+            ] {
+                let (s, t) = (store.clone(), id.clone());
+                let label = if h == harness.as_str() {
+                    format!("Fork with {name} (full context)")
+                } else {
+                    format!("Fork with {name} (handoff)")
+                };
+                menu = menu.item(PopupMenuItem::new(label).icon(IconName::GitFork).on_click(
+                    move |_, _, cx| {
+                        let t = t.clone();
+                        s.update(cx, |s, cx| s.fork_thread(t, HarnessId(h.into()), cx));
+                    },
+                ));
+            }
+            menu = menu.separator();
             let (s, t) = (store.clone(), id.clone());
             menu.item(
                 PopupMenuItem::new("Archive thread")

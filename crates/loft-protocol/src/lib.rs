@@ -123,6 +123,18 @@ pub enum Request {
         #[serde(default)]
         message: Option<String>,
     },
+    /// Fork a thread (ADR-0011). The same harness forks natively; another
+    /// harness gets a handoff digest back as a `draft` first message for the
+    /// user to review. The fork gets its own worktree from the parent's
+    /// current state unless `share_workspace` (or not a git repo).
+    ForkThread {
+        thread_id: ThreadId,
+        /// Harness for the fork; defaults to the parent's.
+        #[serde(default)]
+        harness: Option<HarnessId>,
+        #[serde(default)]
+        share_workspace: bool,
+    },
     /// Stop the thread's agent and terminal and remove its worktree (the
     /// branch is kept). A dirty worktree needs `force`.
     ArchiveThread {
@@ -263,14 +275,36 @@ pub struct Welcome {
 pub enum Response {
     Pong,
     Ok,
-    Project { project: Project },
-    Thread { thread: Thread },
-    DirListing { entries: Vec<DirEntry> },
-    File { file: FileContent },
-    Diff { diff: DiffResult },
-    Terminal { terminal: TerminalInfo },
-    Json { value: serde_json::Value },
-    Text { text: String },
+    Project {
+        project: Project,
+    },
+    Thread {
+        thread: Thread,
+    },
+    DirListing {
+        entries: Vec<DirEntry>,
+    },
+    File {
+        file: FileContent,
+    },
+    Diff {
+        diff: DiffResult,
+    },
+    Terminal {
+        terminal: TerminalInfo,
+    },
+    Json {
+        value: serde_json::Value,
+    },
+    Text {
+        text: String,
+    },
+    /// A new fork, plus the handoff digest to offer as its first message.
+    Forked {
+        thread: Thread,
+        #[serde(default)]
+        draft: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

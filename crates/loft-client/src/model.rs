@@ -220,6 +220,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             workspace: Default::default(),
+            parent: None,
         };
         let item = Item {
             id: ItemId::new(),

@@ -425,6 +425,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             workspace: Default::default(),
+            parent: None,
         }
     }
 

@@ -30,6 +30,28 @@ pub struct Thread {
     /// Where the agent works: the project checkout or its own worktree.
     #[serde(default)]
     pub workspace: ThreadWorkspace,
+    /// Set on forks: the thread this one was forked from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ThreadParent>,
+}
+
+/// Where a fork came from (ADR-0011).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadParent {
+    pub thread_id: ThreadId,
+    /// The parent's last turn at the fork point.
+    #[serde(default)]
+    pub turn_id: Option<TurnId>,
+    pub kind: ForkKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkKind {
+    /// The provider's own fork: the full conversation carries over.
+    Native,
+    /// A different provider: the new thread starts from a handoff digest.
+    Handoff,
 }
 
 /// A thread's workspace (ADR-0008, PLAN §5.2).

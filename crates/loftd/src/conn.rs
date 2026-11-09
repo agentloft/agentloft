@@ -210,7 +210,8 @@ async fn forward(
                     if env.seq <= seq || !matches_topic(&topic, &env.event) {
                         continue;
                     }
-                    if out.send(ServerMsg::Event { sub_id, event: env }).is_err() {
+                    let event = Arc::unwrap_or_clone(env);
+                    if out.send(ServerMsg::Event { sub_id, event }).is_err() {
                         return;
                     }
                 }

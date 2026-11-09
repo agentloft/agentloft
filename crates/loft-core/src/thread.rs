@@ -5,8 +5,8 @@
 use crate::{Core, CoreResult, internal};
 use loft_harness::{HarnessEvent, SessionCommand, SessionConfig, SessionHandle, TurnInput};
 use loft_protocol::{
-    DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, Item, ItemBody, ItemId,
-    ItemStatus, PermissionMode, RequestId, RequestStatus, Response, RuntimeRequest, Thread,
+    DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, ForkKind, Item, ItemBody,
+    ItemId, ItemStatus, PermissionMode, RequestId, RequestStatus, Response, RuntimeRequest, Thread,
     ThreadStatus, Turn, TurnId, TurnStatus,
 };
 use loft_store::now_ms;
@@ -324,6 +324,19 @@ impl ThreadActor {
         Ok(Response::Ok)
     }
 
+    /// For a native fork's first session: the parent's provider session.
+    fn native_fork_source(&self) -> Option<String> {
+        let parent = self.thread.parent.as_ref()?;
+        if self.thread.native_session_id.is_some() || parent.kind != ForkKind::Native {
+            return None;
+        }
+        self.core
+            .with_store(|s| s.thread(&parent.thread_id))
+            .ok()
+            .flatten()
+            .and_then(|p| p.native_session_id)
+    }
+
     fn ensure_session(&mut self) -> CoreResult<()> {
         if self.session.is_some() {
             return Ok(());
@@ -349,6 +362,7 @@ impl ThreadActor {
             permission_mode: self.thread.permission_mode,
             resume: self.thread.native_session_id.clone(),
             new_session_id: new_session_id.clone(),
+            fork_from: self.native_fork_source(),
             env: opts.env.clone(),
             binary: (hcfg.path != "auto").then(|| hcfg.path.clone().into()),
             extra_args: hcfg.extra_args.clone(),

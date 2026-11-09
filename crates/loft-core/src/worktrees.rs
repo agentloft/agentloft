@@ -18,7 +18,7 @@ fn not_found() -> ErrorBody {
     ErrorBody::new(ErrorCode::NotFound, "thread not found")
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> CoreResult<T> {
     tokio::task::spawn_blocking(f)
@@ -187,7 +187,14 @@ impl Core {
         force: bool,
     ) -> CoreResult<Response> {
         let mut thread = self.load_thread(id)?;
-        if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace {
+        // A fork sharing this worktree keeps it alive.
+        let shared = self
+            .with_store(|s| s.threads())?
+            .iter()
+            .any(|t| &t.id != id && t.status != ThreadStatus::Archived && t.cwd == thread.cwd);
+        if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace
+            && !shared
+        {
             let dir = PathBuf::from(path);
             if !force && dir.exists() {
                 let d = dir.clone();
@@ -208,7 +215,9 @@ impl Core {
             }
         }
         self.terminals.close_key(&format!("thread:{}", id.as_str()));
-        if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace {
+        if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace
+            && !shared
+        {
             let project = self
                 .with_store(|s| s.project(&thread.project_id))?
                 .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
@@ -259,7 +268,7 @@ fn commit_message(prompt: Option<&str>, title: &str) -> String {
     msg
 }
 
-fn slug_or(text: &str, fallback: &str) -> String {
+pub(crate) fn slug_or(text: &str, fallback: &str) -> String {
     let slug = wt::slugify(text, 40);
     if slug.is_empty() {
         fallback.to_owned()

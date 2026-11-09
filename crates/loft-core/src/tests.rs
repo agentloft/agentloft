@@ -464,3 +464,81 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
         "branch kept"
     );
 }
+
+#[tokio::test]
+async fn fork_gets_own_worktree_and_handoff_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            ..Default::default()
+        },
+    );
+    let parent = new_thread(&core, &repo).await;
+    core.handle(Request::SendMessage {
+        thread_id: parent.id.clone(),
+        text: "Make the greeting friendlier".into(),
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &parent.id, turn_done).await;
+    // Uncommitted work in the parent's checkout at fork time.
+    std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let Response::Forked { thread, draft } = core
+        .handle(Request::ForkThread {
+            thread_id: parent.id.clone(),
+            harness: None,
+            share_workspace: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let p = thread.parent.clone().expect("parent link");
+    assert_eq!(p.thread_id, parent.id);
+    assert_eq!(
+        p.kind,
+        loft_protocol::ForkKind::Handoff,
+        "fake has no native fork"
+    );
+    let draft = draft.expect("handoff draft");
+    assert!(draft.contains("- Make the greeting friendlier"), "{draft}");
+    assert!(draft.contains(&format!("thread `{}`", parent.id)));
+    let ThreadWorkspace::Worktree { path, branch, base } = &thread.workspace else {
+        panic!("{:?}", thread.workspace)
+    };
+    assert_eq!(branch, "agentloft/make-the-greeting-friendlier-fork");
+    assert_eq!(base, "main");
+    assert_eq!(
+        std::fs::read_to_string(PathBuf::from(path).join("a.txt")).unwrap(),
+        "one\ntwo\n",
+        "fork starts from the parent's current state"
+    );
+    // The parent's checkout is untouched.
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "main");
+
+    // Sharing the workspace instead keeps the parent's cwd.
+    let Response::Forked { thread: shared, .. } = core
+        .handle(Request::ForkThread {
+            thread_id: parent.id.clone(),
+            harness: None,
+            share_workspace: true,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(shared.cwd, parent.cwd);
+}

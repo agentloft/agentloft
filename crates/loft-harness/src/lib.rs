@@ -29,6 +29,9 @@ pub struct SessionConfig {
     pub resume: Option<String>,
     /// Pre-assigned native session id for a brand-new session (Claude).
     pub new_session_id: Option<String>,
+    /// Start as a native fork of this session (ADR-0011); ignored when
+    /// `resume` is set.
+    pub fork_from: Option<String>,
     /// Environment for the child (login-shell capture).
     pub env: Arc<HashMap<String, String>>,
     /// Resolved binary path, or `None` to resolve via `env["PATH"]`.

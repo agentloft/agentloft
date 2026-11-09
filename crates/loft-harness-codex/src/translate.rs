@@ -21,6 +21,7 @@ enum Pending {
     Initialize,
     ThreadStart,
     ThreadResume,
+    ThreadFork,
     TurnStart,
     Other,
 }
@@ -60,6 +61,8 @@ pub struct Translator {
     interrupted: bool,
     /// MCP servers whose tool calls are approved automatically.
     pub auto_allow_mcp: Vec<String>,
+    /// Open the session as a native fork of this Codex thread.
+    pub fork_from: Option<String>,
 }
 
 impl Translator {
@@ -98,13 +101,26 @@ impl Translator {
     }
 
     fn open_thread(&mut self) -> Value {
-        match self.resume.clone() {
-            Some(id) => self.request(
+        match (self.resume.clone(), self.fork_from.clone()) {
+            (Some(id), _) => self.request(
                 Pending::ThreadResume,
                 "thread/resume",
                 json!({ "threadId": id }),
             ),
-            None => {
+            (None, Some(parent)) => {
+                // Native fork (ADR-0011), into this thread's own cwd.
+                let mut params = json!({ "threadId": parent, "cwd": self.cwd });
+                if let Some(model) = &self.model {
+                    params["model"] = json!(model);
+                }
+                if let Some(mode) = self.mode {
+                    let (approval, sandbox) = thread_policy(mode);
+                    params["approvalPolicy"] = json!(approval);
+                    params["sandbox"] = json!(sandbox);
+                }
+                self.request(Pending::ThreadFork, "thread/fork", params)
+            }
+            (None, None) => {
                 let mut params = json!({ "cwd": self.cwd });
                 if let Some(model) = &self.model {
                     params["model"] = json!(model);
@@ -237,6 +253,18 @@ impl Translator {
                         Out::Send(self.open_thread()),
                     ]
                 }
+                Pending::ThreadFork => {
+                    self.fork_from = None;
+                    vec![
+                        Out::Event(HarnessEvent::Notice {
+                            level: NoticeLevel::Warning,
+                            text: format!(
+                                "Couldn't fork the Codex thread ({msg}); started a new one."
+                            ),
+                        }),
+                        Out::Send(self.open_thread()),
+                    ]
+                }
                 Pending::Initialize | Pending::ThreadStart | Pending::TurnStart => {
                     vec![Out::Event(HarnessEvent::TurnCompleted {
                         status: TurnStatus::Failed,
@@ -257,7 +285,7 @@ impl Translator {
                 out.push(Out::Send(self.open_thread()));
                 out
             }
-            Pending::ThreadStart | Pending::ThreadResume => {
+            Pending::ThreadStart | Pending::ThreadResume | Pending::ThreadFork => {
                 let thread = result
                     .pointer("/thread/id")
                     .and_then(Value::as_str)
@@ -904,6 +932,35 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn fork_opens_thread_fork_and_falls_back_on_error() {
+        let mut t = Translator::new("/tmp/wt".into(), None, None, None);
+        t.fork_from = Some("parent-thread".into());
+        t.initialize();
+        let out = t.on_line(r#"{"id":1,"result":{}}"#);
+        let Out::Send(fork) = &out[1] else { panic!() };
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["threadId"], "parent-thread");
+        assert_eq!(fork["params"]["cwd"], "/tmp/wt");
+        // A failed fork starts a fresh thread instead, with a notice.
+        let id = fork["id"].as_u64().unwrap();
+        let out = t.on_line(&format!(
+            r#"{{"id":{id},"error":{{"message":"no rollout"}}}}"#
+        ));
+        assert!(matches!(events(&out)[0], HarnessEvent::Notice { .. }));
+        let Out::Send(start) = &out[1] else { panic!() };
+        assert_eq!(start["method"], "thread/start");
+        // The fork's own id becomes the session id.
+        let id = start["id"].as_u64().unwrap();
+        let out = t.on_line(&format!(
+            r#"{{"id":{id},"result":{{"thread":{{"id":"child"}}}}}}"#
+        ));
+        assert!(matches!(
+            events(&out)[0],
+            HarnessEvent::SessionReady { native_session_id, .. } if native_session_id == "child"
+        ));
     }
 
     #[test]

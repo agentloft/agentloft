@@ -3,6 +3,8 @@
 //! fans them out on a broadcast bus together with ephemeral streaming deltas.
 
 mod clients;
+mod forks;
+mod handoff;
 mod terminals;
 mod thread;
 mod workbench;
@@ -28,7 +30,8 @@ use tokio::sync::{broadcast, oneshot};
 /// Message on the core bus: a committed event or a streaming delta.
 #[derive(Debug, Clone)]
 pub enum BusMsg {
-    Event(EventEnvelope),
+    /// Shared: the bus clones each message per subscriber.
+    Event(Arc<EventEnvelope>),
     Delta(Delta),
     /// Terminal output; `offset` is the byte position of `data` in the
     /// terminal's output stream (for de-duplication against replays).
@@ -129,7 +132,7 @@ impl Core {
         let mut store = lock(&self.store);
         let envs = store.commit(events).map_err(internal)?;
         for env in &envs {
-            let _ = self.bus.send(BusMsg::Event(env.clone()));
+            let _ = self.bus.send(BusMsg::Event(Arc::new(env.clone())));
         }
         Ok(envs)
     }
@@ -378,6 +381,11 @@ impl Core {
             Request::MergeThread { thread_id, message } => {
                 self.merge_thread(&thread_id, message).await
             }
+            Request::ForkThread {
+                thread_id,
+                harness,
+                share_workspace,
+            } => self.fork_thread(&thread_id, harness, share_workspace).await,
             Request::ArchiveThread { thread_id, force } => {
                 self.archive_thread(&thread_id, force).await
             }
@@ -480,6 +488,7 @@ impl Core {
             created_at_ms: now,
             updated_at_ms: now,
             workspace,
+            parent: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

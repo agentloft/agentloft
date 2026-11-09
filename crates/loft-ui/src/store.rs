@@ -91,6 +91,8 @@ pub struct AppStore {
     pub queued: HashMap<ThreadId, std::collections::VecDeque<String>>,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
+    /// Text to prefill a thread's composer with (a fork's handoff digest).
+    pub drafts: HashMap<ThreadId, String>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
@@ -114,6 +116,7 @@ impl AppStore {
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
             last_error: None,
+            drafts: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
             daemon_pid: None,
@@ -478,6 +481,26 @@ impl AppStore {
                 _ => "Merged".into(),
             });
             store.notify_result(result, cx);
+        });
+    }
+
+    /// Fork into `harness` (ADR-0011) and open the fork; a cross-provider
+    /// fork's handoff digest lands in its composer for review.
+    pub fn fork_thread(&mut self, thread_id: ThreadId, harness: HarnessId, cx: &mut Context<Self>) {
+        let body = Request::ForkThread {
+            thread_id,
+            harness: Some(harness),
+            share_workspace: false,
+        };
+        self.request_result(body, cx, |store, result, cx| match result {
+            Ok(Response::Forked { thread, draft }) => {
+                if let Some(draft) = draft {
+                    store.drafts.insert(thread.id.clone(), draft);
+                }
+                store.select_thread(thread.id, cx);
+            }
+            Ok(_) => {}
+            Err(err) => store.notify_result(Err(err), cx),
         });
     }
 

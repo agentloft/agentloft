@@ -187,8 +187,14 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
     .collect();
     if let Some(id) = &cfg.resume {
         args.extend(["--resume".into(), id.clone()]);
-    } else if let Some(id) = &cfg.new_session_id {
-        args.extend(["--session-id".into(), id.clone()]);
+    } else {
+        // A fork resumes the parent into a new session (with our id).
+        if let Some(parent) = &cfg.fork_from {
+            args.extend(["--resume".into(), parent.clone(), "--fork-session".into()]);
+        }
+        if let Some(id) = &cfg.new_session_id {
+            args.extend(["--session-id".into(), id.clone()]);
+        }
     }
     if let Some(model) = &cfg.model {
         args.extend(["--model".into(), model.clone()]);
@@ -247,6 +253,7 @@ mod tests {
             permission_mode: None,
             resume: None,
             new_session_id: Some("abc".into()),
+            fork_from: None,
             env: Arc::new(HashMap::new()),
             binary: None,
             extra_args: vec![],
@@ -280,6 +287,18 @@ mod tests {
         assert!(args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--permission-mode".to_owned()));
         assert!(!args.contains(&"--model".to_owned()));
+    }
+
+    #[test]
+    fn fork_resumes_parent_into_new_session() {
+        let mut c = cfg();
+        c.fork_from = Some("parent".into());
+        let args = build_args(&c);
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--resume parent --fork-session --session-id abc"),
+            "{joined}"
+        );
     }
 
     #[test]
