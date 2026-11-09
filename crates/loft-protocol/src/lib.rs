@@ -149,6 +149,9 @@ pub enum Request {
         harness: Option<HarnessId>,
         #[serde(default)]
         share_workspace: bool,
+        /// Fork from the end of this turn instead of the latest one.
+        #[serde(default)]
+        at_turn: Option<TurnId>,
     },
     /// Restore the thread's files to how they were before `turn_id` (undoing
     /// that turn and every later one). The conversation is kept; the agent

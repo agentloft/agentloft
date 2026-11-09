@@ -188,6 +188,10 @@ pub struct Turn {
     pub checkpoint_before: Option<String>,
     #[serde(default)]
     pub checkpoint_after: Option<String>,
+    /// The agent's own marker for the end of this turn (Claude's last
+    /// assistant message uuid, Codex's turn id), to fork from it natively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

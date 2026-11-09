@@ -333,7 +333,7 @@ impl WorkspaceView {
             }
             Some(("fork", harness)) => {
                 let (t, h) = (thread_id.clone(), HarnessId(harness.into()));
-                self.store.update(cx, |s, cx| s.fork_thread(t, h, cx));
+                self.store.update(cx, |s, cx| s.fork_thread(t, h, None, cx));
             }
             Some(("file", path)) => {
                 let path = path.to_owned();
@@ -2739,7 +2739,9 @@ fn thread_row(
                             .icon(IconName::GitFork)
                             .on_click(move |_, _, cx| {
                                 let i = i.clone();
-                                s.update(cx, |s, cx| s.fork_thread(i, HarnessId(h.into()), cx));
+                                s.update(cx, |s, cx| {
+                                    s.fork_thread(i, HarnessId(h.into()), None, cx)
+                                });
                             }),
                     );
                 }
@@ -2925,7 +2927,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                 menu = menu.item(PopupMenuItem::new(label).icon(IconName::GitFork).on_click(
                     move |_, _, cx| {
                         let t = t.clone();
-                        s.update(cx, |s, cx| s.fork_thread(t, HarnessId(h.into()), cx));
+                        s.update(cx, |s, cx| s.fork_thread(t, HarnessId(h.into()), None, cx));
                     },
                 ));
             }

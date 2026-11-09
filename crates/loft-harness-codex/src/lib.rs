@@ -79,6 +79,7 @@ impl Harness for CodexHarness {
         translator.effort = cfg.effort.clone();
         // `mcp__agentloft` in allowed_tools → auto-approve that server's tools.
         translator.fork_from = cfg.fork_from.clone();
+        translator.fork_at = cfg.fork_at.clone();
         translator.auto_allow_mcp = cfg
             .allowed_tools
             .iter()
@@ -307,6 +308,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             fork_from: None,
+            fork_at: None,
             env: Arc::new(HashMap::new()),
             binary: None,
             extra_args: vec![],

@@ -232,6 +232,9 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
         // A fork resumes the parent into a new session (with our id).
         if let Some(parent) = &cfg.fork_from {
             args.extend(["--resume".into(), parent.clone(), "--fork-session".into()]);
+            if let Some(at) = &cfg.fork_at {
+                args.extend(["--resume-session-at".into(), at.clone()]);
+            }
         }
         if let Some(id) = &cfg.new_session_id {
             args.extend(["--session-id".into(), id.clone()]);
@@ -383,6 +386,7 @@ mod tests {
             resume: None,
             new_session_id: Some("abc".into()),
             fork_from: None,
+            fork_at: None,
             env: Arc::new(HashMap::new()),
             binary: None,
             extra_args: vec![],
@@ -417,6 +421,19 @@ mod tests {
         assert!(!args.contains(&"--permission-mode".to_owned()));
         assert!(!args.contains(&"--model".to_owned()));
         assert!(!args.contains(&"--effort".to_owned()));
+    }
+
+    #[test]
+    fn fork_from_an_earlier_turn() {
+        let mut c = cfg();
+        c.new_session_id = None;
+        c.fork_from = Some("parent".into());
+        c.fork_at = Some("msg-uuid".into());
+        let joined = build_args(&c).join(" ");
+        assert!(
+            joined.contains("--resume parent --fork-session --resume-session-at msg-uuid"),
+            "{joined}"
+        );
     }
 
     #[test]

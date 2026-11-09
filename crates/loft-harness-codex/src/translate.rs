@@ -65,6 +65,8 @@ pub struct Translator {
     pub auto_allow_mcp: Vec<String>,
     /// Open the session as a native fork of this Codex thread.
     pub fork_from: Option<String>,
+    /// With `fork_from`: the last turn to keep (`lastTurnId`).
+    pub fork_at: Option<String>,
 }
 
 impl Translator {
@@ -112,6 +114,9 @@ impl Translator {
             (None, Some(parent)) => {
                 // Native fork (ADR-0011), into this thread's own cwd.
                 let mut params = json!({ "threadId": parent, "cwd": self.cwd });
+                if let Some(at) = &self.fork_at {
+                    params["lastTurnId"] = json!(at);
+                }
                 if let Some(model) = &self.model {
                     params["model"] = json!(model);
                 }
@@ -377,6 +382,11 @@ impl Translator {
             }
             "turn/completed" => {
                 let turn = p.get("turn").unwrap_or(&Value::Null);
+                let marker = turn.get("id").and_then(Value::as_str).map(|id| {
+                    Out::Event(HarnessEvent::TurnMarker {
+                        native_turn: id.to_owned(),
+                    })
+                });
                 let status = match turn.get("status").and_then(Value::as_str) {
                     Some("completed") => TurnStatus::Completed,
                     Some("interrupted") => TurnStatus::Interrupted,
@@ -400,6 +410,7 @@ impl Translator {
                     .collect();
                 self.turn_id = None;
                 self.interrupted = false;
+                out.extend(marker);
                 out.push(Out::Event(HarnessEvent::TurnCompleted {
                     status,
                     usage,
@@ -989,6 +1000,31 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "GPT-6.1-Sol");
         assert!(models[0].is_default);
+    }
+
+    #[test]
+    fn fork_through_an_earlier_turn() {
+        let mut t = Translator::new("/tmp/wt".into(), None, None, None);
+        t.fork_from = Some("parent-thread".into());
+        t.fork_at = Some("turn-1".into());
+        t.initialize();
+        let out = t.on_line(r#"{"id":1,"result":{}}"#);
+        let Out::Send(fork) = &out[1] else { panic!() };
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["lastTurnId"], "turn-1");
+    }
+
+    #[test]
+    fn turn_completion_reports_the_turn_id() {
+        let mut t = Translator::new("/tmp/probe".into(), None, None, None);
+        t.thread_id = Some("T".into());
+        t.start_turn("x");
+        let out = t.on_line(
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-9","status":"completed"}}}"#,
+        );
+        assert!(events(&out).iter().any(
+            |e| matches!(e, HarnessEvent::TurnMarker { native_turn } if native_turn == "turn-9")
+        ));
     }
 
     #[test]

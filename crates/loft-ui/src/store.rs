@@ -706,11 +706,19 @@ impl AppStore {
 
     /// Fork into `harness` (ADR-0011) and open the fork; a cross-provider
     /// fork's handoff digest lands in its composer for review.
-    pub fn fork_thread(&mut self, thread_id: ThreadId, harness: HarnessId, cx: &mut Context<Self>) {
+    /// `at_turn` forks from the end of that turn instead of the latest.
+    pub fn fork_thread(
+        &mut self,
+        thread_id: ThreadId,
+        harness: HarnessId,
+        at_turn: Option<loft_protocol::TurnId>,
+        cx: &mut Context<Self>,
+    ) {
         let body = Request::ForkThread {
             thread_id,
             harness: Some(harness),
             share_workspace: false,
+            at_turn,
         };
         self.request_result(body, cx, |store, result, cx| match result {
             Ok(Response::Forked { thread, draft }) => {

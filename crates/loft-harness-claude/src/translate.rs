@@ -284,6 +284,14 @@ impl Translator {
         let parent = str_at(v, "parent_tool_use_id").map(str::to_owned);
         let streamed = self.streamed_messages.contains(&msg_id);
         let mut out = Vec::new();
+        // The latest main-thread message marks where a fork can resume.
+        if parent.is_none()
+            && let Some(uuid) = str_at(v, "uuid")
+        {
+            out.push(Out::Event(HarnessEvent::TurnMarker {
+                native_turn: uuid.to_owned(),
+            }));
+        }
         let Some(content) = message.get("content").and_then(Value::as_array) else {
             return out;
         };

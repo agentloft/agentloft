@@ -152,7 +152,7 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
                 move |v, _, cx| {
                     let id = id.clone();
                     v.store
-                        .update(cx, |s, cx| s.fork_thread(id, HarnessId(h.into()), cx));
+                        .update(cx, |s, cx| s.fork_thread(id, HarnessId(h.into()), None, cx));
                 },
             ));
         }

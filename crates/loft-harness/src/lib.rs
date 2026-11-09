@@ -34,6 +34,8 @@ pub struct SessionConfig {
     /// Start as a native fork of this session (ADR-0011); ignored when
     /// `resume` is set.
     pub fork_from: Option<String>,
+    /// With `fork_from`: fork through this turn marker only.
+    pub fork_at: Option<String>,
     /// Environment for the child (login-shell capture).
     pub env: Arc<HashMap<String, String>>,
     /// Resolved binary path, or `None` to resolve via `env["PATH"]`.
@@ -128,6 +130,10 @@ pub enum HarnessEvent {
     },
     RequestResolved {
         native_id: String,
+    },
+    /// The agent's marker for the turn so far (see `Turn::native_turn`).
+    TurnMarker {
+        native_turn: String,
     },
     TurnCompleted {
         status: TurnStatus,

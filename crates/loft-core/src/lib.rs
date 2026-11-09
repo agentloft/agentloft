@@ -619,7 +619,11 @@ impl Core {
                 thread_id,
                 harness,
                 share_workspace,
-            } => self.fork_thread(&thread_id, harness, share_workspace).await,
+                at_turn,
+            } => {
+                self.fork_thread(&thread_id, harness, share_workspace, at_turn)
+                    .await
+            }
             Request::ReloadConfig => self.reload_config(),
             Request::ListModels { harness } => self.list_models(&harness).await,
             Request::ProbeHarness { harness } => self.probe_harness(&harness).await,

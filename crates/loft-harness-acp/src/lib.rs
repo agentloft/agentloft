@@ -339,6 +339,7 @@ mod tests {
             resume: None,
             new_session_id: None,
             fork_from: None,
+            fork_at: None,
             env: Arc::new(HashMap::new()),
             binary: None,
             extra_args: extra,

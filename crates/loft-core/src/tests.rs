@@ -580,6 +580,8 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
             thread_id: parent.id.clone(),
             harness: None,
             share_workspace: false,
+
+            at_turn: None,
         })
         .await
         .unwrap()
@@ -615,6 +617,8 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
             thread_id: parent.id.clone(),
             harness: None,
             share_workspace: true,
+
+            at_turn: None,
         })
         .await
         .unwrap()

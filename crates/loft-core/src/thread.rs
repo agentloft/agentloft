@@ -322,6 +322,7 @@ impl ThreadActor {
             error: None,
             checkpoint_before: None,
             checkpoint_after: None,
+            native_turn: None,
         };
         let user_item = self.new_item(
             Some(turn.id.clone()),
@@ -573,16 +574,30 @@ impl ThreadActor {
     }
 
     /// For a native fork's first session: the parent's provider session.
-    fn native_fork_source(&self) -> Option<String> {
-        let parent = self.thread.parent.as_ref()?;
+    /// For a native fork's first session: the parent's session and the
+    /// turn marker to fork through (`None` = all of it).
+    fn native_fork_source(&self) -> (Option<String>, Option<String>) {
+        let Some(parent) = self.thread.parent.as_ref() else {
+            return (None, None);
+        };
         if self.thread.native_session_id.is_some() || parent.kind != ForkKind::Native {
-            return None;
+            return (None, None);
         }
-        self.core
+        let session = self
+            .core
             .with_store(|s| s.thread(&parent.thread_id))
             .ok()
             .flatten()
-            .and_then(|p| p.native_session_id)
+            .and_then(|p| p.native_session_id);
+        let at = parent.turn_id.as_ref().and_then(|turn_id| {
+            self.core
+                .with_store(|s| s.turns(&parent.thread_id))
+                .ok()?
+                .into_iter()
+                .find(|t| &t.id == turn_id)?
+                .native_turn
+        });
+        (session, at)
     }
 
     fn ensure_session(&mut self) -> CoreResult<()> {
@@ -600,6 +615,7 @@ impl ThreadActor {
         let new_session_id = (self.thread.native_session_id.is_none()
             && harness.capabilities().client_session_id)
             .then(|| uuid::Uuid::new_v4().to_string());
+        let (fork_from, fork_at) = self.native_fork_source();
         let cfg = SessionConfig {
             thread_label: self.thread.id.to_string(),
             cwd: self.thread.cwd.clone().into(),
@@ -608,7 +624,8 @@ impl ThreadActor {
             permission_mode: self.thread.permission_mode,
             resume: self.thread.native_session_id.clone(),
             new_session_id: new_session_id.clone(),
-            fork_from: self.native_fork_source(),
+            fork_from,
+            fork_at,
             env: opts.env.clone(),
             binary: (hcfg.path != "auto").then(|| hcfg.path.clone().into()),
             extra_args: hcfg.extra_args.clone(),
@@ -679,6 +696,11 @@ impl ThreadActor {
 
     fn apply_harness_event(&mut self, event: HarnessEvent) -> CoreResult<()> {
         match event {
+            HarnessEvent::TurnMarker { native_turn } => {
+                if let Some(turn) = self.turn.as_mut() {
+                    turn.native_turn = Some(native_turn);
+                }
+            }
             HarnessEvent::SessionReady {
                 native_session_id,
                 model,

@@ -39,8 +39,17 @@ pub fn render_row(
             let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();
             render_tool_group(thread, store, state, model, &items, p)
         }
-        Row::TurnFooter { turn_ix } => render_turn_footer(store, model, *turn_ix, p),
+        Row::TurnFooter { turn_ix } => {
+            let agents = store.read(cx).available_harnesses();
+            render_turn_footer(store, model, *turn_ix, agents, p)
+        }
     };
+    let footer = matches!(row, Row::TurnFooter { .. });
+    // Under a reply, absorb the Markdown view's trailing paragraph gap.
+    let after_prose = footer
+        && ix > 0
+        && matches!(state.rows.get(ix - 1), Some(Row::Item(i))
+            if matches!(model.items[*i].body, ItemBody::AssistantMessage { .. }));
     div()
         .w_full()
         .flex()
@@ -50,7 +59,11 @@ pub fn render_row(
                 .w_full()
                 .max_w(p.content_width)
                 .px_6()
-                .py(p.row_gap / 2.)
+                // The footer sits right under the reply it belongs to (the
+                // Markdown view already ends with paragraph spacing).
+                .when(footer, |d| d.pt_0().pb(p.row_gap))
+                .when(after_prose, |d| d.mt(px(-22.)))
+                .when(!footer, |d| d.py(p.row_gap / 2.))
                 .child(content),
         )
         .into_any_element()
@@ -91,15 +104,32 @@ pub(crate) fn render_item(
                 .pt_2()
                 .when(!attachments.is_empty(), |d| d.child(images))
                 .when(!text.is_empty(), |d| {
+                    let group = SharedString::from(format!("user-{}", item.id));
                     d.child(
-                        div()
-                            .max_w(relative(0.82))
-                            .px_4()
-                            .py(px(9.))
-                            .rounded(px(18.))
-                            .bg(p.bubble)
-                            .text_color(p.foreground)
-                            .child(text.clone()),
+                        h_flex()
+                            .group(group.clone())
+                            .w_full()
+                            .justify_end()
+                            .items_center()
+                            .gap_1()
+                            .child(div().invisible().group_hover(group, |d| d.visible()).child(
+                                copy_button(
+                                    format!("copy-user-{}", item.id),
+                                    text.clone(),
+                                    "Copy message",
+                                    p,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .max_w(relative(0.82))
+                                    .px_4()
+                                    .py(px(9.))
+                                    .rounded(px(18.))
+                                    .bg(p.bubble)
+                                    .text_color(p.foreground)
+                                    .child(text.clone()),
+                            ),
                     )
                 })
                 .into_any_element()
@@ -591,8 +621,10 @@ fn render_turn_footer(
     store: &Entity<AppStore>,
     model: &ThreadModel,
     turn_ix: usize,
+    agents: Vec<(&'static str, &'static str)>,
     p: &Palette,
 ) -> AnyElement {
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
     let Some(turn) = model.turns.get(turn_ix) else {
         return div().into_any_element();
     };
@@ -615,29 +647,64 @@ fn render_turn_footer(
             parts.push(format!("${cost:.3}"));
         }
     }
-    // Undo: restore files to before this turn (hover to reveal).
-    let can_undo = turn.checkpoint_before.is_some() && model.running_turn().is_none();
+    let idle = model.running_turn().is_none();
+
+    // Copy: the turn's reply (main-thread assistant text).
+    let reply: Vec<&str> = model
+        .items
+        .iter()
+        .filter(|i| i.turn_id.as_ref() == Some(&turn.id) && i.parent_id.is_none())
+        .filter_map(|i| match &i.body {
+            ItemBody::AssistantMessage { text } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let copy = (!reply.is_empty()).then(|| {
+        copy_button(
+            format!("copy-turn-{}", turn.id),
+            reply.join("\n\n"),
+            "Copy response",
+            p,
+        )
+    });
+
+    // Fork the conversation (and files) as of the end of this turn.
+    let fork = idle.then(|| {
+        let (store, thread_id, turn_id) = (store.clone(), model.thread.id.clone(), turn.id.clone());
+        let current = model.thread.harness.clone();
+        Button::new(SharedString::from(format!("fork-turn-{}", turn.id)))
+            .icon(IconName::GitFork)
+            .ghost()
+            .xsmall()
+            .tooltip("Fork from here")
+            .dropdown_menu(move |mut menu, _, _| {
+                for &(id, name) in &agents {
+                    let (store, t, at) = (store.clone(), thread_id.clone(), turn_id.clone());
+                    let label = if id == current.as_str() {
+                        format!("Fork with {name} (same conversation)")
+                    } else {
+                        format!("Fork with {name} (handoff summary)")
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        let h = loft_protocol::HarnessId(id.into());
+                        let (t, at) = (t.clone(), Some(at.clone()));
+                        store.update(cx, |s, cx| s.fork_thread(t, h, at, cx));
+                    }));
+                }
+                menu
+            })
+    });
+
+    // Undo: restore files to before this turn.
+    let can_undo = turn.checkpoint_before.is_some() && idle;
     let undo = can_undo.then(|| {
         let (store, thread_id, turn_id) = (store.clone(), model.thread.id.clone(), turn.id.clone());
         let later = model.turns.len().saturating_sub(turn_ix + 1);
-        div()
-            .id(SharedString::from(format!("undo-{}", turn.id)))
-            .ml_2()
-            .px_1p5()
-            .py(px(1.))
-            .rounded(px(5.))
-            .invisible()
-            .group_hover("turn-footer", |d| d.visible())
-            .cursor_pointer()
-            .text_color(p.muted_foreground)
-            .hover(|d| d.bg(p.hover).text_color(p.foreground))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(Icon::new(IconName::RotateCw).xsmall())
-                    .child("Undo changes"),
-            )
+        Button::new(SharedString::from(format!("undo-{}", turn.id)))
+            .icon(IconName::RotateCw)
+            .ghost()
+            .xsmall()
+            .tooltip("Undo this turn's changes")
             .on_click(move |_, window, cx| {
                 confirm_revert(
                     store.clone(),
@@ -650,15 +717,40 @@ fn render_turn_footer(
             })
     });
     h_flex()
-        .group("turn-footer")
         .gap_1p5()
         .items_center()
         .text_xs()
         .text_color(color)
         .child(Icon::new(icon).xsmall())
         .child(parts.join(" · "))
-        .children(undo)
+        .child(
+            h_flex()
+                .ml_1()
+                .gap_px()
+                .items_center()
+                .text_color(p.faint_foreground)
+                .children(copy)
+                .children(fork)
+                .children(undo),
+        )
         .into_any_element()
+}
+
+/// A small copy-to-clipboard icon button.
+fn copy_button(
+    id: String,
+    text: String,
+    tooltip: &'static str,
+    _p: &Palette,
+) -> gpui_kit::component::button::Button {
+    Button::new(SharedString::from(id))
+        .icon(IconName::Copy)
+        .ghost()
+        .xsmall()
+        .tooltip(tooltip)
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+        })
 }
 
 pub(crate) fn confirm_revert(
