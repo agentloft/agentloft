@@ -290,11 +290,10 @@ pub async fn connect_or_spawn(
         }
         tracing::info!(pid, "restarting outdated agentloftd");
         drop(conn);
+        // Wait for the old process itself to exit: it holds the home's lock
+        // until it has stopped its agents, and the new daemon needs it.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while Client::connect_with(&socket, kind, build, &[])
-            .await
-            .is_ok()
-        {
+        while process_alive(pid) {
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!("the outdated agentloftd (pid {pid}) didn't exit");
             }
@@ -312,6 +311,23 @@ pub async fn connect_or_spawn(
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
+}
+
+/// Whether `pid` is still running (signal 0 probes without signalling).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 only checks existence and permission.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
 }
 
 /// The running daemon's executable differs from the one we'd start.

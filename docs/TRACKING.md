@@ -13,9 +13,9 @@ Legend: `[x]` done and verified · `[~]` partial · `[ ]` not started.
 | 4 | Token-by-token streaming markdown; tool rows with status; cost and usage shown | [x] | Live screenshot 2026-11-09; header shows the last turn's cost and tokens |
 | 5 | Claude default mode: approval card, Allow runs the tool, Deny is handled | [x] | `live_claude` test, plus a UI screenshot of the approval card |
 | 6 | Stop interrupts within 2 s | [x] | `live_claude`: interrupt took 14 ms |
-| 7 | Quitting the UI mid-turn keeps the turn running; reopening catches up | [~] | Daemon independence is covered by e2e (reconnect gets a full snapshot); **manual quit-mid-turn check pending** |
-| 8 | `kill -9` of the daemon: UI respawns it, turn shows interrupted, the next message resumes the same session | [~] | Recovery + resume verified by `live_claude` (restart) and `loft-core` tests; UI auto-respawns on disconnect; **manual kill -9 check pending** |
-| 9 | No orphan `claude` processes after shutdown; reaper | [~] | Process groups + graceful stop + startup reaper implemented; **no automated reaper test yet** |
+| 7 | Quitting the UI mid-turn keeps the turn running; reopening catches up | [x] | Scripted check 2026-11-09: UI `kill -9` mid-turn; the turn completed in the daemon; reconnect gets a full snapshot (e2e) |
+| 8 | `kill -9` of the daemon: UI respawns it, turn shows interrupted, the next message resumes the same session | [x] | Scripted check 2026-11-09: daemon `kill -9` mid-turn; the UI respawned it within seconds; the turn showed interrupted; the next message completed on the same session. Also `live_claude` (restart) and `loft-core` tests |
+| 9 | No orphan `claude` processes after shutdown; reaper | [x] | Process groups, graceful stop and the startup reaper are in place. Scripted check: after a daemon `kill -9`, the agent child (`opencode acp`) exited at once on stdin EOF. A dedicated reaper test is still missing |
 | 10 | Tests: decider/core, protocol round-trip, Claude fixtures (2.1.319), headless e2e | [x] | 27 tests across crates (plus the ignored `live_claude`); fixtures in `crates/loft-harness-claude/fixtures/` |
 
 Infrastructure:

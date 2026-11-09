@@ -77,6 +77,9 @@ async fn run(paths: Paths) -> Result<()> {
             exe,
             home: paths.home.clone(),
         });
+    // An app updating us may start this daemon while the old one is still
+    // shutting down; give it a moment to let go of the home.
+    loftd::wait_for_lock(&paths, std::time::Duration::from_secs(15)).await;
     let daemon = match Daemon::start(DaemonOptions {
         paths,
         harnesses,

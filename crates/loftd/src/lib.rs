@@ -150,6 +150,25 @@ async fn accept_loop(
     let _ = std::fs::remove_file(paths.socket_file());
 }
 
+/// Wait up to `timeout` for another daemon on this home to release its
+/// lock (an outdated daemon still stopping its agents during an update).
+pub async fn wait_for_lock(paths: &Paths, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match acquire_lock(paths) {
+            // Free: release it again; `Daemon::start` takes it for real.
+            Ok(file) => {
+                drop(file);
+                return;
+            }
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn acquire_lock(paths: &Paths) -> Result<File> {
     let file = File::options()
         .create(true)
