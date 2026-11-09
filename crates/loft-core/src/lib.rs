@@ -64,6 +64,8 @@ pub struct CoreOptions {
     pub worktrees_dir: PathBuf,
     /// `config.toml`, re-read on `Request::ReloadConfig`.
     pub config_file: Option<PathBuf>,
+    /// Where uploaded attachments are stored (`~/.agentloft/attachments`).
+    pub attachments_dir: PathBuf,
 }
 
 impl Default for CoreOptions {
@@ -75,6 +77,7 @@ impl Default for CoreOptions {
             mcp_bridge: None,
             worktrees_dir: std::env::temp_dir().join("agentloft-worktrees"),
             config_file: None,
+            attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
         }
     }
 }
@@ -161,6 +164,59 @@ impl Core {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Validate and store uploaded images; the agent gets file paths.
+    async fn store_attachments(
+        &self,
+        thread_id: &ThreadId,
+        attachments: Vec<loft_protocol::Attachment>,
+    ) -> CoreResult<Vec<loft_protocol::AttachmentRef>> {
+        const MAX_COUNT: usize = 10;
+        const MAX_BYTES: usize = 20 * 1024 * 1024;
+        if attachments.len() > MAX_COUNT {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                format!("at most {MAX_COUNT} attachments per message"),
+            ));
+        }
+        let dir = self.opts.attachments_dir.join(thread_id.as_str());
+        let mut stored = Vec::new();
+        for a in attachments {
+            let ext = match a.mime.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                other => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::BadRequest,
+                        format!("unsupported attachment type `{other}` (images only)"),
+                    ));
+                }
+            };
+            if a.data.0.len() > MAX_BYTES {
+                return Err(ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    format!("`{}` is larger than 20 MB", a.name),
+                ));
+            }
+            let path = dir.join(format!("{}.{ext}", uuid::Uuid::now_v7()));
+            let (d, p, bytes) = (dir.clone(), path.clone(), a.data.0);
+            tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&d)?;
+                std::fs::write(&p, bytes)
+            })
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+            stored.push(loft_protocol::AttachmentRef {
+                name: a.name,
+                mime: a.mime,
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(stored)
     }
 
     fn reload_config(&self) -> CoreResult<Response> {
@@ -300,13 +356,22 @@ impl Core {
                 harness,
                 title,
             } => self.create_thread(project_id, harness, title),
-            Request::SendMessage { thread_id, text } => {
-                if text.trim().is_empty() {
+            Request::SendMessage {
+                thread_id,
+                text,
+                attachments,
+            } => {
+                if text.trim().is_empty() && attachments.is_empty() {
                     return Err(ErrorBody::new(ErrorCode::BadRequest, "empty message"));
                 }
+                let attachments = self.store_attachments(&thread_id, attachments).await?;
                 self.ensure_workspace(&thread_id, &text).await?;
-                self.thread_call(&thread_id, |reply| ThreadCmd::SendMessage { text, reply })
-                    .await
+                self.thread_call(&thread_id, |reply| ThreadCmd::SendMessage {
+                    text,
+                    attachments,
+                    reply,
+                })
+                .await
             }
             Request::Interrupt { thread_id } => {
                 self.thread_call(&thread_id, |reply| ThreadCmd::Interrupt { reply })

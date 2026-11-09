@@ -54,6 +54,14 @@ pub enum ForkKind {
     Handoff,
 }
 
+/// An attachment stored by the daemon (`~/.agentloft/attachments`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub name: String,
+    pub mime: String,
+    pub path: String,
+}
+
 /// A thread's workspace (ADR-0008, PLAN §5.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -174,6 +182,9 @@ pub enum ItemStatus {
 pub enum ItemBody {
     UserMessage {
         text: String,
+        /// Images sent with the message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentRef>,
     },
     AssistantMessage {
         text: String,

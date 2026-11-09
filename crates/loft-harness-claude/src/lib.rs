@@ -130,7 +130,10 @@ async fn run(
             }
             cmd = ends.commands.recv() => {
                 let outs = match cmd {
-                    Some(SessionCommand::StartTurn(input)) => t.start_turn(&input.text),
+                    Some(SessionCommand::StartTurn(input)) => {
+                        let images = read_images(&input.images).await;
+                        t.start_turn_with(&input.text, &images)
+                    }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::Respond { native_request_id, decision }) => {
                         t.respond(&native_request_id, decision)
@@ -168,6 +171,24 @@ async fn write_json(stdin: &mut ChildStdin, v: &serde_json::Value) -> std::io::R
     line.push(b'\n');
     stdin.write_all(&line).await?;
     stdin.flush().await
+}
+
+/// Attached images as `(mime, base64)` for stream-json image blocks.
+async fn read_images(images: &[loft_harness::ImageInput]) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    let mut out = Vec::new();
+    for image in images {
+        match tokio::fs::read(&image.path).await {
+            Ok(bytes) => out.push((
+                image.mime.clone(),
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )),
+            Err(err) => {
+                tracing::warn!(path = %image.path.display(), %err, "attachment unreadable")
+            }
+        }
+    }
+    out
 }
 
 pub fn build_args(cfg: &SessionConfig) -> Vec<String> {

@@ -54,6 +54,14 @@ pub struct McpServer {
 #[derive(Debug, Clone)]
 pub struct TurnInput {
     pub text: String,
+    pub images: Vec<ImageInput>,
+}
+
+/// An image attached to a prompt: a file the daemon stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageInput {
+    pub path: std::path::PathBuf,
+    pub mime: String,
 }
 
 #[derive(Debug)]

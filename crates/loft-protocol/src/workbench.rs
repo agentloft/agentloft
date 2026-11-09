@@ -141,3 +141,12 @@ mod tests {
         );
     }
 }
+
+/// An image uploaded with a message (stored by the daemon).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    pub data: Bytes,
+}

@@ -56,6 +56,7 @@ Built ahead of the PLAN's milestone order, by request.
 | Browser panel | [x] | WKWebView (`loft-browser`, wry) in the side panel; agents drive it over MCP (navigate, snapshot, click, type, eval); Claude verified live |
 | Office documents | [x] | `loft-docs`: Word (paragraphs/tables), Excel (sheet grid), PowerPoint (slides), CSV; verified with sample files |
 | Queued messages, approval shortcuts (M1) | [x] | ⌘⏎ / ⌘⇧⏎ / ⌘⇧⌫ |
+| Image attachments (M1) | [x] | Paste (⌘V), drag-and-drop or the paperclip. The daemon stores images under `~/.agentloft/attachments` (png/jpeg/gif/webp, at most 10 per message, 20 MB each). Claude gets base64 image blocks, Codex gets `localImage`. Timeline thumbnails open on click, and queued messages keep their images. Verified live with both agents |
 | Settings window (M5) | [x] | ⌘, opens a native window with sections: Appearance (theme, accent swatches, text/code size, density, width, fonts; applied live), Agents (binary, default model and permissions per harness), Worktrees (mode, prefix) and About. Writes `config.toml` with toml_edit, keeping comments. The daemon applies changes via `ReloadConfig`. **Not yet done:** keymap editor, CLI version/auth probe |
 | App icon, bundle, About, menus | [x] | `cargo xtask bundle` |
 

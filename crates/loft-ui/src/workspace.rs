@@ -120,6 +120,8 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 pub struct WorkspaceView {
     store: Entity<AppStore>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
+    /// Images waiting in each thread's composer.
+    attachments: HashMap<ThreadId, Vec<crate::attachments::PendingImage>>,
     composer_harness: HashMap<ThreadId, HarnessId>,
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
@@ -154,6 +156,7 @@ impl WorkspaceView {
         Self {
             store,
             composers: HashMap::new(),
+            attachments: HashMap::new(),
             composer_harness: HashMap::new(),
             observed: HashMap::new(),
             search,
@@ -233,6 +236,10 @@ impl WorkspaceView {
             Some(("settings", section)) => {
                 let section = crate::settings::Section::parse(section);
                 crate::settings::open(self.store.clone(), section, cx);
+            }
+            Some(("attach", path)) => {
+                let paths = vec![std::path::PathBuf::from(path)];
+                self.attach_paths(thread_id.clone(), paths, cx);
             }
             Some(("fork", harness)) => {
                 let (t, h) = (thread_id.clone(), HarnessId(harness.into()));
@@ -413,18 +420,31 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let text = composer.read(cx).value().trim().to_owned();
-        if text.is_empty() {
+        let has_images = self
+            .attachments
+            .get(thread_id)
+            .is_some_and(|a| !a.is_empty());
+        if text.is_empty() && !has_images {
             return;
         }
         composer.update(cx, |c, cx| c.set_value("", window, cx));
+        let attachments: Vec<loft_protocol::Attachment> = self
+            .attachments
+            .remove(thread_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|a| a.to_attachment())
+            .collect();
         let id = thread_id.clone();
         if self.is_running(thread_id, cx) {
             // Sent automatically when the current turn ends.
+            let queued = crate::store::Queued { text, attachments };
             self.store
-                .update(cx, |store, cx| store.enqueue(id, text, cx));
+                .update(cx, |store, cx| store.enqueue(id, queued, cx));
         } else {
-            self.store
-                .update(cx, |store, cx| store.send_message(id, text, cx));
+            self.store.update(cx, |store, cx| {
+                store.send_message(id, text, attachments, cx)
+            });
         }
     }
 
@@ -481,6 +501,50 @@ impl WorkspaceView {
                 store.update(cx, |store, cx| {
                     store.add_project(path.to_string_lossy().into_owned(), cx)
                 });
+            }
+        })
+        .detach();
+    }
+
+    fn add_images(
+        &mut self,
+        thread_id: &ThreadId,
+        images: Vec<crate::attachments::PendingImage>,
+        cx: &mut Context<Self>,
+    ) {
+        let list = self.attachments.entry(thread_id.clone()).or_default();
+        let room = crate::attachments::MAX_IMAGES.saturating_sub(list.len());
+        list.extend(images.into_iter().take(room));
+        cx.notify();
+    }
+
+    /// Attach image files (from a drop or the picker), read off-thread.
+    fn attach_paths(
+        &mut self,
+        thread_id: ThreadId,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let images = cx
+                .background_executor()
+                .spawn(async move { crate::attachments::read_paths(&paths) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.add_images(&thread_id, images, cx));
+        })
+        .detach();
+    }
+
+    fn pick_images(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = this.update(cx, |this, cx| this.attach_paths(thread_id, paths, cx));
             }
         })
         .detach();
@@ -896,13 +960,32 @@ impl WorkspaceView {
         let current_model = model.thread.model.clone();
         let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
-        let queued: Vec<String> = self
+        let queued: Vec<crate::store::Queued> = self
             .store
             .read(cx)
             .queued
             .get(&thread_id)
             .map(|q| q.iter().cloned().collect())
             .unwrap_or_default();
+        let pending = self
+            .attachments
+            .get(&thread_id)
+            .cloned()
+            .unwrap_or_default();
+        let strip = crate::attachments::strip(&pending, p, {
+            let view = cx.entity().downgrade();
+            let id = thread_id.clone();
+            move |ix, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(list) = this.attachments.get_mut(&id)
+                        && ix < list.len()
+                    {
+                        list.remove(ix);
+                    }
+                    cx.notify();
+                });
+            }
+        });
 
         let timeline = if empty {
             v_flex()
@@ -995,6 +1078,7 @@ impl WorkspaceView {
                 .into_any_element()
         };
 
+        let drop_accent = p.accent;
         let action = if running {
             let id = thread_id.clone();
             round_button(
@@ -1048,6 +1132,7 @@ impl WorkspaceView {
                         })
                         .child(
                             v_flex()
+                                .id("composer-card")
                                 .p_2()
                                 .gap_2()
                                 .rounded(px(18.))
@@ -1055,6 +1140,42 @@ impl WorkspaceView {
                                 .border_color(p.border)
                                 .bg(p.elevated)
                                 .shadow_lg()
+                                // ⌘V with an image on the clipboard attaches it;
+                                // text pastes fall through to the textarea.
+                                .capture_action({
+                                    let id = thread_id.clone();
+                                    cx.listener(
+                                        move |this,
+                                              _: &gpui_kit::component::input::Paste,
+                                              _,
+                                              cx| {
+                                            let Some(item) = cx.read_from_clipboard() else {
+                                                return;
+                                            };
+                                            let images = crate::attachments::from_clipboard(&item);
+                                            if !images.is_empty() {
+                                                cx.stop_propagation();
+                                                this.add_images(&id, images, cx);
+                                            }
+                                        },
+                                    )
+                                })
+                                .drag_over::<gpui_kit::ExternalPaths>(move |d, _, _, _| {
+                                    d.border_color(drop_accent)
+                                })
+                                .on_drop({
+                                    let id = thread_id.clone();
+                                    cx.listener(
+                                        move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                                            this.attach_paths(
+                                                id.clone(),
+                                                paths.paths().to_vec(),
+                                                cx,
+                                            );
+                                        },
+                                    )
+                                })
+                                .children(strip)
                                 .child(
                                     div()
                                         .px_2()
@@ -1068,6 +1189,17 @@ impl WorkspaceView {
                                         .child(
                                             h_flex()
                                                 .gap_1()
+                                                .child({
+                                                    let id = thread_id.clone();
+                                                    icon_button(
+                                                        "attach",
+                                                        IconName::Paperclip,
+                                                        p,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.pick_images(id.clone(), cx)
+                                                        }),
+                                                    )
+                                                })
                                                 .child(model_menu(
                                                     &thread_id,
                                                     &harness,
@@ -1419,7 +1551,7 @@ fn pill_button(
 /// Messages waiting for the current turn to end, each removable.
 fn queued_list(
     thread_id: &ThreadId,
-    queued: &[String],
+    queued: &[crate::store::Queued],
     store: &Entity<AppStore>,
     p: &Palette,
 ) -> Option<AnyElement> {
@@ -1427,7 +1559,12 @@ fn queued_list(
         return None;
     }
     let mut list = v_flex().gap_1().px_1();
-    for (ix, text) in queued.iter().enumerate() {
+    for (ix, q) in queued.iter().enumerate() {
+        let text = match (q.text.is_empty(), q.attachments.len()) {
+            (_, 0) => q.text.clone(),
+            (true, n) => format!("{n} image{}", if n == 1 { "" } else { "s" }),
+            (false, n) => format!("{} · {n} image{}", q.text, if n == 1 { "" } else { "s" }),
+        };
         let (store, thread_id) = (store.clone(), thread_id.clone());
         list = list.child(
             h_flex()

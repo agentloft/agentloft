@@ -10,14 +10,21 @@ use loft_client::model::{ThreadModel, WorkspaceModel};
 use loft_client::{Client, ClientEvent};
 use loft_config::Paths;
 use loft_protocol::{
-    ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId, ProjectId,
-    Request, RequestId, Response, Snapshot, TerminalId, ThreadId, Topic,
+    Attachment, ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId,
+    ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId, Topic,
 };
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub const BUILD: &str = env!("CARGO_PKG_VERSION");
+
+/// A message typed while a turn was running.
+#[derive(Debug, Clone)]
+pub struct Queued {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
 
 /// App-wide UI events (e.g. a timeline row asking the panel to open a file).
 #[derive(Debug, Clone)]
@@ -88,7 +95,7 @@ pub struct AppStore {
     /// Harness for new threads (the last one the user picked).
     pub default_harness: HarnessId,
     /// Messages typed while a turn was running, sent when it ends.
-    pub queued: HashMap<ThreadId, std::collections::VecDeque<String>>,
+    pub queued: HashMap<ThreadId, std::collections::VecDeque<Queued>>,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
     /// Text to prefill a thread's composer with (a fork's handoff digest).
@@ -543,8 +550,8 @@ impl AppStore {
     }
 
     /// Queue a message for when the current turn ends.
-    pub fn enqueue(&mut self, thread_id: ThreadId, text: String, cx: &mut Context<Self>) {
-        self.queued.entry(thread_id).or_default().push_back(text);
+    pub fn enqueue(&mut self, thread_id: ThreadId, message: Queued, cx: &mut Context<Self>) {
+        self.queued.entry(thread_id).or_default().push_back(message);
         cx.notify();
     }
 
@@ -563,15 +570,26 @@ impl AppStore {
         if !idle {
             return;
         }
-        let Some(text) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
+        let Some(next) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
             return;
         };
-        self.send_message(id.clone(), text, cx);
+        self.send_message(id.clone(), next.text, next.attachments, cx);
         cx.notify();
     }
 
-    pub fn send_message(&mut self, thread_id: ThreadId, text: String, cx: &mut Context<Self>) {
-        self.request(Request::SendMessage { thread_id, text }, cx, |_, _, _| {});
+    pub fn send_message(
+        &mut self,
+        thread_id: ThreadId,
+        text: String,
+        attachments: Vec<Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        let body = Request::SendMessage {
+            thread_id,
+            text,
+            attachments,
+        };
+        self.request(body, cx, |_, _, _| {});
     }
 
     pub fn set_permission_mode(

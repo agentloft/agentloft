@@ -55,7 +55,7 @@ pub struct Translator {
     thread_id: Option<String>,
     turn_id: Option<String>,
     /// Prompts queued until the thread exists.
-    queued: VecDeque<String>,
+    queued: VecDeque<(String, Vec<String>)>,
     approvals: HashMap<String, OpenApproval>,
     usage: Option<Usage>,
     interrupted: bool,
@@ -135,10 +135,16 @@ impl Translator {
         }
     }
 
-    fn turn_start(&mut self, text: &str, thread: &str) -> Value {
+    fn turn_start(&mut self, text: &str, images: &[String], thread: &str) -> Value {
+        let mut input = vec![json!({ "type": "text", "text": text })];
+        input.extend(
+            images
+                .iter()
+                .map(|path| json!({ "type": "localImage", "path": path })),
+        );
         let mut params = json!({
             "threadId": thread,
-            "input": [{ "type": "text", "text": text }],
+            "input": input,
         });
         if let Some(model) = &self.model {
             params["model"] = json!(model);
@@ -152,12 +158,17 @@ impl Translator {
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {
+        self.start_turn_with(text, &[])
+    }
+
+    /// A prompt with image file paths (`localImage` inputs).
+    pub fn start_turn_with(&mut self, text: &str, images: &[String]) -> Vec<Out> {
         self.interrupted = false;
         self.usage = None;
         let mut out = vec![Out::Event(HarnessEvent::TurnStarted)];
         match self.thread_id.clone() {
-            Some(thread) => out.push(Out::Send(self.turn_start(text, &thread))),
-            None => self.queued.push_back(text.to_owned()),
+            Some(thread) => out.push(Out::Send(self.turn_start(text, images, &thread))),
+            None => self.queued.push_back((text.to_owned(), images.to_vec())),
         }
         out
     }
@@ -300,8 +311,8 @@ impl Translator {
                         .map(str::to_owned),
                     slash_commands: vec![],
                 })];
-                while let Some(text) = self.queued.pop_front() {
-                    out.push(Out::Send(self.turn_start(&text, &thread)));
+                while let Some((text, images)) = self.queued.pop_front() {
+                    out.push(Out::Send(self.turn_start(&text, &images, &thread)));
                 }
                 out
             }

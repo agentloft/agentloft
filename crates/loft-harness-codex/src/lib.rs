@@ -126,7 +126,14 @@ async fn run(
             }
             cmd = ends.commands.recv() => {
                 let outs = match cmd {
-                    Some(SessionCommand::StartTurn(input)) => t.start_turn(&input.text),
+                    Some(SessionCommand::StartTurn(input)) => {
+                        let images: Vec<String> = input
+                            .images
+                            .iter()
+                            .map(|i| i.path.to_string_lossy().into_owned())
+                            .collect();
+                        t.start_turn_with(&input.text, &images)
+                    }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::Respond { native_request_id, decision }) => {
                         t.respond(&native_request_id, decision)

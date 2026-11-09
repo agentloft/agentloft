@@ -19,7 +19,7 @@ pub(crate) fn digest(
     let requests: Vec<&str> = items
         .iter()
         .filter_map(|i| match &i.body {
-            ItemBody::UserMessage { text } => Some(text.trim()),
+            ItemBody::UserMessage { text, .. } => Some(text.trim()),
             _ => None,
         })
         .filter(|t| !t.is_empty())
@@ -154,6 +154,7 @@ mod tests {
         let items = vec![
             item(ItemBody::UserMessage {
                 text: "Add a greet()\nfunction".into(),
+                attachments: vec![],
             }),
             item(ItemBody::ToolCall {
                 tool: "TodoWrite".into(),

@@ -162,6 +162,7 @@ async fn turns_are_checkpointed_and_diffable() {
         .request(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "slow edit a b c d".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();

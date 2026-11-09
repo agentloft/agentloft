@@ -102,6 +102,7 @@ async fn message_streams_and_completes() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "hello world".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -112,7 +113,7 @@ async fn message_streams_and_completes() {
     assert_eq!(thread_now.status, ThreadStatus::Idle);
     assert!(thread_now.native_session_id.is_some());
     assert_eq!(turns[0].status, TurnStatus::Completed);
-    assert!(matches!(&items[0].body, ItemBody::UserMessage { text } if text == "hello world"));
+    assert!(matches!(&items[0].body, ItemBody::UserMessage { text, .. } if text == "hello world"));
     assert!(
         matches!(&items[1].body, ItemBody::AssistantMessage { text } if text == "echo: hello world"),
         "{:?}",
@@ -139,6 +140,7 @@ async fn second_turn_rejected_while_running_then_interrupt() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "slow one two three four five six".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -147,6 +149,7 @@ async fn second_turn_rejected_while_running_then_interrupt() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "again".into(),
+            attachments: vec![],
         })
         .await
         .unwrap_err();
@@ -176,6 +179,7 @@ async fn approval_allow_flow() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "please approve this".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -222,6 +226,7 @@ async fn deny_and_stop_interrupts() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "approve please".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -256,6 +261,7 @@ async fn failed_turn_records_error_item() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "please fail".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -277,6 +283,7 @@ async fn recovery_after_crash_interrupts_running_turns() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "slow a b c d e f g h".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -299,6 +306,7 @@ async fn recovery_after_crash_interrupts_running_turns() {
         .handle(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "after crash".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -388,6 +396,7 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
     core.handle(Request::SendMessage {
         thread_id: thread.id.clone(),
         text: "Add a greet() function!".into(),
+        attachments: vec![],
     })
     .await
     .unwrap();
@@ -487,6 +496,7 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
     core.handle(Request::SendMessage {
         thread_id: parent.id.clone(),
         text: "Make the greeting friendlier".into(),
+        attachments: vec![],
     })
     .await
     .unwrap();

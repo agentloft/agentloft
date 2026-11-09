@@ -41,6 +41,7 @@ async fn turn(
         .request(Request::SendMessage {
             thread_id: model.thread.id.clone(),
             text: text.into(),
+            attachments: vec![],
         })
         .await
         .unwrap();

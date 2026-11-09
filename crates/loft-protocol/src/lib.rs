@@ -84,6 +84,8 @@ pub enum Request {
     SendMessage {
         thread_id: ThreadId,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     Interrupt {
         thread_id: ThreadId,
@@ -453,6 +455,7 @@ mod tests {
                 body: Request::SendMessage {
                     thread_id: ThreadId::new(),
                     text: "hi".into(),
+                    attachments: vec![],
                 },
             },
             ClientMsg::Subscribe {

@@ -63,12 +63,29 @@ impl Translator {
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {
+        self.start_turn_with(text, &[])
+    }
+
+    /// A prompt with images, given as `(mime, base64)`.
+    pub fn start_turn_with(&mut self, text: &str, images: &[(String, String)]) -> Vec<Out> {
         self.turn_active = true;
         self.interrupt_requested = false;
+        let content = if images.is_empty() {
+            json!(text)
+        } else {
+            let mut blocks: Vec<Value> = images
+                .iter()
+                .map(|(mime, data)| {
+                    json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}})
+                })
+                .collect();
+            blocks.push(json!({"type": "text", "text": text}));
+            Value::Array(blocks)
+        };
         vec![
             Out::Send(json!({
                 "type": "user",
-                "message": {"role": "user", "content": text},
+                "message": {"role": "user", "content": content},
             })),
             Out::Event(HarnessEvent::TurnStarted),
         ]

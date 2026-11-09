@@ -63,20 +63,47 @@ pub(crate) fn render_item(
     p: &Palette,
 ) -> AnyElement {
     match &item.body {
-        ItemBody::UserMessage { text } => h_flex()
-            .justify_end()
-            .pt_2()
-            .child(
-                div()
-                    .max_w(relative(0.82))
-                    .px_4()
-                    .py(px(9.))
-                    .rounded(px(18.))
-                    .bg(p.bubble)
-                    .text_color(p.foreground)
-                    .child(text.clone()),
-            )
-            .into_any_element(),
+        ItemBody::UserMessage { text, attachments } => {
+            use gpui_kit::StyledImage as _;
+            let mut images = h_flex().gap_2().justify_end().flex_wrap();
+            for (ix, a) in attachments.iter().enumerate() {
+                let path = std::path::PathBuf::from(&a.path);
+                images = images.child(
+                    div()
+                        .id(SharedString::from(format!("att-{}-{ix}", item.id)))
+                        .size(px(120.))
+                        .rounded(px(12.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(p.border)
+                        .cursor_pointer()
+                        .child(
+                            gpui_kit::img(path.clone())
+                                .size_full()
+                                .object_fit(gpui_kit::ObjectFit::Cover),
+                        )
+                        .on_click(move |_, _, cx| cx.open_with_system(&path)),
+                );
+            }
+            v_flex()
+                .items_end()
+                .gap_1p5()
+                .pt_2()
+                .when(!attachments.is_empty(), |d| d.child(images))
+                .when(!text.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .max_w(relative(0.82))
+                            .px_4()
+                            .py(px(9.))
+                            .rounded(px(18.))
+                            .bg(p.bubble)
+                            .text_color(p.foreground)
+                            .child(text.clone()),
+                    )
+                })
+                .into_any_element()
+        }
 
         ItemBody::AssistantMessage { text } => match state.markdown.get(&item.id) {
             Some(md) => TextView::new(md).stream_fade(true).into_any_element(),

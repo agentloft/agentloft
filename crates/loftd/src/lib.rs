@@ -65,6 +65,7 @@ impl Daemon {
                 mcp_bridge: opts.mcp_bridge,
                 worktrees_dir: paths.worktrees_dir(),
                 config_file: Some(paths.config_file()),
+                attachments_dir: paths.home.join("attachments"),
                 ..CoreOptions::default()
             },
         );

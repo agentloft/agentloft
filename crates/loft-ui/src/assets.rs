@@ -48,6 +48,7 @@ gpui_kit::assets::icon_assets!(
         Minus,
         Moon,
         PanelLeft,
+        Paperclip,
         PanelRight,
         Plus,
         Presentation,

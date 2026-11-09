@@ -52,6 +52,7 @@ impl Session {
             .request(Request::SendMessage {
                 thread_id: self.model.thread.id.clone(),
                 text: text.into(),
+                attachments: vec![],
             })
             .await
             .unwrap();

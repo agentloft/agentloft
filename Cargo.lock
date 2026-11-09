@@ -4247,6 +4247,7 @@ name = "loft-harness-claude"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "loft-config",
  "loft-harness",
  "loft-protocol",
@@ -4318,6 +4319,7 @@ dependencies = [
  "loft-protocol",
  "loft-terminal",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

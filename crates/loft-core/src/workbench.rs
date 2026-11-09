@@ -228,7 +228,7 @@ impl Core {
         );
         for item in items.iter().filter(|i| i.parent_id.is_none()) {
             match &item.body {
-                ItemBody::UserMessage { text } => out.push_str(&format!("## User\n{text}\n\n")),
+                ItemBody::UserMessage { text, .. } => out.push_str(&format!("## User\n{text}\n\n")),
                 ItemBody::AssistantMessage { text } if !text.trim().is_empty() => {
                     out.push_str(&format!("## Assistant\n{text}\n\n"))
                 }

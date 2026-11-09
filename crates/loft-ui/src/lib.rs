@@ -2,6 +2,7 @@
 //! [`store::AppStore`]; views never spawn processes or touch storage.
 
 pub mod assets;
+mod attachments;
 pub mod brand;
 mod items;
 pub mod panel;

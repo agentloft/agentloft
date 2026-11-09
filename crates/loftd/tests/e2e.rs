@@ -95,6 +95,7 @@ async fn full_turn_over_socket_with_reconnect() {
         .request(Request::SendMessage {
             thread_id: thread.id.clone(),
             text: "hello over the socket".into(),
+            attachments: vec![],
         })
         .await
         .unwrap();

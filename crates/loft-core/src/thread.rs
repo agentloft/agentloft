@@ -5,9 +5,9 @@
 use crate::{Core, CoreResult, internal};
 use loft_harness::{HarnessEvent, SessionCommand, SessionConfig, SessionHandle, TurnInput};
 use loft_protocol::{
-    DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, ForkKind, Item, ItemBody,
-    ItemId, ItemStatus, PermissionMode, RequestId, RequestStatus, Response, RuntimeRequest, Thread,
-    ThreadStatus, Turn, TurnId, TurnStatus,
+    AttachmentRef, DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, ForkKind, Item,
+    ItemBody, ItemId, ItemStatus, PermissionMode, RequestId, RequestStatus, Response,
+    RuntimeRequest, Thread, ThreadStatus, Turn, TurnId, TurnStatus,
 };
 use loft_store::now_ms;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +19,7 @@ pub(crate) type Reply = oneshot::Sender<CoreResult<Response>>;
 pub(crate) enum ThreadCmd {
     SendMessage {
         text: String,
+        attachments: Vec<AttachmentRef>,
         reply: Reply,
     },
     Interrupt {
@@ -71,7 +72,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
 struct ThreadActor {
     self_tx: mpsc::WeakUnboundedSender<ThreadCmd>,
     /// Prompt waiting for the "before" checkpoint before it is sent.
-    pending_start: Option<String>,
+    pending_start: Option<(String, Vec<AttachmentRef>)>,
     core: Arc<Core>,
     thread: Thread,
     session: Option<SessionHandle>,
@@ -116,8 +117,12 @@ impl ThreadActor {
 
     fn on_command(&mut self, cmd: ThreadCmd) {
         match cmd {
-            ThreadCmd::SendMessage { text, reply } => {
-                let _ = reply.send(self.send_message(text));
+            ThreadCmd::SendMessage {
+                text,
+                attachments,
+                reply,
+            } => {
+                let _ = reply.send(self.send_message(text, attachments));
             }
             ThreadCmd::Interrupt { reply } if self.pending_start.is_some() => {
                 // The prompt never reached the agent; just end the turn.
@@ -169,7 +174,11 @@ impl ThreadActor {
         }
     }
 
-    fn send_message(&mut self, text: String) -> CoreResult<Response> {
+    fn send_message(
+        &mut self,
+        text: String,
+        attachments: Vec<AttachmentRef>,
+    ) -> CoreResult<Response> {
         if self.turn.is_some() {
             return Err(ErrorBody::new(
                 ErrorCode::Conflict,
@@ -196,7 +205,10 @@ impl ThreadActor {
         };
         let user_item = self.new_item(
             Some(turn.id.clone()),
-            ItemBody::UserMessage { text: text.clone() },
+            ItemBody::UserMessage {
+                text: text.clone(),
+                attachments: attachments.clone(),
+            },
             ItemStatus::Completed,
         )?;
         if ordinal == 1 && self.thread.title == "New thread" {
@@ -215,7 +227,7 @@ impl ThreadActor {
 
         // Snapshot the work tree first; the prompt goes out once that's done
         // so the turn's diff covers exactly the agent's changes.
-        self.pending_start = Some(text);
+        self.pending_start = Some((text, attachments));
         self.capture_checkpoint(&turn, true);
         Ok(Response::Ok)
     }
@@ -271,15 +283,22 @@ impl ThreadActor {
                 let turn = turn.clone();
                 let _ = self.core.commit(vec![Event::TurnUpdated { turn }]);
             }
-            let Some(text) = self.pending_start.take() else {
+            let Some((text, attachments)) = self.pending_start.take() else {
                 return;
             };
+            let images = attachments
+                .into_iter()
+                .map(|a| loft_harness::ImageInput {
+                    path: a.path.into(),
+                    mime: a.mime,
+                })
+                .collect();
             let sent = self
                 .session
                 .as_ref()
                 .map(|s| {
                     s.commands
-                        .send(SessionCommand::StartTurn(TurnInput { text }))
+                        .send(SessionCommand::StartTurn(TurnInput { text, images }))
                         .is_ok()
                 })
                 .unwrap_or(false);
