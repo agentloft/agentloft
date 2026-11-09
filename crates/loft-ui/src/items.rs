@@ -778,7 +778,7 @@ fn copy_button(
             // Back to the copy icon afterwards.
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(COPIED_FOR).await;
-                let _ = cx.update(|cx| cx.refresh_windows());
+                cx.update(|cx| cx.refresh_windows());
             })
             .detach();
         })
