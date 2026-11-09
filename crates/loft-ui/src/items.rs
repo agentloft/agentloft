@@ -73,6 +73,12 @@ pub fn render_row(
             let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();
             render_tool_group(thread, store, state, model, &items, p)
         }
+        Row::Work {
+            turn_ix,
+            open,
+            steps,
+        } => render_work_header(thread, model, *turn_ix, *open, *steps, p),
+        Row::Pending => render_pending(p),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
             render_turn_footer(store, model, *turn_ix, agents, p)
@@ -249,11 +255,16 @@ pub(crate) fn render_item(
                         .cursor_pointer()
                         .hover(|d| d.text_color(p.foreground))
                         .child(Icon::new(IconName::Brain).small())
-                        .child(if thinking {
-                            "Thinking…"
-                        } else {
-                            "Thought process"
-                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(if thinking && text.is_empty() {
+                                    "Thinking…".to_string()
+                                } else {
+                                    reasoning_summary(text).unwrap_or_else(|| "Thought".into())
+                                }),
+                        )
                         .when(!text.is_empty(), |d| d.child(chevron(open)))
                         .on_click(move |_, _, cx| {
                             let key = key.clone();
@@ -308,6 +319,106 @@ pub(crate) fn render_item(
         // Tool calls are rendered as groups (`Row::ToolGroup`).
         ItemBody::ToolCall { .. } => div().into_any_element(),
     }
+}
+
+// -- turn work ---------------------------------------------------------------
+
+/// "1m 58s", "12s", "1h 4m".
+pub(crate) fn human_duration(ms: i64) -> String {
+    let secs = (ms.max(0) / 1000) as u64;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The header over a turn's work: live while it runs, a fold once done.
+fn render_work_header(
+    thread: &Entity<ThreadState>,
+    model: &ThreadModel,
+    turn_ix: usize,
+    open: bool,
+    steps: usize,
+    p: &Palette,
+) -> AnyElement {
+    let Some(turn) = model.turns.get(turn_ix) else {
+        return div().into_any_element();
+    };
+    let running = !turn.status.is_terminal();
+    let elapsed = turn.ended_at_ms.unwrap_or_else(now_ms) - turn.started_at_ms;
+    let label = if running {
+        format!("Working for {}", human_duration(elapsed))
+    } else {
+        format!("Worked for {}", human_duration(elapsed))
+    };
+    let turn_id = turn.id.clone();
+    let thread = thread.clone();
+    h_flex()
+        .id(SharedString::from(format!("work-{}", turn.id.0)))
+        .gap_2()
+        .items_center()
+        .pt_1()
+        .text_sm()
+        .text_color(p.muted_foreground)
+        .child(
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .items_center()
+                .child(label)
+                .when(!running && steps > 0, |d| d.child(chevron(open))),
+        )
+        .child(div().flex_1().h_px().bg(p.border))
+        .when(!running && steps > 0, |d| {
+            d.cursor_pointer()
+                .hover(|d| d.text_color(p.foreground))
+                .on_click(move |_, _, cx| {
+                    thread.update(cx, |t, cx| t.toggle_work(&turn_id, cx));
+                })
+        })
+        .into_any_element()
+}
+
+/// The agent hasn't said anything yet (or is between steps).
+fn render_pending(p: &Palette) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _, pulsating_between};
+    h_flex()
+        .gap_1p5()
+        .items_center()
+        .text_sm()
+        .text_color(p.muted_foreground)
+        .child(Icon::new(IconName::Brain).small())
+        .child("Thinking…")
+        .with_animation(
+            "pending-pulse",
+            Animation::new(std::time::Duration::from_millis(1400))
+                .repeat()
+                .with_easing(pulsating_between(0.45, 1.0)),
+            |d, delta| d.opacity(delta),
+        )
+        .into_any_element()
+}
+
+/// A thought's first line, as its label ("Checking the parser").
+fn reasoning_summary(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.trim_matches(|c: char| c == '*' || c == '#' || c == '_' || c.is_whitespace());
+    if line.is_empty() {
+        return None;
+    }
+    let mut out: String = line.chars().take(90).collect();
+    if line.chars().count() > 90 {
+        out.push('…');
+    }
+    Some(out)
 }
 
 // -- tool activity -----------------------------------------------------------

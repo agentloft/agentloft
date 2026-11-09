@@ -11,7 +11,8 @@ use loft_client::{Client, ClientEvent};
 use loft_config::Paths;
 use loft_protocol::{
     Attachment, ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId,
-    ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId, ThreadStatus, Topic,
+    ItemStatus, ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId,
+    ThreadStatus, Topic,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -1007,6 +1008,15 @@ pub enum Row {
     ToolGroup {
         members: Vec<usize>,
     },
+    /// A turn's work (thinking, tools, interim notes) under one header:
+    /// "Working for 12s" while it runs, "Worked for 1m 58s ›" after.
+    Work {
+        turn_ix: usize,
+        open: bool,
+        steps: usize,
+    },
+    /// The agent is between steps (or hasn't answered yet).
+    Pending,
     TurnFooter {
         turn_ix: usize,
     },
@@ -1023,6 +1033,8 @@ pub struct ThreadState {
     /// Tool groups / reasoning items the user expanded or collapsed,
     /// keyed by their first item id. `true` = expanded.
     pub expanded: HashMap<ItemId, bool>,
+    /// Repaints while a turn runs (its elapsed time).
+    ticker: Option<gpui_kit::Task<()>>,
 }
 
 impl ThreadState {
@@ -1034,6 +1046,7 @@ impl ThreadState {
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             markdown: HashMap::new(),
             expanded: HashMap::new(),
+            ticker: None,
         }
     }
 
@@ -1063,7 +1076,7 @@ impl ThreadState {
         self.rows.iter().position(|r| match r {
             Row::Item(i) => *i == ix,
             Row::ToolGroup { members } => members.contains(&ix),
-            Row::TurnFooter { .. } => false,
+            Row::Work { .. } | Row::Pending | Row::TurnFooter { .. } => false,
         })
     }
 
@@ -1074,53 +1087,131 @@ impl ThreadState {
         let mut rows = Vec::with_capacity(model.items.len());
         let items = &model.items;
         // Subagent activity lives in its own panel tab, not the main timeline.
-        // Claude's internal deferred-tool loading is noise in the timeline.
-        let hidden = |i: usize| matches!(&items[i].body, ItemBody::ToolCall { tool, .. } if tool == "ToolSearch");
-        let top = |i: usize| items[i].parent_id.is_none() && !hidden(i);
-        let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. });
-        let mut i = 0;
-        while i < items.len() {
-            if !top(i) {
-                i += 1;
-                continue;
+        // Claude's internal deferred-tool loading is noise in the timeline, and
+        // a finished thought with nothing to show is just a blank row.
+        let hidden = |i: usize| match &items[i].body {
+            ItemBody::ToolCall { tool, .. } => tool == "ToolSearch",
+            ItemBody::Reasoning { text } => {
+                text.trim().is_empty() && items[i].status != ItemStatus::InProgress
             }
-            if is_tool(i) {
-                // A run of top-level tool calls; nested subagent items in
-                // between are skipped over.
-                let mut members = Vec::new();
-                while i < items.len() && (!top(i) || is_tool(i)) {
-                    if top(i) {
-                        members.push(i);
-                    }
-                    i += 1;
-                }
-                rows.push(Row::ToolGroup { members });
-            } else {
-                rows.push(Row::Item(i));
-                i += 1;
+            _ => false,
+        };
+        let top: Vec<usize> = (0..items.len())
+            .filter(|&i| items[i].parent_id.is_none() && !hidden(i))
+            .collect();
+        let mut k = 0;
+        while k < top.len() {
+            let turn_id = items[top[k]].turn_id.clone();
+            let mut end = k + 1;
+            while end < top.len() && turn_id.is_some() && items[top[end]].turn_id == turn_id {
+                end += 1;
             }
-            // Footer after the last item of a finished turn.
-            let Some(last) = (0..i).rev().find(|&j| top(j)) else {
+            let run = &top[k..end];
+            k = end;
+            let turn_ix = turn_id
+                .as_ref()
+                .and_then(|id| model.turns.iter().position(|t| &t.id == id));
+            let Some(turn_ix) = turn_ix else {
+                push_runs(&mut rows, items, run);
                 continue;
             };
-            let turn_id = &items[last].turn_id;
-            let next_turn = items.get(i).map(|n| &n.turn_id);
-            if turn_id.is_some()
-                && next_turn != Some(turn_id)
-                && let Some(turn_ix) = model
-                    .turns
-                    .iter()
-                    .position(|t| Some(&t.id) == turn_id.as_ref() && t.status.is_terminal())
-            {
-                rows.push(Row::TurnFooter { turn_ix });
+            let turn = &model.turns[turn_ix];
+            let done = turn.status.is_terminal();
+            // The prompt, then the work, then (once done) the answer.
+            let lead = run
+                .iter()
+                .take_while(|&&i| matches!(items[i].body, ItemBody::UserMessage { .. }))
+                .count();
+            push_runs(&mut rows, items, &run[..lead]);
+            let rest = &run[lead..];
+            let answer_at = done
+                .then(|| {
+                    rest.iter()
+                        .rposition(|&i| matches!(items[i].body, ItemBody::AssistantMessage { .. }))
+                })
+                .flatten()
+                .unwrap_or(rest.len());
+            let is_error = |i: usize| matches!(items[i].body, ItemBody::Error { .. });
+            let work: Vec<usize> = rest[..answer_at]
+                .iter()
+                .copied()
+                .filter(|&i| !(done && is_error(i)))
+                .collect();
+            if !done || !work.is_empty() {
+                let key = ItemId(format!("work:{}", turn.id.0));
+                let open = !done || self.expanded.get(&key).copied().unwrap_or(false);
+                rows.push(Row::Work {
+                    turn_ix,
+                    open,
+                    steps: work.len(),
+                });
+                if open {
+                    push_runs(&mut rows, items, &work);
+                }
             }
+            if !done {
+                // Between steps: say so, instead of looking stuck.
+                let busy = work
+                    .iter()
+                    .any(|&i| items[i].status == ItemStatus::InProgress)
+                    || model.open_requests().next().is_some();
+                if !busy {
+                    rows.push(Row::Pending);
+                }
+                continue;
+            }
+            let visible: Vec<usize> = rest[..answer_at]
+                .iter()
+                .copied()
+                .filter(|&i| is_error(i))
+                .chain(rest[answer_at..].iter().copied())
+                .collect();
+            push_runs(&mut rows, items, &visible);
+            rows.push(Row::TurnFooter { turn_ix });
         }
         std::mem::replace(&mut self.rows, rows)
+    }
+
+    /// Fold or unfold a finished turn's work.
+    pub fn toggle_work(&mut self, turn: &loft_protocol::TurnId, cx: &mut Context<Self>) {
+        let key = ItemId(format!("work:{}", turn.0));
+        let open = self.expanded.get(&key).copied().unwrap_or(false);
+        self.expanded.insert(key, !open);
+        self.sync_rows(None, cx);
+        cx.notify();
+    }
+
+    /// While a turn runs, repaint every second so "Working for 12s" ticks.
+    fn ensure_ticker(&mut self, cx: &mut Context<Self>) {
+        let running = self
+            .model
+            .as_ref()
+            .is_some_and(|m| m.running_turn().is_some());
+        if !running || self.ticker.is_some() {
+            return;
+        }
+        self.ticker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let alive = this.update(cx, |t, cx| {
+                    let running = t.model.as_ref().is_some_and(|m| m.running_turn().is_some());
+                    cx.notify();
+                    if !running {
+                        t.ticker = None;
+                    }
+                    running
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Rebuild rows and tell the virtual list what changed.
     fn sync_rows(&mut self, changed_item: Option<&ItemId>, cx: &mut Context<Self>) {
         let old = self.rebuild_rows();
+        self.ensure_ticker(cx);
         let new_len = self.rows.len();
         let common = old
             .iter()
@@ -1154,6 +1245,7 @@ impl ThreadState {
         }
         self.model = Some(model);
         self.rebuild_rows();
+        self.ensure_ticker(cx);
         let count = self.rows.len();
         self.scroller.update(cx, |s, cx| {
             s.reset(count, cx);
@@ -1216,6 +1308,26 @@ impl ThreadState {
                 let md = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
                 self.markdown.insert(id.clone(), md);
             }
+        }
+    }
+}
+
+/// Rows for a list of top-level items: consecutive tool calls fold into
+/// one group row.
+fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
+    let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. });
+    let mut k = 0;
+    while k < ixs.len() {
+        if is_tool(ixs[k]) {
+            let mut members = Vec::new();
+            while k < ixs.len() && is_tool(ixs[k]) {
+                members.push(ixs[k]);
+                k += 1;
+            }
+            rows.push(Row::ToolGroup { members });
+        } else {
+            rows.push(Row::Item(ixs[k]));
+            k += 1;
         }
     }
 }
