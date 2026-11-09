@@ -422,6 +422,7 @@ impl WorkspaceView {
             Some(("sendstop", text)) => {
                 // Send, then stop whatever subagents are running (tests).
                 self.panel_open = false;
+                self.details_open = true;
                 let id = thread_id.clone();
                 let text = text.to_owned();
                 self.store

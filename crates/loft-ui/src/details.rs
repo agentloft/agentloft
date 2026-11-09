@@ -656,27 +656,14 @@ impl Render for DetailsCard {
                         .group("details-agent")
                         .cursor_pointer()
                         .hover(|d| d.bg(p.hover))
-                        .child(
-                            div()
-                                .relative()
-                                .flex_none()
-                                .child(crate::brand::agent_logo(
-                                    harness.as_ref().map(|h| h.as_str()).unwrap_or("claude"),
-                                    px(15.),
-                                    &p,
-                                ))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .right(px(-3.))
-                                        .bottom(px(-3.))
-                                        .size(px(8.))
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(p.elevated)
-                                        .bg(dot),
-                                ),
-                        )
+                        .child(crate::items::agent_avatar(
+                            &format!("details-dot-{}", agent.id),
+                            harness.as_ref().map(|h| h.as_str()).unwrap_or("claude"),
+                            22.,
+                            dot,
+                            status.running,
+                            &p,
+                        ))
                         .child(div().flex_1().min_w_0().truncate().child(title))
                         .children(
                             status

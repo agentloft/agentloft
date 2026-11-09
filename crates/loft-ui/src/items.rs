@@ -897,6 +897,70 @@ pub(crate) fn tool_line(
 }
 
 /// A subagent (Task/Agent tool call): description, live progress, open button.
+/// An agent's mark in a circle with its status dot, which pulses while
+/// it runs. The dot sits on top of the circle (drawn after it), never cut
+/// by its border.
+pub(crate) fn agent_avatar(
+    id: &str,
+    harness: &str,
+    size: f32,
+    dot: gpui_kit::Hsla,
+    running: bool,
+    p: &Palette,
+) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _, ease_in_out};
+    let dot_size = (size * 0.34).round().max(7.);
+    let ring = 2.;
+    let circle = div()
+        .absolute()
+        .inset_0()
+        .rounded_full()
+        .border_1()
+        .border_color(p.border)
+        .bg(p.elevated)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(crate::brand::agent_logo(harness, px(size * 0.53), p));
+    let badge = div()
+        .absolute()
+        .right(px(-ring))
+        .bottom(px(-ring))
+        .size(px(dot_size + ring * 2.))
+        .rounded_full()
+        .bg(p.background)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().size(px(dot_size)).rounded_full().bg(dot));
+    let mut avatar = div().relative().flex_none().size(px(size)).child(circle);
+    if running {
+        // A soft halo that swells and fades behind the dot.
+        let halo = div()
+            .absolute()
+            .right(px(-ring))
+            .bottom(px(-ring))
+            .size(px(dot_size + ring * 2.))
+            .rounded_full()
+            .bg(dot)
+            .with_animation(
+                SharedString::from(format!("{id}-halo")),
+                Animation::new(std::time::Duration::from_millis(1400))
+                    .repeat()
+                    .with_easing(ease_in_out),
+                move |d, t| {
+                    let grow = dot_size * 0.9 * t;
+                    d.right(px(-ring - grow / 2.))
+                        .bottom(px(-ring - grow / 2.))
+                        .size(px(dot_size + ring * 2. + grow))
+                        .opacity(0.45 * (1. - t))
+                },
+            );
+        avatar = avatar.child(halo);
+    }
+    avatar.child(badge).into_any_element()
+}
+
 /// How a subagent (its Agent tool call `item`) is doing.
 pub(crate) struct SubagentStatus {
     pub running: bool,
@@ -1008,36 +1072,14 @@ fn agent_card(
         .rounded(px(10.))
         .cursor_pointer()
         .hover(|d| d.bg(p.hover))
-        .child(
-            // The agent's own mark, with a status dot.
-            div()
-                .relative()
-                .flex_none()
-                .size(px(30.))
-                .rounded_full()
-                .border_1()
-                .border_color(p.border)
-                .bg(p.elevated)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(crate::brand::agent_logo(
-                    model.thread.harness.as_str(),
-                    px(16.),
-                    p,
-                ))
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(-2.))
-                        .bottom(px(-2.))
-                        .size(px(11.))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(p.background)
-                        .bg(dot),
-                ),
-        )
+        .child(agent_avatar(
+            &format!("agent-dot-{}", item.id),
+            model.thread.harness.as_str(),
+            30.,
+            dot,
+            running,
+            p,
+        ))
         .child(
             v_flex()
                 .flex_1()
