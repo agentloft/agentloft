@@ -146,6 +146,9 @@ pub struct WorkspaceView {
     /// it's open.
     model_picker: Option<Entity<crate::model_picker::ModelPicker>>,
     picker_open: bool,
+    /// The new-worktree branch chooser and whether it's open.
+    branch_picker: Option<Entity<crate::branch_picker::BranchPicker>>,
+    branch_picker_open: bool,
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
@@ -197,6 +200,8 @@ impl WorkspaceView {
             completion_seq: 0,
             model_picker: None,
             picker_open: false,
+            branch_picker: None,
+            branch_picker_open: false,
             sidebar_open: true,
             panel,
             panel_open: true,
@@ -330,6 +335,7 @@ impl WorkspaceView {
                     .update(cx, |p, cx| p.open_file(&thread_id, path, window, cx));
             }
             _ => match dev {
+                "branches" => self.branch_picker_open = true,
                 "models" => {
                     self.panel_open = false;
                     let picker = self.model_picker_for(&thread_id, window, cx);
@@ -1206,7 +1212,7 @@ impl WorkspaceView {
                     ThreadWorkspace::Worktree { branch, .. } => {
                         Some(chip_label(IconName::GitBranch, branch.clone(), p))
                     }
-                    ThreadWorkspace::NewWorktree => Some(chip_label(
+                    ThreadWorkspace::NewWorktree { .. } => Some(chip_label(
                         IconName::GitBranch,
                         "New worktree".to_owned(),
                         p,
@@ -1352,6 +1358,37 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
+        // Where a pending worktree starts, and the controls to change it.
+        let pending = thread.read(cx).model.as_ref().and_then(|m| {
+            (m.items.is_empty()
+                && m.thread.parent.is_none()
+                && m.thread.workspace.is_new_worktree())
+            .then(|| {
+                (
+                    m.thread.id.clone(),
+                    m.thread.project_id.clone(),
+                    m.thread.workspace.clone(),
+                )
+            })
+        });
+        let (worktree_base, base_row) = match pending {
+            Some((tid, project_id, workspace)) => {
+                self.store
+                    .update(cx, |s, cx| s.ensure_branches(&project_id, cx));
+                let list = self
+                    .store
+                    .read(cx)
+                    .branches
+                    .get(&project_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let base = crate::branch_picker::effective_base(&workspace, &list);
+                let row =
+                    self.worktree_base_row(&tid, &project_id, base.clone(), &list, p, window, cx);
+                (base, Some(row))
+            }
+            None => (None, None),
+        };
         let fork_parent = thread
             .read(cx)
             .model
@@ -1487,6 +1524,7 @@ impl WorkspaceView {
                         &self.store,
                         p,
                     ))
+                    .children(base_row)
                 })
                 .child(
                     div()
@@ -1494,11 +1532,16 @@ impl WorkspaceView {
                         .truncate()
                         .text_xs()
                         .text_color(p.faint_foreground)
-                        .child(match model.thread.workspace {
-                            ThreadWorkspace::NewWorktree => {
-                                "Your first message creates an isolated worktree on a new branch"
-                                    .to_owned()
-                            }
+                        .child(match &model.thread.workspace {
+                            ThreadWorkspace::NewWorktree { .. } => match &worktree_base {
+                                Some(b) => format!(
+                                    "Your first message creates a worktree on a new branch from {}",
+                                    base_label(b)
+                                ),
+                                None => "Your first message creates an isolated worktree on a \
+                                         new branch"
+                                    .to_owned(),
+                            },
                             _ => format!("Works in {}", tilde(&model.thread.cwd)),
                         }),
                 )
@@ -1737,6 +1780,155 @@ impl WorkspaceView {
                         ),
                 ),
             )
+            .into_any_element()
+    }
+
+    /// "From ⎇ main ▾ · Local | origin" under the workspace picker.
+    #[allow(clippy::too_many_arguments)]
+    fn worktree_base_row(
+        &mut self,
+        thread_id: &ThreadId,
+        project_id: &loft_protocol::ProjectId,
+        base: Option<loft_protocol::WorktreeBase>,
+        list: &loft_protocol::BranchList,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::popover::Popover;
+        let picker = match &self.branch_picker {
+            Some(b) if b.read(cx).thread_id() == thread_id => b.clone(),
+            _ => {
+                let (store, t, pid) = (self.store.clone(), thread_id.clone(), project_id.clone());
+                let picker =
+                    cx.new(|cx| crate::branch_picker::BranchPicker::new(store, t, pid, window, cx));
+                let sub = cx.subscribe(&picker, |this, _, event, cx| match event {
+                    crate::branch_picker::BranchPickerEvent::Close => {
+                        this.branch_picker_open = false;
+                        cx.notify();
+                    }
+                });
+                self._subs.push(sub);
+                self.branch_picker = Some(picker.clone());
+                if self.branch_picker_open {
+                    picker.update(cx, |p, cx| p.reset(window, cx));
+                }
+                picker
+            }
+        };
+        let focus = picker.read(cx).search_focus(cx);
+        let open = self.branch_picker_open;
+        let branch = base.as_ref().map(|b| b.branch.clone());
+        let trigger = Button::new("worktree-base").ghost().xsmall().child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(Icon::new(IconName::GitBranch).xsmall().text_color(p.accent))
+                .child(
+                    div()
+                        .max_w(px(220.))
+                        .truncate()
+                        .text_color(p.foreground)
+                        .child(branch.clone().unwrap_or_else(|| "Choose a branch".into())),
+                )
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .xsmall()
+                        .text_color(p.faint_foreground),
+                ),
+        );
+        let branch_popover = Popover::new("worktree-base-popover")
+            .anchor(gpui_kit::Anchor::TopCenter)
+            .offset(px(6.))
+            .p_0()
+            .open(open)
+            .track_focus(&focus)
+            .on_open_change(cx.listener({
+                let picker = picker.clone();
+                move |this, open: &bool, window, cx| {
+                    this.branch_picker_open = *open;
+                    if *open {
+                        picker.update(cx, |p, cx| p.reset(window, cx));
+                    }
+                    cx.notify();
+                }
+            }))
+            .trigger(trigger)
+            .content(move |_, _, _| picker.clone());
+
+        // Local copy or the remote's, for the chosen branch.
+        let has_local = branch
+            .as_ref()
+            .is_some_and(|b| list.local.iter().any(|l| l == b));
+        let remote = branch.as_ref().and_then(|b| {
+            let mut remotes: Vec<&str> = list
+                .remote
+                .iter()
+                .filter(|r| &r.branch == b)
+                .map(|r| r.remote.as_str())
+                .collect();
+            remotes.sort_by_key(|r| *r != "origin");
+            remotes.first().map(|r| (*r).to_owned())
+        });
+        let from_remote = base.as_ref().is_some_and(|b| b.remote.is_some());
+        let mut source = h_flex().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(p.muted);
+        for (is_remote, label, icon, available) in [
+            (false, "Local".to_owned(), IconName::Laptop, has_local),
+            (
+                true,
+                remote.clone().unwrap_or_else(|| "origin".into()),
+                IconName::Cloud,
+                remote.is_some(),
+            ),
+        ] {
+            let active = from_remote == is_remote;
+            let (store, t) = (self.store.clone(), thread_id.clone());
+            let target = branch.clone().map(|b| loft_protocol::WorktreeBase {
+                branch: b,
+                remote: if is_remote { remote.clone() } else { None },
+            });
+            source = source.child(
+                h_flex()
+                    .id(SharedString::from(format!("base-source-{is_remote}")))
+                    .gap_1()
+                    .items_center()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .text_xs()
+                    .when(active, |d| {
+                        d.bg(p.elevated)
+                            .text_color(p.foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                            .shadow_sm()
+                    })
+                    .when(!active && available, |d| {
+                        d.cursor_pointer()
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.text_color(p.foreground))
+                    })
+                    .when(!available, |d| {
+                        d.text_color(p.faint_foreground).opacity(0.5)
+                    })
+                    .child(Icon::new(icon).xsmall())
+                    .child(label)
+                    .when(!active && available, |d| {
+                        d.on_click(move |_, _, cx| {
+                            let (t, target) = (t.clone(), target.clone());
+                            store.update(cx, |s, cx| s.set_thread_workspace(t, true, target, cx));
+                        })
+                    }),
+            );
+        }
+        h_flex()
+            .gap_2()
+            .items_center()
+            .text_xs()
+            .text_color(p.faint_foreground)
+            .child("From")
+            .child(branch_popover)
+            .child(source)
             .into_any_element()
     }
 
@@ -2727,6 +2919,14 @@ fn confirm_archive(
     });
 }
 
+/// `origin/main` or `main`.
+fn base_label(base: &loft_protocol::WorktreeBase) -> String {
+    match &base.remote {
+        Some(r) => format!("{r}/{}", base.branch),
+        None => base.branch.clone(),
+    }
+}
+
 /// Local checkout vs. a new worktree, for a thread that hasn't started.
 fn workspace_picker(
     thread_id: &ThreadId,
@@ -2734,7 +2934,7 @@ fn workspace_picker(
     store: &Entity<AppStore>,
     p: &Palette,
 ) -> AnyElement {
-    let wants = matches!(current, ThreadWorkspace::NewWorktree);
+    let wants = current.is_new_worktree();
     let mut row = h_flex().gap_1().text_xs();
     for (worktree, label, icon) in [
         (false, "Local", IconName::Laptop),
@@ -2768,7 +2968,7 @@ fn workspace_picker(
                 .on_click(move |_, _, cx| {
                     if !active {
                         let t = thread_id.clone();
-                        store.update(cx, |s, cx| s.set_thread_workspace(t, worktree, cx));
+                        store.update(cx, |s, cx| s.set_thread_workspace(t, worktree, None, cx));
                     }
                 }),
         );

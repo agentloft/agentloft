@@ -387,13 +387,17 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
         .handle(Request::SetThreadWorkspace {
             thread_id: thread.id.clone(),
             worktree: true,
+            base: None,
         })
         .await
         .unwrap()
     else {
         panic!()
     };
-    assert_eq!(thread.workspace, ThreadWorkspace::NewWorktree);
+    assert_eq!(
+        thread.workspace,
+        ThreadWorkspace::NewWorktree { base: None }
+    );
 
     core.handle(Request::SendMessage {
         thread_id: thread.id.clone(),
@@ -423,6 +427,7 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
         core.handle(Request::SetThreadWorkspace {
             thread_id: thread.id.clone(),
             worktree: false,
+            base: None,
         })
         .await
         .is_err()
@@ -609,14 +614,14 @@ async fn config_reload_applies_to_new_threads() {
     std::fs::write(&config, "[worktrees]\nmode = \"worktree\"\n").unwrap();
     core.handle(Request::ReloadConfig).await.unwrap();
     let t = new_thread(&core, &repo).await;
-    assert_eq!(t.workspace, ThreadWorkspace::NewWorktree);
+    assert_eq!(t.workspace, ThreadWorkspace::NewWorktree { base: None });
 
     // A broken file is reported and the last good config stays.
     std::fs::write(&config, "[worktrees\n").unwrap();
     let err = core.handle(Request::ReloadConfig).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
     let t = new_thread(&core, &repo).await;
-    assert_eq!(t.workspace, ThreadWorkspace::NewWorktree);
+    assert_eq!(t.workspace, ThreadWorkspace::NewWorktree { base: None });
 }
 
 #[tokio::test]
@@ -675,6 +680,7 @@ async fn pull_request_pushes_branch_and_calls_gh() {
     core.handle(Request::SetThreadWorkspace {
         thread_id: thread.id.clone(),
         worktree: true,
+        base: None,
     })
     .await
     .unwrap();
@@ -841,6 +847,7 @@ async fn worktree_setup_runs_before_the_first_prompt() {
         core.handle(Request::SetThreadWorkspace {
             thread_id: thread.id.clone(),
             worktree: true,
+            base: None,
         })
         .await
         .unwrap();

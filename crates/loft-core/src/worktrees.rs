@@ -6,8 +6,8 @@ use crate::thread::ThreadCmd;
 use crate::{Core, CoreResult, internal, lock};
 use loft_git::worktree as wt;
 use loft_protocol::{
-    ErrorBody, ErrorCode, Event, ItemBody, Response, Thread, ThreadId, ThreadStatus,
-    ThreadWorkspace,
+    ErrorBody, ErrorCode, Event, ItemBody, ProjectId, Response, Thread, ThreadId, ThreadStatus,
+    ThreadWorkspace, WorktreeBase,
 };
 use loft_store::now_ms;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,72 @@ pub(crate) async fn blocking<T: Send + 'static>(
         .map_err(|e| ErrorBody::new(ErrorCode::Conflict, format!("{e:#}")))
 }
 
+/// Where a new worktree starts (`start`, a rev) and the branch it merges
+/// back into (`base`). A remote base is fetched first; offline, the last
+/// fetched copy is used. No choice means the main branch, from `origin`
+/// when the repository has one.
+fn worktree_start(
+    repo: &Path,
+    requested: Option<WorktreeBase>,
+    env: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<(String, String)> {
+    let from_remote = |remote: &str, branch: &str| -> anyhow::Result<String> {
+        let rev = format!("{remote}/{branch}");
+        if let Err(err) = wt::fetch(repo, remote, branch, env) {
+            if !wt::rev_exists(repo, &rev) {
+                return Err(err.context(format!("couldn't fetch {rev}")));
+            }
+            tracing::warn!("fetch {rev} failed, using the last fetched copy: {err:#}");
+        }
+        Ok(rev)
+    };
+    match requested {
+        Some(WorktreeBase {
+            branch,
+            remote: Some(remote),
+        }) => Ok((from_remote(&remote, &branch)?, branch)),
+        Some(WorktreeBase {
+            branch,
+            remote: None,
+        }) => {
+            anyhow::ensure!(wt::rev_exists(repo, &branch), "no branch `{branch}`");
+            Ok((branch.clone(), branch))
+        }
+        None => match wt::default_branch(repo) {
+            Some(branch) if wt::rev_exists(repo, &format!("origin/{branch}")) => {
+                Ok((from_remote("origin", &branch)?, branch))
+            }
+            Some(branch) => Ok((branch.clone(), branch)),
+            // No branches yet (or detached): start from the commit.
+            None => {
+                loft_git::repo_root(repo).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
+                Ok(("HEAD".to_owned(), "HEAD".to_owned()))
+            }
+        },
+    }
+}
+
 impl Core {
+    pub(crate) async fn list_branches(&self, project_id: &ProjectId) -> CoreResult<Response> {
+        let project = self
+            .with_store(|s| s.project(project_id))?
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+        let repo = PathBuf::from(project.root_path);
+        let list = blocking(move || wt::branches(&repo)).await?;
+        Ok(Response::Branches {
+            branches: loft_protocol::BranchList {
+                local: list.local,
+                remote: list
+                    .remote
+                    .into_iter()
+                    .map(|(remote, branch)| loft_protocol::RemoteBranch { remote, branch })
+                    .collect(),
+                default_branch: list.default,
+                current: list.current,
+            },
+        })
+    }
+
     fn load_thread(&self, id: &ThreadId) -> CoreResult<Thread> {
         self.with_store(|s| s.thread(id))?.ok_or_else(not_found)
     }
@@ -43,7 +108,7 @@ impl Core {
     pub(crate) fn default_workspace(&self, project_root: &str) -> ThreadWorkspace {
         let wants = self.config().worktrees.mode == "worktree";
         if wants && loft_git::repo_root(Path::new(project_root)).is_some() {
-            ThreadWorkspace::NewWorktree
+            ThreadWorkspace::NewWorktree { base: None }
         } else {
             ThreadWorkspace::Local
         }
@@ -53,6 +118,7 @@ impl Core {
         &self,
         id: &ThreadId,
         worktree: bool,
+        base: Option<WorktreeBase>,
     ) -> CoreResult<Response> {
         let mut thread = self.load_thread(id)?;
         if !self.with_store(|s| s.turns(id))?.is_empty() {
@@ -68,7 +134,7 @@ impl Core {
             ));
         }
         thread.workspace = if worktree {
-            ThreadWorkspace::NewWorktree
+            ThreadWorkspace::NewWorktree { base }
         } else {
             ThreadWorkspace::Local
         };
@@ -87,9 +153,10 @@ impl Core {
     ) -> CoreResult<()> {
         let _guard = self.worktree_lock.lock().await;
         let mut thread = self.load_thread(id)?;
-        if thread.workspace != ThreadWorkspace::NewWorktree {
+        let ThreadWorkspace::NewWorktree { base: requested } = thread.workspace.clone() else {
             return Ok(());
-        }
+        };
+        let env = self.opts().env.clone();
         let project = self
             .with_store(|s| s.project(&thread.project_id))?
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
@@ -103,12 +170,7 @@ impl Core {
         let project_cfg = loft_config::ProjectConfig::load(&repo);
         let setup = project_cfg.worktree.setup.clone();
         let workspace = blocking(move || {
-            let base = wt::current_branch(&repo)
-                .or_else(|| {
-                    // Detached HEAD: branch from the commit.
-                    loft_git::repo_root(&repo).and(Some("HEAD".to_owned()))
-                })
-                .ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
+            let (start, base) = worktree_start(&repo, requested, &env)?;
             let branch = wt::unique_branch(&repo, &prefix, &slug);
             let leaf = branch.rsplit('/').next().unwrap_or(&slug).to_owned();
             let mut path = dir.join(&leaf);
@@ -117,7 +179,7 @@ impl Core {
                 path = dir.join(format!("{leaf}-{n}"));
                 n += 1;
             }
-            wt::add(&repo, &path, &branch, &base)?;
+            wt::add(&repo, &path, &branch, &start)?;
             let copied = wt::copy_untracked(&repo, &path, &project_cfg.worktree.copy);
             tracing::info!(branch, path = %path.display(), ?copied, "worktree created");
             Ok(ThreadWorkspace::Worktree {
@@ -455,7 +517,56 @@ pub(crate) fn slug_or(text: &str, fallback: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::commit_message;
+    use super::{WorktreeBase, commit_message, worktree_start};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn worktree_start_points() {
+        let repo = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        git(r, &["init", "-q", "-b", "main"]);
+        git(r, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let env = std::env::vars().collect();
+        // No remote: the main branch, as the local copy has it.
+        assert_eq!(
+            worktree_start(r, None, &env).unwrap(),
+            ("main".into(), "main".into())
+        );
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "--bare"]);
+        git(r, &["remote", "add", "origin", &remote.path().to_string_lossy()]);
+        git(r, &["push", "-q", "origin", "main"]);
+        // With origin: fetched, from origin/main; merges back into main.
+        assert_eq!(
+            worktree_start(r, None, &env).unwrap(),
+            ("origin/main".into(), "main".into())
+        );
+        let local = WorktreeBase {
+            branch: "main".into(),
+            remote: None,
+        };
+        assert_eq!(
+            worktree_start(r, Some(local), &env).unwrap(),
+            ("main".into(), "main".into())
+        );
+        let missing = WorktreeBase {
+            branch: "nope".into(),
+            remote: Some("origin".into()),
+        };
+        assert!(worktree_start(r, Some(missing), &env).is_err());
+    }
 
     #[test]
     fn commit_messages() {

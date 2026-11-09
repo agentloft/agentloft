@@ -65,8 +65,104 @@ pub fn add(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let path = path.to_string_lossy();
-    run(git(repo).args(["worktree", "add", "-q", "-b", branch, &path, base]))?;
+    // `--no-track`: a branch started from `origin/main` must not push there.
+    run(git(repo).args([
+        "worktree",
+        "add",
+        "-q",
+        "--no-track",
+        "-b",
+        branch,
+        &path,
+        base,
+    ]))?;
     Ok(())
+}
+
+/// A repository's branches, for choosing a worktree's starting point.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchList {
+    /// Local branch names, most recently committed first.
+    pub local: Vec<String>,
+    /// `(remote, branch)` remote-tracking branches, most recent first.
+    pub remote: Vec<(String, String)>,
+    /// The repository's main branch (see [`default_branch`]).
+    pub default: Option<String>,
+    pub current: Option<String>,
+}
+
+pub fn branches(repo: &Path) -> Result<BranchList> {
+    let out = run(git(repo).args([
+        "for-each-ref",
+        "--sort=-committerdate",
+        "--format=%(refname)",
+        "refs/heads",
+        "refs/remotes",
+    ]))?;
+    let mut list = BranchList::default();
+    for line in out.lines() {
+        if let Some(name) = line.strip_prefix("refs/heads/") {
+            list.local.push(name.to_owned());
+        } else if let Some(rest) = line.strip_prefix("refs/remotes/")
+            && let Some((remote, name)) = rest.split_once('/')
+            && name != "HEAD"
+        {
+            list.remote.push((remote.to_owned(), name.to_owned()));
+        }
+    }
+    list.default = default_branch(repo);
+    list.current = current_branch(repo);
+    Ok(list)
+}
+
+/// The main branch: what `origin/HEAD` points at, else a local `main` or
+/// `master`, else `init.defaultBranch`, else the checked-out branch.
+pub fn default_branch(repo: &Path) -> Option<String> {
+    let trimmed = |s: String| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
+    if let Some(head) = run(git(repo).args([
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ]))
+    .ok()
+    .and_then(trimmed)
+        && let Some(name) = head.strip_prefix("origin/")
+    {
+        return Some(name.to_owned());
+    }
+    for name in ["main", "master"] {
+        if branch_exists(repo, name) {
+            return Some(name.to_owned());
+        }
+    }
+    run(git(repo).args(["config", "init.defaultBranch"]))
+        .ok()
+        .and_then(trimmed)
+        .filter(|b| branch_exists(repo, b))
+        .or_else(|| current_branch(repo))
+}
+
+/// `git fetch <remote> <branch>`, so a worktree starts from what the remote
+/// has now. `env` is the login environment (credentials, SSH agent).
+pub fn fetch(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let mut cmd = git(repo);
+    cmd.envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .args(["fetch", "-q", "--no-tags", remote, branch]);
+    run(&mut cmd)?;
+    Ok(())
+}
+
+/// Whether `rev` names a commit (`main`, `origin/main`, a sha).
+pub fn rev_exists(repo: &Path, rev: &str) -> bool {
+    run(git(repo).args(["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")])).is_ok()
 }
 
 /// `git worktree add <path> <branch>` for an existing branch (unarchive).
@@ -296,6 +392,47 @@ mod tests {
         std::fs::write(d.join(".gitignore"), ".env*\n").unwrap();
         commit_all(d, "init");
         dir
+    }
+
+    #[test]
+    fn worktree_from_a_fetched_remote_branch() {
+        // `upstream` has a commit the local `main` hasn't seen.
+        let dir = repo();
+        let root = dir.path();
+        let remote = tempfile::tempdir().unwrap();
+        run(git(remote.path()).args(["init", "-q", "--bare"])).unwrap();
+        let url = remote.path().to_string_lossy().into_owned();
+        run(git(root).args(["remote", "add", "origin", &url])).unwrap();
+        run(git(root).args(["push", "-q", "origin", "main"])).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        run(git(other.path()).args(["clone", "-q", &url, "."])).unwrap();
+        std::fs::write(other.path().join("remote.txt"), "new\n").unwrap();
+        commit_all(other.path(), "remote work");
+        run(git(other.path()).args(["push", "-q", "origin", "main"])).unwrap();
+        run(git(root).args(["branch", "-q", "local-only"])).unwrap();
+
+        let env = std::env::vars().collect();
+        fetch(root, "origin", "main", &env).unwrap();
+        let list = branches(root).unwrap();
+        assert_eq!(list.default.as_deref(), Some("main"));
+        assert_eq!(list.current.as_deref(), Some("main"));
+        assert!(list.local.contains(&"local-only".to_owned()));
+        assert!(
+            list.remote
+                .contains(&("origin".to_owned(), "main".to_owned()))
+        );
+        assert!(rev_exists(root, "origin/main"));
+        assert!(!rev_exists(root, "origin/nope"));
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        add(root, &wt, "agentloft/x", "origin/main").unwrap();
+        assert!(
+            wt.join("remote.txt").exists(),
+            "started from the fetched commit"
+        );
+        // No upstream: pushing must not target origin/main.
+        assert!(run(git(&wt).args(["rev-parse", "--abbrev-ref", "@{upstream}"])).is_err());
     }
 
     #[test]

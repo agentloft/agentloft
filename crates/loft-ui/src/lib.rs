@@ -4,6 +4,7 @@
 pub mod assets;
 mod attachments;
 mod attention;
+mod branch_picker;
 pub mod brand;
 mod completion;
 mod items;

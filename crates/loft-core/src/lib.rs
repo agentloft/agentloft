@@ -609,7 +609,9 @@ impl Core {
             Request::SetThreadWorkspace {
                 thread_id,
                 worktree,
-            } => self.set_thread_workspace(&thread_id, worktree),
+                base,
+            } => self.set_thread_workspace(&thread_id, worktree, base),
+            Request::ListBranches { project_id } => self.list_branches(&project_id).await,
             Request::MergeThread { thread_id, message } => {
                 self.merge_thread(&thread_id, message).await
             }

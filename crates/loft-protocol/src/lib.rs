@@ -121,6 +121,13 @@ pub enum Request {
     SetThreadWorkspace {
         thread_id: ThreadId,
         worktree: bool,
+        /// Where the worktree starts; `None` = the main branch.
+        #[serde(default)]
+        base: Option<WorktreeBase>,
+    },
+    /// A project's branches, for choosing where a worktree starts.
+    ListBranches {
+        project_id: ProjectId,
     },
     /// Squash-merge a worktree thread's branch into its base branch in the
     /// project checkout (uncommitted work is committed to the branch first).
@@ -362,6 +369,9 @@ pub enum Response {
     },
     Terminals {
         terminals: Vec<TerminalInfo>,
+    },
+    Branches {
+        branches: BranchList,
     },
     Json {
         value: serde_json::Value,

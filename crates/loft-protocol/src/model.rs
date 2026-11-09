@@ -76,8 +76,11 @@ pub enum ThreadWorkspace {
     #[default]
     Local,
     /// A worktree is created when the first message is sent, on a branch
-    /// named after it.
-    NewWorktree,
+    /// named after it, starting from `base` (default: the main branch).
+    NewWorktree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<WorktreeBase>,
+    },
     /// A git worktree on its own `agentloft/<slug>` branch.
     Worktree {
         path: String,
@@ -87,7 +90,40 @@ pub enum ThreadWorkspace {
     },
 }
 
+/// Where a new worktree starts: a branch, as the local copy has it or (with
+/// `remote`) as fetched from that remote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeBase {
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+}
+
+/// A repository's branches (`ListBranches`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchList {
+    /// Local branches, most recently committed first.
+    pub local: Vec<String>,
+    /// Remote-tracking branches, most recent first.
+    pub remote: Vec<RemoteBranch>,
+    /// The main branch (`origin/HEAD`, else `main`/`master`).
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    #[serde(default)]
+    pub current: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteBranch {
+    pub remote: String,
+    pub branch: String,
+}
+
 impl ThreadWorkspace {
+    pub fn is_new_worktree(&self) -> bool {
+        matches!(self, ThreadWorkspace::NewWorktree { .. })
+    }
+
     pub fn branch(&self) -> Option<&str> {
         match self {
             ThreadWorkspace::Worktree { branch, .. } => Some(branch),

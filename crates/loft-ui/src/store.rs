@@ -108,6 +108,9 @@ pub struct AppStore {
     pub models: HashMap<HarnessId, Vec<loft_protocol::ModelInfo>>,
     /// Installed CLIs (`ProbeHarness`).
     pub harness_status: HashMap<HarnessId, loft_protocol::HarnessStatus>,
+    /// Each project's branches (`ListBranches`), for worktree bases.
+    pub branches: HashMap<ProjectId, loft_protocol::BranchList>,
+    branches_loading: std::collections::HashSet<ProjectId>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
@@ -135,6 +138,8 @@ impl AppStore {
             unread: Default::default(),
             models: HashMap::new(),
             harness_status: HashMap::new(),
+            branches: HashMap::new(),
+            branches_loading: Default::default(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
             daemon_pid: None,
@@ -620,16 +625,43 @@ impl AppStore {
         cx.emit(StoreEvent::Notify { message, error });
     }
 
-    /// Project checkout or a new worktree (before the first message).
+    /// Refresh a project's branch list.
+    pub fn fetch_branches(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        if !self.branches_loading.insert(project_id.clone()) {
+            return;
+        }
+        let body = Request::ListBranches {
+            project_id: project_id.clone(),
+        };
+        self.request_result(body, cx, move |store, result, cx| {
+            store.branches_loading.remove(&project_id);
+            if let Ok(Response::Branches { branches }) = result {
+                store.branches.insert(project_id, branches);
+                cx.notify();
+            }
+        });
+    }
+
+    /// Load a project's branches once.
+    pub fn ensure_branches(&mut self, project_id: &ProjectId, cx: &mut Context<Self>) {
+        if !self.branches.contains_key(project_id) {
+            self.fetch_branches(project_id.clone(), cx);
+        }
+    }
+
+    /// Project checkout or a new worktree (before the first message),
+    /// starting from `base` (`None` = the main branch).
     pub fn set_thread_workspace(
         &mut self,
         thread_id: ThreadId,
         worktree: bool,
+        base: Option<loft_protocol::WorktreeBase>,
         cx: &mut Context<Self>,
     ) {
         let body = Request::SetThreadWorkspace {
             thread_id,
             worktree,
+            base,
         };
         self.request_result(body, cx, |store, result, cx| {
             if let Err(err) = result {
