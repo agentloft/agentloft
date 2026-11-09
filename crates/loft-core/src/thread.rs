@@ -975,6 +975,7 @@ impl ThreadActor {
             body,
             updated_at_ms: now_ms(),
             parent_id: None,
+            started_at_ms: Some(now_ms()),
         })
     }
 

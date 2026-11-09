@@ -668,7 +668,14 @@ fn tab_face(tab: &Open, p: &Palette, cx: &gpui_kit::App) -> (AnyElement, String)
             let name = path.rsplit('/').next().unwrap_or(path).to_owned();
             (crate::file_icons::icon(&name, false, false, px(14.)), name)
         }
-        Open::Agent { view, .. } => (icon(IconName::Bot), view.read(cx).title(cx)),
+        Open::Agent { view, .. } => {
+            let view = view.read(cx);
+            let face = match view.harness(cx) {
+                Some(h) => crate::brand::agent_logo(&h, px(13.), p),
+                None => icon(IconName::Bot),
+            };
+            (face, view.title(cx))
+        }
     }
 }
 

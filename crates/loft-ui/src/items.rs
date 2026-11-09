@@ -656,24 +656,49 @@ fn agent_card(
     p: &Palette,
 ) -> AnyElement {
     let running = item.status == ItemStatus::InProgress;
-    let children = model
-        .items
-        .iter()
-        .filter(|i| i.parent_id.as_ref() == Some(&item.id))
-        .count();
+    let failed = matches!(item.status, ItemStatus::Failed | ItemStatus::Declined)
+        || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. });
+    // Under the title: what it is doing now, else what it answered.
     let latest = model
         .items
         .iter()
         .rev()
         .filter(|i| i.parent_id.as_ref() == Some(&item.id))
         .find_map(|i| match &i.body {
-            ItemBody::ToolCall { tool, title, .. } => Some(format!("{tool} {title}")),
+            ItemBody::ToolCall { title, .. } => Some(title.clone()),
             _ => None,
         });
-    let status = if running {
-        latest.unwrap_or_else(|| "Starting…".into())
+    let answer = match &item.body {
+        ItemBody::ToolCall {
+            output: Some(out), ..
+        } => first_line(&crate::panel::agent::clean_report(out)),
+        _ => None,
+    };
+    let subtitle = if running {
+        latest.unwrap_or_else(|| "Working…".into())
     } else {
-        format!("{children} action{}", if children == 1 { "" } else { "s" })
+        answer.unwrap_or_else(|| {
+            if failed {
+                "Failed".into()
+            } else {
+                "Done".into()
+            }
+        })
+    };
+    let elapsed = item.started_at_ms.map(|start| {
+        let end = if running {
+            now_ms()
+        } else {
+            item.updated_at_ms
+        };
+        human_duration(end - start)
+    });
+    let dot = if running {
+        p.accent
+    } else if failed {
+        p.danger
+    } else {
+        p.success
     };
     let store = store.clone();
     let (thread_id, item_id) = (model.thread.id.clone(), item.id.clone());
@@ -681,24 +706,41 @@ fn agent_card(
         .id(SharedString::from(format!("agent-{}", item.id)))
         .gap_3()
         .items_center()
-        .px_3()
-        .py_2()
+        .px_2()
+        .py_1p5()
+        .ml(px(-8.))
         .rounded(px(10.))
-        .border_1()
-        .border_color(p.border)
-        .bg(p.elevated)
         .cursor_pointer()
-        .hover(|d| d.border_color(p.accent.opacity(0.5)))
+        .hover(|d| d.bg(p.hover))
         .child(
+            // The agent's own mark, with a status dot.
             div()
-                .size(px(28.))
-                .rounded(px(8.))
-                .bg(p.accent_soft)
-                .text_color(p.accent)
+                .relative()
+                .flex_none()
+                .size(px(30.))
+                .rounded_full()
+                .border_1()
+                .border_color(p.border)
+                .bg(p.elevated)
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(Icon::new(IconName::Bot).small()),
+                .child(crate::brand::agent_logo(
+                    model.thread.harness.as_str(),
+                    px(16.),
+                    p,
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(-2.))
+                        .bottom(px(-2.))
+                        .size(px(11.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(p.background)
+                        .bg(dot),
+                ),
         )
         .child(
             v_flex()
@@ -708,28 +750,46 @@ fn agent_card(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.foreground)
                         .truncate()
-                        .child(format!("Agent · {title}")),
+                        .child(title.to_owned()),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(p.muted_foreground)
                         .truncate()
-                        .child(status),
+                        .child(subtitle),
                 ),
         )
-        .child(status_icon(running, false, false, p))
+        .children(elapsed.map(|e| {
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(p.faint_foreground)
+                .child(e)
+        }))
         .child(
             Icon::new(IconName::ChevronRight)
                 .xsmall()
-                .text_color(p.muted_foreground),
+                .text_color(p.faint_foreground),
         )
         .on_click(move |_, _, cx| {
             let (thread_id, item_id) = (thread_id.clone(), item_id.clone());
             store.update(cx, |s, cx| s.open_agent(thread_id, item_id, cx));
         })
         .into_any_element()
+}
+
+/// The first line of `text` with its Markdown marks dropped, if any.
+fn first_line(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let plain: String = line
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '#'))
+        .collect();
+    let plain = plain.trim();
+    (!plain.is_empty()).then(|| plain.chars().take(160).collect())
 }
 
 fn approval_card(
@@ -1164,6 +1224,7 @@ mod tests {
             },
             updated_at_ms: 0,
             parent_id: None,
+            started_at_ms: None,
         }
     }
 

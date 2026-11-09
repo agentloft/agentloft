@@ -232,6 +232,9 @@ pub struct Item {
     /// The subagent (Task/Agent tool call) this item belongs to, if any.
     #[serde(default)]
     pub parent_id: Option<ItemId>,
+    /// When the item began (older items don't have it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -1344,7 +1344,12 @@ impl ThreadState {
 /// Rows for a list of top-level items: consecutive tool calls fold into
 /// one group row.
 fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
-    let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. });
+    // Subagents get a row of their own (their card), never a group's.
+    let is_subagent = |i: usize| {
+        matches!(&items[i].body, ItemBody::ToolCall { tool_kind, .. }
+            if *tool_kind == loft_protocol::ToolKind::Subagent)
+    };
+    let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. }) && !is_subagent(i);
     let mut k = 0;
     while k < ixs.len() {
         if is_tool(ixs[k]) {
@@ -1354,6 +1359,11 @@ fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) 
                 k += 1;
             }
             rows.push(Row::ToolGroup { members });
+        } else if is_subagent(ixs[k]) {
+            rows.push(Row::ToolGroup {
+                members: vec![ixs[k]],
+            });
+            k += 1;
         } else {
             rows.push(Row::Item(ixs[k]));
             k += 1;

@@ -44,6 +44,13 @@ impl AgentView {
     }
 
     /// Short title for the panel tab.
+    /// The agent running the thread (its logo marks the subagent).
+    pub fn harness(&self, cx: &gpui_kit::App) -> Option<String> {
+        let store = self.store.read(cx);
+        let thread = store.threads.get(&self.thread_id)?.read(cx);
+        Some(thread.model.as_ref()?.thread.harness.as_str().to_owned())
+    }
+
     pub fn title(&self, cx: &gpui_kit::App) -> String {
         let store = self.store.read(cx);
         store
@@ -129,14 +136,20 @@ impl Render for AgentView {
             .items_center()
             .child(
                 div()
+                    .flex_none()
                     .size(px(32.))
-                    .rounded(px(9.))
-                    .bg(p.accent_soft)
-                    .text_color(p.accent)
+                    .rounded_full()
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.elevated)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Icon::new(IconName::Bot).small()),
+                    .child(crate::brand::agent_logo(
+                        model.thread.harness.as_str(),
+                        px(17.),
+                        &p,
+                    )),
             )
             .child(
                 v_flex()

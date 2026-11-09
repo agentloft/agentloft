@@ -178,6 +178,7 @@ mod tests {
             body,
             updated_at_ms: 0,
             parent_id: None,
+            started_at_ms: None,
         }
     }
 

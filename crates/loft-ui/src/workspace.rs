@@ -432,6 +432,21 @@ impl WorkspaceView {
             }
             _ => match dev {
                 "branches" => self.branch_picker_open = true,
+                "work" => {
+                    // Unfold every finished turn's work.
+                    self.panel_open = false;
+                    let turns: Vec<_> = thread
+                        .read(cx)
+                        .model
+                        .as_ref()
+                        .map(|m| m.turns.iter().map(|t| t.id.clone()).collect())
+                        .unwrap_or_default();
+                    thread.update(cx, |t, cx| {
+                        for turn in &turns {
+                            t.toggle_work(turn, cx);
+                        }
+                    });
+                }
                 "closesidebar" => {
                     // Shut the sidebar a moment after launch (animation tests).
                     self.panel_open = false;
