@@ -757,24 +757,37 @@ fn agent_card(
     title: &str,
     p: &Palette,
 ) -> AnyElement {
-    let running = item.status == ItemStatus::InProgress;
+    let children: Vec<&Item> = model
+        .items
+        .iter()
+        .filter(|i| i.parent_id.as_ref() == Some(&item.id))
+        .collect();
+    // Launched in the background: the call returns at once with a receipt;
+    // the agent's own steps tell how it is going.
+    let background = matches!(&item.body, ItemBody::ToolCall { output: Some(out), .. }
+        if out.trim_start().starts_with("Async agent launched"));
+    let running = item.status == ItemStatus::InProgress
+        || (background && children.iter().any(|c| c.status == ItemStatus::InProgress));
     let failed = matches!(item.status, ItemStatus::Failed | ItemStatus::Declined)
         || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. });
     // Under the title: what it is doing now, else what it answered.
-    let latest = model
-        .items
-        .iter()
-        .rev()
-        .filter(|i| i.parent_id.as_ref() == Some(&item.id))
-        .find_map(|i| match &i.body {
-            ItemBody::ToolCall { title, .. } => Some(title.clone()),
-            _ => None,
-        });
-    let answer = match &item.body {
-        ItemBody::ToolCall {
-            output: Some(out), ..
-        } => first_line(&crate::panel::agent::clean_report(out)),
+    let latest = children.iter().rev().find_map(|i| match &i.body {
+        ItemBody::ToolCall { title, .. } => Some(title.clone()),
         _ => None,
+    });
+    let answer = if background {
+        // Its last words, once it has stopped.
+        children.iter().rev().find_map(|i| match &i.body {
+            ItemBody::AssistantMessage { text } => first_line(text),
+            _ => None,
+        })
+    } else {
+        match &item.body {
+            ItemBody::ToolCall {
+                output: Some(out), ..
+            } => first_line(&crate::panel::agent::clean_report(out)),
+            _ => None,
+        }
     };
     let subtitle = if running {
         latest.unwrap_or_else(|| "Working…".into())
@@ -790,6 +803,12 @@ fn agent_card(
     let elapsed = item.started_at_ms.map(|start| {
         let end = if running {
             now_ms()
+        } else if background {
+            children
+                .iter()
+                .map(|c| c.updated_at_ms)
+                .max()
+                .unwrap_or(item.updated_at_ms)
         } else {
             item.updated_at_ms
         };

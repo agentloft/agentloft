@@ -90,6 +90,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
         restart_session: false,
         turn: None,
         items: HashMap::new(),
+        subagents: HashMap::new(),
         requests: HashMap::new(),
         dirty: HashSet::new(),
     };
@@ -113,6 +114,10 @@ struct ThreadActor {
     turn: Option<Turn>,
     /// native item id → app item id (current session).
     items: HashMap<String, ItemId>,
+    /// Subagents (native id → item) for the whole session: background ones
+    /// keep working after their turn ends, and their steps must still find
+    /// their parent.
+    subagents: HashMap<String, ItemId>,
     /// app request id → native request id.
     requests: HashMap<RequestId, String>,
     /// Streaming items whose live text hasn't been snapshotted yet.
@@ -736,7 +741,17 @@ impl ThreadActor {
                 parent,
             } => {
                 let mut item = self.new_item(self.turn_id(), body, ItemStatus::InProgress)?;
-                item.parent_id = parent.and_then(|p| self.items.get(&p).cloned());
+                item.parent_id = parent.and_then(|p| {
+                    self.items
+                        .get(&p)
+                        .or_else(|| self.subagents.get(&p))
+                        .cloned()
+                });
+                if matches!(&item.body, ItemBody::ToolCall { tool_kind, .. }
+                    if *tool_kind == loft_protocol::ToolKind::Subagent)
+                {
+                    self.subagents.insert(native_id.clone(), item.id.clone());
+                }
                 self.items.insert(native_id, item.id.clone());
                 self.core.live().insert(item.id.clone(), item.clone());
                 self.core.commit(vec![Event::ItemUpserted { item }])?;
@@ -891,8 +906,27 @@ impl ThreadActor {
         error: Option<String>,
     ) -> CoreResult<()> {
         let mut events = Vec::new();
-        // Close anything still streaming.
+        // A background subagent's steps carry on after the turn: keep them
+        // (and their ids) unless the turn was stopped or failed.
+        let keep: HashMap<String, ItemId> = if status == TurnStatus::Completed {
+            self.items
+                .iter()
+                .filter(|(_, id)| {
+                    self.core
+                        .live()
+                        .get(*id)
+                        .is_some_and(|i| i.parent_id.is_some())
+                })
+                .map(|(n, id)| (n.clone(), id.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        // Close anything else still streaming.
         for item_id in self.items.values() {
+            if keep.values().any(|k| k == item_id) {
+                continue;
+            }
             if let Some(mut item) = self.core.live().remove(item_id) {
                 item.status = if status == TurnStatus::Failed {
                     ItemStatus::Failed
@@ -902,8 +936,8 @@ impl ThreadActor {
                 events.push(Event::ItemUpserted { item });
             }
         }
-        self.dirty.clear();
-        self.items.clear();
+        self.dirty.retain(|id| keep.values().any(|k| k == id));
+        self.items = keep;
         // Expire approvals that were never answered.
         let open: Vec<String> = self.requests.drain().map(|(_, n)| n).collect();
         for native in open {

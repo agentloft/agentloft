@@ -31,8 +31,9 @@ pub struct Translator {
     open_blocks: HashMap<(String, u64), (String, DeltaChannel)>,
     /// Message ids whose text/thinking was streamed via `stream_event`.
     streamed_messages: HashSet<String>,
-    /// Tool calls started but without a result yet.
-    open_tools: HashSet<String>,
+    /// Tool calls started but without a result yet → their subagent (the
+    /// Agent call they run under), if any.
+    open_tools: HashMap<String, Option<String>>,
     /// Tool calls the user denied (their error result becomes `Declined`).
     denied_tools: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
@@ -335,9 +336,10 @@ impl Translator {
                     let Some(id) = str_at(block, "id") else {
                         continue;
                     };
-                    if !self.open_tools.insert(id.to_owned()) {
+                    if self.open_tools.contains_key(id) {
                         continue;
                     }
+                    self.open_tools.insert(id.to_owned(), parent.clone());
                     let name = str_at(block, "name").unwrap_or("tool").to_owned();
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     out.push(Out::Event(HarnessEvent::ItemStarted {
@@ -372,7 +374,7 @@ impl Translator {
             let Some(tool_id) = str_at(block, "tool_use_id") else {
                 continue;
             };
-            if !self.open_tools.remove(tool_id) {
+            if self.open_tools.remove(tool_id).is_none() {
                 continue;
             }
             let is_error = block
@@ -484,7 +486,18 @@ impl Translator {
                 status: ItemStatus::Completed,
             }));
         }
-        for tool in self.open_tools.drain() {
+        // A subagent's steps outlive the turn when it runs in the background;
+        // they stay open (and get their results later) unless the user
+        // stopped the turn.
+        let interrupted = self.interrupt_requested;
+        let ended: Vec<String> = self
+            .open_tools
+            .iter()
+            .filter(|(_, parent)| parent.is_none() || interrupted)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for tool in ended {
+            self.open_tools.remove(&tool);
             out.push(Out::Event(HarnessEvent::ItemCompleted {
                 native_id: tool,
                 body: None,

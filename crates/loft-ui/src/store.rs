@@ -1101,7 +1101,14 @@ impl ThreadState {
             id.0.strip_prefix("group:")
                 .or_else(|| id.0.strip_prefix("fold:"))
                 .unwrap_or(&id.0);
-        let ix = model.items.iter().position(|i| i.id.0 == id)?;
+        let mut ix = model.items.iter().position(|i| i.id.0 == id)?;
+        // A subagent's step shows on its subagent's row.
+        while let Some(parent) = &model.items[ix].parent_id {
+            match model.items.iter().position(|i| &i.id == parent) {
+                Some(p) => ix = p,
+                None => break,
+            }
+        }
         self.rows.iter().position(|r| match r {
             Row::Item(i) => *i == ix,
             Row::ToolGroup { members } => members.contains(&ix),

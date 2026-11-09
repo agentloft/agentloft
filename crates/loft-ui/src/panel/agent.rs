@@ -270,6 +270,10 @@ pub fn clean_report(raw: &str) -> String {
         }
         out
     }
+    // A background launch only returns a receipt; the report comes later.
+    if raw.trim_start().starts_with("Async agent launched") {
+        return String::new();
+    }
     let mut text = strip_tag(&strip_tag(raw, "tools-used-before-summary"), "usage");
     const MARKER: &str = "The report follows:";
     if text.contains("[Subagent hand-back]")
