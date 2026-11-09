@@ -40,7 +40,11 @@ pub struct FolderPicker {
     entries: Vec<Entry>,
     loading: bool,
     error: Option<String>,
+    /// What's typed in the field.
     query: String,
+    /// What filters the list: the typed text, or in a path the part after
+    /// the last slash.
+    filter: String,
     highlighted: usize,
     search: Entity<InputState>,
     scroll: ScrollHandle,
@@ -71,6 +75,7 @@ impl FolderPicker {
             loading: true,
             error: None,
             query: String::new(),
+            filter: String::new(),
             highlighted: 0,
             search,
             scroll: ScrollHandle::new(),
@@ -83,6 +88,11 @@ impl FolderPicker {
 
     /// Type into the filter (dev hook / tests).
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let end = text.len();
+        self.search.update(cx, |s, cx| {
+            s.set_value(text.to_owned(), window, cx);
+            s.set_selected_range(end..end, cx);
+        });
         self.on_query(text.to_owned(), window, cx);
     }
 
@@ -90,13 +100,20 @@ impl FolderPicker {
         self.search.read(cx).focus_handle(cx)
     }
 
+    /// Go to `dir`, clearing the field.
     fn navigate(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.query.clear();
+        self.filter.clear();
+        self.search.update(cx, |s, cx| s.set_value("", window, cx));
+        self.load(dir, cx);
+    }
+
+    /// List `dir` without touching the field.
+    fn load(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.dir = dir.clone();
         self.loading = true;
         self.error = None;
         self.highlighted = 0;
-        self.query.clear();
-        self.search.update(cx, |s, cx| s.set_value("", window, cx));
         let read = cx.background_spawn(async move { list_dirs(&dir) });
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -115,36 +132,35 @@ impl FolderPicker {
         cx.notify();
     }
 
-    /// Typing a path walks it like a shell: each `/` moves into that
-    /// folder, and what follows the last one filters the list.
-    fn on_query(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// The field drives the list. A path (`/…`, `~/…`) shows the folder
+    /// typed so far, filtered by the part after the last slash; the field
+    /// itself is never rewritten while you type.
+    fn on_query(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
         self.highlighted = 0;
-        if let Some((dir, partial)) = split_path_query(&text)
-            && dir.is_dir()
-        {
-            if dir != self.dir {
-                self.navigate(dir, window, cx);
+        self.query = text.clone();
+        match split_path_query(&text) {
+            Some((dir, partial)) => {
+                self.filter = partial;
+                if dir.is_dir() {
+                    if dir != self.dir {
+                        self.load(dir, cx);
+                    } else {
+                        self.error = None;
+                    }
+                } else {
+                    self.entries.clear();
+                    self.error = Some(format!("No folder at {}", tilde_text(&dir)));
+                }
             }
-            // What was typed after the slash stays, as the filter.
-            self.query = partial.clone();
-            let end = partial.len();
-            self.search.update(cx, |s, cx| {
-                s.set_value(partial, window, cx);
-                s.set_selected_range(end..end, cx);
-            });
-            self.error = None;
-            cx.notify();
-            return;
+            // `~` alone, or `/` alone: nothing to list yet.
+            None if looks_like_path(&text) => self.filter.clear(),
+            None => self.filter = text,
         }
-        self.query = text;
         cx.notify();
     }
 
     fn visible(&self) -> Vec<&Entry> {
-        let q = self.query.to_lowercase();
-        if looks_like_path(&self.query) {
-            return Vec::new();
-        }
+        let q = self.filter.to_lowercase();
         let show_hidden = q.starts_with('.');
         self.entries
             .iter()
@@ -153,19 +169,28 @@ impl FolderPicker {
             .collect()
     }
 
+    /// ⏎: in a typed path, complete the highlighted folder into it (or
+    /// finish the path with a slash); otherwise open the folder.
     fn open_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .visible()
+            .get(self.highlighted)
+            .map(|e| (e.name.clone(), e.path.clone()));
         if looks_like_path(&self.query) {
-            let path = expand(&self.query);
-            if path.is_dir() {
-                self.navigate(path, window, cx);
-            } else {
-                self.error = Some(format!("No folder at {}", self.query.trim()));
-                cx.notify();
-            }
+            let typed = self.query.trim_start().to_owned();
+            let next = match (&target, typed.rfind('/')) {
+                (Some((name, _)), Some(slash)) => format!("{}{name}/", &typed[..=slash]),
+                _ if expand(&typed).is_dir() && !typed.ends_with('/') => format!("{typed}/"),
+                _ => return,
+            };
+            let end = next.len();
+            self.search.update(cx, |s, cx| {
+                s.set_value(next, window, cx);
+                s.set_selected_range(end..end, cx);
+            });
             return;
         }
-        let target = self.visible().get(self.highlighted).map(|e| e.path.clone());
-        if let Some(path) = target {
+        if let Some((_, path)) = target {
             self.navigate(path, window, cx);
         }
     }
@@ -196,8 +221,14 @@ impl FolderPicker {
         }));
     }
 
+    /// ⌘⏎: the folder a typed path names, else the one being shown.
     fn add_current(&mut self, cx: &mut Context<Self>) {
-        cx.emit(FolderPickerEvent::Pick(self.dir.clone()));
+        let typed = looks_like_path(&self.query)
+            .then(|| expand(&self.query))
+            .filter(|p| p.is_dir());
+        cx.emit(FolderPickerEvent::Pick(
+            typed.unwrap_or_else(|| self.dir.clone()),
+        ));
     }
 
     fn move_by(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -375,10 +406,10 @@ impl Render for FolderPicker {
             Some("Reading…".to_owned())
         } else if let Some(err) = &self.error {
             Some(err.clone())
-        } else if looks_like_path(&self.query) {
-            Some(format!("⏎ to go to {}", self.query.trim()))
+        } else if rows.is_empty() && looks_like_path(&self.query) {
+            Some("Keep typing a path, or ⌘⏎ to add it.".to_owned())
         } else if rows.is_empty() {
-            Some(if self.query.is_empty() {
+            Some(if self.filter.is_empty() {
                 "No folders here.".to_owned()
             } else {
                 "No folders match.".to_owned()
@@ -662,6 +693,10 @@ fn split_path_query(text: &str) -> Option<(PathBuf, String)> {
     let slash = text.rfind('/')?;
     let (dir, partial) = text.split_at(slash + 1);
     Some((expand(dir), partial.to_owned()))
+}
+
+fn tilde_text(path: &Path) -> String {
+    crate::workspace::tilde_path(path)
 }
 
 fn looks_like_path(query: &str) -> bool {
