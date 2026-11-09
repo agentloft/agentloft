@@ -1573,6 +1573,8 @@ impl WorkspaceView {
             // Title-bar strip: traffic lights on the left, actions on the right.
             .child(
                 h_flex()
+                    .id("sidebar-titlebar")
+                    .on_click(titlebar_double_click)
                     .h(px(HEADER_HEIGHT))
                     .pl(px(if self.tabs_shown {
                         8.
@@ -1691,6 +1693,8 @@ impl WorkspaceView {
     ) -> AnyElement {
         let has_thread = title.is_some();
         h_flex()
+            .id("titlebar")
+            .on_click(titlebar_double_click)
             .h(px(HEADER_HEIGHT))
             .flex_shrink_0()
             .px_4()
@@ -3018,6 +3022,14 @@ fn icon_button(
         .child(Icon::new(icon).small())
         .on_click(move |e, w, cx| handler(e, w, cx))
         .into_any_element()
+}
+
+/// Double-clicking our drawn title bar does what macOS is set to do
+/// (zoom or minimize), like a native title bar.
+fn titlebar_double_click(event: &gpui_kit::ClickEvent, window: &mut Window, _: &mut gpui_kit::App) {
+    if event.click_count() == 2 {
+        window.titlebar_double_click();
+    }
 }
 
 fn toggle_button(
