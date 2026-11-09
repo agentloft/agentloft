@@ -348,10 +348,7 @@ impl ThreadActor {
             )
         })?;
         let opts = self.core.opts();
-        let hcfg = match self.thread.harness.as_str() {
-            "codex" => &opts.config.harness.codex,
-            _ => &opts.config.harness.claude,
-        };
+        let hcfg = crate::harness_config(&self.core.config(), &self.thread.harness);
         let new_session_id = (self.thread.native_session_id.is_none()
             && harness.capabilities().client_session_id)
             .then(|| uuid::Uuid::new_v4().to_string());

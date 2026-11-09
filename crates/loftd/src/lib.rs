@@ -64,6 +64,7 @@ impl Daemon {
                 config,
                 mcp_bridge: opts.mcp_bridge,
                 worktrees_dir: paths.worktrees_dir(),
+                config_file: Some(paths.config_file()),
                 ..CoreOptions::default()
             },
         );

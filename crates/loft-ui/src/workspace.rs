@@ -230,6 +230,10 @@ impl WorkspaceView {
         };
         self.panel_open = true;
         match dev.split_once(':') {
+            Some(("settings", section)) => {
+                let section = crate::settings::Section::parse(section);
+                crate::settings::open(self.store.clone(), section, cx);
+            }
             Some(("fork", harness)) => {
                 let (t, h) = (thread_id.clone(), HarnessId(harness.into()));
                 self.store.update(cx, |s, cx| s.fork_thread(t, h, cx));
@@ -512,7 +516,7 @@ impl WorkspaceView {
         if !path.exists() {
             let _ = std::fs::write(&path, SETTINGS_TEMPLATE);
         }
-        cx.open_with_system(&path);
+        crate::settings::open(self.store.clone(), None, cx);
     }
 
     // -- sidebar ------------------------------------------------------------
@@ -1470,7 +1474,7 @@ fn queued_list(
     )
 }
 
-fn mode_label(mode: Option<loft_protocol::PermissionMode>) -> &'static str {
+pub(crate) fn mode_label(mode: Option<loft_protocol::PermissionMode>) -> &'static str {
     use loft_protocol::PermissionMode::*;
     match mode {
         None => "Default permissions",

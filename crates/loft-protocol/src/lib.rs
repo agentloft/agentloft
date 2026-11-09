@@ -142,6 +142,8 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    /// Re-read `config.toml` (harness and worktree settings changed).
+    ReloadConfig,
     /// Ask the daemon to exit (graceful shutdown or upgrade).
     Shutdown {
         reason: ShutdownReason,

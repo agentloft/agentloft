@@ -62,6 +62,8 @@ pub struct CoreOptions {
     pub mcp_bridge: Option<McpBridge>,
     /// Where per-thread worktrees go (`~/.agentloft/worktrees`).
     pub worktrees_dir: PathBuf,
+    /// `config.toml`, re-read on `Request::ReloadConfig`.
+    pub config_file: Option<PathBuf>,
 }
 
 impl Default for CoreOptions {
@@ -72,6 +74,7 @@ impl Default for CoreOptions {
             flush_interval: Duration::from_millis(250),
             mcp_bridge: None,
             worktrees_dir: std::env::temp_dir().join("agentloft-worktrees"),
+            config_file: None,
         }
     }
 }
@@ -87,6 +90,8 @@ pub struct Core {
     clients: ClientRegistry,
     /// Serializes worktree creation (two first messages racing).
     worktree_lock: tokio::sync::Mutex<()>,
+    /// Live config (starts as `opts.config`; replaced on reload).
+    config: std::sync::RwLock<loft_config::Config>,
     opts: CoreOptions,
 }
 
@@ -112,6 +117,7 @@ impl Core {
             terminals: terminals::Terminals::default(),
             clients: ClientRegistry::default(),
             worktree_lock: tokio::sync::Mutex::new(()),
+            config: std::sync::RwLock::new(opts.config.clone()),
             opts,
         })
     }
@@ -147,6 +153,25 @@ impl Core {
 
     pub(crate) fn live(&self) -> MutexGuard<'_, HashMap<ItemId, Item>> {
         lock(&self.live)
+    }
+
+    /// The current config (reloaded by the settings window).
+    pub(crate) fn config(&self) -> loft_config::Config {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn reload_config(&self) -> CoreResult<Response> {
+        let Some(file) = &self.opts.config_file else {
+            return Ok(Response::Ok);
+        };
+        let config = loft_config::Config::load_file(file)
+            .map_err(|e| ErrorBody::new(ErrorCode::BadRequest, format!("{e:#}")))?;
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+        tracing::info!("config reloaded");
+        Ok(Response::Ok)
     }
 
     pub(crate) fn opts(&self) -> &CoreOptions {
@@ -386,6 +411,7 @@ impl Core {
                 harness,
                 share_workspace,
             } => self.fork_thread(&thread_id, harness, share_workspace).await,
+            Request::ReloadConfig => self.reload_config(),
             Request::ArchiveThread { thread_id, force } => {
                 self.archive_thread(&thread_id, force).await
             }
@@ -448,9 +474,11 @@ impl Core {
         }
         // Drop any idle actor holding the old thread state.
         lock(&self.threads).remove(id);
+        let (model, mode) = thread_defaults(&self.config(), &harness);
         thread.harness = harness;
         thread.native_session_id = None;
-        thread.model = None;
+        thread.model = model;
+        thread.permission_mode = mode;
         thread.updated_at_ms = now_ms();
         self.commit(vec![Event::ThreadUpdated {
             thread: thread.clone(),
@@ -475,14 +503,15 @@ impl Core {
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let now = now_ms();
         let workspace = self.default_workspace(&project.root_path);
+        let (model, permission_mode) = thread_defaults(&self.config(), &harness);
         let thread = Thread {
             id: ThreadId::new(),
             project_id,
             title: title.unwrap_or_else(|| "New thread".into()),
             harness,
             cwd: project.root_path,
-            model: None,
-            permission_mode: None,
+            model,
+            permission_mode,
             native_session_id: None,
             status: ThreadStatus::Idle,
             created_at_ms: now,
@@ -552,6 +581,30 @@ impl Core {
     pub(crate) fn forget_process(&self, pid: u32) {
         let _ = self.with_store(|s| s.forget_process(pid));
     }
+}
+
+/// `[harness.<id>]` settings for a harness (defaults when unknown).
+pub(crate) fn harness_config(
+    config: &loft_config::Config,
+    harness: &HarnessId,
+) -> loft_config::HarnessConfig {
+    match harness.as_str() {
+        HarnessId::CODEX => config.harness.codex.clone(),
+        HarnessId::CLAUDE => config.harness.claude.clone(),
+        _ => loft_config::HarnessConfig::default(),
+    }
+}
+
+/// The user's per-harness defaults for a new thread: model and mode.
+pub(crate) fn thread_defaults(
+    config: &loft_config::Config,
+    harness: &HarnessId,
+) -> (Option<String>, Option<loft_protocol::PermissionMode>) {
+    let h = harness_config(config, harness);
+    let model =
+        (h.default_model != "auto" && !h.default_model.is_empty()).then(|| h.default_model.clone());
+    let mode = serde_json::from_value(serde_json::json!(h.default_permission_mode)).ok();
+    (model, mode)
 }
 
 fn expand_tilde(path: &str) -> PathBuf {

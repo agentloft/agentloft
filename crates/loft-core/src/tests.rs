@@ -542,3 +542,34 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
     };
     assert_eq!(shared.cwd, parent.cwd);
 }
+
+#[tokio::test]
+async fn config_reload_applies_to_new_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let config = dir.path().join("config.toml");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(config.clone()),
+            ..Default::default()
+        },
+    );
+    let t = new_thread(&core, &repo).await;
+    assert_eq!(t.workspace, ThreadWorkspace::Local);
+
+    std::fs::write(&config, "[worktrees]\nmode = \"worktree\"\n").unwrap();
+    core.handle(Request::ReloadConfig).await.unwrap();
+    let t = new_thread(&core, &repo).await;
+    assert_eq!(t.workspace, ThreadWorkspace::NewWorktree);
+
+    // A broken file is reported and the last good config stays.
+    std::fs::write(&config, "[worktrees\n").unwrap();
+    let err = core.handle(Request::ReloadConfig).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    let t = new_thread(&core, &repo).await;
+    assert_eq!(t.workspace, ThreadWorkspace::NewWorktree);
+}

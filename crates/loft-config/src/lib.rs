@@ -223,13 +223,69 @@ impl Default for HarnessConfig {
 impl Config {
     /// Load `config.toml`; a missing file yields defaults.
     pub fn load(paths: &Paths) -> Result<Self> {
-        let file = paths.config_file();
-        match std::fs::read_to_string(&file) {
+        Self::load_file(&paths.config_file())
+    }
+
+    /// Load a config file; a missing file yields defaults.
+    pub fn load_file(file: &Path) -> Result<Self> {
+        match std::fs::read_to_string(file) {
             Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", file.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("read {}", file.display())),
         }
     }
+}
+
+/// A value written by the settings UI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingValue {
+    Str(String),
+    Float(f64),
+    /// Remove the key (back to the default).
+    Unset,
+}
+
+/// Set one key in `config.toml` (e.g. `["ui", "theme"]`), keeping the rest
+/// of the file — comments and formatting included — as the user wrote it.
+pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result<()> {
+    use toml_edit::{DocumentMut, Item, Table, value as v};
+    let file = paths.config_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
+    };
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("parse {}", file.display()))?;
+    let (last, tables) = key.split_last().context("empty key")?;
+    let mut table = doc.as_table_mut();
+    for name in tables {
+        let entry = table.entry(name).or_insert(Item::Table(Table::new()));
+        table = entry
+            .as_table_mut()
+            .with_context(|| format!("`{name}` is not a table"))?;
+    }
+    match value {
+        SettingValue::Str(s) => {
+            table.insert(last, v(s));
+        }
+        SettingValue::Float(f) => {
+            // Whole numbers stay floats (`14.0`) so serde reads them as f32.
+            table.insert(last, v(f));
+        }
+        SettingValue::Unset => {
+            table.remove(last);
+        }
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Write-then-rename so a crash never leaves a truncated config.
+    let tmp = file.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +405,43 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn write_setting_keeps_comments_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().to_path_buf());
+        std::fs::write(
+            paths.config_file(),
+            "# my settings\n[ui]\ntheme = \"dark\" # night owl\n",
+        )
+        .unwrap();
+        write_setting(&paths, &["ui", "font_size"], SettingValue::Float(15.0)).unwrap();
+        write_setting(
+            &paths,
+            &["ui", "accent"],
+            SettingValue::Str("#3b82f6".into()),
+        )
+        .unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "default_model"],
+            SettingValue::Str("gpt-5".into()),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(
+            text.contains("# my settings") && text.contains("# night owl"),
+            "{text}"
+        );
+        let cfg = Config::load(&paths).unwrap();
+        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.ui.font_size, 15.0);
+        assert_eq!(cfg.ui.accent.as_deref(), Some("#3b82f6"));
+        assert_eq!(cfg.harness.codex.default_model, "gpt-5");
+        write_setting(&paths, &["ui", "accent"], SettingValue::Unset).unwrap();
+        assert_eq!(Config::load(&paths).unwrap().ui.accent, None);
+    }
+
     use super::*;
 
     #[test]

@@ -124,7 +124,7 @@ impl Core {
             }
             _ => slug_or(&parent.title, "thread"),
         };
-        let prefix = self.opts().config.worktrees.branch_prefix.clone();
+        let prefix = self.config().worktrees.branch_prefix.clone();
         let dir = self
             .opts()
             .worktrees_dir

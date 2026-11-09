@@ -45,6 +45,7 @@ gpui_kit::assets::icon_assets!(
         GitFork,
         Globe,
         Loader,
+        Minus,
         Moon,
         PanelLeft,
         PanelRight,

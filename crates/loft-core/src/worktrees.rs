@@ -41,7 +41,7 @@ impl Core {
 
     /// Workspace for a new thread from `[worktrees] mode`.
     pub(crate) fn default_workspace(&self, project_root: &str) -> ThreadWorkspace {
-        let wants = self.opts().config.worktrees.mode == "worktree";
+        let wants = self.config().worktrees.mode == "worktree";
         if wants && loft_git::repo_root(Path::new(project_root)).is_some() {
             ThreadWorkspace::NewWorktree
         } else {
@@ -94,7 +94,7 @@ impl Core {
             .with_store(|s| s.project(&thread.project_id))?
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let repo = PathBuf::from(&project.root_path);
-        let prefix = self.opts().config.worktrees.branch_prefix.clone();
+        let prefix = self.config().worktrees.branch_prefix.clone();
         let dir = self
             .opts()
             .worktrees_dir
