@@ -638,6 +638,7 @@ impl Core {
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await
             }
+            Request::DeleteThread { thread_id } => self.delete_thread(&thread_id).await,
             Request::SetDraft { thread_id, text } => {
                 let draft = (!text.trim().is_empty()).then_some(text);
                 self.thread_call(&thread_id, |reply| ThreadCmd::SetDraft { draft, reply })

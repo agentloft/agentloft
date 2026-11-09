@@ -809,7 +809,24 @@ impl AppStore {
         });
     }
 
-    /// Move the selection off an archived thread.
+    /// Delete a thread for good (after the user confirmed).
+    pub fn delete_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let body = Request::DeleteThread {
+            thread_id: thread_id.clone(),
+        };
+        self.request_result(body, cx, move |store, result, cx| match result {
+            Ok(_) => {
+                store.on_archived(&thread_id, cx);
+                store.threads.remove(&thread_id);
+                store.unread.remove(&thread_id);
+                store.drafts.remove(&thread_id);
+                store.notify_result(Ok("Thread deleted".into()), cx);
+            }
+            Err(err) => store.notify_result(Err(err), cx),
+        });
+    }
+
+    /// Move the selection off an archived (or deleted) thread.
     fn on_archived(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
         if self.selected.as_ref() != Some(thread_id) {
             return;

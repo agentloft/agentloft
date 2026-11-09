@@ -186,6 +186,11 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    /// Delete a thread for good: stop it, remove its worktree (the branch is
+    /// kept) and checkpoints, and erase its history.
+    DeleteThread {
+        thread_id: ThreadId,
+    },
     /// Re-read `config.toml` (harness and worktree settings changed).
     ReloadConfig,
     /// Is the harness's CLI installed, where, and which version.
@@ -476,14 +481,34 @@ pub struct EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    ProjectAdded { project: Project },
-    ThreadCreated { thread: Thread },
-    ThreadUpdated { thread: Thread },
-    TurnStarted { turn: Turn },
-    TurnUpdated { turn: Turn },
-    ItemUpserted { item: Item },
-    RequestOpened { request: RuntimeRequest },
-    RequestUpdated { request: RuntimeRequest },
+    ProjectAdded {
+        project: Project,
+    },
+    ThreadCreated {
+        thread: Thread,
+    },
+    ThreadUpdated {
+        thread: Thread,
+    },
+    TurnStarted {
+        turn: Turn,
+    },
+    TurnUpdated {
+        turn: Turn,
+    },
+    ItemUpserted {
+        item: Item,
+    },
+    RequestOpened {
+        request: RuntimeRequest,
+    },
+    RequestUpdated {
+        request: RuntimeRequest,
+    },
+    /// The thread and its history are gone.
+    ThreadDeleted {
+        thread_id: ThreadId,
+    },
 }
 
 impl Event {
@@ -497,6 +522,7 @@ impl Event {
             Event::RequestOpened { request } | Event::RequestUpdated { request } => {
                 Some(&request.thread_id)
             }
+            Event::ThreadDeleted { thread_id } => Some(thread_id),
         }
     }
 
@@ -504,7 +530,10 @@ impl Event {
     pub fn is_workspace_event(&self) -> bool {
         matches!(
             self,
-            Event::ProjectAdded { .. } | Event::ThreadCreated { .. } | Event::ThreadUpdated { .. }
+            Event::ProjectAdded { .. }
+                | Event::ThreadCreated { .. }
+                | Event::ThreadUpdated { .. }
+                | Event::ThreadDeleted { .. }
         )
     }
 }

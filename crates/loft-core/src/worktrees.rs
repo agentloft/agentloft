@@ -428,6 +428,32 @@ impl Core {
     }
 }
 
+impl Core {
+    /// Delete a thread: stop it, remove its worktree (keeping the branch)
+    /// and checkpoint refs, then erase it from the store.
+    pub(crate) async fn delete_thread(self: &Arc<Self>, id: &ThreadId) -> CoreResult<Response> {
+        let thread = self.load_thread(id)?;
+        if thread.status != ThreadStatus::Archived {
+            self.archive_thread(id, true).await?;
+        }
+        if let Some(project) = self.with_store(|s| s.project(&thread.project_id))? {
+            let repo = PathBuf::from(project.root_path);
+            let prefix = format!("{}/{}", loft_git::REF_PREFIX, id.as_str());
+            let _ = blocking(move || {
+                if loft_git::repo_root(&repo).is_some() {
+                    loft_git::delete_refs(&repo, &prefix)?;
+                }
+                Ok(())
+            })
+            .await;
+        }
+        self.commit(vec![Event::ThreadDeleted {
+            thread_id: id.clone(),
+        }])?;
+        Ok(Response::Ok)
+    }
+}
+
 /// `gh pr create`; an already-open PR for the branch is returned instead.
 fn gh_pr_create(
     gh: &Path,

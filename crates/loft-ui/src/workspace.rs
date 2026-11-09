@@ -2711,7 +2711,8 @@ fn thread_row(
             let store = store.clone();
             let id = thread.id.clone();
             let title = thread.title.clone();
-            move |menu, _, cx| {
+            let harness = thread.harness.clone();
+            move |menu, window, cx| {
                 use gpui_kit::component::menu::PopupMenuItem;
                 let (s1, i1, t1) = (store.clone(), id.clone(), title.clone());
                 let i2 = id.clone();
@@ -2732,28 +2733,25 @@ fn thread_row(
                             }),
                     )
                     .separator();
-                for (h, name) in store.read(cx).available_harnesses() {
-                    let (s, i) = (store.clone(), id.clone());
-                    menu = menu.item(
-                        PopupMenuItem::new(format!("Fork with {name}"))
-                            .icon(IconName::GitFork)
+                menu = fork_submenu(menu, &store, &id, &harness, window, cx);
+                let (s, i) = (store.clone(), id.clone());
+                let (s2, i2, t2) = (store.clone(), id.clone(), title.clone());
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new("Archive")
+                            .icon(IconName::Archive)
                             .on_click(move |_, _, cx| {
                                 let i = i.clone();
-                                s.update(cx, |s, cx| {
-                                    s.fork_thread(i, HarnessId(h.into()), None, cx)
-                                });
+                                s.update(cx, |s, cx| s.archive_thread(i, false, cx));
                             }),
-                    );
-                }
-                let (s, i) = (store.clone(), id.clone());
-                menu.separator().item(
-                    PopupMenuItem::new("Archive")
-                        .icon(IconName::Archive)
-                        .on_click(move |_, _, cx| {
-                            let i = i.clone();
-                            s.update(cx, |s, cx| s.archive_thread(i, false, cx));
-                        }),
-                )
+                    )
+                    .item(
+                        PopupMenuItem::new("Delete…")
+                            .icon(IconName::Trash)
+                            .on_click(move |_, window, cx| {
+                                confirm_delete(s2.clone(), i2.clone(), t2.clone(), window, cx)
+                            }),
+                    )
             }
         })
         .into_any_element()
@@ -2848,6 +2846,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
     let store = store.clone();
     let id = thread.id.clone();
     let harness = thread.harness.clone();
+    let title = thread.title.clone();
     let worktree = match &thread.workspace {
         ThreadWorkspace::Worktree { path, branch, base } => {
             Some((path.clone(), branch.clone(), base.clone()))
@@ -2862,7 +2861,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
         .icon(IconName::Ellipsis)
         .ghost()
         .xsmall()
-        .dropdown_menu(move |mut menu, _, cx| {
+        .dropdown_menu(move |mut menu, window, cx| {
             if let Some((path, branch, base)) = &worktree {
                 let (s, t) = (store.clone(), id.clone());
                 menu = menu
@@ -2916,23 +2915,9 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                         }),
                 )
                 .separator();
-            for (h, name) in store.read(cx).available_harnesses() {
-                let (s, t) = (store.clone(), id.clone());
-                let native = matches!(h, HarnessId::CLAUDE | HarnessId::CODEX);
-                let label = if h == harness.as_str() && native {
-                    format!("Fork with {name} (full context)")
-                } else {
-                    format!("Fork with {name} (handoff)")
-                };
-                menu = menu.item(PopupMenuItem::new(label).icon(IconName::GitFork).on_click(
-                    move |_, _, cx| {
-                        let t = t.clone();
-                        s.update(cx, |s, cx| s.fork_thread(t, HarnessId(h.into()), None, cx));
-                    },
-                ));
-            }
-            menu = menu.separator();
+            menu = fork_submenu(menu, &store, &id, &harness, window, cx).separator();
             let (s, t) = (store.clone(), id.clone());
+            let (s2, t2, title2) = (store.clone(), id.clone(), title.clone());
             menu.item(
                 PopupMenuItem::new("Archive thread")
                     .icon(IconName::Archive)
@@ -2941,8 +2926,95 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                         s.update(cx, |s, cx| s.archive_thread(t, false, cx));
                     }),
             )
+            .item(
+                PopupMenuItem::new("Delete thread…")
+                    .icon(IconName::Trash)
+                    .on_click(move |_, window, cx| {
+                        confirm_delete(s2.clone(), t2.clone(), title2.clone(), window, cx)
+                    }),
+            )
         })
         .into_any_element()
+}
+
+/// "Fork ▸" with one entry per agent: the same agent continues the real
+/// conversation, another starts from a handoff summary.
+fn fork_submenu(
+    menu: gpui_kit::component::menu::PopupMenu,
+    store: &Entity<AppStore>,
+    thread_id: &ThreadId,
+    current: &HarnessId,
+    window: &mut Window,
+    cx: &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu {
+    use gpui_kit::component::menu::PopupMenuItem;
+    let agents = store.read(cx).available_harnesses();
+    let (store, thread_id, current) = (store.clone(), thread_id.clone(), current.clone());
+    menu.submenu_with_icon(
+        Some(Icon::new(IconName::GitFork)),
+        "Fork",
+        window,
+        cx,
+        move |mut sub, _, _| {
+            for &(h, name) in &agents {
+                let (s, t) = (store.clone(), thread_id.clone());
+                let label = if h == current.as_str() {
+                    format!("{name} · same conversation")
+                } else {
+                    format!("{name} · from a summary")
+                };
+                sub = sub.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    let t = t.clone();
+                    s.update(cx, |s, cx| s.fork_thread(t, HarnessId(h.into()), None, cx));
+                }));
+            }
+            sub
+        },
+    )
+}
+
+/// Confirm, then delete a thread for good.
+fn confirm_delete(
+    store: Entity<AppStore>,
+    thread_id: ThreadId,
+    title: String,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    let branch = store
+        .read(cx)
+        .workspace
+        .threads
+        .iter()
+        .find(|t| t.id == thread_id)
+        .and_then(|t| t.workspace.branch().map(str::to_owned));
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (store, thread_id) = (store.clone(), thread_id.clone());
+        let mut text = "Its conversation, turn history and checkpoints are erased and its \
+                        agent and terminals are stopped. This can't be undone."
+            .to_owned();
+        if let Some(branch) = &branch {
+            text.push_str(&format!(
+                " The worktree is removed; the branch {branch} is kept."
+            ));
+        }
+        dialog
+            .title(format!("Delete “{title}”?"))
+            .child(text)
+            .footer(
+                DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
+                    .child(DialogAction::new().child(Button::new("ok").danger().label("Delete"))),
+            )
+            .on_ok(move |_, _, cx| {
+                let t = thread_id.clone();
+                store.update(cx, |s, cx| s.delete_thread(t, cx));
+                true
+            })
+    });
 }
 
 fn confirm_archive(

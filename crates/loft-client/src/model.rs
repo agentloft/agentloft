@@ -50,6 +50,9 @@ impl WorkspaceModel {
                 }
                 self.sort();
             }
+            Event::ThreadDeleted { thread_id } => {
+                self.threads.retain(|t| &t.id != thread_id);
+            }
             _ => return false,
         }
         true
@@ -132,7 +135,7 @@ impl ThreadModel {
                     None => self.requests.push(request.clone()),
                 }
             }
-            Event::ProjectAdded { .. } => return false,
+            Event::ProjectAdded { .. } | Event::ThreadDeleted { .. } => return false,
         }
         true
     }

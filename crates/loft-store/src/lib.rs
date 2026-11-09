@@ -327,6 +327,7 @@ fn event_type(event: &Event) -> &'static str {
         Event::ItemUpserted { .. } => "item_upserted",
         Event::RequestOpened { .. } => "request_opened",
         Event::RequestUpdated { .. } => "request_updated",
+        Event::ThreadDeleted { .. } => "thread_deleted",
     }
 }
 
@@ -368,6 +369,19 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
             )?;
         }
         Event::ItemUpserted { item } => upsert_item(conn, item)?,
+        Event::ThreadDeleted { thread_id } => {
+            let id = thread_id.as_str();
+            for sql in [
+                "DELETE FROM items WHERE thread_id = ?1",
+                "DELETE FROM turns WHERE thread_id = ?1",
+                "DELETE FROM requests WHERE thread_id = ?1",
+                "DELETE FROM threads WHERE id = ?1",
+                // The log keeps only the deletion itself.
+                "DELETE FROM events WHERE thread_id = ?1 AND type != 'thread_deleted'",
+            ] {
+                conn.execute(sql, params![id])?;
+            }
+        }
         Event::RequestOpened { request } | Event::RequestUpdated { request } => {
             conn.execute(
                 "INSERT INTO requests(id, thread_id, data) VALUES (?1, ?2, ?3)

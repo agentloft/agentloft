@@ -71,6 +71,7 @@ gpui_kit::assets::icon_assets!(
         SquareTerminal,
         Sun,
         Table,
+        Trash,
         X,
     ]
 );

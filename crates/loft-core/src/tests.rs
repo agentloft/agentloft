@@ -166,6 +166,45 @@ async fn drafts_persist_until_the_first_message() {
 }
 
 #[tokio::test]
+async fn delete_thread_erases_it() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "hello".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    f.core
+        .handle(Request::DeleteThread {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap();
+    let threads = f.core.with_store(|s| s.threads()).unwrap();
+    assert!(threads.iter().all(|t| t.id != thread.id));
+    let (turns, items) = f
+        .core
+        .with_store(|s| Ok((s.turns(&thread.id)?, s.items(&thread.id)?)))
+        .unwrap();
+    assert!(turns.is_empty() && items.is_empty());
+    // Gone for clients too.
+    let err = f
+        .core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "again".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
 async fn second_turn_rejected_while_running_then_interrupt() {
     let f = fixture();
     let thread = new_thread(&f.core, f._dir.path()).await;
