@@ -76,6 +76,8 @@ pub enum TerminalEvent {
     TitleChanged(String),
     /// The program rang the bell (BEL).
     Bell,
+    /// ⌘-click on a URL in the grid.
+    OpenUrl(String),
 }
 
 const CTRL_LETTERS: [&str; 26] = [
@@ -720,6 +722,15 @@ impl TerminalView {
     ) {
         window.focus(&self.focus_handle, cx);
         let Some(grid) = self.grid else { return };
+        // ⌘-click opens a URL under the pointer (before mouse reporting, so
+        // it works inside TUIs too).
+        if event.button == MouseButton::Left && event.modifiers.platform {
+            let (col, row) = grid.cell_at(event.position);
+            if let Some(url) = crate::links::url_at(&self.row_text(row as usize), col as usize) {
+                cx.emit(TerminalEvent::OpenUrl(url));
+                return;
+            }
+        }
         if self.reporting_mouse(&event.modifiers) {
             let Some(button) = vt_button(event.button) else {
                 return;

@@ -24,6 +24,7 @@
 mod backend;
 mod element;
 mod input;
+mod links;
 mod theme;
 mod view;
 

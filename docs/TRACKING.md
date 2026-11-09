@@ -52,7 +52,7 @@ Built ahead of the PLAN's milestone order, by request.
 | File explorer + viewer | [x] | .gitignore-aware tree; tree-sitter highlighting; Markdown preview; images |
 | Subagent view | [x] | Agent cards in the timeline; subagent tab with steps and report |
 | Agentloft MCP server | [x] | `browser_*`, `list_threads`, `read_thread`, `get_thread_diff`; verified with Claude and Codex |
-| Terminal (M4) | [x] | Ghostty VT (`loft-terminal`, libghostty-vt) on daemon PTYs with an 8 MiB replay; one shell per thread that reattaches after a UI restart; vim, truecolor and CJK verified live. Stress: 3M lines (~25 MB) in 1.9 s with the UI responsive; the daemon stays at ~28 MB because output is read from the ring and never queued on the bus. **Not yet done:** terminal tabs, URL detection |
+| Terminal (M4) | [x] | Ghostty VT (`loft-terminal`, libghostty-vt) on daemon PTYs with an 8 MiB replay; one shell per thread that reattaches after a UI restart; vim, truecolor and CJK verified live. Stress: 3M lines (~25 MB) in 1.9 s with the UI responsive; the daemon stays at ~28 MB because output is read from the ring and never queued on the bus. ⌘-click opens URLs: localhost dev servers in the side-panel browser, others in the default browser. **Not yet done:** terminal tabs |
 | Browser panel | [x] | WKWebView (`loft-browser`, wry) in the side panel; agents drive it over MCP (navigate, snapshot, click, type, eval); Claude verified live |
 | Office documents | [x] | `loft-docs`: Word (paragraphs/tables), Excel (sheet grid), PowerPoint (slides), CSV; verified with sample files |
 | Queued messages, approval shortcuts (M1) | [x] | ⌘⏎ / ⌘⇧⏎ / ⌘⇧⌫ |

@@ -42,6 +42,8 @@ pub enum StoreEvent {
         call_id: u64,
         command: serde_json::Value,
     },
+    /// Show `url` in the side-panel browser.
+    Browse { url: String },
     /// A transient message for the user (toast).
     Notify { message: String, error: bool },
     /// Archiving needs confirmation (e.g. the worktree is dirty).

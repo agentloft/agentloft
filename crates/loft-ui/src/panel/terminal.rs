@@ -93,6 +93,26 @@ impl TerminalPane {
                 cx.notify();
             }
             TerminalEvent::Bell => {}
+            TerminalEvent::OpenUrl(url) => {
+                // Local dev servers open next to the chat; the rest in the
+                // default browser.
+                let local = [
+                    "http://localhost",
+                    "http://127.0.0.1",
+                    "http://0.0.0.0",
+                    "https://localhost",
+                ]
+                .iter()
+                .any(|p| url.starts_with(p));
+                if local {
+                    let url = url.clone();
+                    self.store.update(cx, |_, cx| {
+                        cx.emit(crate::store::StoreEvent::Browse { url })
+                    });
+                } else {
+                    cx.open_url(url);
+                }
+            }
         }
     }
 

@@ -252,6 +252,13 @@ impl WorkspaceView {
                 };
                 window.push_notification(note, cx);
             }
+            StoreEvent::Browse { url } => {
+                self.panel_open = true;
+                self.panel
+                    .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
+                let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
+                browser.update(cx, |b, cx| b.navigate(url, cx));
+            }
             StoreEvent::ConfirmArchive { thread_id, reason } => {
                 confirm_archive(
                     thread_id.clone(),
