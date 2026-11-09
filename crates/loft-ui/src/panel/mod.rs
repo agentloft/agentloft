@@ -330,35 +330,9 @@ impl Render for WorkbenchPanel {
         let panel = self.ensure(&thread_id, &thread, window, cx);
         let active = panel.active.clone();
 
-        // Fixed tabs, then open files and agents.
-        let mut tabs: Vec<(Tab, AnyElement, String, bool)> = vec![
-            (
-                Tab::Files,
-                Icon::new(IconName::FolderTree).xsmall().into_any_element(),
-                "Files".into(),
-                false,
-            ),
-            (
-                Tab::Changes,
-                Icon::new(IconName::GitCompare).xsmall().into_any_element(),
-                "Changes".into(),
-                false,
-            ),
-            (
-                Tab::Terminal,
-                Icon::new(IconName::SquareTerminal)
-                    .xsmall()
-                    .into_any_element(),
-                "Terminal".into(),
-                false,
-            ),
-            (
-                Tab::Browser,
-                Icon::new(IconName::Globe).xsmall().into_any_element(),
-                "Browser".into(),
-                false,
-            ),
-        ];
+        // Files, Changes, Terminal and Browser live in the title bar; the
+        // strip only lists the files and agents opened here.
+        let mut tabs: Vec<(Tab, AnyElement, String, bool)> = Vec::new();
         for (path, _) in &panel.viewers {
             let name = path.rsplit('/').next().unwrap_or(path).to_owned();
             tabs.push((
@@ -382,9 +356,10 @@ impl Render for WorkbenchPanel {
             ));
         }
 
+        let has_tabs = !tabs.is_empty();
         let mut strip = h_flex()
             .id("panel-tabs")
-            .h(px(44.))
+            .h(px(40.))
             .flex_shrink_0()
             .px_2()
             .gap_1()
@@ -454,7 +429,7 @@ impl Render for WorkbenchPanel {
         v_flex()
             .size_full()
             .bg(p.background)
-            .child(strip)
+            .when(has_tabs, |d| d.child(strip))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
