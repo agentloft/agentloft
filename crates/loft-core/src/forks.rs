@@ -130,6 +130,15 @@ impl Core {
             .worktrees_dir
             .join(slug_or(&project.name, "project"));
         let ref_name = format!("{}/{}/fork", loft_git::REF_PREFIX, child);
+        let project_cfg = loft_config::ProjectConfig::load(&repo);
+        if let Some(cmd) = project_cfg
+            .worktree
+            .setup
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+        {
+            crate::lock(&self.pending_setup).insert(child.clone(), cmd);
+        }
         let workspace = blocking(move || {
             let base = base
                 .or_else(|| wt::current_branch(&repo))
@@ -145,7 +154,7 @@ impl Core {
                 n += 1;
             }
             wt::add(&repo, &path, &branch, &commit)?;
-            wt::copy_env_files(&repo, &path);
+            wt::copy_untracked(&repo, &path, &project_cfg.worktree.copy);
             Ok(ThreadWorkspace::Worktree {
                 path: path.to_string_lossy().into_owned(),
                 branch,

@@ -772,3 +772,81 @@ async fn revert_turn_restores_files_and_tells_the_agent() {
             .any(|i| matches!(&i.body, ItemBody::UserMessage { text, .. } if text == "continue"))
     );
 }
+
+#[tokio::test]
+async fn worktree_setup_runs_before_the_first_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let make_repo = |name: &str, setup: &str| {
+        let repo = dir.path().join(name);
+        std::fs::create_dir_all(repo.join(".agentloft")).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        std::fs::write(
+            repo.join(".agentloft/config.toml"),
+            format!("[worktree]\nsetup = \"{setup}\"\ncopy = [\".env*\", \"secrets/*.json\"]\n"),
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), ".env*\nsecrets/\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "init"]);
+        std::fs::write(repo.join(".env"), "KEY=1\n").unwrap();
+        std::fs::create_dir_all(repo.join("secrets")).unwrap();
+        std::fs::write(repo.join("secrets/api.json"), "{}").unwrap();
+        repo
+    };
+    let ok_repo = make_repo("ok", "echo ready > setup.txt");
+    let bad_repo = make_repo("bad", "echo boom; exit 3");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            ..Default::default()
+        },
+    );
+    let mut results = Vec::new();
+    for repo in [&ok_repo, &bad_repo] {
+        let thread = new_thread(&core, repo).await;
+        core.handle(Request::SetThreadWorkspace {
+            thread_id: thread.id.clone(),
+            worktree: true,
+        })
+        .await
+        .unwrap();
+        core.handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "go".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+        wait_for(&core, &thread.id, turn_done).await;
+        results.push(thread_snapshot(&core, &thread.id));
+    }
+
+    let (thread, turns, items, _) = &results[0];
+    let wt = PathBuf::from(&thread.cwd);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("setup.txt")).unwrap(),
+        "ready\n"
+    );
+    assert!(wt.join(".env").exists() && wt.join("secrets/api.json").exists());
+    assert!(items.iter().any(|i| matches!(&i.body,
+        ItemBody::Notice { text, .. } if text.starts_with("Worktree set up: `echo ready > setup.txt`"))));
+    // The turn's checkpoint was taken after setup, so its diff excludes it.
+    assert!(turns[0].checkpoint_before.is_some());
+
+    let (_, _, items, _) = &results[1];
+    assert!(items.iter().any(|i| matches!(&i.body,
+        ItemBody::Notice { level: loft_protocol::NoticeLevel::Warning, text } if text.contains("boom"))));
+    let echoed: String = items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::AssistantMessage { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(echoed.contains("setup command failed"), "{echoed}");
+}

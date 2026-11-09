@@ -236,6 +236,49 @@ impl Config {
     }
 }
 
+/// Per-project settings in `<repo>/.agentloft/config.toml` (PLAN §5.2),
+/// meant to be committed so the whole team gets them.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectConfig {
+    pub worktree: ProjectWorktreeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectWorktreeConfig {
+    /// Shell command run in a new worktree before the agent starts
+    /// (e.g. `npm install`).
+    pub setup: Option<String>,
+    /// Untracked files to copy into new worktrees: paths relative to the
+    /// repo, `*`/`?` wildcards in the last component (`.env*`,
+    /// `config/*.local.json`).
+    pub copy: Vec<String>,
+}
+
+impl Default for ProjectWorktreeConfig {
+    fn default() -> Self {
+        Self {
+            setup: None,
+            copy: vec![".env*".into()],
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// `<root>/.agentloft/config.toml`; missing or invalid → defaults.
+    pub fn load(root: &Path) -> Self {
+        let file = root.join(".agentloft").join("config.toml");
+        match std::fs::read_to_string(&file) {
+            Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
+                tracing::warn!(file = %file.display(), %err, "invalid project config");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+}
+
 /// A value written by the settings UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingValue {
@@ -405,6 +448,24 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn project_config_defaults_and_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ProjectConfig::load(dir.path()).worktree.copy,
+            vec![".env*".to_owned()]
+        );
+        std::fs::create_dir_all(dir.path().join(".agentloft")).unwrap();
+        std::fs::write(
+            dir.path().join(".agentloft/config.toml"),
+            "[worktree]\nsetup = \"npm ci\"\ncopy = [\".env*\", \"config/*.local.json\"]\n",
+        )
+        .unwrap();
+        let c = ProjectConfig::load(dir.path());
+        assert_eq!(c.worktree.setup.as_deref(), Some("npm ci"));
+        assert_eq!(c.worktree.copy.len(), 2);
+    }
 
     #[test]
     fn write_setting_keeps_comments_and_round_trips() {

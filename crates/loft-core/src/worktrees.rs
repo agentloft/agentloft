@@ -100,6 +100,8 @@ impl Core {
             .worktrees_dir
             .join(slug_or(&project.name, "project"));
         let slug = slug_or(text, "thread");
+        let project_cfg = loft_config::ProjectConfig::load(&repo);
+        let setup = project_cfg.worktree.setup.clone();
         let workspace = blocking(move || {
             let base = wt::current_branch(&repo)
                 .or_else(|| {
@@ -116,7 +118,7 @@ impl Core {
                 n += 1;
             }
             wt::add(&repo, &path, &branch, &base)?;
-            let copied = wt::copy_env_files(&repo, &path);
+            let copied = wt::copy_untracked(&repo, &path, &project_cfg.worktree.copy);
             tracing::info!(branch, path = %path.display(), ?copied, "worktree created");
             Ok(ThreadWorkspace::Worktree {
                 path: path.to_string_lossy().into_owned(),
@@ -130,6 +132,9 @@ impl Core {
         }
         thread.workspace = workspace;
         thread.updated_at_ms = now_ms();
+        if let Some(cmd) = setup.filter(|c| !c.trim().is_empty()) {
+            lock(&self.pending_setup).insert(id.clone(), cmd);
+        }
         // An actor spawned earlier (e.g. by a model switch) has the old cwd.
         lock(&self.threads).remove(id);
         self.save_thread(&thread)

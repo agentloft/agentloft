@@ -97,6 +97,8 @@ pub struct Core {
     config: std::sync::RwLock<loft_config::Config>,
     /// `ListModels` answers per harness (probing Codex starts its CLI).
     models: Mutex<HashMap<String, Vec<loft_protocol::ModelInfo>>>,
+    /// Worktree setup commands to run before a thread's first prompt.
+    pending_setup: Mutex<HashMap<ThreadId, String>>,
     opts: CoreOptions,
 }
 
@@ -124,6 +126,7 @@ impl Core {
             worktree_lock: tokio::sync::Mutex::new(()),
             config: std::sync::RwLock::new(opts.config.clone()),
             models: Mutex::new(HashMap::new()),
+            pending_setup: Mutex::new(HashMap::new()),
             opts,
         })
     }
@@ -159,6 +162,10 @@ impl Core {
 
     pub(crate) fn live(&self) -> MutexGuard<'_, HashMap<ItemId, Item>> {
         lock(&self.live)
+    }
+
+    pub(crate) fn take_pending_setup(&self, thread: &ThreadId) -> Option<String> {
+        lock(&self.pending_setup).remove(thread)
     }
 
     /// The current config (reloaded by the settings window).

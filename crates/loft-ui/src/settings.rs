@@ -540,6 +540,17 @@ impl SettingsView {
                 path_link("wt-dir", dir, p, cx),
                 p,
             ))
+            .child(row(
+                "Per-project setup",
+                "Commit .agentloft/config.toml to a repo: [worktree] setup = \"npm ci\" runs before the agent starts; copy = [\".env*\"] lists untracked files to bring along.",
+                div()
+                    .text_xs()
+                    .font_family(p.mono.clone())
+                    .text_color(p.muted_foreground)
+                    .child(".agentloft/config.toml")
+                    .into_any_element(),
+                p,
+            ))
             .into_any_element()
     }
 

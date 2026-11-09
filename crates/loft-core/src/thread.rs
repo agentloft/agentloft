@@ -38,6 +38,13 @@ pub(crate) enum ThreadCmd {
         model: Option<String>,
         reply: Reply,
     },
+    /// The worktree setup command finished (internal).
+    SetupDone {
+        turn_id: TurnId,
+        item_id: ItemId,
+        ok: bool,
+        text: String,
+    },
     /// Files were restored to before turn `ordinal`: show a notice and tell
     /// the agent before its next prompt.
     Reverted {
@@ -147,6 +154,12 @@ impl ThreadActor {
                 before,
                 sha,
             } => self.on_checkpoint(turn_id, before, sha),
+            ThreadCmd::SetupDone {
+                turn_id,
+                item_id,
+                ok,
+                text,
+            } => self.on_setup_done(turn_id, item_id, ok, text),
             ThreadCmd::Interrupt { reply } => {
                 let res = match (&self.session, &self.turn) {
                     (Some(s), Some(_)) => {
@@ -269,8 +282,113 @@ impl ThreadActor {
         // Snapshot the work tree first; the prompt goes out once that's done
         // so the turn's diff covers exactly the agent's changes.
         self.pending_start = Some((text, attachments));
-        self.capture_checkpoint(&turn, true);
+        // A new worktree's setup runs first, so the turn's checkpoint (and
+        // diff) start after it.
+        match self.core.take_pending_setup(&self.thread.id) {
+            Some(cmd) => self.run_setup(&turn, cmd)?,
+            None => self.capture_checkpoint(&turn, true),
+        }
         Ok(Response::Ok)
+    }
+
+    fn run_setup(&mut self, turn: &Turn, cmd: String) -> CoreResult<()> {
+        let item = self.new_item(
+            Some(turn.id.clone()),
+            ItemBody::Notice {
+                level: loft_protocol::NoticeLevel::Info,
+                text: format!("Setting up the worktree: `{cmd}`…"),
+            },
+            ItemStatus::InProgress,
+        )?;
+        let item_id = item.id.clone();
+        self.core.commit(vec![Event::ItemUpserted { item }])?;
+        let env = self.core.opts().env.clone();
+        let shell = env
+            .get("SHELL")
+            .cloned()
+            .unwrap_or_else(|| "/bin/sh".into());
+        let cwd = self.thread.cwd.clone();
+        let tx = self.self_tx.clone();
+        let turn_id = turn.id.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let run = tokio::process::Command::new(&shell)
+                .args(["-lc", &cmd])
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(env.iter())
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            let (ok, text) =
+                match tokio::time::timeout(std::time::Duration::from_secs(15 * 60), run).await {
+                    Ok(Ok(out)) if out.status.success() => (
+                        true,
+                        format!(
+                            "Worktree set up: `{cmd}` ({:.1}s)",
+                            started.elapsed().as_secs_f64()
+                        ),
+                    ),
+                    Ok(Ok(out)) => {
+                        let all = format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                        let tail: Vec<&str> = all.lines().rev().take(12).collect();
+                        let tail: Vec<&str> = tail.into_iter().rev().collect();
+                        (
+                            false,
+                            format!(
+                                "Setup failed ({}): `{cmd}`\n{}",
+                                out.status,
+                                tail.join("\n")
+                            ),
+                        )
+                    }
+                    Ok(Err(err)) => (false, format!("Setup couldn't start: `{cmd}`: {err}")),
+                    Err(_) => (false, format!("Setup timed out after 15 minutes: `{cmd}`")),
+                };
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(ThreadCmd::SetupDone {
+                    turn_id,
+                    item_id,
+                    ok,
+                    text,
+                });
+            }
+        });
+        Ok(())
+    }
+
+    fn on_setup_done(&mut self, turn_id: TurnId, item_id: ItemId, ok: bool, text: String) {
+        if let Ok(Some(mut item)) = self.load_item(&item_id) {
+            item.status = ItemStatus::Completed;
+            item.body = ItemBody::Notice {
+                level: if ok {
+                    loft_protocol::NoticeLevel::Info
+                } else {
+                    loft_protocol::NoticeLevel::Warning
+                },
+                text: text.clone(),
+            };
+            item.updated_at_ms = now_ms();
+            let _ = self.core.commit(vec![Event::ItemUpserted { item }]);
+        }
+        // Stopped while setting up: nothing more to do.
+        let Some(turn) = self.turn.clone().filter(|t| t.id == turn_id) else {
+            return;
+        };
+        if self.pending_start.is_none() {
+            return;
+        }
+        if !ok {
+            // The agent goes ahead, but knows the environment may be incomplete.
+            self.pending_note = Some(format!(
+                "[Agentloft: the worktree setup command failed, so dependencies may be missing.]\n{text}"
+            ));
+        }
+        self.capture_checkpoint(&turn, true);
     }
 
     fn capture_checkpoint(&self, turn: &Turn, before: bool) {

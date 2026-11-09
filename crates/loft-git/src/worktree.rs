@@ -69,25 +69,64 @@ pub fn add(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy top-level untracked `.env*` files (secrets the agent's build needs
-/// but git doesn't carry) from the main checkout into a new worktree.
-pub fn copy_env_files(from: &Path, to: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return Vec::new();
-    };
+/// Copy untracked files matching `patterns` (paths relative to the repo,
+/// `*`/`?` in the last component) from the main checkout into a new
+/// worktree — the secrets and local config git doesn't carry.
+pub fn copy_untracked(from: &Path, to: &Path, patterns: &[String]) -> Vec<String> {
     let mut copied = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_file = entry.file_type().is_ok_and(|t| t.is_file());
-        if !is_file || !name.starts_with(".env") || to.join(&name).exists() {
+    for pattern in patterns {
+        let (dir, name) = match pattern.rsplit_once('/') {
+            Some((dir, name)) => (dir, name),
+            None => ("", pattern.as_str()),
+        };
+        if dir.split('/').any(|c| c == "..") {
             continue;
         }
-        if std::fs::copy(entry.path(), to.join(&name)).is_ok() {
-            copied.push(name);
+        let Ok(entries) = std::fs::read_dir(from.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+            let rel = if dir.is_empty() {
+                file.clone()
+            } else {
+                format!("{dir}/{file}")
+            };
+            if !is_file || !wildcard(name, &file) || to.join(&rel).exists() {
+                continue;
+            }
+            if let Some(parent) = to.join(&rel).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::copy(entry.path(), to.join(&rel)).is_ok() {
+                copied.push(rel);
+            }
         }
     }
     copied.sort();
+    copied.dedup();
     copied
+}
+
+/// Top-level `.env*` files (the default `copy` list).
+pub fn copy_env_files(from: &Path, to: &Path) -> Vec<String> {
+    copy_untracked(from, to, &[".env*".to_owned()])
+}
+
+/// `*` and `?` glob match on one path component.
+fn wildcard(pattern: &str, name: &str) -> bool {
+    fn go(p: &[char], n: &[char]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some('*'), _) => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
+            (Some('?'), Some(_)) => go(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    go(&p, &n)
 }
 
 /// Tracked changes or untracked (non-ignored) files present.
@@ -270,6 +309,29 @@ mod tests {
             run(git(remote.path()).args(["log", "--format=%s", "agentloft/pr", "-1"])).unwrap();
         assert_eq!(log.trim(), "Add new");
         assert!(!is_dirty(&wt).unwrap());
+    }
+
+    #[test]
+    fn copies_matching_untracked_files() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        std::fs::write(from.path().join(".env"), "A=1").unwrap();
+        std::fs::write(from.path().join(".env.local"), "B=2").unwrap();
+        std::fs::write(from.path().join("README.md"), "x").unwrap();
+        std::fs::create_dir_all(from.path().join("config")).unwrap();
+        std::fs::write(from.path().join("config/db.local.json"), "{}").unwrap();
+        std::fs::write(from.path().join("config/db.json"), "{}").unwrap();
+        let copied = copy_untracked(
+            from.path(),
+            to.path(),
+            &[
+                ".env*".into(),
+                "config/*.local.json".into(),
+                "../etc/*".into(),
+            ],
+        );
+        assert_eq!(copied, vec![".env", ".env.local", "config/db.local.json"]);
+        assert!(wildcard("a?c*", "abcdef") && !wildcard("*.json", "x.jsonl"));
     }
 
     #[test]
