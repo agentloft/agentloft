@@ -347,8 +347,25 @@ pub fn capture_login_env(timeout: Duration) -> HashMap<String, String> {
         Err(err) => tracing::warn!(%err, "login shell env capture failed; using fallback"),
     }
     let path = env.get("PATH").cloned().unwrap_or_default();
-    env.insert("PATH".into(), with_fallback_dirs(&path));
+    env.insert("PATH".into(), with_fallback_dirs(&stable_path_var(&path)));
     env
+}
+
+/// `PATH` with fnm's per-session directories resolved (see [`stable_path`]),
+/// so Node-based CLIs keep finding `node` after that shell is gone.
+fn stable_path_var(path: &str) -> String {
+    path.split(':')
+        .map(|dir| {
+            if dir.contains("fnm_multishells") {
+                std::fs::canonicalize(dir)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| dir.to_owned())
+            } else {
+                dir.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn run_login_shell_env(timeout: Duration) -> Result<HashMap<String, String>> {
@@ -431,6 +448,22 @@ pub fn which(bin: &str, path: &str) -> Option<PathBuf> {
     path.split(':')
         .map(|dir| Path::new(dir).join(bin))
         .find(|candidate| is_executable(candidate))
+        .map(|found| stable_path(&found))
+}
+
+/// fnm puts each shell session's Node on a temporary `fnm_multishells/<id>`
+/// symlink farm that disappears with that shell; resolve through it so a
+/// path captured once keeps working. (Other shims — Volta, asdf — must stay
+/// as found: they dispatch on the name they were invoked by.)
+fn stable_path(found: &Path) -> PathBuf {
+    if found
+        .components()
+        .any(|c| c.as_os_str() == "fnm_multishells")
+        && let Ok(real) = std::fs::canonicalize(found)
+    {
+        return real;
+    }
+    found.to_path_buf()
 }
 
 #[cfg(unix)]
@@ -465,6 +498,29 @@ mod tests {
         let c = ProjectConfig::load(dir.path());
         assert_eq!(c.worktree.setup.as_deref(), Some("npm ci"));
         assert_eq!(c.worktree.copy.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_resolves_fnm_session_links_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("node-v24/bin");
+        std::fs::create_dir_all(&real).unwrap();
+        let tool = real.join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = dir.path().join("fnm_multishells/123_456/bin");
+        std::fs::create_dir_all(&session).unwrap();
+        std::os::unix::fs::symlink(&tool, session.join("tool")).unwrap();
+        let shim = dir.path().join("shims");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::os::unix::fs::symlink(&tool, shim.join("tool")).unwrap();
+
+        let found = which("tool", &session.to_string_lossy()).unwrap();
+        assert_eq!(found, std::fs::canonicalize(&tool).unwrap());
+        let found = which("tool", &shim.to_string_lossy()).unwrap();
+        assert_eq!(found, shim.join("tool"), "other shims keep their name");
     }
 
     #[test]

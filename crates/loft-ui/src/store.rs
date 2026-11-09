@@ -106,6 +106,8 @@ pub struct AppStore {
     pub unread: std::collections::HashSet<ThreadId>,
     /// Model pickers' options per harness (`ListModels`).
     pub models: HashMap<HarnessId, Vec<loft_protocol::ModelInfo>>,
+    /// Installed CLIs (`ProbeHarness`).
+    pub harness_status: HashMap<HarnessId, loft_protocol::HarnessStatus>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
@@ -132,6 +134,7 @@ impl AppStore {
             drafts: HashMap::new(),
             unread: Default::default(),
             models: HashMap::new(),
+            harness_status: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
             daemon_pid: None,
@@ -198,6 +201,7 @@ impl AppStore {
         self.terminals.retain(|_, pane| pane.upgrade().is_some());
         let terminals = std::mem::take(&mut self.terminals);
         self.client = Some(client);
+        self.probe_harnesses(cx);
         // Model pickers (Codex asks its CLI; answers are cached daemon-side).
         for harness in [HarnessId::claude(), HarnessId(HarnessId::CODEX.into())] {
             let body = Request::ListModels {
@@ -219,6 +223,21 @@ impl AppStore {
             }
         }
         cx.notify();
+    }
+
+    /// Refresh which agent CLIs are installed (also after settings change).
+    pub fn probe_harnesses(&mut self, cx: &mut Context<Self>) {
+        for harness in [HarnessId::claude(), HarnessId(HarnessId::CODEX.into())] {
+            let body = Request::ProbeHarness {
+                harness: harness.clone(),
+            };
+            self.request_result(body, cx, move |store, result, cx| {
+                if let Ok(Response::HarnessStatus { status }) = result {
+                    store.harness_status.insert(harness, status);
+                    cx.notify();
+                }
+            });
+        }
     }
 
     /// Route a terminal's replay/output/exit to `pane`.

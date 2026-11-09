@@ -167,6 +167,10 @@ pub enum Request {
     },
     /// Re-read `config.toml` (harness and worktree settings changed).
     ReloadConfig,
+    /// Is the harness's CLI installed, where, and which version.
+    ProbeHarness {
+        harness: HarnessId,
+    },
     /// The models a harness offers (cached by the daemon).
     ListModels {
         harness: HarnessId,
@@ -350,6 +354,9 @@ pub enum Response {
     },
     Models {
         models: Vec<ModelInfo>,
+    },
+    HarnessStatus {
+        status: HarnessStatus,
     },
     /// A new fork, plus the handoff digest to offer as its first message.
     Forked {

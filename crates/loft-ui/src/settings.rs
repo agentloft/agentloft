@@ -278,13 +278,17 @@ impl SettingsView {
         theme::reload_if_changed(cx);
         if daemon && let Some(client) = self.store.read(cx).client() {
             let fut = client.request(Request::ReloadConfig);
+            let store = self.store.clone();
             cx.spawn(async move |this, cx| {
-                if let Err(err) = fut.await {
-                    let _ = this.update(cx, |this, cx| {
-                        this.error = Some(err.message);
-                        cx.notify();
-                    });
-                }
+                let result = fut.await;
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Err(err) => this.error = Some(err.message),
+                        // A new binary path: re-check what's installed.
+                        Ok(_) => store.update(cx, |s, cx| s.probe_harnesses(cx)),
+                    }
+                    cx.notify();
+                });
             })
             .detach();
         }
@@ -486,8 +490,47 @@ impl SettingsView {
             } else {
                 self.config.harness.claude.clone()
             };
+            let status = self
+                .store
+                .read(cx)
+                .harness_status
+                .get(&HarnessId(id.into()))
+                .cloned();
+            let (status_text, status_hint, ok) = match &status {
+                None => ("Checking…".to_owned(), String::new(), true),
+                Some(s) if s.installed => (
+                    s.version.clone().unwrap_or_else(|| "Installed".into()),
+                    s.path.clone().unwrap_or_default(),
+                    s.error.is_none(),
+                ),
+                Some(s) => (
+                    "Not found".to_owned(),
+                    s.error.clone().unwrap_or_default(),
+                    false,
+                ),
+            };
             col = col
                 .child(group_title(name, p))
+                .child(row(
+                    "Status",
+                    &status_hint,
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .text_sm()
+                        .text_color(if ok { p.success } else { p.warning })
+                        .child(
+                            Icon::new(if ok {
+                                IconName::CircleCheck
+                            } else {
+                                IconName::CircleAlert
+                            })
+                            .small(),
+                        )
+                        .child(status_text)
+                        .into_any_element(),
+                    p,
+                ))
                 .child(row(
                     "Binary",
                     "Path to the CLI. Leave empty to find it on your login shell's PATH.",

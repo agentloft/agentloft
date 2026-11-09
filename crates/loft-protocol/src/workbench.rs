@@ -157,6 +157,19 @@ pub struct ModelInfo {
     pub is_default: bool,
 }
 
+/// Whether a harness's CLI is installed (Settings → Agents, onboarding).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HarnessStatus {
+    pub installed: bool,
+    #[serde(default)]
+    pub path: Option<String>,
+    /// `--version` output, first line.
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// An image uploaded with a message (stored by the daemon).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attachment {

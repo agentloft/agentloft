@@ -1513,6 +1513,51 @@ impl WorkspaceView {
 
     fn render_welcome(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let has_projects = !self.store.read(cx).workspace.projects.is_empty();
+        // Which agents are ready (onboarding): version, or how to install.
+        let statuses = self.store.read(cx).harness_status.clone();
+        let mut agents = v_flex().gap_1p5().pt_4().text_sm();
+        for (id, name, install) in [
+            (
+                HarnessId::CLAUDE,
+                "Claude Code",
+                "npm i -g @anthropic-ai/claude-code",
+            ),
+            (HarnessId::CODEX, "Codex", "npm i -g @openai/codex"),
+        ] {
+            let Some(status) = statuses.get(&HarnessId(id.into())) else {
+                continue;
+            };
+            let ok = status.installed && status.error.is_none();
+            agents = agents.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(if ok {
+                            IconName::CircleCheck
+                        } else {
+                            IconName::CircleAlert
+                        })
+                        .small()
+                        .text_color(if ok {
+                            p.success
+                        } else {
+                            p.warning
+                        }),
+                    )
+                    .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                    .child(
+                        div()
+                            .text_color(p.muted_foreground)
+                            .when(ok, |d| d.child(status.version.clone().unwrap_or_default()))
+                            .when(!ok, |d| {
+                                d.child("not installed — ").child(
+                                    div().font_family(p.mono.clone()).text_xs().child(install),
+                                )
+                            }),
+                    ),
+            );
+        }
         v_flex()
             .flex_1()
             .items_center()
@@ -1558,6 +1603,7 @@ impl WorkspaceView {
                         ))
                     }),
             )
+            .child(agents)
             .into_any_element()
     }
 }

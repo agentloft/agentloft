@@ -239,6 +239,63 @@ impl Core {
         Ok(stored)
     }
 
+    /// Resolve the harness's CLI (config path or login PATH) and ask its
+    /// version.
+    async fn probe_harness(&self, harness: &HarnessId) -> CoreResult<Response> {
+        let bin = match harness.as_str() {
+            HarnessId::CLAUDE => "claude",
+            HarnessId::CODEX => "codex",
+            other => other,
+        }
+        .to_owned();
+        let hcfg = harness_config(&self.config(), harness);
+        let env = self.opts.env.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            let path = if hcfg.path != "auto" {
+                Some(PathBuf::from(&hcfg.path)).filter(|p| p.exists())
+            } else {
+                loft_config::which(&bin, env.get("PATH").map(String::as_str).unwrap_or(""))
+            };
+            let Some(path) = path else {
+                return loft_protocol::HarnessStatus {
+                    installed: false,
+                    path: None,
+                    version: None,
+                    error: Some(format!("`{bin}` was not found on your login shell's PATH")),
+                };
+            };
+            let out = std::process::Command::new(&path)
+                .arg("--version")
+                .env_clear()
+                .envs(env.iter())
+                .stdin(std::process::Stdio::null())
+                .output();
+            let (version, error) = match out {
+                Ok(o) if o.status.success() => (
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .next()
+                        .map(|l| l.trim().to_owned()),
+                    None,
+                ),
+                Ok(o) => (
+                    None,
+                    Some(String::from_utf8_lossy(&o.stderr).trim().to_owned()),
+                ),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            loft_protocol::HarnessStatus {
+                installed: true,
+                path: Some(path.to_string_lossy().into_owned()),
+                version,
+                error,
+            }
+        })
+        .await
+        .map_err(internal)?;
+        Ok(Response::HarnessStatus { status })
+    }
+
     async fn list_models(&self, harness: &HarnessId) -> CoreResult<Response> {
         if let Some(models) = lock(&self.models).get(harness.as_str()) {
             return Ok(Response::Models {
@@ -526,6 +583,7 @@ impl Core {
             } => self.fork_thread(&thread_id, harness, share_workspace).await,
             Request::ReloadConfig => self.reload_config(),
             Request::ListModels { harness } => self.list_models(&harness).await,
+            Request::ProbeHarness { harness } => self.probe_harness(&harness).await,
             Request::CreatePullRequest { thread_id } => self.create_pull_request(&thread_id).await,
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await
