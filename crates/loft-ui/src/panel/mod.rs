@@ -2,6 +2,7 @@
 //! browser, open files and subagents — per thread.
 
 pub mod agent;
+pub mod browser;
 pub mod changes;
 pub mod docs;
 pub mod files;
@@ -41,6 +42,8 @@ struct ThreadPanel {
     agents: Vec<(ItemId, Entity<AgentView>)>,
     /// The thread's shell, created when the Terminal tab is first shown.
     terminal: Option<Entity<terminal::TerminalTabs>>,
+    /// The thread's browser tabs, created when first needed.
+    browser: Option<Entity<browser::BrowserTabs>>,
     active: Tab,
     /// Last finished turn we refreshed for.
     seen_turn: Option<TurnId>,
@@ -49,12 +52,20 @@ struct ThreadPanel {
     _subs: Vec<Subscription>,
 }
 
+/// What the panel tells the workspace.
+pub enum PanelEvent {
+    /// A note left on a page in `thread`'s browser.
+    Annotation(ThreadId, loft_browser::Annotation),
+    /// A screenshot taken in `thread`'s browser (PNG), for its composer.
+    Screenshot(ThreadId, Vec<u8>),
+}
+
 pub struct WorkbenchPanel {
     store: Entity<AppStore>,
     threads: HashMap<ThreadId, ThreadPanel>,
-    /// One shared browser (agents drive it; created on first use).
-    browser: Option<Entity<loft_browser::BrowserView>>,
 }
+
+impl gpui_kit::EventEmitter<PanelEvent> for WorkbenchPanel {}
 
 impl WorkbenchPanel {
     pub fn new(store: Entity<AppStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -62,7 +73,6 @@ impl WorkbenchPanel {
         Self {
             store,
             threads: HashMap::new(),
-            browser: None,
         }
     }
 
@@ -118,6 +128,7 @@ impl WorkbenchPanel {
                     viewers: Vec::new(),
                     agents: Vec::new(),
                     terminal: None,
+                    browser: None,
                     active: Tab::Files,
                     seen_turn,
                     cwd,
@@ -164,18 +175,51 @@ impl WorkbenchPanel {
         }
     }
 
-    /// The browser panel, created on first use.
+    /// The selected thread's active browser tab (created on first use).
     pub fn browser(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<loft_browser::BrowserView> {
-        if let Some(b) = &self.browser {
-            return b.clone();
+    ) -> Option<Entity<loft_browser::BrowserView>> {
+        let (id, _) = self.selected(cx)?;
+        self.browser_for(&id, window, cx)
+    }
+
+    /// `thread_id`'s active browser tab (its tabs are created on first use).
+    pub fn browser_for(
+        &mut self,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<loft_browser::BrowserView>> {
+        let tabs = self.browser_tabs(thread_id, window, cx)?;
+        Some(tabs.read(cx).active())
+    }
+
+    fn browser_tabs(
+        &mut self,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<browser::BrowserTabs>> {
+        let thread = self.store.read(cx).threads.get(thread_id).cloned()?;
+        if let Some(tabs) = &self.ensure(thread_id, &thread, window, cx).browser {
+            return Some(tabs.clone());
         }
-        let browser = cx.new(|cx| loft_browser::BrowserView::new(window, cx));
-        self.browser = Some(browser.clone());
-        browser
+        let tabs = cx.new(|cx| browser::BrowserTabs::new(window, cx));
+        let id = thread_id.clone();
+        let sub = cx.subscribe(&tabs, move |_, _, event, cx| match event {
+            browser::BrowserTabsEvent::Annotation(note) => {
+                cx.emit(PanelEvent::Annotation(id.clone(), note.clone()))
+            }
+            browser::BrowserTabsEvent::Screenshot(png) => {
+                cx.emit(PanelEvent::Screenshot(id.clone(), png.clone()))
+            }
+        });
+        let panel = self.threads.get_mut(thread_id).expect("ensured");
+        panel._subs.push(sub);
+        panel.browser = Some(tabs.clone());
+        Some(tabs)
     }
 
     /// Show a tab for the selected thread (creating file/agent views).
@@ -268,9 +312,14 @@ impl WorkbenchPanel {
         cx.notify();
     }
 
-    /// The browser, if it was ever opened.
-    pub fn existing_browser(&self) -> Option<Entity<loft_browser::BrowserView>> {
-        self.browser.clone()
+    /// `thread_id`'s active browser tab, if its browser was ever opened.
+    pub fn existing_browser(
+        &self,
+        thread_id: &ThreadId,
+        cx: &gpui_kit::App,
+    ) -> Option<Entity<loft_browser::BrowserView>> {
+        let tabs = self.threads.get(thread_id)?.browser.as_ref()?;
+        Some(tabs.read(cx).active())
     }
 
     pub fn active_tab(&self, cx: &gpui_kit::App) -> Option<Tab> {
@@ -429,7 +478,10 @@ impl Render for WorkbenchPanel {
                 Some(pane) => pane.clone().into_any_element(),
                 None => placeholder(&p, IconName::SquareTerminal, "Terminal"),
             },
-            Tab::Browser => self.browser(window, cx).into_any_element(),
+            Tab::Browser => match self.browser_tabs(&thread_id, window, cx) {
+                Some(tabs) => tabs.into_any_element(),
+                None => div().into_any_element(),
+            },
         };
         let _ = store;
         v_flex()

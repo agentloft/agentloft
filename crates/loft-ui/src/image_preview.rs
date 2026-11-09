@@ -107,7 +107,7 @@ pub fn menu(
             )
             .item(
                 PopupMenuItem::new("Save Image As…")
-                    .icon(IconName::ArrowDown)
+                    .icon(IconName::Download)
                     .on_click(move |_, _, cx| save_as(c.clone(), cx)),
             );
         if let Pic::File { path, .. } = &pic {
@@ -173,7 +173,7 @@ pub fn open(pic: Pic, window: &mut Window, cx: &mut App) {
                                 .cursor_pointer()
                                 .small()
                                 .label("Save As…")
-                                .icon(IconName::ArrowDown)
+                                .icon(IconName::Download)
                                 .ghost()
                                 .on_click(move |_, _, cx| save_as(save_pic.clone(), cx)),
                         )

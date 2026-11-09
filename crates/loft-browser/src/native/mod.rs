@@ -50,6 +50,14 @@ pub(crate) enum JsWorld {
     Page,
 }
 
+/// Site data the user can clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteData {
+    /// Cookies and site storage (signs you out).
+    Cookies,
+    Cache,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Screenshot {
     pub png: Vec<u8>,

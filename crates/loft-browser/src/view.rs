@@ -63,6 +63,8 @@ pub enum BrowserEvent {
     LoadingChanged(bool),
     /// The user left a note on an element in annotation mode.
     Annotation(Annotation),
+    /// The user took a screenshot of the page (PNG).
+    Screenshot(Vec<u8>),
 }
 
 /// A note the user pinned to an element of the page.
@@ -237,6 +239,8 @@ pub struct BrowserView {
     /// A picture of the page shown in its place while the device menu is
     /// open (the native view would cover the menu).
     frozen: Option<Arc<gpui_kit::Image>>,
+    /// The user's page zoom (1.0 = 100%), on top of any device scaling.
+    user_zoom: f32,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -319,6 +323,7 @@ impl BrowserView {
             annotating: false,
             device_menu_open: false,
             frozen: None,
+            user_zoom: 1.0,
             _tasks: tasks,
             _subscriptions: subscriptions,
         }
@@ -442,7 +447,7 @@ impl BrowserView {
             .relative()
             .flex()
             .flex_col()
-            .child(Surface::new(native, self.page_shown()).zoom(f64::from(zoom)))
+            .child(Surface::new(native, self.page_shown()).zoom(f64::from(zoom * self.user_zoom)))
             .when_some(self.frozen.clone(), |d, image| {
                 d.child(
                     gpui_kit::img(image)
@@ -491,6 +496,114 @@ impl BrowserView {
     pub fn capture(&self, cx: &mut Context<Self>) -> Option<gpui_kit::Task<Option<Vec<u8>>>> {
         let rx = self.native.as_ref()?.screenshot();
         Some(cx.background_spawn(async move { rx.await.ok()?.ok().map(|s| s.png) }))
+    }
+
+    /// Screenshot the page for the composer.
+    fn take_screenshot(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = self.capture(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Some(png) = task.await {
+                let _ = this.update(cx, |_, cx| cx.emit(BrowserEvent::Screenshot(png)));
+            }
+        })
+        .detach();
+    }
+
+    /// Step the page zoom: `1` in, `-1` out, `0` back to 100%.
+    pub fn zoom_step(&mut self, dir: i32, cx: &mut Context<Self>) {
+        const STEPS: [f32; 11] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
+        let at = STEPS
+            .iter()
+            .position(|z| (z - self.user_zoom).abs() < 0.01)
+            .unwrap_or(5);
+        self.user_zoom = match dir {
+            0 => 1.0,
+            d if d > 0 => STEPS[(at + 1).min(STEPS.len() - 1)],
+            _ => STEPS[at.saturating_sub(1)],
+        };
+        cx.notify();
+    }
+
+    /// The ⋮ menu: reloads, inspector, zoom, site data.
+    fn more_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let view = cx.weak_entity();
+        let on_open = view.clone();
+        let zoom = self.user_zoom;
+        Button::new("loft-browser-more")
+            .cursor_pointer()
+            .small()
+            .ghost()
+            .icon(IconName::EllipsisVertical)
+            .tooltip("More")
+            .disabled(self.native.is_none())
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                let act =
+                    |label: String,
+                     icon: IconName,
+                     f: fn(&mut BrowserView, &mut Context<BrowserView>)| {
+                        let v = view.clone();
+                        PopupMenuItem::new(label)
+                            .icon(icon)
+                            .on_click(move |_, _, cx| {
+                                _ = v.update(cx, f);
+                            })
+                    };
+                menu.item(act("Hard Reload".into(), IconName::RotateCw, |this, cx| {
+                    if let Some(native) = &this.native {
+                        native.hard_reload();
+                        cx.notify();
+                    }
+                }))
+                .item(act(
+                    "Open Web Inspector".into(),
+                    IconName::Bug,
+                    |this, _| {
+                        if let Some(native) = &this.native {
+                            native.open_devtools();
+                        }
+                    },
+                ))
+                .separator()
+                .item(act("Zoom In".into(), IconName::ZoomIn, |this, cx| {
+                    this.zoom_step(1, cx)
+                }))
+                .item(act("Zoom Out".into(), IconName::ZoomOut, |this, cx| {
+                    this.zoom_step(-1, cx)
+                }))
+                .item(
+                    act(
+                        format!("Actual Size · {:.0}%", zoom * 100.),
+                        IconName::Expand,
+                        |this, cx| this.zoom_step(0, cx),
+                    )
+                    .disabled((zoom - 1.0).abs() < 0.01),
+                )
+                .separator()
+                .item(act(
+                    "Clear Cookies & Site Data".into(),
+                    IconName::Cookie,
+                    |this, cx| {
+                        if let Some(native) = &this.native {
+                            native.clear_data(crate::native::SiteData::Cookies);
+                            native.reload();
+                            cx.notify();
+                        }
+                    },
+                ))
+                .item(act("Clear Cache".into(), IconName::Eraser, |this, _| {
+                    if let Some(native) = &this.native {
+                        native.clear_data(crate::native::SiteData::Cache);
+                    }
+                }))
+            })
+            .on_open_change(move |open, _, cx| {
+                let open = *open;
+                _ = on_open.update(cx, |this, cx| this.set_menu_open(open, cx));
+            })
+            .into_any_element()
     }
 
     /// Remove the numbered pins from the page (after the notes were sent).
@@ -978,6 +1091,16 @@ impl Render for BrowserView {
                         .disabled(self.native.is_none()),
                 ),
             )
+            .child(
+                Button::new("loft-browser-shot")
+                    .cursor_pointer()
+                    .ghost()
+                    .small()
+                    .icon(IconName::Camera)
+                    .tooltip("Screenshot to the composer")
+                    .disabled(self.native.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.take_screenshot(cx))),
+            )
             .child(self.device_menu(cx))
             .child(
                 Button::new("loft-browser-annotate")
@@ -997,6 +1120,7 @@ impl Render for BrowserView {
                         this.set_annotating(on, cx);
                     })),
             )
+            .child(self.more_menu(cx))
             .when(loading, |d| {
                 d.child(
                     div()
@@ -1135,8 +1259,8 @@ impl BrowserView {
             .cursor_pointer()
             .small()
             .icon(icon)
-            .when(self.device_menu_open || device.is_some(), |b| b.primary())
-            .when(!(self.device_menu_open || device.is_some()), |b| b.ghost())
+            .when(device.is_some(), |b| b.primary())
+            .when(device.is_none(), |b| b.ghost())
             .tooltip(format!("Screen size: {label}"))
             .disabled(self.native.is_none())
             .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |mut menu, _, _| {

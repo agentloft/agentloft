@@ -36,6 +36,18 @@ impl NativeWebView {
     pub fn reload(&self) {
         match self.never {}
     }
+    pub fn hard_reload(&self) {
+        match self.never {}
+    }
+
+    pub fn open_devtools(&self) {
+        match self.never {}
+    }
+
+    pub fn clear_data(&self, _what: super::SiteData) {
+        match self.never {}
+    }
+
     pub fn stop(&self) {
         match self.never {}
     }

@@ -41,6 +41,7 @@ pub enum StoreEvent {
     /// An agent wants to drive the browser panel (answer via `respond_call`).
     BrowserCall {
         call_id: u64,
+        thread_id: ThreadId,
         command: serde_json::Value,
     },
     /// Show `url` in the side-panel browser.
@@ -467,8 +468,12 @@ impl AppStore {
                 }
             }
             ClientEvent::ClientCall { call_id, call } => match call {
-                loft_protocol::ClientCall::Browser { command, .. } => {
-                    cx.emit(StoreEvent::BrowserCall { call_id, command });
+                loft_protocol::ClientCall::Browser { thread_id, command } => {
+                    cx.emit(StoreEvent::BrowserCall {
+                        call_id,
+                        thread_id,
+                        command,
+                    });
                 }
             },
             ClientEvent::Fatal(err) => {

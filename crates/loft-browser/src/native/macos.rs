@@ -63,7 +63,7 @@ impl NativeWebView {
             })
             .with_visible(false)
             .with_focused(false)
-            .with_devtools(cfg!(debug_assertions))
+            .with_devtools(true)
             .with_user_agent(USER_AGENT)
             .with_back_forward_navigation_gestures(true)
             .with_navigation_handler({
@@ -137,6 +137,51 @@ impl NativeWebView {
             self.nav.permit_host_navigation(&url);
         }
         let _ = self.webview.reload();
+    }
+
+    /// Reload, revalidating everything against the server (skips caches).
+    pub fn hard_reload(&self) {
+        if let Some(url) = self.state().url {
+            self.nav.permit_host_navigation(&url);
+        }
+        // SAFETY: plain WKWebView method on the main thread.
+        unsafe { self.wk.reloadFromOrigin() };
+    }
+
+    /// Show WebKit's Web Inspector for the page.
+    pub fn open_devtools(&self) {
+        self.webview.open_devtools();
+    }
+
+    /// Forget the browser's cookies (and other site storage), or its cache.
+    pub fn clear_data(&self, what: super::SiteData) {
+        use objc2_foundation::{NSDate, NSSet};
+        use objc2_web_kit::{
+            WKWebsiteDataTypeCookies, WKWebsiteDataTypeDiskCache,
+            WKWebsiteDataTypeIndexedDBDatabases, WKWebsiteDataTypeLocalStorage,
+            WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeSessionStorage,
+        };
+        // SAFETY: main-thread WebKit calls; the statics are WebKit constants.
+        unsafe {
+            let types: objc2::rc::Retained<NSSet<NSString>> = match what {
+                super::SiteData::Cookies => NSSet::from_slice(&[
+                    WKWebsiteDataTypeCookies,
+                    WKWebsiteDataTypeLocalStorage,
+                    WKWebsiteDataTypeSessionStorage,
+                    WKWebsiteDataTypeIndexedDBDatabases,
+                ]),
+                super::SiteData::Cache => {
+                    NSSet::from_slice(&[WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache])
+                }
+            };
+            let store = self.wk.configuration().websiteDataStore();
+            let done = RcBlock::new(|| {});
+            store.removeDataOfTypes_modifiedSince_completionHandler(
+                &types,
+                &NSDate::distantPast(),
+                &done,
+            );
+        }
     }
 
     pub fn stop(&self) {

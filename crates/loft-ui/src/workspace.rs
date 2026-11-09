@@ -153,7 +153,6 @@ pub struct WorkspaceView {
     /// while the panel isn't showing it.
     browser_preview: bool,
     /// Whether we listen to the browser's events yet (annotations).
-    browser_subscribed: bool,
     /// The composer's model picker (for the selected thread) and whether
     /// it's open.
     model_picker: Option<Entity<crate::model_picker::ModelPicker>>,
@@ -185,6 +184,19 @@ impl WorkspaceView {
         let subs = vec![
             cx.subscribe_in(&store, window, |this, _, event, window, cx| {
                 this.on_store_event(event, window, cx)
+            }),
+            // Notes and screenshots from a thread's browser go to its composer.
+            cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
+                crate::panel::PanelEvent::Annotation(thread_id, note) => {
+                    this.add_annotation(thread_id, note, window, cx)
+                }
+                crate::panel::PanelEvent::Screenshot(thread_id, png) => {
+                    if let Some(image) =
+                        crate::attachments::PendingImage::png("screenshot.png", png.clone())
+                    {
+                        this.add_images(thread_id, vec![image], cx);
+                    }
+                }
             }),
             cx.observe(&store, |_, _, cx| cx.notify()),
             // The window title is the native tab label; hidden tabs don't
@@ -218,7 +230,6 @@ impl WorkspaceView {
             completion_seq: 0,
             pending_add_project: false,
             browser_preview: false,
-            browser_subscribed: false,
             model_picker: None,
             picker_open: false,
             branch_picker: None,
@@ -277,8 +288,12 @@ impl WorkspaceView {
                 self.panel
                     .update(cx, |panel, cx| panel.open_agent(&t, i, window, cx));
             }
-            StoreEvent::BrowserCall { call_id, command } => {
-                self.run_browser_call(*call_id, command.clone(), window, cx);
+            StoreEvent::BrowserCall {
+                call_id,
+                thread_id,
+                command,
+            } => {
+                self.run_browser_call(*call_id, thread_id.clone(), command.clone(), window, cx);
             }
             StoreEvent::Notify { message, error } => {
                 use gpui_kit::component::WindowExt as _;
@@ -295,8 +310,9 @@ impl WorkspaceView {
                 self.panel_open = true;
                 self.panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
-                let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
-                browser.update(cx, |b, cx| b.navigate(url, cx));
+                if let Some(browser) = self.panel.update(cx, |p, cx| p.browser(window, cx)) {
+                    browser.update(cx, |b, cx| b.navigate(url, cx));
+                }
             }
             StoreEvent::ConfirmArchive { thread_id, reason } => {
                 confirm_archive(
@@ -362,11 +378,12 @@ impl WorkspaceView {
             Some(("annotate", url)) => {
                 self.panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
-                let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
-                browser.update(cx, |b, cx| {
-                    b.navigate(url, cx);
-                    b.set_annotating(true, cx);
-                });
+                if let Some(browser) = self.panel.update(cx, |p, cx| p.browser(window, cx)) {
+                    browser.update(cx, |b, cx| {
+                        b.navigate(url, cx);
+                        b.set_annotating(true, cx);
+                    });
+                }
             }
             Some(("file", path)) => {
                 let path = path.to_owned();
@@ -466,42 +483,22 @@ impl WorkspaceView {
         self.panel_open && self.panel.read(cx).active_tab(cx) == Some(Tab::Browser)
     }
 
-    /// Listen for annotations: each note goes into the composer.
-    fn subscribe_browser(
-        &mut self,
-        browser: &Entity<loft_browser::BrowserView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.browser_subscribed {
-            return;
-        }
-        self.browser_subscribed = true;
-        let sub = cx.subscribe_in(browser, window, |this, _, event, window, cx| {
-            if let loft_browser::BrowserEvent::Annotation(note) = event {
-                this.add_annotation(note, window, cx);
-            }
-        });
-        self._subs.push(sub);
-    }
-
     /// A note left on the page: it waits as a chip in the composer, and a
     /// picture of the page with its numbered pins is attached.
     fn add_annotation(
         &mut self,
+        thread_id: &ThreadId,
         note: &loft_browser::Annotation,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread_id) = self.store.read(cx).selected.clone() else {
-            return;
-        };
+        let thread_id = thread_id.clone();
         self.page_notes
             .entry(thread_id.clone())
             .or_default()
             .push(note.clone());
         cx.notify();
-        let Some(browser) = self.panel.read(cx).existing_browser() else {
+        let Some(browser) = self.panel.read(cx).existing_browser(&thread_id, cx) else {
             return;
         };
         let Some(task) = browser.update(cx, |b, cx| b.capture(cx)) else {
@@ -646,6 +643,7 @@ impl WorkspaceView {
     fn run_browser_call(
         &mut self,
         call_id: u64,
+        thread_id: ThreadId,
         command: serde_json::Value,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -671,8 +669,19 @@ impl WorkspaceView {
         if !self.browser_in_panel(cx) {
             self.browser_preview = true;
         }
-        let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
-        self.subscribe_browser(&browser, window, cx);
+        let Some(browser) = self
+            .panel
+            .update(cx, |p, cx| p.browser_for(&thread_id, window, cx))
+        else {
+            client.respond_call(
+                call_id,
+                Err(loft_protocol::ErrorBody::new(
+                    loft_protocol::ErrorCode::NotFound,
+                    "the thread isn't open in this window",
+                )),
+            );
+            return;
+        };
         let task = browser.update(cx, |b, cx| b.execute(command, window, cx));
         cx.spawn(async move |_, _| {
             let result = task.await.map_err(|err| {
@@ -837,7 +846,7 @@ impl WorkspaceView {
         if !notes.is_empty() {
             self.page_notes.remove(thread_id);
             // Sent: take the pins off the page and leave annotation mode.
-            if let Some(browser) = self.panel.read(cx).existing_browser() {
+            if let Some(browser) = self.panel.read(cx).existing_browser(thread_id, cx) {
                 browser.update(cx, |b, cx| {
                     b.clear_annotations();
                     b.set_annotating(false, cx);
@@ -2381,14 +2390,14 @@ impl WorkspaceView {
     fn browser_preview_card(
         &mut self,
         p: &Palette,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.browser_preview || self.browser_in_panel(cx) {
             return None;
         }
-        let browser = self.panel.read(cx).existing_browser()?;
-        self.subscribe_browser(&browser, window, cx);
+        let thread_id = self.store.read(cx).selected.clone()?;
+        let browser = self.panel.read(cx).existing_browser(&thread_id, cx)?;
         const W: f32 = 340.;
         const H: f32 = 212.;
         let (title, surface) = {
@@ -2694,13 +2703,6 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
-        // Notes left on the page reach the composer however the browser
-        // was opened.
-        if !self.browser_subscribed
-            && let Some(browser) = self.panel.read(cx).existing_browser()
-        {
-            self.subscribe_browser(&browser, window, cx);
-        }
         if std::mem::take(&mut self.pending_add_project) {
             cx.defer_in(window, |this, window, cx| {
                 this.add_project(window, cx);
