@@ -8,6 +8,7 @@ mod branch_picker;
 pub mod brand;
 mod completion;
 mod file_icons;
+mod folder_picker;
 mod items;
 mod model_picker;
 mod palette;

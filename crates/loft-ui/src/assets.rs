@@ -47,6 +47,7 @@ gpui_kit::assets::icon_assets!(
         GitCompare,
         GitFork,
         Globe,
+        House,
         Loader,
         Minus,
         Moon,

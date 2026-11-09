@@ -142,6 +142,9 @@ pub struct WorkspaceView {
     /// The open `/` or `@` completion popover.
     completion: Option<crate::completion::Completion>,
     completion_seq: u64,
+    /// Open the folder browser on the next render (asked for without a
+    /// window at hand).
+    pending_add_project: bool,
     /// The composer's model picker (for the selected thread) and whether
     /// it's open.
     model_picker: Option<Entity<crate::model_picker::ModelPicker>>,
@@ -202,6 +205,7 @@ impl WorkspaceView {
             show_archived: false,
             completion: None,
             completion_seq: 0,
+            pending_add_project: false,
             model_picker: None,
             picker_open: false,
             branch_picker: None,
@@ -342,6 +346,10 @@ impl WorkspaceView {
             }
             _ => match dev {
                 "branches" => self.branch_picker_open = true,
+                "addproject" => {
+                    self.panel_open = false;
+                    cx.defer_in(window, |this, window, cx| this.add_project(window, cx));
+                }
                 "models" => {
                     self.panel_open = false;
                     let picker = self.model_picker_for(&thread_id, window, cx);
@@ -668,24 +676,30 @@ impl WorkspaceView {
             .update(cx, |s, cx| s.respond(req.thread_id, req.id, decision, cx));
     }
 
-    pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add project".into()),
-        });
+    /// Add Project: the built-in folder browser.
+    pub(crate) fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::folder_picker::{FolderPicker, FolderPickerEvent};
+        use gpui_kit::component::WindowExt as _;
         let store = self.store.clone();
-        cx.spawn(async move |_, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                store.update(cx, |store, cx| {
-                    store.add_project(path.to_string_lossy().into_owned(), cx)
-                });
+        let picker = cx.new(|cx| FolderPicker::new(store, window, cx));
+        let sub = cx.subscribe_in(&picker, window, |this, _, event, window, cx| {
+            if let FolderPickerEvent::Pick(path) = event {
+                let path = path.to_string_lossy().into_owned();
+                this.store.update(cx, |s, cx| s.add_project(path, cx));
             }
-        })
-        .detach();
+            window.close_dialog(cx);
+        });
+        self._subs.push(sub);
+        let focus = picker.read(cx).focus_handle(cx);
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .w(px(620.))
+                .p_0()
+                .margin_top(px(80.))
+                .close_button(false)
+                .child(picker.clone())
+        });
+        focus.focus(window, cx);
     }
 
     /// Recompute the `/` or `@` completion for the composer's cursor.
@@ -860,7 +874,11 @@ impl WorkspaceView {
             .or_else(|| store.workspace.projects.first().map(|p| p.id.clone()));
         match project {
             Some(id) => self.store.update(cx, |s, cx| s.new_thread(id, cx)),
-            None => self.add_project(cx),
+            // No window here: open the folder browser on the next render.
+            None => {
+                self.pending_add_project = true;
+                cx.notify();
+            }
         }
     }
 
@@ -1175,7 +1193,7 @@ impl WorkspaceView {
                         "add-project",
                         IconName::FolderPlus,
                         p,
-                        cx.listener(|this, _, _, cx| this.add_project(cx)),
+                        cx.listener(|this, _, window, cx| this.add_project(window, cx)),
                     )),
             )
             .child(
@@ -2200,7 +2218,7 @@ impl WorkspaceView {
                         "Add project",
                         "⌘O",
                         p,
-                        cx.listener(|this, _, _, cx| this.add_project(cx)),
+                        cx.listener(|this, _, window, cx| this.add_project(window, cx)),
                     ))
                     .when(has_projects, |d| {
                         d.child(pill_button(
@@ -2221,6 +2239,9 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        if std::mem::take(&mut self.pending_add_project) {
+            cx.defer_in(window, |this, window, cx| this.add_project(window, cx));
+        }
         let selected = self.store.read(cx).selected_thread();
         if let Some(thread) = &selected
             && thread.read(cx).model.is_some()
@@ -2266,7 +2287,7 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| theme::toggle_mode(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
-            .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
+            .on_action(cx.listener(|this, _: &AddProject, window, cx| this.add_project(window, cx)))
             .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 crate::palette::open(cx.entity(), &this.store, window, cx)
@@ -2826,6 +2847,11 @@ fn take_dev_tab() -> Option<String> {
     std::env::var("AGENTLOFT_DEV_TAB")
         .ok()
         .filter(|v| !v.is_empty())
+}
+
+/// [`tilde`] for a path.
+pub(crate) fn tilde_path(path: &std::path::Path) -> String {
+    tilde(&path.to_string_lossy())
 }
 
 /// `/Users/me/x` → `~/x`.
