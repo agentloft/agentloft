@@ -28,7 +28,9 @@ actions!(
         ToggleTheme,
         OpenSettings,
         AddProject,
-        FocusSearch
+        FocusSearch,
+        About,
+        Quit
     ]
 );
 
@@ -47,7 +49,46 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
         KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
         KeyBinding::new("cmd-o", AddProject, Some(CONTEXT)),
         KeyBinding::new("cmd-k", FocusSearch, Some(CONTEXT)),
+        KeyBinding::new("cmd-q", Quit, None),
     ]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// The native menu bar.
+pub fn app_menus() -> Vec<gpui_kit::Menu> {
+    use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+    use gpui_kit::{Menu, MenuItem, OsAction, SystemMenuType};
+    vec![
+        Menu::new("Agentloft").items([
+            MenuItem::action("About Agentloft", About),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Quit Agentloft", Quit),
+        ]),
+        Menu::new("File").items([
+            MenuItem::action("New Thread", NewThread),
+            MenuItem::action("Add Project…", AddProject),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Undo", Undo, OsAction::Undo),
+            MenuItem::os_action("Redo", Redo, OsAction::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action("Cut", Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+            MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action("Search Threads", FocusSearch),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Light/Dark", ToggleTheme),
+        ]),
+        Menu::new("Agent").items([MenuItem::action("Stop Turn", Interrupt)]),
+    ]
 }
 
 pub struct WorkspaceView {
@@ -359,7 +400,8 @@ impl WorkspaceView {
                     .border_color(p.border)
                     .text_xs()
                     .text_color(p.muted_foreground)
-                    .child(div().size(px(7.)).rounded_full().bg(dot))
+                    .child(crate::brand::app_icon(px(18.)))
+                    .child(div().size(px(6.)).rounded_full().bg(dot))
                     .child(div().flex_1().child(status))
                     .child(icon_button(
                         "toggle-theme",
@@ -596,17 +638,7 @@ impl WorkspaceView {
             .items_center()
             .justify_center()
             .gap_3()
-            .child(
-                div()
-                    .size(px(48.))
-                    .rounded(px(14.))
-                    .bg(p.accent_soft)
-                    .text_color(p.accent)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(IconName::Sparkles).large()),
-            )
+            .child(crate::brand::app_icon(px(88.)))
             .child(
                 div()
                     .text_xl()
@@ -691,6 +723,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| theme::toggle_mode(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
+            .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
                 this.search.update(cx, |s, cx| s.focus(window, cx));
@@ -721,6 +754,45 @@ impl Render for WorkspaceView {
                     .child(body),
             )
     }
+}
+
+fn show_about(window: &mut Window, cx: &mut gpui_kit::App) {
+    use gpui_kit::component::WindowExt as _;
+    let p = Palette::of(cx);
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog.child(
+            v_flex()
+                .items_center()
+                .gap_2()
+                .py_4()
+                .child(crate::brand::app_icon(px(96.)))
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Agentloft"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(p.muted_foreground)
+                        .child(format!("Version {}", crate::brand::VERSION)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(p.muted_foreground)
+                        .child("Run coding agents side by side — natively."),
+                )
+                .child(
+                    div()
+                        .pt_2()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child("Apache-2.0 · github.com/agentloft/agentloft"),
+                ),
+        )
+    });
 }
 
 // -- small building blocks -------------------------------------------------------

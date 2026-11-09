@@ -2,3 +2,5 @@
 /.dev-home
 *.swp
 .DS_Store
+# Icon exploration (≈7 MB of rejected concepts; kept locally, never shipped)
+/assets/icon/exploration/

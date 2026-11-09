@@ -1,4 +1,8 @@
-# Agentloft
+<p align="center">
+  <img src="assets/icon/png/agentloft-128.png" width="112" height="112" alt="Agentloft icon">
+</p>
+
+<h1 align="center">Agentloft</h1>
 
 A native desktop app for running coding agents side by side: **Claude Code**, **OpenAI Codex**, and ACP agents such as Gemini CLI and OpenCode. It is built in Rust with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
@@ -16,6 +20,13 @@ A native desktop app for running coding agents side by side: **Claude Code**, **
 - **Terminal and remote access.** An integrated terminal, plus optional remote access over your own Tailscale tailnet or SSH.
 
 macOS (Apple Silicon) comes first; Linux and Windows follow.
+
+## Building
+
+```sh
+cargo xtask dev            # run the app against an isolated ./.dev-home
+cargo xtask bundle --open  # build target/bundle/Agentloft.app (macOS)
+```
 
 ## License
 
