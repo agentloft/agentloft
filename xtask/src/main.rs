@@ -1,10 +1,10 @@
 //! Developer tasks: `cargo xtask <task>`.
 //!
-//! - `dev`          build both binaries and run the app against `./.dev-home`
-//!                  (the app starts its own isolated `agentloftd`).
-//! - `stop-dev`     ask the dev daemon to shut down.
-//! - `live-claude`  run the live Claude end-to-end test (uses real tokens).
-//! - `ci`           fmt check, clippy, tests, cargo-deny — what CI runs.
+//! - `dev`: build both binaries and run the app against `./.dev-home`
+//!   (the app starts its own isolated `agentloftd`).
+//! - `stop-dev`: ask the dev daemon to shut down.
+//! - `live-claude`: run the live Claude end-to-end test (uses real tokens).
+//! - `ci`: fmt check, clippy, tests, cargo-deny — what CI runs.
 
 use anyhow::{Context as _, Result, bail};
 use std::path::PathBuf;
@@ -16,11 +16,25 @@ fn main() -> Result<()> {
         "dev" => dev(),
         "stop-dev" => stop_dev(),
         "live-claude" => run(cargo().args([
-            "test", "-p", "loftd", "--test", "live_claude", "--", "--ignored", "--nocapture",
+            "test",
+            "-p",
+            "loftd",
+            "--test",
+            "live_claude",
+            "--",
+            "--ignored",
+            "--nocapture",
         ])),
         "ci" => {
             run(cargo().args(["fmt", "--all", "--check"]))?;
-            run(cargo().args(["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]))?;
+            run(cargo().args([
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ]))?;
             run(cargo().args(["test", "--workspace"]))?;
             run(cargo().args(["deny", "check"]))
         }
@@ -79,8 +93,14 @@ fn stop_dev() -> Result<()> {
         s.write_all(json.as_bytes())?;
         Ok(())
     };
-    send(&mut s, r#"{"type":"hello","protocol_version":1,"client_kind":"cli","client_build":"xtask"}"#)?;
-    send(&mut s, r#"{"type":"request","id":1,"body":{"op":"shutdown","reason":"upgrade"}}"#)?;
+    send(
+        &mut s,
+        r#"{"type":"hello","protocol_version":1,"client_kind":"cli","client_build":"xtask"}"#,
+    )?;
+    send(
+        &mut s,
+        r#"{"type":"request","id":1,"body":{"op":"shutdown","reason":"upgrade"}}"#,
+    )?;
     let mut buf = [0u8; 256];
     let _ = s.read(&mut buf);
     std::thread::sleep(std::time::Duration::from_millis(500));
