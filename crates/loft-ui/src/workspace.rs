@@ -169,6 +169,8 @@ pub struct WorkspaceView {
     pub(crate) panel_open: bool,
     /// Where the details button is (its card opens under it).
     details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    /// The turn-map tick being hovered (its peek card shows).
+    peek: Option<usize>,
     /// The details card is docked open (shown while the window is wide).
     details_open: bool,
     details_card: Option<Entity<crate::details::DetailsCard>>,
@@ -249,6 +251,7 @@ impl WorkspaceView {
             panel_open: false,
             details_anchor: Default::default(),
             details_open: false,
+            peek: None,
             details_card: None,
             details_room: Default::default(),
             window_title: String::new(),
@@ -396,6 +399,10 @@ impl WorkspaceView {
                         b.set_annotating(true, cx);
                     });
                 }
+            }
+            Some(("peek", n)) => {
+                self.panel_open = false;
+                self.peek = n.parse().ok();
             }
             Some(("queue", text)) => {
                 self.panel_open = false;
@@ -991,6 +998,159 @@ impl WorkspaceView {
                 store.send_message(id, text, attachments, cx)
             });
         }
+    }
+
+    /// The thread at a glance: a tick per message you sent, down the left
+    /// edge. Hover one to peek at it and its reply; click to go there.
+    fn turn_map(
+        &self,
+        thread: &Entity<ThreadState>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let state = thread.read(cx);
+        let model = state.model.as_ref()?;
+        let items = &model.items;
+        let mut marks: Vec<(usize, String, String)> = Vec::new();
+        for (row_ix, row) in state.rows.iter().enumerate() {
+            let crate::store::Row::Item(i) = row else {
+                continue;
+            };
+            let loft_protocol::ItemBody::UserMessage { text, attachments } = &items[*i].body else {
+                continue;
+            };
+            let title = text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(90).collect::<String>())
+                .unwrap_or_else(|| match attachments.len() {
+                    0 => "Message".into(),
+                    1 => "Image".into(),
+                    n => format!("{n} images"),
+                });
+            let turn = &items[*i].turn_id;
+            let reply = items
+                .iter()
+                .rev()
+                .filter(|it| it.parent_id.is_none() && &it.turn_id == turn)
+                .find_map(|it| match &it.body {
+                    loft_protocol::ItemBody::AssistantMessage { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .map(|t| {
+                    // Plain text: no Markdown emphasis, code ticks or headings.
+                    let plain: String = t
+                        .chars()
+                        .filter(|c| !matches!(c, '*' | '`' | '#'))
+                        .collect();
+                    let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+                    flat.chars().take(220).collect::<String>()
+                })
+                .unwrap_or_default();
+            marks.push((row_ix, title, reply));
+        }
+        if marks.len() < 2 {
+            return None;
+        }
+        // Where the reader is: the last message at or above the top row.
+        let top = state.scroller.read(cx).logical_scroll_top().item_ix;
+        let current = marks.iter().rposition(|(row, ..)| *row <= top).unwrap_or(0);
+        let spacing = match marks.len() {
+            0..=40 => 14.,
+            41..=80 => 8.,
+            _ => 5.,
+        };
+        let scroller = state.scroller.clone();
+        let mut rail = v_flex().w(px(34.)).items_start();
+        for (ix, (row, title, reply)) in marks.into_iter().enumerate() {
+            let hovered = self.peek == Some(ix);
+            let is_current = ix == current;
+            let scroller = scroller.clone();
+            let card = hovered.then(|| {
+                v_flex()
+                    .absolute()
+                    .left(px(38.))
+                    .top(px(-24.))
+                    .w(px(320.))
+                    .gap_1()
+                    .px_3()
+                    .py_2p5()
+                    .rounded(px(12.))
+                    .bg(p.elevated)
+                    .border_1()
+                    .border_color(p.border)
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .truncate()
+                            .child(title),
+                    )
+                    .when(!reply.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(p.muted_foreground)
+                                .line_clamp(3)
+                                .child(reply),
+                        )
+                    })
+            });
+            rail = rail.child(
+                h_flex()
+                    .id(SharedString::from(format!("turn-mark-{ix}")))
+                    .relative()
+                    .w_full()
+                    .h(px(spacing))
+                    .pl_3()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .h(px(2.))
+                            .rounded(px(1.))
+                            .w(px(if is_current {
+                                20.
+                            } else if hovered {
+                                16.
+                            } else {
+                                10.
+                            }))
+                            .bg(if is_current || hovered {
+                                p.foreground.opacity(0.85)
+                            } else {
+                                p.muted_foreground.opacity(0.45)
+                            }),
+                    )
+                    .children(card)
+                    .on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                        if *on {
+                            this.peek = Some(ix);
+                        } else if this.peek == Some(ix) {
+                            this.peek = None;
+                        }
+                        cx.notify();
+                    }))
+                    .on_click(move |_, _, cx| {
+                        scroller.update(cx, |s, cx| {
+                            s.scroll_to_item(row, cx);
+                        });
+                    }),
+            );
+        }
+        Some(
+            v_flex()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .justify_center()
+                .child(rail)
+                .into_any_element(),
+        )
     }
 
     /// Messages waiting for the current turn to end: dashed bubbles you can
@@ -2106,6 +2266,7 @@ impl WorkspaceView {
                 .unwrap_or_default();
             self.queued_list(&id, &queued, p, cx)
         };
+        let turn_map = self.turn_map(&thread, p, cx);
         let state = thread.read(cx);
         let Some(model) = state.model.as_ref() else {
             return v_flex()
@@ -2308,7 +2469,16 @@ impl WorkspaceView {
             .relative()
             .flex_1()
             .min_h_0()
-            .child(div().flex_1().min_h_0().flex().flex_col().child(timeline))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .relative()
+                    .child(timeline)
+                    .children(turn_map),
+            )
             .child(
                 div().px_6().pb_5().pt_1().flex().justify_center().child(
                     v_flex()
