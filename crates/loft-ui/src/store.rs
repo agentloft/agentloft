@@ -1348,6 +1348,10 @@ impl ThreadState {
             after,
             state: CardState::Loading,
             open: true,
+            week: false,
+            filter: 0,
+            model: 0,
+            expanded: Vec::new(),
         });
         let ix = self.cards.len() - 1;
         self.sync_rows(None, cx);
@@ -1401,6 +1405,19 @@ impl ThreadState {
         if ix < self.cards.len() {
             self.cards.remove(ix);
             self.sync_rows(None, cx);
+            cx.notify();
+        }
+    }
+
+    /// Change how card `ix` is shown (its controls), then redraw it.
+    pub fn card_ui(&mut self, ix: usize, f: impl FnOnce(&mut InfoCard), cx: &mut Context<Self>) {
+        if let Some(card) = self.cards.get_mut(ix) {
+            f(card);
+            if let Some(row) = self.rows.iter().position(|r| *r == Row::Card(ix)) {
+                self.scroller.update(cx, |s, cx| {
+                    s.remeasure_items(row..row + 1, cx);
+                });
+            }
             cx.notify();
         }
     }
@@ -1567,6 +1584,14 @@ pub struct InfoCard {
     pub state: CardState,
     /// Details unfolded.
     pub open: bool,
+    /// Usage: the last week rather than the last day.
+    pub week: bool,
+    /// Usage: which kind of source to list (0 = all).
+    pub filter: usize,
+    /// Usage: the model the breakdown shows.
+    pub model: usize,
+    /// Context: sections unfolded (MCP tools, memory files, …).
+    pub expanded: Vec<&'static str>,
 }
 
 pub enum CardState {

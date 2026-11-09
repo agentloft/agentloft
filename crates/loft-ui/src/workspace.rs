@@ -455,13 +455,22 @@ impl WorkspaceView {
             }
             Some(("card", which)) => {
                 self.panel_open = false;
-                let kind = if which == "usage" {
-                    loft_protocol::AgentInfoKind::Usage
-                } else {
-                    loft_protocol::AgentInfoKind::Context
+                let kind = match which {
+                    "usage" => loft_protocol::AgentInfoKind::Usage,
+                    "status" => loft_protocol::AgentInfoKind::Status,
+                    _ => loft_protocol::AgentInfoKind::Context,
                 };
                 let client = self.store.read(cx).client();
-                thread.update(cx, |t, cx| t.add_card(kind, client, cx));
+                thread.update(cx, |t, cx| {
+                    t.add_card(kind, client, cx);
+                    // Unfold every section (tests).
+                    let ix = t.cards.len() - 1;
+                    t.card_ui(
+                        ix,
+                        |c| c.expanded = vec!["messages", "mcp", "memory", "skills", "agents"],
+                        cx,
+                    );
+                });
             }
             Some(("peek", n)) => {
                 self.panel_open = false;
@@ -1099,17 +1108,27 @@ impl WorkspaceView {
             .is_some_and(|a| !a.is_empty());
         let pasted = self.pasted.get(thread_id).cloned().unwrap_or_default();
         let notes = self.page_notes.get(thread_id).cloned().unwrap_or_default();
-        // `/context` and `/usage` to Claude: shown as cards, not sent.
-        let report = match typed.as_str() {
-            "/context" => Some(loft_protocol::AgentInfoKind::Context),
-            "/usage" | "/cost" => Some(loft_protocol::AgentInfoKind::Usage),
-            _ => None,
+        // Reports shown as cards, not sent: Claude's `/context` and
+        // `/usage`, Codex's `/status`.
+        let harness = self
+            .store
+            .read(cx)
+            .workspace
+            .threads
+            .iter()
+            .find(|t| &t.id == thread_id)
+            .map(|t| t.harness.as_str().to_owned())
+            .unwrap_or_default();
+        let report = {
+            use loft_protocol::{AgentInfoKind, HarnessId};
+            match (harness.as_str(), typed.as_str()) {
+                (HarnessId::CLAUDE, "/context") => Some(AgentInfoKind::Context),
+                (HarnessId::CLAUDE, "/usage" | "/cost") => Some(AgentInfoKind::Usage),
+                (HarnessId::CODEX, "/status" | "/usage") => Some(AgentInfoKind::Status),
+                _ => None,
+            }
         };
-        let claude =
-            self.store.read(cx).workspace.threads.iter().any(|t| {
-                &t.id == thread_id && t.harness.as_str() == loft_protocol::HarnessId::CLAUDE
-            });
-        if let Some(kind) = report.filter(|_| claude && pasted.is_empty() && notes.is_empty())
+        if let Some(kind) = report.filter(|_| pasted.is_empty() && notes.is_empty())
             && let Some(thread) = self.store.read(cx).threads.get(thread_id).cloned()
         {
             composer.update(cx, |c, cx| c.set_value("", window, cx));

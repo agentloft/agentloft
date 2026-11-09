@@ -638,4 +638,6 @@ pub enum AgentInfoKind {
     Context,
     /// Plan limits, session cost and tips.
     Usage,
+    /// Account, limits and this thread's tokens (Codex's `/status`).
+    Status,
 }

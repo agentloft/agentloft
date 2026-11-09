@@ -119,7 +119,9 @@ impl Translator {
         self.queries.insert(id.clone());
         let subtype = match kind {
             loft_protocol::AgentInfoKind::Context => "get_context_usage",
-            loft_protocol::AgentInfoKind::Usage => "get_usage",
+            loft_protocol::AgentInfoKind::Usage | loft_protocol::AgentInfoKind::Status => {
+                "get_usage"
+            }
         };
         let v = json!({
             "type": "control_request", "request_id": id,

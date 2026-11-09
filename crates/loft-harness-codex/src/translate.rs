@@ -14,6 +14,11 @@ use std::collections::{HashMap, VecDeque};
 pub enum Out {
     Event(HarnessEvent),
     Send(Value),
+    /// The answer to a query started with [`Translator::query`].
+    Reply {
+        query: u64,
+        result: Result<Value, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +28,39 @@ enum Pending {
     ThreadResume,
     ThreadFork,
     TurnStart,
+    /// One part of a status query.
+    Query {
+        query: u64,
+        part: QueryPart,
+    },
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPart {
+    Account,
+    RateLimits,
+    Usage,
+}
+
+impl QueryPart {
+    const ALL: [QueryPart; 3] = [QueryPart::Account, QueryPart::RateLimits, QueryPart::Usage];
+
+    fn key(self) -> &'static str {
+        match self {
+            QueryPart::Account => "account",
+            QueryPart::RateLimits => "rateLimits",
+            QueryPart::Usage => "usage",
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            QueryPart::Account => "account/read",
+            QueryPart::RateLimits => "account/rateLimits/read",
+            QueryPart::Usage => "account/usage/read",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +104,14 @@ pub struct Translator {
     pub fork_from: Option<String>,
     /// With `fork_from`: the last turn to keep (`lastTurnId`).
     pub fork_at: Option<String>,
+    /// The server answered `initialize` (other requests may go out).
+    ready: bool,
+    /// Status queries: their parts so far, and those asked before `ready`.
+    queries: HashMap<u64, serde_json::Map<String, Value>>,
+    deferred: Vec<u64>,
+    next_query: u64,
+    /// The thread's latest `tokenUsage` (totals and the context window).
+    token_usage: Option<Value>,
 }
 
 impl Translator {
@@ -89,6 +134,57 @@ impl Translator {
         self.next_id += 1;
         self.pending.insert(self.next_id, kind);
         json!({ "id": self.next_id, "method": method, "params": params })
+    }
+
+    /// Ask for a status report (account, limits, usage history); answered
+    /// with `Out::Reply` carrying the returned query id.
+    pub fn query(&mut self) -> (u64, Vec<Out>) {
+        self.next_query += 1;
+        let query = self.next_query;
+        self.queries.insert(query, serde_json::Map::new());
+        if !self.ready {
+            self.deferred.push(query);
+            return (query, vec![]);
+        }
+        (query, self.query_requests(query))
+    }
+
+    fn query_requests(&mut self, query: u64) -> Vec<Out> {
+        QueryPart::ALL
+            .iter()
+            .map(|&part| {
+                Out::Send(self.request(Pending::Query { query, part }, part.method(), json!({})))
+            })
+            .collect()
+    }
+
+    /// One part of `query` came back; the reply goes out once all have.
+    fn query_part(&mut self, query: u64, part: QueryPart, value: Value) -> Vec<Out> {
+        let Some(parts) = self.queries.get_mut(&query) else {
+            return vec![];
+        };
+        parts.insert(part.key().to_owned(), value);
+        if parts.len() < QueryPart::ALL.len() {
+            return vec![];
+        }
+        let mut parts = self.queries.remove(&query).unwrap_or_default();
+        parts.insert(
+            "tokenUsage".into(),
+            self.token_usage.clone().unwrap_or(Value::Null),
+        );
+        parts.insert(
+            "session".into(),
+            json!({
+                "model": self.model,
+                "effort": self.effort,
+                "cwd": self.cwd,
+                "threadId": self.thread_id,
+            }),
+        );
+        vec![Out::Reply {
+            query,
+            result: Ok(Value::Object(parts)),
+        }]
     }
 
     // -- outgoing -----------------------------------------------------------
@@ -254,6 +350,11 @@ impl Translator {
         let Some(kind) = id.as_u64().and_then(|id| self.pending.remove(&id)) else {
             return vec![];
         };
+        if let Pending::Query { query, part } = kind {
+            // A part that failed is just missing from the report.
+            let value = v.get("result").cloned().unwrap_or(Value::Null);
+            return self.query_part(query, part, value);
+        }
         if let Some(err) = v.get("error") {
             let msg = err
                 .get("message")
@@ -293,7 +394,7 @@ impl Translator {
                         error: Some(format!("Codex: {msg}")),
                     })]
                 }
-                Pending::Other => vec![Out::Event(HarnessEvent::Notice {
+                Pending::Other | Pending::Query { .. } => vec![Out::Event(HarnessEvent::Notice {
                     level: NoticeLevel::Warning,
                     text: format!("Codex: {msg}"),
                 })],
@@ -302,8 +403,12 @@ impl Translator {
         let result = v.get("result").unwrap_or(&Value::Null);
         match kind {
             Pending::Initialize => {
+                self.ready = true;
                 let mut out = vec![Out::Send(json!({ "method": "initialized" }))];
                 out.push(Out::Send(self.open_thread()));
+                for query in std::mem::take(&mut self.deferred) {
+                    out.extend(self.query_requests(query));
+                }
                 out
             }
             Pending::ThreadStart | Pending::ThreadResume | Pending::ThreadFork => {
@@ -333,7 +438,7 @@ impl Translator {
                 }
                 vec![]
             }
-            Pending::Other => vec![],
+            Pending::Other | Pending::Query { .. } => vec![],
         }
     }
 
@@ -359,6 +464,7 @@ impl Translator {
                 delta(p, DeltaChannel::Output)
             }
             "thread/tokenUsage/updated" => {
+                self.token_usage = p.get("tokenUsage").cloned();
                 if let Some(last) = p.pointer("/tokenUsage/last") {
                     let n = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
                     let cached = n("cachedInputTokens");
@@ -1269,6 +1375,62 @@ mod tests {
         let Out::Send(v) = &reply[0] else { panic!() };
         assert_eq!(v["id"], 4);
         assert_eq!(v["result"]["action"], "decline");
+    }
+
+    #[test]
+    fn status_query_collects_its_parts() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        // Before `initialize` answers, the query waits.
+        let (q, outs) = t.query();
+        assert!(outs.is_empty());
+        let init = t.initialize();
+        let init_id = init["id"].as_u64().unwrap();
+        let outs = t.on_line(&format!(r#"{{"id":{init_id},"result":{{}}}}"#));
+        let ids: Vec<u64> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Out::Send(v)
+                    if v.get("method")
+                        .and_then(Value::as_str)
+                        .is_some_and(|m| m.starts_with("account/")) =>
+                {
+                    v["id"].as_u64()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(
+            t.on_line(&format!(
+                r#"{{"id":{},"result":{{"account":{{"email":"a@b"}}}}}}"#,
+                ids[0]
+            ))
+            .is_empty()
+        );
+        assert!(
+            t.on_line(&format!(
+                r#"{{"id":{},"error":{{"message":"no"}}}}"#,
+                ids[1]
+            ))
+            .is_empty()
+        );
+        let out = t.on_line(&format!(
+            r#"{{"id":{},"result":{{"summary":{{}}}}}}"#,
+            ids[2]
+        ));
+        let [
+            Out::Reply {
+                query,
+                result: Ok(v),
+            },
+        ] = out.as_slice()
+        else {
+            panic!("expected the reply");
+        };
+        assert_eq!(*query, q);
+        assert_eq!(v["account"]["account"]["email"], "a@b");
+        assert!(v["rateLimits"].is_null());
+        assert_eq!(v["session"]["cwd"], "/w");
     }
 
     #[test]
