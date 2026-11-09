@@ -1449,7 +1449,6 @@ impl WorkspaceView {
             .effort
             .as_deref()
             .map(|e| crate::model_picker::effort_label(e).to_owned());
-        let mode = mode_label(model.thread.permission_mode).to_owned();
         let current_mode = model.thread.permission_mode;
         let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
@@ -1772,15 +1771,10 @@ impl WorkspaceView {
                                                     &harness,
                                                     model_name,
                                                     effort_name,
+                                                    current_mode,
                                                     p,
                                                     window,
                                                     cx,
-                                                ))
-                                                .child(mode_menu(
-                                                    &thread_id,
-                                                    current_mode,
-                                                    mode,
-                                                    &self.store,
                                                 )),
                                         )
                                         .child(
@@ -1988,6 +1982,7 @@ impl WorkspaceView {
         harness: &HarnessId,
         model_name: String,
         effort_name: Option<String>,
+        mode: Option<loft_protocol::PermissionMode>,
         p: &Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2006,6 +2001,19 @@ impl WorkspaceView {
                 .when_some(effort_name, |d, effort| {
                     d.child(div().text_color(p.faint_foreground).child("·"))
                         .child(div().text_color(p.muted_foreground).child(effort))
+                })
+                // The permission mode, when one is chosen.
+                .when(mode.is_some(), |d| {
+                    let full = mode == Some(loft_protocol::PermissionMode::FullAccess);
+                    d.child(div().text_color(p.faint_foreground).child("·"))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .text_color(if full { p.warning } else { p.muted_foreground })
+                                .child(Icon::new(crate::model_picker::mode_icon(mode)).xsmall())
+                                .child(crate::model_picker::mode_short(mode)),
+                        )
                 })
                 .child(
                     Icon::new(if open {
@@ -2493,50 +2501,6 @@ pub(crate) fn mode_label(mode: Option<loft_protocol::PermissionMode>) -> &'stati
         Some(Auto) => "Auto",
         Some(FullAccess) => "Full access",
     }
-}
-
-/// Permission-mode dropdown in the composer footer (PLAN §2.7).
-fn mode_menu(
-    thread_id: &ThreadId,
-    current: Option<loft_protocol::PermissionMode>,
-    label: String,
-    store: &Entity<AppStore>,
-) -> AnyElement {
-    use gpui_kit::component::button::{Button, ButtonVariants as _};
-    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-    use loft_protocol::PermissionMode::*;
-    let store = store.clone();
-    let thread_id = thread_id.clone();
-    Button::new("mode-menu")
-        .label(label)
-        .icon(IconName::ShieldCheck)
-        .ghost()
-        .xsmall()
-        .dropdown_menu(move |mut menu, _, _| {
-            for mode in [
-                None,
-                Some(ReadOnly),
-                Some(AskAll),
-                Some(AcceptEdits),
-                Some(Auto),
-                Some(FullAccess),
-            ] {
-                let (store, thread_id) = (store.clone(), thread_id.clone());
-                menu = menu.item(
-                    PopupMenuItem::new(mode_label(mode))
-                        .checked(mode == current)
-                        .on_click(move |_, _, cx| {
-                            let t = thread_id.clone();
-                            store.update(cx, |s, cx| s.set_permission_mode(t, mode, cx));
-                        }),
-                );
-                if mode.is_none() {
-                    menu = menu.separator();
-                }
-            }
-            menu
-        })
-        .into_any_element()
 }
 
 fn chip_label(icon: IconName, label: impl Into<SharedString>, p: &Palette) -> AnyElement {

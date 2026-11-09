@@ -16,7 +16,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use loft_protocol::{HarnessId, ModelInfo, ThreadId};
+use loft_protocol::{HarnessId, ModelInfo, PermissionMode, ThreadId};
 
 pub enum PickerEvent {
     Close,
@@ -44,6 +44,7 @@ struct Snapshot {
     started: bool,
     current_model: Option<String>,
     current_effort: Option<String>,
+    current_mode: Option<PermissionMode>,
     models: Vec<ModelInfo>,
     agents: Vec<(&'static str, &'static str)>,
 }
@@ -111,9 +112,9 @@ impl ModelPicker {
             .get(&self.thread_id)
             .and_then(|t| t.read(cx).model.as_ref())
             .map(|m| (m.thread.clone(), !m.items.is_empty()));
-        let (harness, started, current_model, current_effort) = match thread {
-            Some((t, started)) => (t.harness, started, t.model, t.effort),
-            None => (HarnessId::claude(), false, None, None),
+        let (harness, started, current_model, current_effort, current_mode) = match thread {
+            Some((t, started)) => (t.harness, started, t.model, t.effort, t.permission_mode),
+            None => (HarnessId::claude(), false, None, None, None),
         };
         let all = store.models.get(&harness).cloned().unwrap_or_default();
         let models = all
@@ -132,6 +133,7 @@ impl ModelPicker {
             started,
             current_model,
             current_effort,
+            current_mode,
             models,
             agents: store.available_harnesses(),
         }
@@ -270,7 +272,16 @@ impl ModelPicker {
                             .text_color(p.muted_foreground)
                             .hover(|d| d.text_color(p.foreground))
                     })
-                    .when(locked, |d| d.text_color(p.faint_foreground).opacity(0.6))
+                    .when(locked, |d| {
+                        d.text_color(p.faint_foreground)
+                            .opacity(0.6)
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(
+                                    "Fork the thread (⋯) to use another agent",
+                                )
+                                .build(window, cx)
+                            })
+                    })
                     .child(crate::brand::agent_logo(id, px(13.), p))
                     .child(name)
                     .when(!locked, |d| {
@@ -320,8 +331,8 @@ impl ModelPicker {
                     .gap_1()
                     .items_center()
                     .px_2()
-                    .pt_2()
-                    .pb_1()
+                    .pt_1p5()
+                    .pb_0p5()
                     .text_xs()
                     .text_color(p.faint_foreground)
                     .child(Icon::new(IconName::Clock).xsmall())
@@ -331,53 +342,35 @@ impl ModelPicker {
             let current = is_current(model, snap.current_model.as_deref());
             let row = h_flex()
                 .id(SharedString::from(format!("picker-model-{ix}")))
-                .relative()
                 .gap_2()
                 .items_center()
+                .h(px(30.))
                 .px_2()
-                .py(px(6.))
-                .rounded(px(8.))
+                .rounded(px(7.))
                 .cursor_pointer()
+                .text_sm()
                 .when(active, |d| d.bg(p.selected))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
+                .child(crate::brand::agent_logo(snap.harness.as_str(), px(14.), p))
                 .child(
-                    // Accent rail on the model in use.
                     div()
-                        .w(px(3.))
-                        .h(px(18.))
-                        .rounded_full()
-                        .when(current, |d| d.bg(p.accent)),
+                        .flex_none()
+                        .font_weight(if current {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .child(model.display_name.clone()),
                 )
-                .child(crate::brand::agent_logo(snap.harness.as_str(), px(15.), p))
+                .when(model.is_default, |d| d.child(tag("default", p)))
                 .child(
-                    v_flex()
+                    div()
                         .flex_1()
                         .min_w_0()
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .items_center()
-                                .text_sm()
-                                .child(
-                                    div()
-                                        .font_weight(if current {
-                                            FontWeight::SEMIBOLD
-                                        } else {
-                                            FontWeight::MEDIUM
-                                        })
-                                        .child(model.display_name.clone()),
-                                )
-                                .when(model.is_default, |d| d.child(tag("default", p))),
-                        )
-                        .when_some(model.description.clone(), |d, desc| {
-                            d.child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(p.faint_foreground)
-                                    .child(desc),
-                            )
-                        }),
+                        .truncate()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .children(model.description.clone()),
                 )
                 .when(current, |d| {
                     d.child(Icon::new(IconName::Check).xsmall().text_color(p.accent))
@@ -398,7 +391,7 @@ impl ModelPicker {
 
     fn render_efforts(&self, snap: &Snapshot, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let column = v_flex()
-            .w(px(212.))
+            .w(px(176.))
             .flex_none()
             .border_l_1()
             .border_color(p.border)
@@ -420,13 +413,7 @@ impl ModelPicker {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(p.muted_foreground)
                     .child(Icon::new(IconName::Brain).xsmall())
-                    .child("Reasoning effort"),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .text_color(p.faint_foreground)
-                    .child(model.display_name.clone()),
+                    .child("Effort"),
             );
         if model.efforts.is_empty() {
             return column
@@ -437,7 +424,7 @@ impl ModelPicker {
                         .py_2()
                         .text_xs()
                         .text_color(p.faint_foreground)
-                        .child("This model doesn't take an effort setting."),
+                        .child("Not adjustable for this model."),
                 )
                 .into_any_element();
         }
@@ -460,49 +447,34 @@ impl ModelPicker {
             .overflow_y_scroll()
             .gap_px();
         for level in 0..=total {
-            let (label, hint) = if level == 0 {
-                let default = model.default_effort.as_deref().map(effort_label);
-                (
-                    "Auto".to_owned(),
-                    match default {
-                        Some(d) => format!("Model default · {d}"),
-                        None => "Model default".to_owned(),
-                    },
-                )
-            } else {
-                let e = &model.efforts[level - 1];
-                let mut hint = effort_hint(e).to_owned();
-                if model.default_effort.as_deref() == Some(e) {
-                    hint = format!("{hint} · default");
-                }
-                (effort_label(e).to_owned(), hint)
+            let label = match level {
+                0 => "Auto",
+                _ => effort_label(&model.efforts[level - 1]),
             };
+            let is_default = level > 0 && default_level == Some(level);
             let active = level == selected;
             ladder = ladder.child(
                 h_flex()
                     .id(SharedString::from(format!("picker-effort-{level}")))
                     .gap_2()
                     .items_center()
+                    .h(px(28.))
                     .px_2()
-                    .py(px(5.))
-                    .rounded(px(8.))
+                    .rounded(px(7.))
                     .cursor_pointer()
+                    .text_sm()
                     .when(active, |d| d.bg(p.selected))
                     .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                     .child(meter(level, total, default_level, p))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_sm().child(label))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(p.faint_foreground)
-                                    .child(hint),
-                            ),
-                    )
+                    .child(div().flex_1().min_w_0().truncate().child(label.to_owned()))
+                    .when(is_default, |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.faint_foreground)
+                                .child("default"),
+                        )
+                    })
                     .when(applied == Some(level), |d| {
                         d.child(Icon::new(IconName::Check).xsmall().text_color(p.accent))
                     })
@@ -510,6 +482,126 @@ impl ModelPicker {
             );
         }
         column.child(heading).child(ladder).into_any_element()
+    }
+}
+
+impl ModelPicker {
+    /// Permission modes as an icon strip, the chosen one named.
+    fn render_permissions(
+        &self,
+        snap: &Snapshot,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut strip = h_flex()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(px(8.))
+            .bg(p.background);
+        for mode in MODES {
+            let active = mode == snap.current_mode;
+            strip = strip.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "picker-mode-{}",
+                        mode_short(mode)
+                    )))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(28.))
+                    .h(px(22.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(active, |d| {
+                        d.bg(p.elevated)
+                            .text_color(if mode == Some(PermissionMode::FullAccess) {
+                                p.warning
+                            } else {
+                                p.accent
+                            })
+                            .shadow_sm()
+                    })
+                    .when(!active, |d| {
+                        d.text_color(p.muted_foreground)
+                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    })
+                    .child(Icon::new(mode_icon(mode)).small())
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(crate::workspace::mode_label(
+                            mode,
+                        ))
+                        .build(window, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let t = this.thread_id.clone();
+                        this.store
+                            .update(cx, |s, cx| s.set_permission_mode(t, mode, cx));
+                    })),
+            );
+        }
+        h_flex()
+            .gap_2()
+            .items_center()
+            .px_3()
+            .py_1p5()
+            .border_t_1()
+            .border_color(p.border)
+            .bg(p.muted)
+            .text_xs()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .text_color(p.muted_foreground)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(Icon::new(IconName::ShieldCheck).xsmall())
+                    .child("Permissions"),
+            )
+            .child(strip)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_right()
+                    .text_color(p.foreground)
+                    .child(crate::workspace::mode_label(snap.current_mode)),
+            )
+            .into_any_element()
+    }
+}
+
+/// Every permission mode, `None` (the agent's default) first.
+const MODES: [Option<PermissionMode>; 6] = [
+    None,
+    Some(PermissionMode::ReadOnly),
+    Some(PermissionMode::AskAll),
+    Some(PermissionMode::AcceptEdits),
+    Some(PermissionMode::Auto),
+    Some(PermissionMode::FullAccess),
+];
+
+pub fn mode_icon(mode: Option<PermissionMode>) -> IconName {
+    match mode {
+        None => IconName::ShieldCheck,
+        Some(PermissionMode::ReadOnly) => IconName::Eye,
+        Some(PermissionMode::AskAll) => IconName::Hand,
+        Some(PermissionMode::AcceptEdits) => IconName::FilePen,
+        Some(PermissionMode::Auto) => IconName::WandSparkles,
+        Some(PermissionMode::FullAccess) => IconName::ShieldOff,
+    }
+}
+
+/// A word for the composer chip.
+pub fn mode_short(mode: Option<PermissionMode>) -> &'static str {
+    match mode {
+        None => "Default",
+        Some(PermissionMode::ReadOnly) => "Plan",
+        Some(PermissionMode::AskAll) => "Ask",
+        Some(PermissionMode::AcceptEdits) => "Edits",
+        Some(PermissionMode::Auto) => "Auto",
+        Some(PermissionMode::FullAccess) => "Full access",
     }
 }
 
@@ -521,13 +613,8 @@ impl Render for ModelPicker {
         if self.highlighted >= snap.models.len() {
             self.highlighted = snap.models.len().saturating_sub(1);
         }
-        let footer_note = if snap.started {
-            "Fork the thread (⋯) to use another agent"
-        } else {
-            "The agent is fixed once the thread starts"
-        };
         v_flex()
-            .w(px(580.))
+            .w(px(540.))
             .rounded(px(14.))
             .overflow_hidden()
             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
@@ -578,32 +665,12 @@ impl Render for ModelPicker {
             )
             .child(
                 h_flex()
-                    .h(px(330.))
+                    .h(px(250.))
                     .items_stretch()
                     .child(self.render_models(&snap, &p, cx))
                     .child(self.render_efforts(&snap, &p, cx)),
             )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(p.border)
-                    .bg(p.muted)
-                    .text_xs()
-                    .text_color(p.faint_foreground)
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(keys("↑↓", "model", &p))
-                            .child(keys("←→", "effort", &p))
-                            .child(keys("⏎", "apply", &p)),
-                    )
-                    .child(div().truncate().child(footer_note)),
-            )
+            .child(self.render_permissions(&snap, &p, cx))
     }
 }
 
@@ -635,19 +702,6 @@ pub fn effort_label(effort: &str) -> &str {
         "max" => "Max",
         "ultra" => "Ultra",
         other => other,
-    }
-}
-
-fn effort_hint(effort: &str) -> &'static str {
-    match effort {
-        "none" | "minimal" => "Answers straight away",
-        "low" => "Quick, light thinking",
-        "medium" => "Balanced",
-        "high" => "Thinks it through",
-        "xhigh" => "For hard problems",
-        "max" => "No limit on thinking",
-        "ultra" => "Longest, deepest runs",
-        _ => "",
     }
 }
 
@@ -690,23 +744,6 @@ fn tag(text: &'static str, p: &Palette) -> AnyElement {
         .text_color(p.accent)
         .text_xs()
         .child(text)
-        .into_any_element()
-}
-
-fn keys(k: &'static str, what: &'static str, p: &Palette) -> AnyElement {
-    h_flex()
-        .gap_1()
-        .items_center()
-        .child(
-            div()
-                .px_1()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(p.border)
-                .text_color(p.muted_foreground)
-                .child(k),
-        )
-        .child(what)
         .into_any_element()
 }
 
