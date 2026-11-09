@@ -9,6 +9,7 @@ pub mod panel;
 pub mod settings;
 pub mod store;
 pub mod theme;
+pub mod windows;
 pub mod workspace;
 
 pub use store::AppStore;

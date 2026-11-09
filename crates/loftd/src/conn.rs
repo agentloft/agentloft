@@ -154,10 +154,14 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 if let Some(old) = subs.remove(&sub_id) {
                     old.abort();
                 }
+                if let Topic::Thread(thread) = &topic {
+                    core.clients().watch(conn_id, sub_id, thread.clone());
+                }
                 let task = tokio::spawn(forward(core.clone(), sub_id, topic, out_tx.clone()));
                 subs.insert(sub_id, task.abort_handle());
             }
             ClientMsg::Unsubscribe { sub_id } => {
+                core.clients().unwatch(conn_id, sub_id);
                 if let Some(task) = subs.remove(&sub_id) {
                     task.abort();
                 }

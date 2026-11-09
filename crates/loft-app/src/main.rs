@@ -1,11 +1,8 @@
 //! `agentloft`: the GPUI client. Connects to (or starts) `agentloftd` and
 //! renders its state.
 
-use gpui_kit::{
-    AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
-};
 use loft_config::Paths;
-use loft_ui::{AppStore, WorkspaceView, theme};
+use loft_ui::{theme, windows};
 use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
@@ -21,43 +18,33 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let handle = runtime.handle().clone();
 
-    gpui_kit::application()
-        .with_assets(loft_ui::assets::Assets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            theme::init(paths.clone(), cx);
-            loft_ui::bind_keys(cx);
-            cx.set_menus(loft_ui::app_menus());
-            dock_icon::set();
+    let app = gpui_kit::application().with_assets(loft_ui::assets::Assets);
+    // Clicking the Dock icon with every window closed opens one.
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            windows::open(None, windows::Placement::Window, cx);
+        }
+    });
+    app.run(move |cx| {
+        gpui_kit::init(cx);
+        theme::init(paths.clone(), cx);
+        loft_ui::bind_keys(cx);
+        cx.set_menus(loft_ui::app_menus());
+        dock_icon::set();
 
-            // Live-reload appearance settings from config.toml.
-            cx.spawn(async move |cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    cx.update(theme::reload_if_changed);
-                }
-            })
-            .detach();
+        // Live-reload appearance settings from config.toml.
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.update(theme::reload_if_changed);
+            }
+        })
+        .detach();
 
-            let store = cx.new(|cx| AppStore::new(handle.clone(), paths.clone(), cx));
-            let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(720.), px(480.))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Agentloft".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(16.), px(18.))),
-                    }),
-                    ..Default::default()
-                },
-                cx,
-                move |window, cx| cx.new(|cx| WorkspaceView::new(store.clone(), window, cx)),
-            )
-            .expect("failed to open window");
-            cx.activate(true);
-        });
+        windows::init(handle.clone(), paths.clone(), cx);
+        windows::open(None, windows::Placement::Window, cx);
+        cx.activate(true);
+    });
     drop(runtime);
     Ok(())
 }

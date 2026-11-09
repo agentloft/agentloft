@@ -40,7 +40,9 @@ actions!(
         ShowFiles,
         ShowChanges,
         ShowTerminal,
-        ShowBrowser
+        ShowBrowser,
+        NewWindow,
+        NewTab
     ]
 );
 
@@ -54,6 +56,8 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
     loft_browser::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-n", NewWindow, None),
+        KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-.", Interrupt, Some(CONTEXT)),
         KeyBinding::new("cmd-b", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-l", ToggleTheme, Some(CONTEXT)),
@@ -89,6 +93,9 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
         ]),
         Menu::new("File").items([
             MenuItem::action("New Thread", NewThread),
+            MenuItem::action("New Tab", NewTab),
+            MenuItem::action("New Window", NewWindow),
+            MenuItem::separator(),
             MenuItem::action("Add Project…", AddProject),
         ]),
         Menu::new("Edit").items([
@@ -132,6 +139,10 @@ pub struct WorkspaceView {
     /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>`
     /// opens a panel tab once the first thread has loaded.
     dev_tab: Option<String>,
+    /// Last window title set (the native tab label).
+    window_title: String,
+    /// This window is one of several native tabs (we draw the tab strip).
+    tabs_shown: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -152,6 +163,8 @@ impl WorkspaceView {
             }),
             // Follow the system light/dark switch when theme = "system".
             cx.observe_window_appearance(window, |_, _, cx| theme::apply(cx)),
+            // Switching native tabs: refresh the tab strip.
+            cx.observe_window_activation(window, |_, _, cx| cx.notify()),
         ];
         Self {
             store,
@@ -164,9 +177,9 @@ impl WorkspaceView {
             sidebar_open: true,
             panel,
             panel_open: true,
-            dev_tab: std::env::var("AGENTLOFT_DEV_TAB")
-                .ok()
-                .filter(|v| !v.is_empty()),
+            window_title: String::new(),
+            tabs_shown: false,
+            dev_tab: take_dev_tab(),
             _subs: subs,
         }
     }
@@ -269,6 +282,20 @@ impl WorkspaceView {
                     let t = thread_id.clone();
                     self.store
                         .update(cx, |s, cx| s.archive_thread(t, false, cx));
+                }
+                "newtab" => {
+                    // A second thread in a native tab next to this one.
+                    let other = self
+                        .store
+                        .read(cx)
+                        .workspace
+                        .threads
+                        .iter()
+                        .filter(|t| t.id != thread_id && t.status != ThreadStatus::Archived)
+                        .map(|t| t.id.clone())
+                        .next();
+                    let tab = crate::windows::Placement::TabOf(window.window_handle());
+                    crate::windows::open(other, tab, cx);
                 }
                 "agent" => {
                     if let Some(item) = agent {
@@ -585,6 +612,91 @@ impl WorkspaceView {
 
     // -- sidebar ------------------------------------------------------------
 
+    fn render_tab_strip(
+        &mut self,
+        tabs: Vec<gpui_kit::SystemWindowTab>,
+        window: &mut Window,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = window.window_handle().window_id();
+        let mut strip = h_flex()
+            .h(px(38.))
+            .flex_shrink_0()
+            .pl(px(TRAFFIC_LIGHTS_INSET))
+            .pr_2()
+            .gap_1()
+            .items_center()
+            .bg(p.sidebar)
+            .border_b_1()
+            .border_color(p.border);
+        for (ix, tab) in tabs.into_iter().enumerate() {
+            let active = tab.id == current;
+            let handle = tab.handle;
+            let title = tab
+                .title
+                .split(" — ")
+                .next()
+                .unwrap_or("Agentloft")
+                .to_owned();
+            strip = strip.child(
+                h_flex()
+                    .id(SharedString::from(format!("win-tab-{ix}")))
+                    .group("win-tab")
+                    .flex_1()
+                    .min_w_0()
+                    .max_w(px(260.))
+                    .h(px(28.))
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .rounded(px(7.))
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(active, |d| {
+                        d.bg(p.background)
+                            .text_color(p.foreground)
+                            .border_1()
+                            .border_color(p.border)
+                    })
+                    .when(!active, |d| {
+                        d.text_color(p.muted_foreground)
+                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("win-tab-x-{ix}")))
+                            .p(px(2.))
+                            .rounded(px(4.))
+                            .invisible()
+                            .when(active, |d| d.visible())
+                            .group_hover("win-tab", |d| d.visible())
+                            .hover(|d| d.bg(p.border))
+                            .child(Icon::new(IconName::X).xsmall())
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                            }),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    }),
+            );
+        }
+        strip
+            .child(icon_button(
+                "win-tab-new",
+                IconName::Plus,
+                p,
+                cx.listener(|_, _, window, cx| {
+                    let tab = crate::windows::Placement::TabOf(window.window_handle());
+                    crate::windows::open(None, tab, cx)
+                }),
+            ))
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (projects, all_threads, selected, conn, error) = {
             let store = self.store.read(cx);
@@ -662,7 +774,11 @@ impl WorkspaceView {
             .child(
                 h_flex()
                     .h(px(HEADER_HEIGHT))
-                    .pl(px(TRAFFIC_LIGHTS_INSET))
+                    .pl(px(if self.tabs_shown {
+                        8.
+                    } else {
+                        TRAFFIC_LIGHTS_INSET
+                    }))
                     .pr_2()
                     .items_center()
                     .justify_end()
@@ -782,15 +898,16 @@ impl WorkspaceView {
             .border_b_1()
             .border_color(p.border)
             .when(!self.sidebar_open, |d| {
-                d.pl(px(TRAFFIC_LIGHTS_INSET)).child(icon_button(
-                    "show-sidebar",
-                    IconName::PanelLeft,
-                    p,
-                    cx.listener(|this, _, _, cx| {
-                        this.sidebar_open = true;
-                        cx.notify();
-                    }),
-                ))
+                d.when(!self.tabs_shown, |d| d.pl(px(TRAFFIC_LIGHTS_INSET)))
+                    .child(icon_button(
+                        "show-sidebar",
+                        IconName::PanelLeft,
+                        p,
+                        cx.listener(|this, _, _, cx| {
+                            this.sidebar_open = true;
+                            cx.notify();
+                        }),
+                    ))
             })
             .when_some(title, |d, (project, thread)| {
                 let chip = harness_name(&thread.harness).to_owned();
@@ -1315,11 +1432,25 @@ impl Render for WorkspaceView {
             Some(thread) => self.render_thread(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
         };
+        // The window title doubles as the native tab label.
+        let title = header_title
+            .as_ref()
+            .map(|(project, t)| format!("{} — {project}", t.title))
+            .unwrap_or_else(|| "Agentloft".into());
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
         let show_panel = self.panel_open && header_title.is_some();
         let header = self.render_header(header_title, &p, cx);
+        // Native tab group (⌘T): GPUI doesn't draw macOS's tab bar under our
+        // transparent title bar, so we draw the tabs ourselves.
+        let window_tabs = window.tabbed_windows().filter(|tabs| tabs.len() > 1);
+        self.tabs_shown = window_tabs.is_some();
+        let tab_strip = window_tabs.map(|tabs| self.render_tab_strip(tabs, window, &p, cx));
         let sidebar = self.sidebar_open.then(|| self.render_sidebar(&p, cx));
 
-        h_flex()
+        v_flex()
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &NewThread, _, cx| this.new_thread(None, cx)))
             .on_action(cx.listener(|this, _: &Interrupt, _, cx| this.interrupt(cx)))
@@ -1331,6 +1462,13 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
             .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
+            .on_action(cx.listener(|_, _: &NewWindow, _, cx| {
+                crate::windows::open(None, crate::windows::Placement::Window, cx)
+            }))
+            .on_action(cx.listener(|_, _: &NewTab, window, cx| {
+                let tab = crate::windows::Placement::TabOf(window.window_handle());
+                crate::windows::open(None, tab, cx)
+            }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
                 this.search.update(cx, |s, cx| s.focus(window, cx));
@@ -1361,43 +1499,45 @@ impl Render for WorkspaceView {
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
-            .children(sidebar)
+            .children(tab_strip)
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(header)
-                    .when(disconnected, |d| {
-                        d.child(
-                            h_flex()
-                                .justify_center()
-                                .gap_2()
-                                .py_1p5()
-                                .bg(p.warning_soft)
-                                .text_xs()
-                                .text_color(p.warning)
-                                .child(Spinner::new().xsmall().color(p.warning))
-                                .child("Lost connection to agentloftd — reconnecting…"),
-                        )
-                    })
-                    .child(
-                        h_resizable("workbench")
-                            .child(resizable_panel().child(body))
-                            .child(
-                                resizable_panel()
-                                    .size(px(560.))
-                                    .size_range(px(340.)..px(1600.))
-                                    .visible(show_panel)
-                                    .child(
-                                        div()
-                                            .size_full()
-                                            .border_l_1()
-                                            .border_color(p.border)
-                                            .child(self.panel.clone()),
-                                    ),
-                            ),
-                    ),
+                h_flex().flex_1().min_h_0().children(sidebar).child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(header)
+                        .when(disconnected, |d| {
+                            d.child(
+                                h_flex()
+                                    .justify_center()
+                                    .gap_2()
+                                    .py_1p5()
+                                    .bg(p.warning_soft)
+                                    .text_xs()
+                                    .text_color(p.warning)
+                                    .child(Spinner::new().xsmall().color(p.warning))
+                                    .child("Lost connection to agentloftd — reconnecting…"),
+                            )
+                        })
+                        .child(
+                            h_resizable("workbench")
+                                .child(resizable_panel().child(body))
+                                .child(
+                                    resizable_panel()
+                                        .size(px(560.))
+                                        .size_range(px(340.)..px(1600.))
+                                        .visible(show_panel)
+                                        .child(
+                                            div()
+                                                .size_full()
+                                                .border_l_1()
+                                                .border_color(p.border)
+                                                .child(self.panel.clone()),
+                                        ),
+                                ),
+                        ),
+                ),
             )
     }
 }
@@ -1860,6 +2000,18 @@ fn placeholder_for(h: &HarnessId) -> String {
     )
 }
 
+/// `AGENTLOFT_DEV_TAB` (screenshots/tests): applied by the first window
+/// only, so hooks that open windows don't cascade.
+fn take_dev_tab() -> Option<String> {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    std::env::var("AGENTLOFT_DEV_TAB")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 /// `/Users/me/x` → `~/x`.
 fn tilde(path: &str) -> String {
     match std::env::home_dir() {
@@ -1925,6 +2077,17 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                     })
                     .separator();
             }
+            let t = id.clone();
+            menu = menu
+                .item(
+                    PopupMenuItem::new("Open in New Tab")
+                        .icon(IconName::SquarePen)
+                        .on_click(move |_, window, cx| {
+                            let tab = crate::windows::Placement::TabOf(window.window_handle());
+                            crate::windows::open(Some(t.clone()), tab, cx)
+                        }),
+                )
+                .separator();
             for (h, name) in [
                 (HarnessId::CLAUDE, "Claude Code"),
                 (HarnessId::CODEX, "Codex"),
