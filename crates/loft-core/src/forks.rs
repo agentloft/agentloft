@@ -92,6 +92,11 @@ impl Core {
                     ForkKind::Handoff
                 },
             }),
+            slash_commands: if same {
+                parent.slash_commands.clone()
+            } else {
+                Vec::new()
+            },
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

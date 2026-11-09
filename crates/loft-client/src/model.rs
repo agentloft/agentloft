@@ -221,6 +221,7 @@ mod tests {
             updated_at_ms: 0,
             workspace: Default::default(),
             parent: None,
+            slash_commands: Vec::new(),
         };
         let item = Item {
             id: ItemId::new(),

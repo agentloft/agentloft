@@ -27,6 +27,9 @@ use std::time::Duration;
 use thread::{ThreadCmd, ThreadHandle};
 use tokio::sync::{broadcast, oneshot};
 
+/// A directory's file list and when it was taken.
+type FileIndex = (std::time::Instant, Arc<Vec<String>>);
+
 /// Message on the core bus: a committed event or a streaming delta.
 #[derive(Debug, Clone)]
 pub enum BusMsg {
@@ -99,6 +102,8 @@ pub struct Core {
     models: Mutex<HashMap<String, Vec<loft_protocol::ModelInfo>>>,
     /// Worktree setup commands to run before a thread's first prompt.
     pending_setup: Mutex<HashMap<ThreadId, String>>,
+    /// File lists per directory for `FindFiles`, briefly cached.
+    file_index: Mutex<HashMap<PathBuf, FileIndex>>,
     opts: CoreOptions,
 }
 
@@ -127,6 +132,7 @@ impl Core {
             config: std::sync::RwLock::new(opts.config.clone()),
             models: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
+            file_index: Mutex::new(HashMap::new()),
             opts,
         })
     }
@@ -237,6 +243,24 @@ impl Core {
             });
         }
         Ok(stored)
+    }
+
+    /// Every file under `dir` (gitignore-aware, ≤100k), cached for 15 s so
+    /// typing `@…` doesn't rewalk the tree on each keystroke.
+    async fn file_index(&self, dir: PathBuf) -> CoreResult<Arc<Vec<String>>> {
+        if let Some((at, files)) = lock(&self.file_index).get(&dir)
+            && at.elapsed() < Duration::from_secs(15)
+        {
+            return Ok(files.clone());
+        }
+        let d = dir.clone();
+        let files = Arc::new(
+            tokio::task::spawn_blocking(move || workbench::walk_files(&d))
+                .await
+                .map_err(internal)?,
+        );
+        lock(&self.file_index).insert(dir, (std::time::Instant::now(), files.clone()));
+        Ok(files)
     }
 
     /// Resolve the harness's CLI (config path or login PATH) and ask its
@@ -584,6 +608,13 @@ impl Core {
             Request::ReloadConfig => self.reload_config(),
             Request::ListModels { harness } => self.list_models(&harness).await,
             Request::ProbeHarness { harness } => self.probe_harness(&harness).await,
+            Request::FindFiles { root, query, limit } => {
+                let dir = self.root_dir(&root)?;
+                let files = self.file_index(dir).await?;
+                Ok(Response::Paths {
+                    paths: workbench::fuzzy_find(&files, &query, limit.min(100) as usize),
+                })
+            }
             Request::CreatePullRequest { thread_id } => self.create_pull_request(&thread_id).await,
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await
@@ -703,6 +734,7 @@ impl Core {
             updated_at_ms: now,
             workspace,
             parent: None,
+            slash_commands: Vec::new(),
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

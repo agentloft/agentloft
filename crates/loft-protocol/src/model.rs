@@ -33,6 +33,9 @@ pub struct Thread {
     /// Set on forks: the thread this one was forked from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ThreadParent>,
+    /// Slash commands the agent reported (composer completions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slash_commands: Vec<String>,
 }
 
 /// Where a fork came from (ADR-0011).

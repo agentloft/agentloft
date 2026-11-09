@@ -171,6 +171,13 @@ pub enum Request {
     ProbeHarness {
         harness: HarnessId,
     },
+    /// Files under a root matching `query` fuzzily (composer `@` mentions).
+    FindFiles {
+        root: FsRoot,
+        query: String,
+        #[serde(default = "default_find_limit")]
+        limit: u32,
+    },
     /// The models a harness offers (cached by the daemon).
     ListModels {
         harness: HarnessId,
@@ -313,6 +320,10 @@ pub struct Welcome {
     pub daemon_exe_mtime_ms: Option<i64>,
 }
 
+fn default_find_limit() -> u32 {
+    20
+}
+
 /// Modification time of a file in ms since the epoch (exe staleness check).
 pub fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
@@ -357,6 +368,9 @@ pub enum Response {
     },
     HarnessStatus {
         status: HarnessStatus,
+    },
+    Paths {
+        paths: Vec<String>,
     },
     /// A new fork, plus the handoff digest to offer as its first message.
     Forked {

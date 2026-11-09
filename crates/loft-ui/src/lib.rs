@@ -5,6 +5,7 @@ pub mod assets;
 mod attachments;
 mod attention;
 pub mod brand;
+mod completion;
 mod items;
 mod palette;
 pub mod panel;

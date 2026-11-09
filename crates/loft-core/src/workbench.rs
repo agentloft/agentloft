@@ -16,6 +16,82 @@ fn bad(msg: impl Into<String>) -> ErrorBody {
     ErrorBody::new(ErrorCode::BadRequest, msg)
 }
 
+const MAX_INDEXED_FILES: usize = 100_000;
+
+/// All files under `dir`, relative, honoring .gitignore (skips `.git`).
+pub(crate) fn walk_files(dir: &Path) -> Vec<String> {
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    walker
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .filter_map(|e| {
+            e.path()
+                .strip_prefix(dir)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        })
+        .take(MAX_INDEXED_FILES)
+        .collect()
+}
+
+/// Fuzzy-rank `files` against `query` (subsequence match; bonuses for
+/// matches in the file name, at segment starts, and in runs). An empty
+/// query lists the shortest paths first.
+pub(crate) fn fuzzy_find(files: &[String], query: &str, limit: usize) -> Vec<String> {
+    let q: Vec<char> = query
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut scored: Vec<(i64, &String)> = files
+        .iter()
+        .filter_map(|f| score(f, &q).map(|s| (s, f)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, f)| f.clone())
+        .collect()
+}
+
+fn score(path: &str, q: &[char]) -> Option<i64> {
+    if q.is_empty() {
+        return Some(-(path.len() as i64));
+    }
+    let lower: Vec<char> = path.to_lowercase().chars().collect();
+    let name_start = path
+        .rfind('/')
+        .map(|i| path[..=i].chars().count())
+        .unwrap_or(0);
+    let mut score = 0i64;
+    let mut qi = 0;
+    let mut prev: Option<usize> = None;
+    for (i, c) in lower.iter().enumerate() {
+        if qi < q.len() && *c == q[qi] {
+            score += 1;
+            if i >= name_start {
+                score += 3;
+            }
+            if i == 0 || matches!(lower[i - 1], '/' | '_' | '-' | '.') {
+                score += 4;
+            }
+            if prev == Some(i.wrapping_sub(1)) {
+                score += 5;
+            }
+            prev = Some(i);
+            qi += 1;
+        }
+    }
+    (qi == q.len()).then_some(score - (path.len() as i64) / 8)
+}
+
 impl Core {
     /// Absolute directory for a root.
     pub fn root_dir(&self, root: &FsRoot) -> CoreResult<PathBuf> {
@@ -257,5 +333,34 @@ impl Core {
             out = format!("[… {cut} earlier characters omitted …]\n{}", &out[cut..]);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::fuzzy_find;
+
+    #[test]
+    fn fuzzy_ranks_file_names_first() {
+        let files: Vec<String> = [
+            "src/main.rs",
+            "src/workspace/mod.rs",
+            "docs/maintenance.md",
+            "crates/loft-ui/src/workspace.rs",
+            "README.md",
+        ]
+        .map(String::from)
+        .into();
+        let hits = fuzzy_find(&files, "workspace", 3);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.contains("workspace")), "{hits:?}");
+        assert_eq!(fuzzy_find(&files, "main", 1), vec!["src/main.rs"]);
+        assert_eq!(fuzzy_find(&files, "rdme", 1), vec!["README.md"]);
+        assert!(fuzzy_find(&files, "zzz", 5).is_empty());
+        assert_eq!(
+            fuzzy_find(&files, "", 1),
+            vec!["README.md"],
+            "shortest first"
+        );
     }
 }

@@ -426,6 +426,7 @@ mod tests {
             updated_at_ms: 1,
             workspace: Default::default(),
             parent: None,
+            slash_commands: Vec::new(),
         }
     }
 

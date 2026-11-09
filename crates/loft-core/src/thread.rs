@@ -627,9 +627,13 @@ impl ThreadActor {
             HarnessEvent::SessionReady {
                 native_session_id,
                 model,
-                ..
+                slash_commands,
             } => {
                 let mut changed = false;
+                if !slash_commands.is_empty() && self.thread.slash_commands != slash_commands {
+                    self.thread.slash_commands = slash_commands;
+                    changed = true;
+                }
                 if !native_session_id.is_empty()
                     && self.thread.native_session_id.as_deref() != Some(&native_session_id)
                 {

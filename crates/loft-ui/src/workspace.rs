@@ -139,6 +139,9 @@ pub struct WorkspaceView {
     query: String,
     /// The sidebar lists archived threads too.
     show_archived: bool,
+    /// The open `/` or `@` completion popover.
+    completion: Option<crate::completion::Completion>,
+    completion_seq: u64,
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
@@ -186,6 +189,8 @@ impl WorkspaceView {
             search,
             query: String::new(),
             show_archived: false,
+            completion: None,
+            completion_seq: 0,
             sidebar_open: true,
             panel,
             panel_open: true,
@@ -290,6 +295,17 @@ impl WorkspaceView {
         };
         self.panel_open = true;
         match dev.split_once(':') {
+            Some(("type", text)) => {
+                let composer = self.composer_for(thread, window, cx);
+                let text = text.to_owned();
+                let end = text.len();
+                composer.update(cx, |c, cx| {
+                    c.set_value(text, window, cx);
+                    c.focus(window, cx);
+                    c.set_selected_range(end..end, cx);
+                });
+                self.refresh_completion(&thread_id, &composer, cx);
+            }
             Some(("settings", section)) => {
                 let section = crate::settings::Section::parse(section);
                 crate::settings::open(self.store.clone(), section, cx);
@@ -495,6 +511,8 @@ impl WorkspaceView {
                 InputEvent::PressEnter { shift: false, .. } => {
                     this.submit(&thread_id, state, window, cx);
                 }
+                InputEvent::Change => this.refresh_completion(&thread_id, state, cx),
+                InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
                 _ => {}
             }
         });
@@ -603,6 +621,121 @@ impl WorkspaceView {
             }
         })
         .detach();
+    }
+
+    /// Recompute the `/` or `@` completion for the composer's cursor.
+    fn refresh_completion(
+        &mut self,
+        thread_id: &ThreadId,
+        composer: &Entity<TextareaState>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::completion::{Completion, Kind, MAX_ITEMS, match_commands, trigger};
+        let (text, cursor) = {
+            let c = composer.read(cx);
+            (c.value().to_string(), c.cursor())
+        };
+        self.completion_seq += 1;
+        let Some((kind, token, query)) = trigger(&text, cursor) else {
+            if self.completion.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        let previous = self
+            .completion
+            .as_ref()
+            .filter(|c| c.kind == kind)
+            .map(|c| c.selected)
+            .unwrap_or(0);
+        match kind {
+            Kind::Slash => {
+                // This thread's commands, else another of its harness's.
+                let store = self.store.read(cx);
+                let thread = store.workspace.threads.iter().find(|t| &t.id == thread_id);
+                let commands = thread
+                    .filter(|t| !t.slash_commands.is_empty())
+                    .or_else(|| {
+                        let harness = &thread?.harness;
+                        store
+                            .workspace
+                            .threads
+                            .iter()
+                            .find(|t| &t.harness == harness && !t.slash_commands.is_empty())
+                    })
+                    .map(|t| t.slash_commands.clone())
+                    .unwrap_or_default();
+                let items = match_commands(&commands, &query);
+                self.completion = (!items.is_empty()).then(|| Completion {
+                    thread_id: thread_id.clone(),
+                    kind,
+                    token,
+                    selected: previous.min(items.len() - 1),
+                    items,
+                });
+                cx.notify();
+            }
+            Kind::File => {
+                let Some(client) = self.store.read(cx).client() else {
+                    return;
+                };
+                let seq = self.completion_seq;
+                let body = loft_protocol::Request::FindFiles {
+                    root: loft_protocol::FsRoot::Thread(thread_id.clone()),
+                    query,
+                    limit: MAX_ITEMS as u32,
+                };
+                let thread_id = thread_id.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = client.request(body).await;
+                    let _ = this.update(cx, |this, cx| {
+                        // A newer keystroke already moved on.
+                        if this.completion_seq != seq {
+                            return;
+                        }
+                        let items = match result {
+                            Ok(loft_protocol::Response::Paths { paths }) => paths,
+                            _ => Vec::new(),
+                        };
+                        this.completion = (!items.is_empty()).then(|| Completion {
+                            thread_id,
+                            kind,
+                            token,
+                            selected: previous.min(items.len().saturating_sub(1)),
+                            items,
+                        });
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Replace the token with the chosen completion.
+    fn accept_completion(
+        &mut self,
+        ix: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut c) = self.completion.take() else {
+            return;
+        };
+        if let Some(ix) = ix {
+            c.selected = ix;
+        }
+        let (Some(text), Some(composer)) =
+            (c.insertion(), self.composers.get(&c.thread_id).cloned())
+        else {
+            return;
+        };
+        composer.update(cx, |state, cx| {
+            state.set_selected_range(c.token.clone(), cx);
+            state.replace(text, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
     }
 
     fn add_images(
@@ -1405,6 +1538,19 @@ impl WorkspaceView {
                                     )),
                             )
                         })
+                        .children(
+                            self.completion
+                                .as_ref()
+                                .filter(|c| c.thread_id == thread_id)
+                                .map(|c| {
+                                    let view = cx.entity().downgrade();
+                                    crate::completion::popover(c, p, move |ix, window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            this.accept_completion(Some(ix), window, cx)
+                                        });
+                                    })
+                                }),
+                        )
                         .child(
                             v_flex()
                                 .id("composer-card")
@@ -1415,6 +1561,53 @@ impl WorkspaceView {
                                 .border_color(p.border)
                                 .bg(p.elevated)
                                 .shadow_lg()
+                                // While completions show, ↑/↓/⏎/⇥/esc drive them
+                                // instead of the textarea.
+                                .capture_action(cx.listener(
+                                    |this, _: &gpui_kit::component::input::MoveUp, _, cx| {
+                                        if let Some(c) = &mut this.completion {
+                                            c.move_by(-1);
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .capture_action(cx.listener(
+                                    |this, _: &gpui_kit::component::input::MoveDown, _, cx| {
+                                        if let Some(c) = &mut this.completion {
+                                            c.move_by(1);
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .capture_action(cx.listener(
+                                    |this, _: &gpui_kit::component::input::Enter, window, cx| {
+                                        if this.completion.is_some() {
+                                            cx.stop_propagation();
+                                            this.accept_completion(None, window, cx);
+                                        }
+                                    },
+                                ))
+                                .capture_action(cx.listener(
+                                    |this,
+                                     _: &gpui_kit::component::input::IndentInline,
+                                     window,
+                                     cx| {
+                                        if this.completion.is_some() {
+                                            cx.stop_propagation();
+                                            this.accept_completion(None, window, cx);
+                                        }
+                                    },
+                                ))
+                                .capture_action(cx.listener(
+                                    |this, _: &gpui_kit::component::input::Escape, _, cx| {
+                                        if this.completion.take().is_some() {
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
                                 // ⌘V with an image on the clipboard attaches it;
                                 // text pastes fall through to the textarea.
                                 .capture_action({
