@@ -41,8 +41,26 @@ impl Paths {
     pub fn run_dir(&self) -> PathBuf {
         self.home.join("run")
     }
+    /// The daemon socket. Unix socket paths are limited to ~104 bytes on
+    /// macOS, so deep data homes fall back to a short per-user directory
+    /// (`/tmp/agentloft-<user>/<hash>.sock`) keyed by the home path.
     pub fn socket_file(&self) -> PathBuf {
-        self.run_dir().join("agentloftd.sock")
+        let preferred = self.run_dir().join("agentloftd.sock");
+        if preferred.as_os_str().len() < MAX_SOCKET_PATH {
+            return preferred;
+        }
+        short_socket_dir().join(format!(
+            "{:016x}.sock",
+            fnv1a(self.home.as_os_str().as_encoded_bytes())
+        ))
+    }
+
+    /// Directory holding the socket (created by [`Paths::ensure_dirs`]).
+    pub fn socket_dir(&self) -> PathBuf {
+        self.socket_file()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.run_dir())
     }
     pub fn lock_file(&self) -> PathBuf {
         self.run_dir().join("agentloftd.lock")
@@ -59,11 +77,34 @@ impl Paths {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
-        let run = self.run_dir();
-        std::fs::create_dir_all(&run).with_context(|| format!("create {}", run.display()))?;
-        set_mode(&run, 0o700)?;
+        for dir in [self.run_dir(), self.socket_dir()] {
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            set_mode(&dir, 0o700)?;
+        }
         Ok(())
     }
+}
+
+/// macOS `sun_path` is 104 bytes including the NUL; keep a margin.
+const MAX_SOCKET_PATH: usize = 100;
+
+fn short_socket_dir() -> PathBuf {
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| {
+            !u.is_empty()
+                && u.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .unwrap_or_else(|| "user".into());
+    PathBuf::from("/tmp").join(format!("agentloft-{user}"))
+}
+
+/// Stable, dependency-free 64-bit FNV-1a hash.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 #[cfg(unix)]
@@ -302,6 +343,29 @@ mod tests {
         let p = with_fallback_dirs("/usr/bin:/opt/homebrew/bin");
         assert_eq!(p.matches("/opt/homebrew/bin").count(), 1);
         assert!(p.starts_with("/usr/bin:"));
+    }
+
+    #[test]
+    fn long_homes_get_a_short_socket_path() {
+        let short = Paths::new("/tmp/h");
+        assert_eq!(
+            short.socket_file(),
+            PathBuf::from("/tmp/h/run/agentloftd.sock")
+        );
+        let long = Paths::new(format!("/tmp/{}", "x".repeat(120)));
+        let sock = long.socket_file();
+        assert!(
+            sock.as_os_str().len() < MAX_SOCKET_PATH,
+            "{}",
+            sock.display()
+        );
+        assert!(sock.to_string_lossy().starts_with("/tmp/agentloft-"));
+        // Stable per home, different across homes.
+        assert_eq!(sock, long.socket_file());
+        assert_ne!(
+            sock,
+            Paths::new(format!("/tmp/{}", "y".repeat(120))).socket_file()
+        );
     }
 
     #[test]
