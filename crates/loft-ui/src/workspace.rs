@@ -34,6 +34,9 @@ actions!(
         About,
         Quit,
         TogglePanel,
+        ApproveOnce,
+        ApproveSession,
+        DenyRequest,
         ShowFiles,
         ShowChanges,
         ShowTerminal,
@@ -58,6 +61,9 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
         KeyBinding::new("cmd-k", FocusSearch, Some(CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-j", TogglePanel, Some(CONTEXT)),
+        KeyBinding::new("cmd-enter", ApproveOnce, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-enter", ApproveSession, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-backspace", DenyRequest, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-e", ShowFiles, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-g", ShowChanges, Some(CONTEXT)),
         KeyBinding::new("ctrl-`", ShowTerminal, Some(CONTEXT)),
@@ -287,8 +293,23 @@ impl WorkspaceView {
         });
         let thread_id = id.clone();
         let sub = cx.subscribe_in(&composer, window, move |this, state, event, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = event {
-                this.submit(&thread_id, state, window, cx);
+            match event {
+                // ⌘⏎ / ⌘⇧⏎ answer an open approval even while typing.
+                InputEvent::PressEnter {
+                    secondary: true,
+                    shift,
+                } if this.open_request(cx).is_some() => {
+                    let decision = if *shift {
+                        loft_protocol::DecisionKind::AllowSession
+                    } else {
+                        loft_protocol::DecisionKind::AllowOnce
+                    };
+                    this.answer(decision, cx);
+                }
+                InputEvent::PressEnter { shift: false, .. } => {
+                    this.submit(&thread_id, state, window, cx);
+                }
+                _ => {}
             }
         });
         self._subs.push(sub);
@@ -305,13 +326,19 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let text = composer.read(cx).value().trim().to_owned();
-        if text.is_empty() || self.is_running(thread_id, cx) {
-            return; // queueing while running arrives in M1
+        if text.is_empty() {
+            return;
         }
         composer.update(cx, |c, cx| c.set_value("", window, cx));
         let id = thread_id.clone();
-        self.store
-            .update(cx, |store, cx| store.send_message(id, text, cx));
+        if self.is_running(thread_id, cx) {
+            // Sent automatically when the current turn ends.
+            self.store
+                .update(cx, |store, cx| store.enqueue(id, text, cx));
+        } else {
+            self.store
+                .update(cx, |store, cx| store.send_message(id, text, cx));
+        }
     }
 
     fn is_running(&self, thread_id: &ThreadId, cx: &gpui_kit::App) -> bool {
@@ -326,6 +353,30 @@ impl WorkspaceView {
                     .map(|m| m.running_turn().is_some())
             })
             .unwrap_or(false)
+    }
+
+    /// The oldest open approval in the selected thread.
+    fn open_request(&self, cx: &gpui_kit::App) -> Option<loft_protocol::RuntimeRequest> {
+        let store = self.store.read(cx);
+        let id = store.selected.as_ref()?;
+        let thread = store.threads.get(id)?.read(cx);
+        thread
+            .model
+            .as_ref()?
+            .open_requests()
+            .min_by_key(|r| r.opened_at_ms)
+            .cloned()
+    }
+
+    fn answer(&mut self, decision: loft_protocol::DecisionKind, cx: &mut Context<Self>) {
+        let Some(req) = self.open_request(cx) else {
+            return;
+        };
+        if !req.options.contains(&decision) {
+            return;
+        }
+        self.store
+            .update(cx, |s, cx| s.respond(req.thread_id, req.id, decision, cx));
     }
 
     fn add_project(&mut self, cx: &mut Context<Self>) {
@@ -678,6 +729,13 @@ impl WorkspaceView {
         let current_model = model.thread.model.clone();
         let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
+        let queued: Vec<String> = self
+            .store
+            .read(cx)
+            .queued
+            .get(&thread_id)
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default();
 
         let timeline = if empty {
             v_flex()
@@ -754,6 +812,7 @@ impl WorkspaceView {
                         .w_full()
                         .max_w(p.content_width)
                         .gap_1()
+                        .children(queued_list(&thread_id, &queued, &self.store, p))
                         .when(waiting, |d| {
                             d.child(
                                 h_flex()
@@ -928,6 +987,15 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
                 this.search.update(cx, |s, cx| s.focus(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ApproveOnce, _, cx| {
+                this.answer(loft_protocol::DecisionKind::AllowOnce, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ApproveSession, _, cx| {
+                this.answer(loft_protocol::DecisionKind::AllowSession, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DenyRequest, _, cx| {
+                this.answer(loft_protocol::DecisionKind::Deny, cx)
             }))
             .on_action(cx.listener(|this, _: &TogglePanel, _, cx| {
                 this.panel_open = !this.panel_open;
@@ -1131,6 +1199,64 @@ fn pill_button(
         )
         .on_click(on_click)
         .into_any_element()
+}
+
+/// Messages waiting for the current turn to end, each removable.
+fn queued_list(
+    thread_id: &ThreadId,
+    queued: &[String],
+    store: &Entity<AppStore>,
+    p: &Palette,
+) -> Option<AnyElement> {
+    if queued.is_empty() {
+        return None;
+    }
+    let mut list = v_flex().gap_1().px_1();
+    for (ix, text) in queued.iter().enumerate() {
+        let (store, thread_id) = (store.clone(), thread_id.clone());
+        list = list.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .px_3()
+                .py_1p5()
+                .rounded(px(10.))
+                .bg(p.muted)
+                .text_sm()
+                .child(
+                    Icon::new(IconName::Clock)
+                        .xsmall()
+                        .text_color(p.muted_foreground),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(text.clone()))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("unqueue-{ix}")))
+                        .p(px(2.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .text_color(p.muted_foreground)
+                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                        .child(Icon::new(IconName::X).xsmall())
+                        .on_click(move |_, _, cx| {
+                            store.update(cx, |s, cx| s.dequeue(&thread_id, ix, cx));
+                        }),
+                ),
+        );
+    }
+    Some(
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .text_xs()
+                    .text_color(p.faint_foreground)
+                    .child("Queued · sends when the current turn finishes"),
+            )
+            .child(list)
+            .into_any_element(),
+    )
 }
 
 fn mode_label(mode: Option<loft_protocol::PermissionMode>) -> &'static str {

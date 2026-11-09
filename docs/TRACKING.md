@@ -38,6 +38,24 @@ Goal: visual quality on par with Codex and Claude Desktop, plus appearance custo
 - [x] Empty states: welcome, empty thread, reconnecting banner
 - [~] Performance: palette computed once per frame, incremental row splicing; 10k-item benchmark pending
 
+## Workbench (branch `feat/workbench`)
+
+Built ahead of the PLAN's milestone order, by request.
+
+| Area | Status | Notes |
+|---|---|---|
+| Codex harness (M2) | [x] | `codex app-server`; approvals follow `availableDecisions`; MCP elicitations; resume verified live (`live_codex`) |
+| Harness picker / model / permission menus | [x] | Picker on empty threads; model + mode dropdowns in the composer |
+| Checkpoints + diffs (M3 subset) | [x] | Hidden refs per turn; Changes tab: this thread / last turn / uncommitted |
+| File explorer + viewer | [x] | .gitignore-aware tree; tree-sitter highlighting; Markdown preview; images |
+| Subagent view | [x] | Agent cards in the timeline; subagent tab with steps and report |
+| Agentloft MCP server | [x] | `browser_*`, `list_threads`, `read_thread`, `get_thread_diff`; verified with Claude and Codex |
+| Daemon terminals | [x] | PTYs in agentloftd with replay; UI widget: Ghostty delegate (`feat/terminal-ghostty`) |
+| Browser panel | [~] | Daemon→UI call path done; widget: delegate (`feat/browser-panel`) |
+| Office documents | [~] | Viewer hook done; parser: delegate (`feat/docs-parser`) |
+| Queued messages, approval shortcuts (M1) | [x] | ⌘⏎ / ⌘⇧⏎ / ⌘⇧⌫ |
+| App icon, bundle, About, menus | [x] | `cargo xtask bundle` |
+
 ## M1 → M9
 
 See [PLAN §7](PLAN.md#7-milestones). Not started.

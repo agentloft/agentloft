@@ -79,6 +79,8 @@ pub struct AppStore {
     pub selected: Option<ThreadId>,
     /// Harness for new threads (the last one the user picked).
     pub default_harness: HarnessId,
+    /// Messages typed while a turn was running, sent when it ends.
+    pub queued: HashMap<ThreadId, std::collections::VecDeque<String>>,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
 }
@@ -96,6 +98,7 @@ impl AppStore {
             subs: HashMap::new(),
             selected: None,
             default_harness: HarnessId::claude(),
+            queued: HashMap::new(),
             last_error: None,
         };
         this.connect(cx);
@@ -195,10 +198,11 @@ impl AppStore {
                     if self.workspace.apply_event(&event) {
                         cx.notify();
                     }
-                } else if let Some(id) = self.subs.get(&sub_id)
-                    && let Some(entity) = self.threads.get(id)
+                } else if let Some(id) = self.subs.get(&sub_id).cloned()
+                    && let Some(entity) = self.threads.get(&id).cloned()
                 {
                     entity.update(cx, |t, cx| t.apply_event(&event, cx));
+                    self.flush_queue(&id, &entity, cx);
                 }
             }
             ClientEvent::Delta { sub_id, delta } => {
@@ -328,6 +332,34 @@ impl AppStore {
             cx,
             |_, _, _| {},
         );
+    }
+
+    /// Queue a message for when the current turn ends.
+    pub fn enqueue(&mut self, thread_id: ThreadId, text: String, cx: &mut Context<Self>) {
+        self.queued.entry(thread_id).or_default().push_back(text);
+        cx.notify();
+    }
+
+    pub fn dequeue(&mut self, thread_id: &ThreadId, index: usize, cx: &mut Context<Self>) {
+        if let Some(q) = self.queued.get_mut(thread_id) {
+            q.remove(index);
+        }
+        cx.notify();
+    }
+
+    /// Send the next queued message once the thread is idle.
+    fn flush_queue(&mut self, id: &ThreadId, thread: &Entity<ThreadState>, cx: &mut Context<Self>) {
+        let idle = thread.read(cx).model.as_ref().is_some_and(|m| {
+            m.running_turn().is_none() && m.thread.status != loft_protocol::ThreadStatus::Running
+        });
+        if !idle {
+            return;
+        }
+        let Some(text) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
+            return;
+        };
+        self.send_message(id.clone(), text, cx);
+        cx.notify();
     }
 
     pub fn send_message(&mut self, thread_id: ThreadId, text: String, cx: &mut Context<Self>) {

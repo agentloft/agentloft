@@ -493,8 +493,14 @@ fn approval_card(
         let decision = *decision;
         let store = store.clone();
         let (thread_id, request_id) = (req.thread_id.clone(), req.id.clone());
+        let hint = match decision {
+            DecisionKind::AllowOnce => "  ⌘⏎",
+            DecisionKind::AllowSession => "  ⌘⇧⏎",
+            DecisionKind::Deny => "  ⌘⇧⌫",
+            DecisionKind::DenyAndStop => "",
+        };
         let button = Button::new(SharedString::from(format!("{}-{decision:?}", req.id)))
-            .label(decision.label())
+            .label(format!("{}{hint}", decision.label()))
             .small();
         let button = match decision {
             DecisionKind::AllowOnce => button.primary(),

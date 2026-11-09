@@ -16,6 +16,7 @@ gpui_kit::assets::icon_assets!(
         Check,
         ChevronDown,
         ChevronRight,
+        Clock,
         CircleAlert,
         CircleCheck,
         CircleStop,
