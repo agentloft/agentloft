@@ -482,6 +482,26 @@ impl Translator {
     }
 
     fn on_control_response(&mut self, v: &Value) -> Vec<Out> {
+        if let Some(list) = v
+            .pointer("/response/response/commands")
+            .and_then(Value::as_array)
+        {
+            let commands: Vec<loft_protocol::SlashCommandInfo> = list
+                .iter()
+                .filter_map(|c| {
+                    let name = str_at(c, "name")?.to_owned();
+                    Some(loft_protocol::SlashCommandInfo {
+                        name,
+                        description: str_at(c, "description").unwrap_or_default().to_owned(),
+                        argument_hint: str_at(c, "argumentHint").unwrap_or_default().to_owned(),
+                        builtin: c.get("builtin").and_then(Value::as_bool).unwrap_or(false),
+                    })
+                })
+                .collect();
+            if !commands.is_empty() {
+                return vec![Out::Event(HarnessEvent::CommandsAvailable(commands))];
+            }
+        }
         if v.pointer("/response/subtype").and_then(Value::as_str) == Some("error") {
             let msg = v
                 .pointer("/response/error")
@@ -852,6 +872,19 @@ mod tests {
         }
         let agent_id = agent_id.expect("an Agent tool call");
         assert_eq!(child_parent.as_deref(), Some(agent_id.as_str()));
+    }
+
+    #[test]
+    fn initialize_response_lists_commands() {
+        let mut t = Translator::new();
+        let out = t.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"loft_1","response":{"commands":[{"name":"compact","description":"Free up context","argumentHint":"<instructions>","builtin":true},{"name":"pdf","description":"Work with PDFs"}]}}}"#);
+        let [Out::Event(HarnessEvent::CommandsAvailable(cmds))] = out.as_slice() else {
+            panic!("expected the commands");
+        };
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].name, "compact");
+        assert_eq!(cmds[0].argument_hint, "<instructions>");
+        assert!(cmds[0].builtin && !cmds[1].builtin);
     }
 
     #[test]

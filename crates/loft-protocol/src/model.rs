@@ -11,6 +11,20 @@ pub struct Project {
     pub created_at_ms: i64,
 }
 
+/// A slash command the agent accepts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlashCommandInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// What to type after it, e.g. `<model>`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub argument_hint: String,
+    /// One of the agent's own commands (vs. a skill or plugin).
+    #[serde(default)]
+    pub builtin: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Thread {
     pub id: ThreadId,
@@ -39,6 +53,9 @@ pub struct Thread {
     /// Slash commands the agent reported (composer completions).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slash_commands: Vec<String>,
+    /// The same commands with what they do, when the agent says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_info: Vec<SlashCommandInfo>,
     /// When the first message was sent. Unstarted threads stay out of the
     /// sidebar unless they hold a draft.
     #[serde(default, skip_serializing_if = "Option::is_none")]

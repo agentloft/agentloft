@@ -161,6 +161,11 @@ impl Core {
             } else {
                 Vec::new()
             },
+            command_info: if same {
+                parent.command_info.clone()
+            } else {
+                Vec::new()
+            },
             started_at_ms: None,
             draft: None,
         };

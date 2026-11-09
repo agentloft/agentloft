@@ -384,7 +384,16 @@ impl WorkspaceView {
                     c.focus(window, cx);
                     c.set_selected_range(end..end, cx);
                 });
-                self.refresh_completion(&thread_id, &composer, cx);
+                // Once the thread's commands are in.
+                let tid = thread_id.clone();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(2000))
+                        .await;
+                    let _ =
+                        this.update(cx, |this, cx| this.refresh_completion(&tid, &composer, cx));
+                })
+                .detach();
             }
             Some(("addproject", text)) => {
                 let text = text.to_owned();
@@ -1542,7 +1551,9 @@ impl WorkspaceView {
         composer: &Entity<TextareaState>,
         cx: &mut Context<Self>,
     ) {
-        use crate::completion::{Completion, Kind, MAX_ITEMS, match_commands, trigger};
+        use crate::completion::{
+            Completion, Kind, MAX_ITEMS, bare_commands, match_commands, trigger,
+        };
         let (text, cursor) = {
             let c = composer.read(cx);
             (c.value().to_string(), c.cursor())
@@ -1560,30 +1571,48 @@ impl WorkspaceView {
             .filter(|c| c.kind == kind)
             .map(|c| c.selected)
             .unwrap_or(0);
+        let scroll = self
+            .completion
+            .as_ref()
+            .filter(|c| c.kind == kind)
+            .map(|c| c.scroll.clone())
+            .unwrap_or_default();
         match kind {
             Kind::Slash => {
                 // This thread's commands, else another of its harness's.
                 let store = self.store.read(cx);
                 let thread = store.workspace.threads.iter().find(|t| &t.id == thread_id);
+                let has = |t: &&loft_protocol::Thread| {
+                    !t.command_info.is_empty() || !t.slash_commands.is_empty()
+                };
                 let commands = thread
-                    .filter(|t| !t.slash_commands.is_empty())
+                    .filter(has)
                     .or_else(|| {
                         let harness = &thread?.harness;
                         store
                             .workspace
                             .threads
                             .iter()
-                            .find(|t| &t.harness == harness && !t.slash_commands.is_empty())
+                            .find(|t| &t.harness == harness && has(t))
                     })
-                    .map(|t| t.slash_commands.clone())
+                    .map(|t| {
+                        if t.command_info.is_empty() {
+                            bare_commands(&t.slash_commands)
+                        } else {
+                            t.command_info.clone()
+                        }
+                    })
                     .unwrap_or_default();
-                let items = match_commands(&commands, &query);
+                let info = match_commands(&commands, &query);
+                let items: Vec<String> = info.iter().map(|c| c.name.clone()).collect();
                 self.completion = (!items.is_empty()).then(|| Completion {
                     thread_id: thread_id.clone(),
                     kind,
                     token,
                     selected: previous.min(items.len() - 1),
                     items,
+                    info,
+                    scroll,
                 });
                 cx.notify();
             }
@@ -1615,6 +1644,8 @@ impl WorkspaceView {
                             token,
                             selected: previous.min(items.len().saturating_sub(1)),
                             items,
+                            info: Vec::new(),
+                            scroll,
                         });
                         cx.notify();
                     });

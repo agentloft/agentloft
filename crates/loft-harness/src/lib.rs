@@ -102,6 +102,9 @@ pub enum HarnessEvent {
         /// `configOptions`); feeds the model picker.
         models: Vec<loft_protocol::ModelInfo>,
     },
+    /// The agent's slash commands with what they do (Claude's initialize
+    /// response).
+    CommandsAvailable(Vec<loft_protocol::SlashCommandInfo>),
     TurnStarted,
     ItemStarted {
         native_id: String,

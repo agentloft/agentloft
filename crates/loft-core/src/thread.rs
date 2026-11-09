@@ -766,6 +766,15 @@ impl ThreadActor {
                     self.save_thread()?;
                 }
             }
+            HarnessEvent::CommandsAvailable(commands) => {
+                if self.thread.command_info != commands {
+                    self.thread.command_info = commands;
+                    // Not activity: keep `updated_at_ms` (sidebar order).
+                    self.core.commit(vec![Event::ThreadUpdated {
+                        thread: self.thread.clone(),
+                    }])?;
+                }
+            }
             HarnessEvent::TurnStarted => {}
             HarnessEvent::ItemStarted {
                 native_id,

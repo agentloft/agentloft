@@ -777,6 +777,7 @@ impl Core {
             workspace,
             parent: None,
             slash_commands: Vec::new(),
+            command_info: Vec::new(),
             started_at_ms: None,
             draft: None,
         };

@@ -9,7 +9,7 @@ use gpui_kit::{
     AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
-use loft_protocol::ThreadId;
+use loft_protocol::{SlashCommandInfo, ThreadId};
 use std::ops::Range;
 
 pub const MAX_ITEMS: usize = 8;
@@ -27,7 +27,11 @@ pub struct Completion {
     /// Byte range of the token being completed (`/co`, `@src/ma`).
     pub token: Range<usize>,
     pub items: Vec<String>,
+    /// For slash commands: what each item does (same order as `items`).
+    pub info: Vec<SlashCommandInfo>,
     pub selected: usize,
+    /// The list scrolls; the chosen row is kept in view.
+    pub scroll: gpui_kit::ScrollHandle,
 }
 
 impl Completion {
@@ -44,6 +48,7 @@ impl Completion {
         let n = self.items.len() as isize;
         if n > 0 {
             self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
+            self.scroll.scroll_to_item(self.selected);
         }
     }
 }
@@ -70,22 +75,37 @@ pub fn trigger(text: &str, cursor: usize) -> Option<(Kind, Range<usize>, String)
     None
 }
 
-/// Slash commands matching `query`: prefix matches first.
-pub fn match_commands(commands: &[String], query: &str) -> Vec<String> {
+/// Slash commands matching `query`: name prefix matches first, then other
+/// name matches, then description matches; the agent's order within each.
+pub fn match_commands(commands: &[SlashCommandInfo], query: &str) -> Vec<SlashCommandInfo> {
     let q = query.to_lowercase();
-    let mut prefix: Vec<String> = Vec::new();
-    let mut inner: Vec<String> = Vec::new();
-    for c in commands {
-        let lc = c.to_lowercase();
-        if lc.starts_with(&q) {
-            prefix.push(c.clone());
-        } else if lc.contains(&q) {
-            inner.push(c.clone());
-        }
+    let mut ranked: Vec<(u8, usize, &SlashCommandInfo)> = Vec::new();
+    for (ix, c) in commands.iter().enumerate() {
+        let name = c.name.to_lowercase();
+        let rank = if name.starts_with(&q) {
+            0
+        } else if name.contains(&q) {
+            1
+        } else if !q.is_empty() && c.description.to_lowercase().contains(&q) {
+            2
+        } else {
+            continue;
+        };
+        ranked.push((rank, ix, c));
     }
-    prefix.extend(inner);
-    prefix.truncate(MAX_ITEMS);
-    prefix
+    ranked.sort_by_key(|(rank, ix, _)| (*rank, *ix));
+    ranked.into_iter().map(|(.., c)| c.clone()).collect()
+}
+
+/// Commands as names only (agents that don't describe them).
+pub fn bare_commands(names: &[String]) -> Vec<SlashCommandInfo> {
+    names
+        .iter()
+        .map(|name| SlashCommandInfo {
+            name: name.clone(),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// The popover above the composer.
@@ -94,12 +114,27 @@ pub fn popover(
     p: &Palette,
     on_pick: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
 ) -> AnyElement {
-    let mut list = v_flex().p_1().gap_px();
+    let mut list = v_flex()
+        .id("completion-list")
+        .max_h(px(340.))
+        .overflow_y_scroll()
+        .track_scroll(&c.scroll)
+        .p_1()
+        .gap_px();
     for (ix, item) in c.items.iter().enumerate() {
+        let info = c.info.get(ix);
         let active = ix == c.selected;
         let on_pick = on_pick.clone();
         let (icon, dir, name) = match c.kind {
-            Kind::Slash => (IconName::SquareTerminal, String::new(), format!("/{item}")),
+            Kind::Slash => (
+                if info.is_none_or(|i| i.builtin) {
+                    IconName::SquareTerminal
+                } else {
+                    IconName::WandSparkles
+                },
+                info.map(|i| i.description.clone()).unwrap_or_default(),
+                format!("/{item}"),
+            ),
             Kind::File => {
                 let (dir, name) = match item.rsplit_once('/') {
                     Some((d, n)) => (format!("{d}/"), n.to_owned()),
@@ -121,7 +156,21 @@ pub fn popover(
                 .when(active, |d| d.bg(p.selected))
                 .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                 .child(Icon::new(icon).xsmall().text_color(p.muted_foreground))
-                .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(name))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .child(name),
+                )
+                .children(info.filter(|i| !i.argument_hint.is_empty()).map(|i| {
+                    div()
+                        .flex_shrink(1.)
+                        .max_w(px(180.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child(i.argument_hint.clone())
+                }))
                 .child(
                     div()
                         .flex_1()
@@ -150,7 +199,14 @@ pub fn popover(
                 .border_color(p.border)
                 .text_xs()
                 .text_color(p.faint_foreground)
-                .child("↑↓ to choose · ⏎ or ⇥ to insert · esc to dismiss"),
+                .child(match c.kind {
+                    Kind::Slash => format!(
+                        "{} command{} · ↑↓ to choose · ⏎ or ⇥ to insert · esc to dismiss",
+                        c.items.len(),
+                        if c.items.len() == 1 { "" } else { "s" }
+                    ),
+                    Kind::File => "↑↓ to choose · ⏎ or ⇥ to insert · esc to dismiss".into(),
+                }),
         )
         .into_any_element()
 }
@@ -174,12 +230,22 @@ mod tests {
 
     #[test]
     fn commands_prefix_first() {
-        let cmds: Vec<String> = ["review", "compact", "context", "pr-comments"]
-            .map(String::from)
-            .into();
+        let mut cmds =
+            bare_commands(&["review", "compact", "context", "pr-comments"].map(String::from));
+        cmds[0].description = "Look it over".into();
+        let names = |q: &str| -> Vec<String> {
+            match_commands(&cmds, q)
+                .into_iter()
+                .map(|c| c.name)
+                .collect()
+        };
+        assert_eq!(names("co"), vec!["compact", "context", "pr-comments"]);
+        // Every command shows for "/", in the agent's order.
         assert_eq!(
-            match_commands(&cmds, "co"),
-            vec!["compact", "context", "pr-comments"]
+            names(""),
+            vec!["review", "compact", "context", "pr-comments"]
         );
+        // Descriptions match too, after names.
+        assert_eq!(names("over"), vec!["review"]);
     }
 }
