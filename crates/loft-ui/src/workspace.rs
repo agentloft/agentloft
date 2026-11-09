@@ -42,7 +42,8 @@ actions!(
         ShowTerminal,
         ShowBrowser,
         NewWindow,
-        NewTab
+        NewTab,
+        OpenPalette
     ]
 );
 
@@ -63,7 +64,8 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
         KeyBinding::new("cmd-shift-l", ToggleTheme, Some(CONTEXT)),
         KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
         KeyBinding::new("cmd-o", AddProject, Some(CONTEXT)),
-        KeyBinding::new("cmd-k", FocusSearch, Some(CONTEXT)),
+        KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-f", FocusSearch, Some(CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-j", TogglePanel, Some(CONTEXT)),
         KeyBinding::new("cmd-enter", ApproveOnce, Some(CONTEXT)),
@@ -116,6 +118,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
             MenuItem::action("Terminal", ShowTerminal),
             MenuItem::action("Browser", ShowBrowser),
             MenuItem::separator(),
+            MenuItem::action("Command Palette…", OpenPalette),
             MenuItem::action("Search Threads", FocusSearch),
             MenuItem::separator(),
             MenuItem::action("Toggle Light/Dark", ToggleTheme),
@@ -125,7 +128,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 }
 
 pub struct WorkspaceView {
-    store: Entity<AppStore>,
+    pub(crate) store: Entity<AppStore>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
     /// Images waiting in each thread's composer.
     attachments: HashMap<ThreadId, Vec<crate::attachments::PendingImage>>,
@@ -133,9 +136,9 @@ pub struct WorkspaceView {
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
     query: String,
-    sidebar_open: bool,
+    pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
-    panel_open: bool,
+    pub(crate) panel_open: bool,
     /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>`
     /// opens a panel tab once the first thread has loaded.
     dev_tab: Option<String>,
@@ -283,6 +286,7 @@ impl WorkspaceView {
                     self.store
                         .update(cx, |s, cx| s.archive_thread(t, false, cx));
                 }
+                "palette" => crate::palette::open(cx.entity(), &self.store, window, cx),
                 "undo" => {
                     let last = thread
                         .read(cx)
@@ -370,7 +374,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn show_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         let already = self.panel_open && self.panel.read(cx).active_tab(cx).as_ref() == Some(&tab);
         if already {
             self.panel_open = false;
@@ -530,7 +534,7 @@ impl WorkspaceView {
             .update(cx, |s, cx| s.respond(req.thread_id, req.id, decision, cx));
     }
 
-    fn add_project(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn add_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -594,7 +598,7 @@ impl WorkspaceView {
         .detach();
     }
 
-    fn new_thread(&mut self, project: Option<ProjectId>, cx: &mut Context<Self>) {
+    pub(crate) fn new_thread(&mut self, project: Option<ProjectId>, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         let project = project
             .or_else(|| {
@@ -611,7 +615,7 @@ impl WorkspaceView {
         }
     }
 
-    fn interrupt(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn interrupt(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.store.read(cx).selected.clone()
             && self.is_running(&id, cx)
         {
@@ -619,7 +623,7 @@ impl WorkspaceView {
         }
     }
 
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         let path = self.store.read(cx).paths().config_file();
         if !path.exists() {
             let _ = std::fs::write(&path, SETTINGS_TEMPLATE);
@@ -1481,6 +1485,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &AddProject, _, cx| this.add_project(cx)))
             .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                crate::palette::open(cx.entity(), &this.store, window, cx)
+            }))
             .on_action(cx.listener(|_, _: &NewWindow, _, cx| {
                 crate::windows::open(None, crate::windows::Placement::Window, cx)
             }))

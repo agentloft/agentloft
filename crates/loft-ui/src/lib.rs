@@ -6,6 +6,7 @@ mod attachments;
 mod attention;
 pub mod brand;
 mod items;
+mod palette;
 pub mod panel;
 pub mod settings;
 pub mod store;
