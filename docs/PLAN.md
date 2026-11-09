@@ -259,7 +259,7 @@ Notice{level, text}   Error{fatal, text}   SessionExited{code, signal}
 | approval "always/session" | ✅ `updatedPermissions` | ✅ `acceptForSession`, execpolicy amendment | ✅ `allow_always` |
 | native fork | ✅ `--resume … --fork-session` (+ `--resume-session-at`) | ✅ `thread/fork{lastTurnId, cwd}` | ⚠️ unstable `session/fork` |
 | native revert | ✅ control `rewind_files` (files only) | ✅ `thread/revert{beforeTurnId}` | ❌ |
-| model listing | ⚠️ initialize response / static aliases (verify) | ✅ `model/list` | ⚠️ config options |
+| model listing | ✅ `initialize` control response `models` (verified 2.1.319) | ✅ `model/list` | ⚠️ config options |
 | slash commands | ✅ from init / initialize | ✅ `skills/list` | ✅ `available_commands_update` |
 | turn diff from agent | ❌ (use checkpoints) | ✅ `turn/diff/updated` (we use checkpoints anyway) | ❌ |
 
@@ -997,7 +997,6 @@ Each milestone ends with a demo plus the listed automated tests passing in CI (m
   - `--resume`, `--session-id`, `--fork-session`, `--model`, `--mcp-config`, `--json-schema`
 - **Codex:** method, request and notification names were taken from `codex app-server generate-json-schema`. `thread/fork` accepts `lastTurnId` and `cwd`; `thread/revert` takes `beforeTurnId`.
 - **Unverified, to check during M0–M2:**
-  - Whether Claude's `initialize` control response includes a model list.
   - The exact `--resume-session-at` semantics.
   - The exact ACP flags for each long-tail agent.
   - OpenCode 2.x HTTP API details.

@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/agentloft/agentloft"
+publish = false
+
+[workspace.dependencies]
+# internal
+loft-protocol = { path = "crates/loft-protocol" }
+loft-config = { path = "crates/loft-config" }
+loft-store = { path = "crates/loft-store" }
+loft-harness = { path = "crates/loft-harness" }
+loft-harness-claude = { path = "crates/loft-harness-claude" }
+loft-core = { path = "crates/loft-core" }
+loft-client = { path = "crates/loft-client" }
+loft-ui = { path = "crates/loft-ui" }
+loft-testkit = { path = "crates/loft-testkit" }
+
+# UI — gpui-kit pins the matching gpui-pre release (ADR-0005)
+gpui-kit = "=0.9.0"
+
+# async / io
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+toml = "0.9"
+
+# misc
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

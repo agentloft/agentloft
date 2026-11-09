@@ -1,0 +1,630 @@
+//! One actor per active thread. It owns the harness session, maps native ids
+//! to app ids, turns harness events into domain events, and coalesces
+//! streaming deltas into periodic item snapshots.
+
+use crate::{Core, CoreResult, internal};
+use loft_harness::{HarnessEvent, SessionCommand, SessionConfig, SessionHandle, TurnInput};
+use loft_protocol::{
+    DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, Item, ItemBody, ItemId,
+    ItemStatus, PermissionMode, RequestId, RequestStatus, Response, RuntimeRequest, Thread,
+    ThreadStatus, Turn, TurnId, TurnStatus,
+};
+use loft_store::now_ms;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+
+pub(crate) type Reply = oneshot::Sender<CoreResult<Response>>;
+
+pub(crate) enum ThreadCmd {
+    SendMessage {
+        text: String,
+        reply: Reply,
+    },
+    Interrupt {
+        reply: Reply,
+    },
+    Respond {
+        request_id: RequestId,
+        decision: DecisionKind,
+        reply: Reply,
+    },
+    SetPermissionMode {
+        mode: Option<PermissionMode>,
+        reply: Reply,
+    },
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
+}
+
+pub(crate) type ThreadHandle = mpsc::UnboundedSender<ThreadCmd>;
+
+pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let actor = ThreadActor {
+        core,
+        thread,
+        session: None,
+        session_pid: None,
+        turn: None,
+        items: HashMap::new(),
+        requests: HashMap::new(),
+        dirty: HashSet::new(),
+    };
+    tokio::spawn(actor.run(rx));
+    tx
+}
+
+struct ThreadActor {
+    core: Arc<Core>,
+    thread: Thread,
+    session: Option<SessionHandle>,
+    session_pid: Option<u32>,
+    turn: Option<Turn>,
+    /// native item id → app item id (current session).
+    items: HashMap<String, ItemId>,
+    /// app request id → native request id.
+    requests: HashMap<RequestId, String>,
+    /// Streaming items whose live text hasn't been snapshotted yet.
+    dirty: HashSet<ItemId>,
+}
+
+impl ThreadActor {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<ThreadCmd>) {
+        let mut flush = tokio::time::interval(self.core.opts().flush_interval);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                cmd = rx.recv() => match cmd {
+                    Some(ThreadCmd::Shutdown { done }) => {
+                        self.stop_session().await;
+                        let _ = done.send(());
+                        return;
+                    }
+                    Some(cmd) => self.on_command(cmd),
+                    None => {
+                        self.stop_session().await;
+                        return;
+                    }
+                },
+                event = next_event(&mut self.session) => match event {
+                    Some(event) => self.on_harness_event(event),
+                    None => self.on_session_lost(None, String::new()),
+                },
+                _ = flush.tick() => self.flush_dirty(),
+            }
+        }
+    }
+
+    // -- commands -----------------------------------------------------------
+
+    fn on_command(&mut self, cmd: ThreadCmd) {
+        match cmd {
+            ThreadCmd::SendMessage { text, reply } => {
+                let _ = reply.send(self.send_message(text));
+            }
+            ThreadCmd::Interrupt { reply } => {
+                let res = match (&self.session, &self.turn) {
+                    (Some(s), Some(_)) => {
+                        let _ = s.commands.send(SessionCommand::Interrupt);
+                        Ok(Response::Ok)
+                    }
+                    _ => Err(ErrorBody::new(ErrorCode::Conflict, "no running turn")),
+                };
+                let _ = reply.send(res);
+            }
+            ThreadCmd::Respond {
+                request_id,
+                decision,
+                reply,
+            } => {
+                let _ = reply.send(self.respond(request_id, decision));
+            }
+            ThreadCmd::SetPermissionMode { mode, reply } => {
+                self.thread.permission_mode = mode;
+                if let Some(s) = &self.session {
+                    let _ = s.commands.send(SessionCommand::SetPermissionMode(mode));
+                }
+                let res = self.save_thread().map(|_| Response::Ok);
+                let _ = reply.send(res);
+            }
+            ThreadCmd::Shutdown { .. } => unreachable!("handled in run loop"),
+        }
+    }
+
+    fn send_message(&mut self, text: String) -> CoreResult<Response> {
+        if self.turn.is_some() {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "a turn is already running in this thread",
+            ));
+        }
+        self.ensure_session()?;
+
+        let now = now_ms();
+        let ordinal = self
+            .core
+            .with_store(|s| s.next_turn_ordinal(&self.thread.id))?;
+        let turn = Turn {
+            id: TurnId::new(),
+            thread_id: self.thread.id.clone(),
+            ordinal,
+            status: TurnStatus::Running,
+            started_at_ms: now,
+            ended_at_ms: None,
+            usage: None,
+            error: None,
+        };
+        let user_item = self.new_item(
+            Some(turn.id.clone()),
+            ItemBody::UserMessage { text: text.clone() },
+            ItemStatus::Completed,
+        )?;
+        if ordinal == 1 && self.thread.title == "New thread" {
+            self.thread.title = title_from(&text);
+        }
+        self.thread.status = ThreadStatus::Running;
+        self.thread.updated_at_ms = now;
+        self.core.commit(vec![
+            Event::TurnStarted { turn: turn.clone() },
+            Event::ItemUpserted { item: user_item },
+            Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            },
+        ])?;
+        self.turn = Some(turn.clone());
+
+        let session = self.session.as_ref().expect("ensured above");
+        session
+            .commands
+            .send(SessionCommand::StartTurn(TurnInput { text }))
+            .map_err(|_| internal("harness session closed"))?;
+        Ok(Response::Ok)
+    }
+
+    fn respond(&mut self, request_id: RequestId, decision: DecisionKind) -> CoreResult<Response> {
+        let native = self
+            .requests
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "request is not open"))?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| ErrorBody::new(ErrorCode::Conflict, "session is not running"))?;
+        session
+            .commands
+            .send(SessionCommand::Respond {
+                native_request_id: native.clone(),
+                decision,
+            })
+            .map_err(|_| internal("harness session closed"))?;
+        self.resolve_request(&native, Some(decision))?;
+        Ok(Response::Ok)
+    }
+
+    fn ensure_session(&mut self) -> CoreResult<()> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let harness = self.core.harness(&self.thread.harness).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Harness,
+                format!("harness `{}` is not available", self.thread.harness),
+            )
+        })?;
+        let opts = self.core.opts();
+        let hcfg = match self.thread.harness.as_str() {
+            "codex" => &opts.config.harness.codex,
+            _ => &opts.config.harness.claude,
+        };
+        let new_session_id = self
+            .thread
+            .native_session_id
+            .is_none()
+            .then(|| uuid::Uuid::new_v4().to_string());
+        let cfg = SessionConfig {
+            thread_label: self.thread.id.to_string(),
+            cwd: self.thread.cwd.clone().into(),
+            model: self.thread.model.clone(),
+            permission_mode: self.thread.permission_mode,
+            resume: self.thread.native_session_id.clone(),
+            new_session_id: new_session_id.clone(),
+            env: opts.env.clone(),
+            binary: (hcfg.path != "auto").then(|| hcfg.path.clone().into()),
+            extra_args: hcfg.extra_args.clone(),
+        };
+        let session = harness
+            .open_session(cfg)
+            .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
+        if let Some(pid) = session.pid {
+            self.core
+                .record_process(pid, self.thread.harness.as_str(), &self.thread.id);
+            self.session_pid = Some(pid);
+        }
+        self.session = Some(session);
+        if let Some(id) = new_session_id {
+            // Persist the pre-assigned id right away so a crash can resume it.
+            self.thread.native_session_id = Some(id);
+            self.save_thread()?;
+        }
+        Ok(())
+    }
+
+    async fn stop_session(&mut self) {
+        self.flush_dirty();
+        if let Some(session) = self.session.take() {
+            let _ = session.commands.send(SessionCommand::Shutdown);
+            // Give the adapter a moment to close stdin and stop the child.
+            let mut events = session.events;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                while events.recv().await.is_some() {}
+            })
+            .await;
+        }
+        if let Some(pid) = self.session_pid.take() {
+            self.core.forget_process(pid);
+        }
+    }
+
+    // -- harness events -----------------------------------------------------
+
+    fn on_harness_event(&mut self, event: HarnessEvent) {
+        if let Err(err) = self.apply_harness_event(event) {
+            tracing::error!(thread = %self.thread.id, %err, "failed to apply harness event");
+        }
+    }
+
+    fn apply_harness_event(&mut self, event: HarnessEvent) -> CoreResult<()> {
+        match event {
+            HarnessEvent::SessionReady {
+                native_session_id,
+                model,
+                ..
+            } => {
+                let mut changed = false;
+                if !native_session_id.is_empty()
+                    && self.thread.native_session_id.as_deref() != Some(&native_session_id)
+                {
+                    self.thread.native_session_id = Some(native_session_id);
+                    changed = true;
+                }
+                if self.thread.model.is_none() && model.is_some() {
+                    self.thread.model = model;
+                    changed = true;
+                }
+                if changed {
+                    self.save_thread()?;
+                }
+            }
+            HarnessEvent::TurnStarted => {}
+            HarnessEvent::ItemStarted { native_id, body } => {
+                let item = self.new_item(self.turn_id(), body, ItemStatus::InProgress)?;
+                self.items.insert(native_id, item.id.clone());
+                self.core.live().insert(item.id.clone(), item.clone());
+                self.core.commit(vec![Event::ItemUpserted { item }])?;
+            }
+            HarnessEvent::ItemDelta {
+                native_id,
+                channel,
+                text,
+            } => self.on_delta(&native_id, channel, text),
+            HarnessEvent::ItemCompleted {
+                native_id,
+                body,
+                tool_result,
+                status,
+            } => {
+                let item_id = match self.items.get(&native_id) {
+                    Some(id) => id.clone(),
+                    None => return Ok(()),
+                };
+                let mut item = match self.core.live().remove(&item_id) {
+                    Some(item) => item,
+                    None => match self.load_item(&item_id)? {
+                        Some(item) => item,
+                        None => return Ok(()),
+                    },
+                };
+                self.dirty.remove(&item_id);
+                if let Some(body) = body {
+                    item.body = body;
+                }
+                if let (
+                    Some(result),
+                    ItemBody::ToolCall {
+                        output, is_error, ..
+                    },
+                ) = (tool_result, &mut item.body)
+                {
+                    *output = Some(result.output);
+                    *is_error = result.is_error;
+                }
+                item.status = status;
+                item.updated_at_ms = now_ms();
+                self.core.commit(vec![Event::ItemUpserted { item }])?;
+            }
+            HarnessEvent::RequestOpened {
+                native_id,
+                kind,
+                title,
+                detail,
+                options,
+                related_item,
+            } => {
+                let request = RuntimeRequest {
+                    id: RequestId::new(),
+                    thread_id: self.thread.id.clone(),
+                    turn_id: self.turn_id(),
+                    item_id: related_item.and_then(|n| self.items.get(&n).cloned()),
+                    kind,
+                    title,
+                    detail,
+                    options,
+                    status: RequestStatus::Open,
+                    decision: None,
+                    opened_at_ms: now_ms(),
+                };
+                self.requests.insert(request.id.clone(), native_id);
+                self.thread.status = ThreadStatus::WaitingApproval;
+                self.thread.updated_at_ms = now_ms();
+                self.core.commit(vec![
+                    Event::RequestOpened { request },
+                    Event::ThreadUpdated {
+                        thread: self.thread.clone(),
+                    },
+                ])?;
+            }
+            HarnessEvent::RequestResolved { native_id } => {
+                self.resolve_request(&native_id, None)?;
+            }
+            HarnessEvent::TurnCompleted {
+                status,
+                usage,
+                error,
+            } => self.finish_turn(status, usage, error)?,
+            HarnessEvent::Notice { level, text } => {
+                let item = self.new_item(
+                    self.turn_id(),
+                    ItemBody::Notice { level, text },
+                    ItemStatus::Completed,
+                )?;
+                self.core.commit(vec![Event::ItemUpserted { item }])?;
+            }
+            HarnessEvent::Exited { code, stderr_tail } => {
+                self.session = None;
+                self.on_session_lost(code, stderr_tail);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_delta(&mut self, native_id: &str, channel: DeltaChannel, text: String) {
+        let Some(item_id) = self.items.get(native_id).cloned() else {
+            return;
+        };
+        let offset = {
+            let mut live = self.core.live();
+            let Some(item) = live.get_mut(&item_id) else {
+                return;
+            };
+            let Some(buf) = item.body.stream_text_mut(channel) else {
+                return;
+            };
+            let offset = buf.len();
+            buf.push_str(&text);
+            item.updated_at_ms = now_ms();
+            offset
+        };
+        self.dirty.insert(item_id.clone());
+        self.core.publish_delta(Delta {
+            thread_id: self.thread.id.clone(),
+            item_id,
+            channel,
+            offset,
+            text,
+        });
+    }
+
+    fn on_session_lost(&mut self, code: Option<i32>, stderr_tail: String) {
+        self.session = None;
+        if let Some(pid) = self.session_pid.take() {
+            self.core.forget_process(pid);
+        }
+        if self.turn.is_some() {
+            let mut msg = match code {
+                Some(c) => format!("The agent process exited unexpectedly (code {c})."),
+                None => "The agent process exited unexpectedly.".to_owned(),
+            };
+            let tail = stderr_tail.trim();
+            if !tail.is_empty() {
+                msg.push_str("\n\n");
+                msg.push_str(tail);
+            }
+            if let Err(err) = self.finish_turn(TurnStatus::Failed, None, Some(msg)) {
+                tracing::error!(%err, "failed to record session loss");
+            }
+        }
+    }
+
+    fn finish_turn(
+        &mut self,
+        status: TurnStatus,
+        usage: Option<loft_protocol::Usage>,
+        error: Option<String>,
+    ) -> CoreResult<()> {
+        let mut events = Vec::new();
+        // Close anything still streaming.
+        for item_id in self.items.values() {
+            if let Some(mut item) = self.core.live().remove(item_id) {
+                item.status = if status == TurnStatus::Failed {
+                    ItemStatus::Failed
+                } else {
+                    ItemStatus::Completed
+                };
+                events.push(Event::ItemUpserted { item });
+            }
+        }
+        self.dirty.clear();
+        self.items.clear();
+        // Expire approvals that were never answered.
+        let open: Vec<String> = self.requests.drain().map(|(_, n)| n).collect();
+        for native in open {
+            if let Some(mut request) = self.find_open_request(&native)? {
+                request.status = RequestStatus::Expired;
+                events.push(Event::RequestUpdated { request });
+            }
+        }
+        if let Some(error) = error.clone().filter(|_| status == TurnStatus::Failed) {
+            let item = self.new_item(
+                self.turn_id(),
+                ItemBody::Error { text: error },
+                ItemStatus::Completed,
+            )?;
+            events.push(Event::ItemUpserted { item });
+        }
+        if let Some(mut turn) = self.turn.take() {
+            turn.status = status;
+            turn.usage = usage;
+            turn.error = error;
+            turn.ended_at_ms = Some(now_ms());
+            events.push(Event::TurnUpdated { turn });
+        }
+        self.thread.status = ThreadStatus::Idle;
+        self.thread.updated_at_ms = now_ms();
+        events.push(Event::ThreadUpdated {
+            thread: self.thread.clone(),
+        });
+        self.core.commit(events)?;
+        Ok(())
+    }
+
+    // -- helpers ------------------------------------------------------------
+
+    fn turn_id(&self) -> Option<TurnId> {
+        self.turn.as_ref().map(|t| t.id.clone())
+    }
+
+    fn new_item(
+        &self,
+        turn_id: Option<TurnId>,
+        body: ItemBody,
+        status: ItemStatus,
+    ) -> CoreResult<Item> {
+        let ordinal = self
+            .core
+            .with_store(|s| s.next_item_ordinal(&self.thread.id))?;
+        // Live (uncommitted-ordinal) items must also be counted.
+        let live_max = self
+            .core
+            .live()
+            .values()
+            .filter(|i| i.thread_id == self.thread.id)
+            .map(|i| i.ordinal + 1)
+            .max()
+            .unwrap_or(0);
+        Ok(Item {
+            id: ItemId::new(),
+            thread_id: self.thread.id.clone(),
+            turn_id,
+            ordinal: ordinal.max(live_max),
+            status,
+            body,
+            updated_at_ms: now_ms(),
+        })
+    }
+
+    fn load_item(&self, id: &ItemId) -> CoreResult<Option<Item>> {
+        Ok(self
+            .core
+            .with_store(|s| s.items(&self.thread.id))?
+            .into_iter()
+            .find(|i| &i.id == id))
+    }
+
+    fn find_open_request(&self, native: &str) -> CoreResult<Option<RuntimeRequest>> {
+        // Map native → app id through our table first.
+        let app_id = self
+            .requests
+            .iter()
+            .find(|(_, n)| n.as_str() == native)
+            .map(|(id, _)| id.clone());
+        let requests = self.core.with_store(|s| s.requests(&self.thread.id))?;
+        Ok(requests.into_iter().find(|r| {
+            r.status == RequestStatus::Open && app_id.as_ref().is_none_or(|id| &r.id == id)
+        }))
+    }
+
+    fn resolve_request(&mut self, native: &str, decision: Option<DecisionKind>) -> CoreResult<()> {
+        let Some(mut request) = self.find_open_request(native)? else {
+            return Ok(());
+        };
+        self.requests.retain(|_, n| n != native);
+        request.status = RequestStatus::Resolved;
+        if decision.is_some() {
+            request.decision = decision;
+        }
+        let mut events = vec![Event::RequestUpdated { request }];
+        if self.requests.is_empty() && self.thread.status == ThreadStatus::WaitingApproval {
+            self.thread.status = if self.turn.is_some() {
+                ThreadStatus::Running
+            } else {
+                ThreadStatus::Idle
+            };
+            self.thread.updated_at_ms = now_ms();
+            events.push(Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            });
+        }
+        self.core.commit(events)?;
+        Ok(())
+    }
+
+    fn flush_dirty(&mut self) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let items: Vec<Item> = {
+            let live = self.core.live();
+            self.dirty
+                .drain()
+                .filter_map(|id| live.get(&id).cloned())
+                .collect()
+        };
+        let _ = self.core.with_store(|s| {
+            for item in &items {
+                s.snapshot_item(item)?;
+            }
+            Ok(())
+        });
+    }
+
+    fn save_thread(&mut self) -> CoreResult<()> {
+        self.thread.updated_at_ms = now_ms();
+        self.core.commit(vec![Event::ThreadUpdated {
+            thread: self.thread.clone(),
+        }])?;
+        Ok(())
+    }
+}
+
+async fn next_event(session: &mut Option<SessionHandle>) -> Option<HarnessEvent> {
+    match session {
+        Some(s) => s.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn title_from(text: &str) -> String {
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("New thread")
+        .trim();
+    let mut title: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        title.push('…');
+    }
+    title
+}

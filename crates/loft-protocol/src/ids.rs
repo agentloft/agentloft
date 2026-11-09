@@ -1,0 +1,73 @@
+//! Strongly typed identifiers. App ids are UUIDv7 (time-ordered); provider
+//! ("native") ids are opaque strings owned by the harness.
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+macro_rules! uuid_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(uuid::Uuid::now_v7().to_string())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                Self(s)
+            }
+        }
+    };
+}
+
+uuid_id!(ProjectId);
+uuid_id!(ThreadId);
+uuid_id!(TurnId);
+uuid_id!(ItemId);
+uuid_id!(RequestId);
+
+/// Which harness drives a thread: `claude`, `codex`, `acp:gemini`, …
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HarnessId(pub String);
+
+impl HarnessId {
+    pub const CLAUDE: &'static str = "claude";
+    pub const CODEX: &'static str = "codex";
+    pub const FAKE: &'static str = "fake";
+
+    pub fn claude() -> Self {
+        Self(Self::CLAUDE.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HarnessId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}

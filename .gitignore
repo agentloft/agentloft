@@ -1,0 +1,4 @@
+/target
+/.dev-home
+*.swp
+.DS_Store

@@ -1,0 +1,23 @@
+[package]
+name = "loft-app"
+description = "Agentloft desktop app (GPUI client)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "agentloft"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit.workspace = true
+loft-ui.workspace = true
+loft-config.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
