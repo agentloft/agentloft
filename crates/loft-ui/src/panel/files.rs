@@ -152,28 +152,6 @@ impl FileTree {
     }
 }
 
-pub fn file_icon(name: &str, is_dir: bool, open: bool) -> IconName {
-    if is_dir {
-        return if open {
-            IconName::FolderOpen
-        } else {
-            IconName::Folder
-        };
-    }
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("md" | "markdown" | "mdx" | "txt" | "rst") => IconName::FileText,
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "bmp" | "tiff") => {
-            IconName::FileImage
-        }
-        Some("docx" | "doc" | "pdf" | "pptx") => IconName::FileText,
-        Some("xlsx" | "xls" | "xlsm" | "xlsb" | "ods" | "csv" | "tsv") => IconName::FileSpreadsheet,
-        Some("json" | "toml" | "yaml" | "yml" | "lock") => IconName::FileBraces,
-        Some(_) => IconName::FileCode,
-        None => IconName::File,
-    }
-}
-
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
@@ -208,7 +186,6 @@ impl Render for FileTree {
                             };
                             let is_open = entry.is_dir && expanded.contains(&entry.rel_path);
                             let active = selected.as_deref() == Some(entry.rel_path.as_str());
-                            let icon = file_icon(&entry.name, entry.is_dir, is_open);
                             h_flex()
                                 .id(ElementId::Name(entry.rel_path.clone().into()))
                                 .h(px(26.))
@@ -235,11 +212,12 @@ impl Render for FileTree {
                                         )
                                     },
                                 ))
-                                .child(Icon::new(icon).small().text_color(if entry.is_dir {
-                                    p.accent
-                                } else {
-                                    p.muted_foreground
-                                }))
+                                .child(crate::file_icons::icon(
+                                    &entry.name,
+                                    entry.is_dir,
+                                    is_open,
+                                    px(16.),
+                                ))
                                 .child(
                                     div()
                                         .flex_1()

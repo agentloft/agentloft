@@ -12,7 +12,7 @@ use crate::store::{AppStore, ThreadState};
 use crate::theme::Palette;
 use agent::AgentView;
 use changes::ChangesView;
-use files::{FileTree, FileTreeEvent, file_icon};
+use files::{FileTree, FileTreeEvent};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -276,7 +276,7 @@ impl WorkbenchPanel {
 
 fn tab_chip(
     id: SharedString,
-    icon: IconName,
+    icon: AnyElement,
     label: String,
     active: bool,
     closable: bool,
@@ -303,7 +303,7 @@ fn tab_chip(
             d.text_color(p.muted_foreground)
                 .hover(|d| d.bg(p.hover).text_color(p.foreground))
         })
-        .child(Icon::new(icon).xsmall())
+        .child(icon)
         .when(active || closable, |d| {
             d.child(div().truncate().child(label))
         })
@@ -331,22 +331,39 @@ impl Render for WorkbenchPanel {
         let active = panel.active.clone();
 
         // Fixed tabs, then open files and agents.
-        let mut tabs: Vec<(Tab, IconName, String, bool)> = vec![
-            (Tab::Files, IconName::FolderTree, "Files".into(), false),
-            (Tab::Changes, IconName::GitCompare, "Changes".into(), false),
+        let mut tabs: Vec<(Tab, AnyElement, String, bool)> = vec![
+            (
+                Tab::Files,
+                Icon::new(IconName::FolderTree).xsmall().into_any_element(),
+                "Files".into(),
+                false,
+            ),
+            (
+                Tab::Changes,
+                Icon::new(IconName::GitCompare).xsmall().into_any_element(),
+                "Changes".into(),
+                false,
+            ),
             (
                 Tab::Terminal,
-                IconName::SquareTerminal,
+                Icon::new(IconName::SquareTerminal)
+                    .xsmall()
+                    .into_any_element(),
                 "Terminal".into(),
                 false,
             ),
-            (Tab::Browser, IconName::Globe, "Browser".into(), false),
+            (
+                Tab::Browser,
+                Icon::new(IconName::Globe).xsmall().into_any_element(),
+                "Browser".into(),
+                false,
+            ),
         ];
         for (path, _) in &panel.viewers {
             let name = path.rsplit('/').next().unwrap_or(path).to_owned();
             tabs.push((
                 Tab::File(path.clone()),
-                file_icon(&name, false, false),
+                crate::file_icons::icon(&name, false, false, px(14.)),
                 name,
                 true,
             ));
@@ -357,7 +374,12 @@ impl Render for WorkbenchPanel {
             .map(|(id, view)| (id.clone(), view.read(cx).title(cx)))
             .collect();
         for (id, title) in agent_titles {
-            tabs.push((Tab::Agent(id), IconName::Bot, title, true));
+            tabs.push((
+                Tab::Agent(id),
+                Icon::new(IconName::Bot).xsmall().into_any_element(),
+                title,
+                true,
+            ));
         }
 
         let mut strip = h_flex()

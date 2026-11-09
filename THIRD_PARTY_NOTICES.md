@@ -52,6 +52,26 @@ SOFTWARE.
   `gemini.svg`), shown to identify each agent. The marks are trademarks of
   their owners (Anthropic, OpenAI, Google). `opencode.svg` is our own glyph.
 
+## Material Icon Theme
+
+- Project: Material Icon Theme, https://github.com/material-extensions/vscode-material-icon-theme (`material-icon-theme` 5.40.0)
+- License: MIT
+- Used in: `crates/loft-ui/assets/file-icons/` (a curated subset of its SVG
+  icons) and the generated `crates/loft-ui/src/file_icons_table.rs`
+  (file name, extension and folder mappings). Regenerate with
+  `python3 xtask/scripts/file_icons.py`.
+
+```
+The MIT License (MIT)
+Copyright (c) 2025 Material Extensions
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
 ## Ghostty (libghostty-vt)
 
 - Project: Ghostty, https://github.com/ghostty-org/ghostty
