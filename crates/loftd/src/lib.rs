@@ -17,6 +17,13 @@ use tokio::sync::watch;
 
 pub const BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CARGO_PKG_NAME"));
 
+/// Our executable's mtime at startup (see `Welcome::daemon_exe_mtime_ms`).
+pub static EXE_MTIME: std::sync::LazyLock<Option<i64>> = std::sync::LazyLock::new(|| {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| loft_protocol::file_mtime_ms(&exe))
+});
+
 pub struct DaemonOptions {
     pub paths: Paths,
     pub harnesses: Vec<Arc<dyn Harness>>,

@@ -283,6 +283,23 @@ impl WorkspaceView {
                     self.store
                         .update(cx, |s, cx| s.archive_thread(t, false, cx));
                 }
+                "undo" => {
+                    let last = thread
+                        .read(cx)
+                        .model
+                        .as_ref()
+                        .and_then(|m| Some((m.turns.last()?.id.clone(), 0)));
+                    if let Some((turn, later)) = last {
+                        crate::items::confirm_revert(
+                            self.store.clone(),
+                            thread_id.clone(),
+                            turn,
+                            later,
+                            window,
+                            cx,
+                        );
+                    }
+                }
                 "newtab" => {
                     // A second thread in a native tab next to this one.
                     let other = self

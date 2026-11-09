@@ -181,6 +181,45 @@ impl Core {
         })
     }
 
+    /// Restore files to a turn's before-checkpoint (PLAN §5.3).
+    pub(crate) async fn revert_turn(
+        self: &Arc<Self>,
+        id: &ThreadId,
+        turn_id: &loft_protocol::TurnId,
+    ) -> CoreResult<Response> {
+        let thread = self.load_thread(id)?;
+        if matches!(
+            thread.status,
+            ThreadStatus::Running | ThreadStatus::WaitingApproval
+        ) {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "stop the running turn before reverting",
+            ));
+        }
+        let turn = self
+            .with_store(|s| s.turns(id))?
+            .into_iter()
+            .find(|t| &t.id == turn_id)
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "turn not found"))?;
+        let before = turn.checkpoint_before.clone().ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::BadRequest,
+                "this turn has no checkpoint (not a git repository?)",
+            )
+        })?;
+        let dir = PathBuf::from(&thread.cwd);
+        let changed = blocking(move || loft_git::restore_worktree(&dir, &before)).await?;
+        let ordinal = turn.ordinal;
+        let files = changed.len();
+        self.thread_call(id, |reply| ThreadCmd::Reverted {
+            ordinal,
+            files,
+            reply,
+        })
+        .await
+    }
+
     /// Commit + push the branch, then `gh pr create` (PLAN §5.2).
     pub(crate) async fn create_pull_request(
         self: &Arc<Self>,

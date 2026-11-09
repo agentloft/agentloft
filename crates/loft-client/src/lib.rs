@@ -272,7 +272,34 @@ pub async fn connect_or_spawn(
 ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
     let socket = paths.socket_file();
     if let Ok(conn) = Client::connect_with(&socket, kind, build, capabilities).await {
-        return Ok(conn);
+        if !is_stale(conn.0.welcome(), daemon_bin) {
+            return Ok(conn);
+        }
+        // The daemon binary changed since it started (rebuild or app update).
+        // Swap it if it's idle; with agents running, keep it for now.
+        let pid = conn.0.welcome().daemon_pid;
+        let asked = conn
+            .0
+            .request(Request::Shutdown {
+                reason: loft_protocol::ShutdownReason::Upgrade,
+            })
+            .await;
+        if asked.is_err() {
+            tracing::info!(pid, "daemon is outdated but busy; using it until idle");
+            return Ok(conn);
+        }
+        tracing::info!(pid, "restarting outdated agentloftd");
+        drop(conn);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while Client::connect_with(&socket, kind, build, &[])
+            .await
+            .is_ok()
+        {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("the outdated agentloftd (pid {pid}) didn't exit");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     spawn_daemon(paths, daemon_bin)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -284,6 +311,20 @@ pub async fn connect_or_spawn(
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
+    }
+}
+
+/// The running daemon's executable differs from the one we'd start.
+fn is_stale(welcome: &loft_protocol::Welcome, daemon_bin: &Path) -> bool {
+    match (
+        welcome.daemon_exe_mtime_ms,
+        loft_protocol::file_mtime_ms(daemon_bin),
+    ) {
+        (Some(running), Some(on_disk)) => running != on_disk,
+        // A daemon from before this check existed is outdated by definition.
+        (None, Some(_)) => true,
+        // No binary to compare against (e.g. tests): keep it.
+        (_, None) => false,
     }
 }
 

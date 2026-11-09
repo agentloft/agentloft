@@ -137,6 +137,13 @@ pub enum Request {
         #[serde(default)]
         share_workspace: bool,
     },
+    /// Restore the thread's files to how they were before `turn_id` (undoing
+    /// that turn and every later one). The conversation is kept; the agent
+    /// is told on its next turn. Answers `Response::Text` with a summary.
+    RevertTurn {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    },
     /// Push a worktree thread's branch and open a GitHub pull request into
     /// its base with `gh`. Answers `Response::Text` with the PR URL.
     CreatePullRequest {
@@ -277,6 +284,18 @@ pub struct Welcome {
     pub protocol_version: u32,
     pub daemon_build: String,
     pub daemon_pid: u32,
+    /// Modification time of the daemon's executable when it started. If the
+    /// binary on disk changed since (rebuild, app update), the app restarts
+    /// the daemon once it's idle.
+    #[serde(default)]
+    pub daemon_exe_mtime_ms: Option<i64>,
+}
+
+/// Modification time of a file in ms since the epoch (exe staleness check).
+pub fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

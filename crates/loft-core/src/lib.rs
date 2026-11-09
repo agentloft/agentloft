@@ -478,6 +478,9 @@ impl Core {
             } => self.fork_thread(&thread_id, harness, share_workspace).await,
             Request::ReloadConfig => self.reload_config(),
             Request::CreatePullRequest { thread_id } => self.create_pull_request(&thread_id).await,
+            Request::RevertTurn { thread_id, turn_id } => {
+                self.revert_turn(&thread_id, &turn_id).await
+            }
             Request::ArchiveThread { thread_id, force } => {
                 self.archive_thread(&thread_id, force).await
             }

@@ -38,6 +38,13 @@ pub(crate) enum ThreadCmd {
         model: Option<String>,
         reply: Reply,
     },
+    /// Files were restored to before turn `ordinal`: show a notice and tell
+    /// the agent before its next prompt.
+    Reverted {
+        ordinal: u32,
+        files: usize,
+        reply: Reply,
+    },
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -56,6 +63,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
     let actor = ThreadActor {
         self_tx: tx.downgrade(),
         pending_start: None,
+        pending_note: None,
         core,
         thread,
         session: None,
@@ -73,6 +81,8 @@ struct ThreadActor {
     self_tx: mpsc::WeakUnboundedSender<ThreadCmd>,
     /// Prompt waiting for the "before" checkpoint before it is sent.
     pending_start: Option<(String, Vec<AttachmentRef>)>,
+    /// Said to the agent ahead of the next prompt (e.g. after a revert).
+    pending_note: Option<String>,
     core: Arc<Core>,
     thread: Thread,
     session: Option<SessionHandle>,
@@ -168,6 +178,37 @@ impl ThreadActor {
                     let _ = s.commands.send(SessionCommand::SetModel(model));
                 }
                 let res = self.save_thread().map(|_| Response::Ok);
+                let _ = reply.send(res);
+            }
+            ThreadCmd::Reverted {
+                ordinal,
+                files,
+                reply,
+            } => {
+                let text = if files == 0 {
+                    format!(
+                        "Nothing to undo: files already match how they were before turn {ordinal}."
+                    )
+                } else {
+                    self.pending_note = Some(format!(
+                        "[Agentloft: the user reverted the workspace files to their state before turn {ordinal}. Changes made from that turn on are gone; re-read files before relying on earlier edits.]"
+                    ));
+                    format!(
+                        "Restored {files} file{} to how they were before turn {ordinal}.",
+                        if files == 1 { "" } else { "s" }
+                    )
+                };
+                let res = self
+                    .new_item(
+                        None,
+                        ItemBody::Notice {
+                            level: loft_protocol::NoticeLevel::Info,
+                            text: text.clone(),
+                        },
+                        ItemStatus::Completed,
+                    )
+                    .and_then(|item| self.core.commit(vec![Event::ItemUpserted { item }]))
+                    .map(|_| Response::Text { text });
                 let _ = reply.send(res);
             }
             ThreadCmd::Shutdown { .. } => unreachable!("handled in run loop"),
@@ -285,6 +326,10 @@ impl ThreadActor {
             }
             let Some((text, attachments)) = self.pending_start.take() else {
                 return;
+            };
+            let text = match self.pending_note.take() {
+                Some(note) => format!("{note}\n\n{text}"),
+                None => text,
             };
             let images = attachments
                 .into_iter()

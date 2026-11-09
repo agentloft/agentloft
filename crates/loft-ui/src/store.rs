@@ -560,6 +560,23 @@ impl AppStore {
         });
     }
 
+    /// Restore the thread's files to before `turn_id`.
+    pub fn revert_turn(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: loft_protocol::TurnId,
+        cx: &mut Context<Self>,
+    ) {
+        let body = Request::RevertTurn { thread_id, turn_id };
+        self.request_result(body, cx, |store, result, cx| {
+            let result = result.map(|r| match r {
+                Response::Text { text } => text,
+                _ => "Files restored".into(),
+            });
+            store.notify_result(result, cx);
+        });
+    }
+
     /// Push the worktree branch and open a PR with `gh`; opens it in the
     /// browser when done.
     pub fn create_pull_request(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {

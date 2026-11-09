@@ -203,3 +203,87 @@ async fn incompatible_protocol_is_refused() {
     assert!(matches!(msg, ServerMsg::Fatal(e) if e.code == ErrorCode::IncompatibleVersion));
     daemon.shutdown().await;
 }
+
+/// A newer app sending a request this daemon doesn't know gets a clear
+/// error instead of a hang; an upgrade shutdown waits for running turns.
+#[tokio::test]
+async fn unknown_requests_are_answered_and_upgrade_waits_for_idle() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(dir.path().join("home"));
+    let project_dir = dir.path().join("repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let daemon = start(&paths).await;
+
+    let stream = tokio::net::UnixStream::connect(paths.socket_file())
+        .await
+        .unwrap();
+    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let send = |v: serde_json::Value| bytes::Bytes::from(serde_json::to_vec(&v).unwrap());
+    framed
+        .send(send(serde_json::json!({
+            "type": "hello", "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "test", "client_build": "future"
+        })))
+        .await
+        .unwrap();
+    let welcome: serde_json::Value =
+        serde_json::from_slice(&framed.next().await.unwrap().unwrap()).unwrap();
+    assert_eq!(welcome["type"], "welcome");
+    assert!(welcome["daemon_exe_mtime_ms"].is_i64(), "{welcome}");
+    framed
+        .send(send(serde_json::json!({
+            "type": "request", "id": 7, "body": {"op": "teleport", "to": "mars"}
+        })))
+        .await
+        .unwrap();
+    let reply: serde_json::Value = tokio::time::timeout(Duration::from_secs(5), framed.next())
+        .await
+        .expect("an answer, not a hang")
+        .unwrap()
+        .map(|f| serde_json::from_slice(&f).unwrap())
+        .unwrap();
+    assert_eq!(reply["id"], 7);
+    assert_eq!(reply["result"]["Err"]["code"], "unsupported", "{reply}");
+
+    // Busy daemon: an upgrade shutdown is refused until the turn ends.
+    let (client, _rx) = connect(&paths).await;
+    let Response::Project { project } = client
+        .request(Request::AddProject {
+            path: project_dir.to_string_lossy().into_owned(),
+            name: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Response::Thread { thread } = client
+        .request(Request::CreateThread {
+            project_id: project.id,
+            harness: HarnessId(HarnessId::FAKE.into()),
+            title: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    client
+        .request(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "slow reply please".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    let refused = client
+        .request(Request::Shutdown {
+            reason: ShutdownReason::Upgrade,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    daemon.shutdown().await;
+}

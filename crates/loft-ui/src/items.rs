@@ -39,7 +39,7 @@ pub fn render_row(
             let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();
             render_tool_group(thread, store, state, model, &items, p)
         }
-        Row::TurnFooter { turn_ix } => render_turn_footer(model, *turn_ix, p),
+        Row::TurnFooter { turn_ix } => render_turn_footer(store, model, *turn_ix, p),
     };
     div()
         .w_full()
@@ -587,7 +587,12 @@ fn approval_card(
         .into_any_element()
 }
 
-fn render_turn_footer(model: &ThreadModel, turn_ix: usize, p: &Palette) -> AnyElement {
+fn render_turn_footer(
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    turn_ix: usize,
+    p: &Palette,
+) -> AnyElement {
     let Some(turn) = model.turns.get(turn_ix) else {
         return div().into_any_element();
     };
@@ -610,14 +615,86 @@ fn render_turn_footer(model: &ThreadModel, turn_ix: usize, p: &Palette) -> AnyEl
             parts.push(format!("${cost:.3}"));
         }
     }
+    // Undo: restore files to before this turn (hover to reveal).
+    let can_undo = turn.checkpoint_before.is_some() && model.running_turn().is_none();
+    let undo = can_undo.then(|| {
+        let (store, thread_id, turn_id) = (store.clone(), model.thread.id.clone(), turn.id.clone());
+        let later = model.turns.len().saturating_sub(turn_ix + 1);
+        div()
+            .id(SharedString::from(format!("undo-{}", turn.id)))
+            .ml_2()
+            .px_1p5()
+            .py(px(1.))
+            .rounded(px(5.))
+            .invisible()
+            .group_hover("turn-footer", |d| d.visible())
+            .cursor_pointer()
+            .text_color(p.muted_foreground)
+            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(IconName::RotateCw).xsmall())
+                    .child("Undo changes"),
+            )
+            .on_click(move |_, window, cx| {
+                confirm_revert(
+                    store.clone(),
+                    thread_id.clone(),
+                    turn_id.clone(),
+                    later,
+                    window,
+                    cx,
+                )
+            })
+    });
     h_flex()
+        .group("turn-footer")
         .gap_1p5()
         .items_center()
         .text_xs()
         .text_color(color)
         .child(Icon::new(icon).xsmall())
         .child(parts.join(" · "))
+        .children(undo)
         .into_any_element()
+}
+
+pub(crate) fn confirm_revert(
+    store: Entity<AppStore>,
+    thread_id: loft_protocol::ThreadId,
+    turn_id: loft_protocol::TurnId,
+    later_turns: usize,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    let scope = match later_turns {
+        0 => "the changes made in this turn".to_owned(),
+        1 => "the changes made in this turn and the one after it".to_owned(),
+        n => format!("the changes made in this turn and the {n} after it"),
+    };
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (store, thread_id, turn_id) = (store.clone(), thread_id.clone(), turn_id.clone());
+        dialog
+            .title("Undo changes?")
+            .child(format!(
+                "Files go back to how they were before this turn, discarding {scope}. The conversation is kept and the agent is told."
+            ))
+            .footer(
+                DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
+                    .child(DialogAction::new().child(Button::new("ok").danger().label("Undo changes"))),
+            )
+            .on_ok(move |_, _, cx| {
+                let (t, u) = (thread_id.clone(), turn_id.clone());
+                store.update(cx, |s, cx| s.revert_turn(t, u, cx));
+                true
+            })
+    });
 }
 
 // -- helpers -------------------------------------------------------------------

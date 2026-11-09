@@ -677,3 +677,88 @@ async fn pull_request_pushes_branch_and_calls_gh() {
     );
     assert!(gh_log.contains("## Requests") && gh_log.contains("- Add a changelog"));
 }
+
+#[tokio::test]
+async fn revert_turn_restores_files_and_tells_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, &repo).await;
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "edit things".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    // What "the agent" did during the turn.
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    let (_, turns, ..) = thread_snapshot(&core, &thread.id);
+
+    let Response::Text { text } = core
+        .handle(Request::RevertTurn {
+            thread_id: thread.id.clone(),
+            turn_id: turns[0].id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(text, "Restored 2 files to how they were before turn 1.");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(!repo.join("new.txt").exists());
+    let (_, _, items, _) = thread_snapshot(&core, &thread.id);
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(&i.body, ItemBody::Notice { text: t, .. } if *t == text))
+    );
+
+    // The next prompt carries the note to the agent; the user's bubble doesn't.
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "continue".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, |_, turns| {
+        turns.len() == 2 && turns[1].status.is_terminal()
+    })
+    .await;
+    let (_, _, items, _) = thread_snapshot(&core, &thread.id);
+    let echoed: String = items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::AssistantMessage { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        echoed.contains("user reverted the workspace files"),
+        "{echoed}"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(&i.body, ItemBody::UserMessage { text, .. } if text == "continue"))
+    );
+}

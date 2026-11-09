@@ -98,6 +98,55 @@ pub fn checkpoint(dir: &Path, ref_name: &str, message: &str) -> Result<String> {
     Ok(commit)
 }
 
+/// Make the work tree under `dir` match `commit` again (revert to a
+/// checkpoint): files added since are removed, changed or deleted ones are
+/// restored. The index and `HEAD` are untouched. Returns the paths changed.
+pub fn restore_worktree(dir: &Path, commit: &str) -> Result<Vec<String>> {
+    let now = snapshot_tree(dir)?;
+    let out = run(git(dir).args([
+        "diff",
+        "--no-renames",
+        "--relative",
+        "--name-status",
+        "-z",
+        commit,
+        &now,
+    ]))?;
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
+    let mut removed = Vec::new();
+    let mut restore = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        match status {
+            // Added since the checkpoint: delete it.
+            "A" => removed.push(path.to_owned()),
+            _ => restore.push(path.to_owned()),
+        }
+    }
+    for path in &removed {
+        let file = dir.join(path);
+        if std::fs::remove_file(&file).is_ok() {
+            // Drop directories the agent created and left empty.
+            let mut parent = file.parent();
+            while let Some(p) = parent {
+                if p == dir || std::fs::remove_dir(p).is_err() {
+                    break;
+                }
+                parent = p.parent();
+            }
+        }
+    }
+    if !restore.is_empty() {
+        let mut cmd = git(dir);
+        cmd.args(["restore", "--worktree", "--source", commit, "--"])
+            .args(&restore);
+        run(&mut cmd)?;
+    }
+    let mut changed = removed;
+    changed.extend(restore);
+    changed.sort();
+    Ok(changed)
+}
+
 /// Delete all checkpoint refs under `prefix` (e.g. when a thread is deleted).
 pub fn delete_refs(dir: &Path, prefix: &str) -> Result<()> {
     let refs = run(git(dir).args(["for-each-ref", "--format=%(refname)", prefix]))?;
@@ -202,6 +251,39 @@ mod tests {
         ]))
         .unwrap();
         dir
+    }
+
+    #[test]
+    fn restore_worktree_to_checkpoint() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join("keep.txt"), "user's untracked file\n").unwrap();
+        let before = checkpoint(d, "refs/agentloft/checkpoints/t/1-before", "before").unwrap();
+        // The agent edits, deletes and creates files.
+        std::fs::write(d.join("a.txt"), "changed\n").unwrap();
+        std::fs::remove_file(d.join("keep.txt")).unwrap();
+        std::fs::create_dir_all(d.join("src/new")).unwrap();
+        std::fs::write(d.join("src/new/mod.rs"), "x").unwrap();
+        let index_before = run(git(d).args(["diff", "--cached", "--name-only"])).unwrap();
+        let changed = restore_worktree(d, &before).unwrap();
+        assert_eq!(changed, vec!["a.txt", "keep.txt", "src/new/mod.rs"]);
+        assert_eq!(
+            std::fs::read_to_string(d.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("keep.txt")).unwrap(),
+            "user's untracked file\n"
+        );
+        assert!(!d.join("src").exists(), "empty dirs removed");
+        assert_eq!(
+            run(git(d).args(["diff", "--cached", "--name-only"])).unwrap(),
+            index_before
+        );
+        assert!(
+            restore_worktree(d, &before).unwrap().is_empty(),
+            "idempotent"
+        );
     }
 
     #[test]

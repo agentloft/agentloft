@@ -73,6 +73,7 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 protocol_version: PROTOCOL_VERSION,
                 daemon_build: crate::BUILD.into(),
                 daemon_pid: std::process::id(),
+                daemon_exe_mtime_ms: *crate::EXE_MTIME,
             }));
         }
         Some(ClientMsg::Hello(h)) => {
@@ -125,6 +126,24 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
             Ok(m) => m,
             Err(err) => {
                 tracing::warn!(%err, "bad client frame");
+                // A newer app asking for something this daemon predates:
+                // answer instead of leaving the request hanging.
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&frame)
+                    && v["type"] == "request"
+                    && let Some(id) = v["id"].as_u64()
+                {
+                    let op = v["body"]["op"].as_str().unwrap_or("?");
+                    let _ = out_tx.send(ServerMsg::Response {
+                        id,
+                        result: Err(ErrorBody::new(
+                            ErrorCode::Unsupported,
+                            format!(
+                                "agentloftd {} doesn't understand `{op}`; it's older than the app. Restart it (quit Agentloft with no agents running) to update.",
+                                crate::BUILD
+                            ),
+                        )),
+                    });
+                }
                 continue;
             }
         };
@@ -140,6 +159,13 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     let result = match body {
+                        // An upgrade waits for running turns; a user quit doesn't.
+                        Request::Shutdown {
+                            reason: loft_protocol::ShutdownReason::Upgrade,
+                        } if core.is_busy() => Err(ErrorBody::new(
+                            ErrorCode::Conflict,
+                            "agents are running; the update applies once they're done",
+                        )),
                         Request::Shutdown { reason } => {
                             tracing::info!(?reason, "shutdown requested by client");
                             let _ = shutdown.send(true);
