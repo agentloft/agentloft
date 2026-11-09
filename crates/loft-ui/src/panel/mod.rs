@@ -47,9 +47,10 @@ struct ThreadPanel {
 pub struct WorkbenchPanel {
     store: Entity<AppStore>,
     threads: HashMap<ThreadId, ThreadPanel>,
-    /// Extra tab contents provided by the host (terminal, browser).
+    /// Extra tab content provided by the host (terminal).
     pub terminal: Option<AnyViewFn>,
-    pub browser: Option<AnyViewFn>,
+    /// One shared browser (agents drive it; created on first use).
+    browser: Option<Entity<loft_browser::BrowserView>>,
 }
 
 /// Renders a host-provided view for the selected thread.
@@ -145,6 +146,20 @@ impl WorkbenchPanel {
                 viewer.update(cx, |v, cx| v.reload(window, cx));
             }
         }
+    }
+
+    /// The browser panel, created on first use.
+    pub fn browser(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<loft_browser::BrowserView> {
+        if let Some(b) = &self.browser {
+            return b.clone();
+        }
+        let browser = cx.new(|cx| loft_browser::BrowserView::new(window, cx));
+        self.browser = Some(browser.clone());
+        browser
     }
 
     /// Show a tab for the selected thread (creating file/agent views).
@@ -369,10 +384,7 @@ impl Render for WorkbenchPanel {
                 Some(render) => render(&thread_id, window, cx),
                 None => placeholder(&p, IconName::SquareTerminal, "Terminal"),
             },
-            Tab::Browser => match &self.browser {
-                Some(render) => render(&thread_id, window, cx),
-                None => placeholder(&p, IconName::Globe, "Browser"),
-            },
+            Tab::Browser => self.browser(window, cx).into_any_element(),
         };
         let _ = store;
         v_flex()

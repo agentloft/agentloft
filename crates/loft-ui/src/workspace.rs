@@ -51,6 +51,7 @@ const HEADER_HEIGHT: f32 = 52.;
 const TRAFFIC_LIGHTS_INSET: f32 = 78.;
 
 pub fn bind_keys(cx: &mut gpui_kit::App) {
+    loft_browser::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),
         KeyBinding::new("cmd-.", Interrupt, Some(CONTEXT)),
@@ -184,10 +185,8 @@ impl WorkspaceView {
                 self.panel
                     .update(cx, |panel, cx| panel.open_agent(&t, i, window, cx));
             }
-            StoreEvent::BrowserActivity => {
-                if !self.panel_open || self.panel.read(cx).active_tab(cx) != Some(Tab::Browser) {
-                    self.show_tab(Tab::Browser, window, cx);
-                }
+            StoreEvent::BrowserCall { call_id, command } => {
+                self.run_browser_call(*call_id, command.clone(), window, cx);
             }
         }
         cx.notify();
@@ -237,6 +236,49 @@ impl WorkspaceView {
                     .update(cx, |p, cx| p.show(Tab::Files, window, cx)),
             },
         }
+    }
+
+    /// An agent drives the browser: show it, run the command, answer.
+    fn run_browser_call(
+        &mut self,
+        call_id: u64,
+        command: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.store.read(cx).client() else {
+            return;
+        };
+        let command: loft_browser::BrowserCommand = match serde_json::from_value(command) {
+            Ok(c) => c,
+            Err(err) => {
+                client.respond_call(
+                    call_id,
+                    Err(loft_protocol::ErrorBody::new(
+                        loft_protocol::ErrorCode::BadRequest,
+                        format!("invalid browser command: {err}"),
+                    )),
+                );
+                return;
+            }
+        };
+        // Let the user watch: bring the browser tab forward.
+        self.panel_open = true;
+        self.panel
+            .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
+        let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
+        let task = browser.update(cx, |b, cx| b.execute(command, window, cx));
+        cx.spawn(async move |_, _| {
+            let result = task.await.map_err(|err| {
+                loft_protocol::ErrorBody::new(
+                    loft_protocol::ErrorCode::Internal,
+                    format!("{err:#}"),
+                )
+            });
+            client.respond_call(call_id, result);
+        })
+        .detach();
+        cx.notify();
     }
 
     fn show_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {

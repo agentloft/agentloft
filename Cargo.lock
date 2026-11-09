@@ -4027,8 +4027,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "gpui-kit",
+ "loft-browser",
  "loft-client",
  "loft-config",
+ "loft-docs",
  "loft-protocol",
  "serde_json",
  "tokio",

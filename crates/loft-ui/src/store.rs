@@ -29,8 +29,11 @@ pub enum StoreEvent {
         thread_id: ThreadId,
         item_id: ItemId,
     },
-    /// A browser call arrived from an agent; the panel should show the browser.
-    BrowserActivity,
+    /// An agent wants to drive the browser panel (answer via `respond_call`).
+    BrowserCall {
+        call_id: u64,
+        command: serde_json::Value,
+    },
 }
 
 impl gpui_kit::EventEmitter<StoreEvent> for AppStore {}
@@ -213,17 +216,11 @@ impl AppStore {
                 }
             }
             ClientEvent::TerminalOutput { .. } | ClientEvent::TerminalExited { .. } => {}
-            ClientEvent::ClientCall { call_id, .. } => {
-                if let Some(client) = &self.client {
-                    client.respond_call(
-                        call_id,
-                        Err(ErrorBody::new(
-                            loft_protocol::ErrorCode::Unsupported,
-                            "the browser panel is not available in this build",
-                        )),
-                    );
+            ClientEvent::ClientCall { call_id, call } => match call {
+                loft_protocol::ClientCall::Browser { command, .. } => {
+                    cx.emit(StoreEvent::BrowserCall { call_id, command });
                 }
-            }
+            },
             ClientEvent::Fatal(err) => {
                 self.last_error = Some(err.message);
                 cx.notify();
