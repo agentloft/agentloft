@@ -546,7 +546,10 @@ mod tests {
         );
         let remote = tempfile::tempdir().unwrap();
         git(remote.path(), &["init", "-q", "--bare"]);
-        git(r, &["remote", "add", "origin", &remote.path().to_string_lossy()]);
+        git(
+            r,
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
         git(r, &["push", "-q", "origin", "main"]);
         // With origin: fetched, from origin/main; merges back into main.
         assert_eq!(

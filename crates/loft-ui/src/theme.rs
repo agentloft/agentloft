@@ -162,14 +162,34 @@ pub fn reload_if_changed(cx: &mut App) -> bool {
     changed
 }
 
-/// Toggle light/dark (persisted only for this session).
+/// Toggle light/dark and save it as `ui.theme`, as Settings does; the
+/// config file is the source of truth, so an unsaved switch would be undone
+/// by the next settings reload.
 pub fn toggle_mode(cx: &mut App) {
-    let dark = cx.theme().mode.is_dark();
-    if cx.has_global::<AppearanceState>() {
-        cx.global_mut::<AppearanceState>().config.theme =
-            if dark { "light".into() } else { "dark".into() };
+    let next = if cx.theme().mode.is_dark() {
+        "light"
+    } else {
+        "dark"
+    };
+    let Some(state) = cx.try_global::<AppearanceState>() else {
+        return;
+    };
+    let paths = state.paths.clone();
+    match loft_config::write_setting(
+        &paths,
+        &["ui", "theme"],
+        loft_config::SettingValue::Str(next.into()),
+    ) {
+        Ok(()) => {
+            reload_if_changed(cx);
+        }
+        Err(err) => {
+            // Still switch for this session.
+            tracing::warn!("couldn't save the theme: {err:#}");
+            cx.global_mut::<AppearanceState>().config.theme = next.into();
+            apply(cx);
+        }
     }
-    apply(cx);
 }
 
 /// Apply the current settings (call again when the system appearance flips).
