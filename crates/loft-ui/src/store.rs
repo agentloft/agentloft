@@ -2,6 +2,7 @@
 //! [`ThreadState`] entity per open thread (ADR-0010: client I/O on tokio,
 //! state applied on the GPUI main thread).
 
+use crate::panel::terminal::TerminalPane;
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::text::TextViewState;
 use gpui_kit::{App, AppContext as _, AsyncApp, Context, Entity, WeakEntity};
@@ -10,7 +11,7 @@ use loft_client::{Client, ClientEvent};
 use loft_config::Paths;
 use loft_protocol::{
     ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId, ProjectId,
-    Request, RequestId, Response, Snapshot, ThreadId, Topic,
+    Request, RequestId, Response, Snapshot, TerminalId, ThreadId, Topic,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -86,6 +87,12 @@ pub struct AppStore {
     pub queued: HashMap<ThreadId, std::collections::VecDeque<String>>,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
+    /// Terminal panes fed by `Topic::Terminal` subscriptions.
+    terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
+    terminal_subs: HashMap<u64, TerminalId>,
+    /// Daemon pid of the current connection: a new pid means the daemon
+    /// restarted and its PTYs are gone.
+    daemon_pid: Option<u32>,
 }
 
 impl AppStore {
@@ -103,6 +110,9 @@ impl AppStore {
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
             last_error: None,
+            terminals: HashMap::new(),
+            terminal_subs: HashMap::new(),
+            daemon_pid: None,
         };
         this.connect(cx);
         this
@@ -159,8 +169,58 @@ impl AppStore {
             let sub = client.subscribe(Topic::Thread(id.clone()));
             self.subs.insert(sub, id.clone());
         }
+        let pid = client.welcome().daemon_pid;
+        let restarted = self.daemon_pid.is_some_and(|old| old != pid);
+        self.daemon_pid = Some(pid);
+        self.terminal_subs.clear();
+        self.terminals.retain(|_, pane| pane.upgrade().is_some());
+        let terminals = std::mem::take(&mut self.terminals);
         self.client = Some(client);
+        for (id, pane) in terminals {
+            if restarted {
+                // The old PTY died with the daemon; the pane opens a new one.
+                let _ = pane.update(cx, |p, cx| p.on_lost(cx));
+            } else {
+                self.subscribe_terminal(id, pane, cx);
+            }
+        }
         cx.notify();
+    }
+
+    /// Route a terminal's replay/output/exit to `pane`.
+    pub fn subscribe_terminal(
+        &mut self,
+        id: TerminalId,
+        pane: WeakEntity<TerminalPane>,
+        _cx: &mut Context<Self>,
+    ) {
+        self.terminal_subs.retain(|_, t| *t != id);
+        if let Some(client) = &self.client {
+            let sub = client.subscribe(Topic::Terminal(id.clone()));
+            self.terminal_subs.insert(sub, id.clone());
+        }
+        self.terminals.insert(id, pane);
+    }
+
+    pub fn forget_terminal(&mut self, id: &TerminalId) {
+        self.terminals.remove(id);
+        let subs: Vec<u64> = self
+            .terminal_subs
+            .iter()
+            .filter(|(_, t)| *t == id)
+            .map(|(s, _)| *s)
+            .collect();
+        for sub in subs {
+            self.terminal_subs.remove(&sub);
+            if let Some(client) = &self.client {
+                client.unsubscribe(sub);
+            }
+        }
+    }
+
+    fn terminal_pane(&self, sub_id: u64) -> Option<WeakEntity<TerminalPane>> {
+        let id = self.terminal_subs.get(&sub_id)?;
+        self.terminals.get(id).cloned()
     }
 
     fn on_disconnected(&mut self, cx: &mut Context<Self>) {
@@ -180,7 +240,15 @@ impl AppStore {
     fn on_client_event(&mut self, event: ClientEvent, cx: &mut Context<Self>) {
         match event {
             ClientEvent::Snapshot { sub_id, snapshot } => {
-                if Some(sub_id) == self.ws_sub {
+                if let Snapshot::Terminal {
+                    terminal, replay, ..
+                } = &snapshot
+                {
+                    if let Some(pane) = self.terminal_pane(sub_id) {
+                        let _ =
+                            pane.update(cx, |p, cx| p.on_replay(&replay.0, terminal.exited, cx));
+                    }
+                } else if Some(sub_id) == self.ws_sub {
                     self.workspace.apply_snapshot(snapshot);
                     // Reopen the most recently active thread on launch.
                     if self.selected.is_none()
@@ -215,7 +283,16 @@ impl AppStore {
                     entity.update(cx, |t, cx| t.apply_delta(&delta, cx));
                 }
             }
-            ClientEvent::TerminalOutput { .. } | ClientEvent::TerminalExited { .. } => {}
+            ClientEvent::TerminalOutput { sub_id, data, .. } => {
+                if let Some(pane) = self.terminal_pane(sub_id) {
+                    let _ = pane.update(cx, |p, cx| p.on_output(&data, cx));
+                }
+            }
+            ClientEvent::TerminalExited { sub_id, code, .. } => {
+                if let Some(pane) = self.terminal_pane(sub_id) {
+                    let _ = pane.update(cx, |p, cx| p.on_exit(code, cx));
+                }
+            }
             ClientEvent::ClientCall { call_id, call } => match call {
                 loft_protocol::ClientCall::Browser { command, .. } => {
                     cx.emit(StoreEvent::BrowserCall { call_id, command });

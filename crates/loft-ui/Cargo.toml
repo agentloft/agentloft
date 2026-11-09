@@ -13,6 +13,7 @@ loft-config.workspace = true
 gpui-kit.workspace = true
 loft-docs = { path = "../loft-docs" }
 loft-browser = { path = "../loft-browser" }
+loft-terminal.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

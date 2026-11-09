@@ -126,10 +126,15 @@ pub enum Request {
         thread_id: ThreadId,
         scope: DiffScope,
     },
+    /// Open a shell. With `key`, a live terminal opened earlier with the same
+    /// key is returned (resized, unless `cols`/`rows` are 0) instead, so a UI
+    /// restart reattaches.
     TerminalOpen {
         root: FsRoot,
         cols: u16,
         rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     TerminalInput {
         id: TerminalId,

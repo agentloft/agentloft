@@ -131,6 +131,10 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
         match msg {
             ClientMsg::Hello(_) => {}
             ClientMsg::Request { id, body } => {
+                if let Some(result) = core.handle_inline(&body) {
+                    let _ = out_tx.send(ServerMsg::Response { id, result });
+                    continue;
+                }
                 let core = core.clone();
                 let out = out_tx.clone();
                 let shutdown = shutdown.clone();

@@ -240,6 +240,22 @@ impl Core {
 
     // -- requests -----------------------------------------------------------
 
+    /// Requests that must run in arrival order on the connection (keystrokes
+    /// to a terminal). Returns `None` for everything else.
+    pub fn handle_inline(&self, req: &Request) -> Option<CoreResult<Response>> {
+        match req {
+            Request::TerminalInput { id, data } => {
+                Some(self.terminals.input(id, &data.0).map(|_| Response::Ok))
+            }
+            Request::TerminalResize { id, cols, rows } => Some(
+                self.terminals
+                    .resize(id, *cols, *rows)
+                    .map(|_| Response::Ok),
+            ),
+            _ => None,
+        }
+    }
+
     pub async fn handle(self: &Arc<Self>, req: Request) -> CoreResult<Response> {
         match req {
             Request::Ping => Ok(Response::Pong),
@@ -300,11 +316,22 @@ impl Core {
             Request::GetDiff { thread_id, scope } => Ok(Response::Diff {
                 diff: self.diff(&thread_id, scope).await?,
             }),
-            Request::TerminalOpen { root, cols, rows } => {
+            Request::TerminalOpen {
+                root,
+                cols,
+                rows,
+                key,
+            } => {
+                if let Some(terminal) = key
+                    .as_deref()
+                    .and_then(|k| self.terminals.reattach(k, cols, rows))
+                {
+                    return Ok(Response::Terminal { terminal });
+                }
                 let dir = self.root_dir(&root)?;
                 let terminal =
                     self.terminals
-                        .open(&dir, cols, rows, &self.opts.env, self.bus.clone())?;
+                        .open(&dir, cols, rows, key, &self.opts.env, self.bus.clone())?;
                 Ok(Response::Terminal { terminal })
             }
             Request::TerminalInput { id, data } => {

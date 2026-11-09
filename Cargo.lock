@@ -4315,6 +4315,7 @@ dependencies = [
  "loft-config",
  "loft-docs",
  "loft-protocol",
+ "loft-terminal",
  "serde_json",
  "tokio",
  "tracing",

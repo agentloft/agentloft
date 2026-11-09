@@ -235,6 +235,7 @@ async fn terminals_stream_output_and_accept_input() {
             root: FsRoot::Project(env.project.id.clone()),
             cols: 80,
             rows: 24,
+            key: Some("main".into()),
         })
         .await
         .unwrap()
@@ -295,6 +296,22 @@ async fn terminals_stream_output_and_accept_input() {
     };
     assert!(String::from_utf8_lossy(&replay.0).contains("loft-42"));
     assert_eq!((info.cols, info.rows), (100, 30));
+
+    // Opening with the same key reattaches to the live shell.
+    let Response::Terminal { terminal: again } = late
+        .request(Request::TerminalOpen {
+            root: FsRoot::Project(env.project.id.clone()),
+            cols: 90,
+            rows: 20,
+            key: Some("main".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(again.id, terminal.id);
+    assert_eq!((again.cols, again.rows), (90, 20));
 
     env.client
         .request(Request::TerminalClose { id: terminal.id })

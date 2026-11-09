@@ -5,6 +5,7 @@ pub mod agent;
 pub mod changes;
 pub mod docs;
 pub mod files;
+pub mod terminal;
 pub mod viewer;
 
 use crate::store::{AppStore, ThreadState};
@@ -38,6 +39,8 @@ struct ThreadPanel {
     changes: Entity<ChangesView>,
     viewers: Vec<(String, Entity<FileViewer>)>,
     agents: Vec<(ItemId, Entity<AgentView>)>,
+    /// The thread's shell, created when the Terminal tab is first shown.
+    terminal: Option<Entity<terminal::TerminalPane>>,
     active: Tab,
     /// Last finished turn we refreshed for.
     seen_turn: Option<TurnId>,
@@ -47,14 +50,9 @@ struct ThreadPanel {
 pub struct WorkbenchPanel {
     store: Entity<AppStore>,
     threads: HashMap<ThreadId, ThreadPanel>,
-    /// Extra tab content provided by the host (terminal).
-    pub terminal: Option<AnyViewFn>,
     /// One shared browser (agents drive it; created on first use).
     browser: Option<Entity<loft_browser::BrowserView>>,
 }
-
-/// Renders a host-provided view for the selected thread.
-pub type AnyViewFn = Box<dyn Fn(&ThreadId, &mut Window, &mut gpui_kit::App) -> AnyElement>;
 
 impl WorkbenchPanel {
     pub fn new(store: Entity<AppStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -62,7 +60,6 @@ impl WorkbenchPanel {
         Self {
             store,
             threads: HashMap::new(),
-            terminal: None,
             browser: None,
         }
     }
@@ -112,6 +109,7 @@ impl WorkbenchPanel {
                     changes,
                     viewers: Vec::new(),
                     agents: Vec::new(),
+                    terminal: None,
                     active: Tab::Files,
                     seen_turn,
                     _subs: subs,
@@ -167,8 +165,32 @@ impl WorkbenchPanel {
         let Some((id, thread)) = self.selected(cx) else {
             return;
         };
-        self.ensure(&id, &thread, window, cx).active = tab;
+        self.ensure(&id, &thread, window, cx).active = tab.clone();
+        if tab == Tab::Terminal {
+            let pane = self.ensure_terminal(&id, window, cx);
+            let handle = gpui_kit::Focusable::focus_handle(&pane.read(cx).view, cx);
+            window.focus(&handle, cx);
+        }
         cx.notify();
+    }
+
+    /// The thread's terminal pane (one reattachable shell per thread).
+    fn ensure_terminal(
+        &mut self,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<terminal::TerminalPane> {
+        let store = self.store.clone();
+        let panel = self.threads.get_mut(thread_id).expect("ensured");
+        panel
+            .terminal
+            .get_or_insert_with(|| {
+                let root = FsRoot::Thread(thread_id.clone());
+                let key = format!("thread:{}", thread_id.as_str());
+                cx.new(|cx| terminal::TerminalPane::new(store, root, key, window, cx))
+            })
+            .clone()
     }
 
     pub fn open_file(
@@ -364,6 +386,9 @@ impl Render for WorkbenchPanel {
             strip = strip.child(chip);
         }
 
+        if active == Tab::Terminal {
+            self.ensure_terminal(&thread_id, window, cx);
+        }
         let panel = self.threads.get(&thread_id).expect("ensured");
         let body: AnyElement = match &active {
             Tab::Files => panel.files.clone().into_any_element(),
@@ -380,8 +405,8 @@ impl Render for WorkbenchPanel {
                 .find(|(i, _)| i == id)
                 .map(|(_, v)| v.clone().into_any_element())
                 .unwrap_or_else(|| div().into_any_element()),
-            Tab::Terminal => match &self.terminal {
-                Some(render) => render(&thread_id, window, cx),
+            Tab::Terminal => match &panel.terminal {
+                Some(pane) => pane.clone().into_any_element(),
                 None => placeholder(&p, IconName::SquareTerminal, "Terminal"),
             },
             Tab::Browser => self.browser(window, cx).into_any_element(),

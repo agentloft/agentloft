@@ -31,6 +31,8 @@ struct Term {
 #[derive(Default)]
 pub struct Terminals {
     map: Mutex<HashMap<TerminalId, Arc<Term>>>,
+    /// Client-chosen keys (e.g. one per thread) → terminal, for reattach.
+    keys: Mutex<HashMap<String, TerminalId>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -47,6 +49,7 @@ impl Terminals {
         cwd: &Path,
         cols: u16,
         rows: u16,
+        key: Option<String>,
         env: &HashMap<String, String>,
         bus: broadcast::Sender<BusMsg>,
     ) -> Result<TerminalInfo, ErrorBody> {
@@ -110,6 +113,13 @@ impl Terminals {
             }),
         });
         lock(&self.map).insert(id.clone(), term.clone());
+        // A terminal previously under this key has exited: drop it.
+        if let Some(key) = key
+            && let Some(old) = lock(&self.keys).insert(key, id.clone())
+            && let Some(old) = lock(&self.map).remove(&old)
+        {
+            let _ = lock(&old.killer).kill();
+        }
 
         // Reader thread: PTY → ring buffer → bus.
         std::thread::Builder::new()
@@ -122,6 +132,21 @@ impl Terminals {
             })
             .map_err(|e| err(format!("spawn reader: {e}")))?;
         Ok(info)
+    }
+
+    /// The live terminal opened under `key`, resized to the caller's grid.
+    pub fn reattach(&self, key: &str, cols: u16, rows: u16) -> Option<TerminalInfo> {
+        let id = lock(&self.keys).get(key).cloned()?;
+        let term = self.get(&id).ok()?;
+        if lock(&term.info).exited.is_some() {
+            return None;
+        }
+        // 0×0 attaches without resizing (e.g. a CLI peeking at a UI's shell).
+        if cols > 0 && rows > 0 {
+            self.resize(&id, cols, rows).ok()?;
+        }
+        let info = lock(&term.info).clone();
+        Some(info)
     }
 
     fn get(&self, id: &TerminalId) -> Result<Arc<Term>, ErrorBody> {
@@ -157,6 +182,7 @@ impl Terminals {
 
     pub fn close(&self, id: &TerminalId) -> Result<(), ErrorBody> {
         let term = lock(&self.map).remove(id);
+        lock(&self.keys).retain(|_, t| t != id);
         if let Some(term) = term {
             let _ = lock(&term.killer).kill();
         }
