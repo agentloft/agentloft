@@ -1371,6 +1371,20 @@ impl WorkspaceView {
                 )
             })
         });
+        // A thread working in the checkout: the branch checked out there.
+        let local_branch = thread.read(cx).model.as_ref().and_then(|m| {
+            (m.items.is_empty() && m.thread.workspace == ThreadWorkspace::Local)
+                .then(|| m.thread.project_id.clone())
+        });
+        let local_branch = local_branch.and_then(|project_id| {
+            self.store
+                .update(cx, |s, cx| s.ensure_branches(&project_id, cx));
+            self.store
+                .read(cx)
+                .branches
+                .get(&project_id)
+                .and_then(|l| l.current.clone())
+        });
         let (worktree_base, base_row) = match pending {
             Some((tid, project_id, workspace)) => {
                 self.store
@@ -1541,6 +1555,13 @@ impl WorkspaceView {
                                 None => "Your first message creates an isolated worktree on a \
                                          new branch"
                                     .to_owned(),
+                            },
+                            ThreadWorkspace::Local => match &local_branch {
+                                Some(b) => format!(
+                                    "Works in {} on {b}, as it is now",
+                                    tilde(&model.thread.cwd)
+                                ),
+                                None => format!("Works in {}", tilde(&model.thread.cwd)),
                             },
                             _ => format!("Works in {}", tilde(&model.thread.cwd)),
                         }),
@@ -1857,24 +1878,18 @@ impl WorkspaceView {
             .trigger(trigger)
             .content(move |_, _, _| picker.clone());
 
-        // Local copy or the remote's, for the chosen branch.
-        let has_local = branch
-            .as_ref()
-            .is_some_and(|b| list.local.iter().any(|l| l == b));
-        let remote = branch.as_ref().and_then(|b| {
-            let mut remotes: Vec<&str> = list
-                .remote
-                .iter()
-                .filter(|r| &r.branch == b)
-                .map(|r| r.remote.as_str())
-                .collect();
-            remotes.sort_by_key(|r| *r != "origin");
-            remotes.first().map(|r| (*r).to_owned())
-        });
+        // Local copy or the remote's. Switching lands on that source's main
+        // branch; the branch list then shows only its branches.
+        let remote = crate::branch_picker::main_remote(list);
         let from_remote = base.as_ref().is_some_and(|b| b.remote.is_some());
         let mut source = h_flex().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(p.muted);
         for (is_remote, label, icon, available) in [
-            (false, "Local".to_owned(), IconName::Laptop, has_local),
+            (
+                false,
+                "Local".to_owned(),
+                IconName::Laptop,
+                !list.local.is_empty(),
+            ),
             (
                 true,
                 remote.clone().unwrap_or_else(|| "origin".into()),
@@ -1884,10 +1899,10 @@ impl WorkspaceView {
         ] {
             let active = from_remote == is_remote;
             let (store, t) = (self.store.clone(), thread_id.clone());
-            let target = branch.clone().map(|b| loft_protocol::WorktreeBase {
-                branch: b,
-                remote: if is_remote { remote.clone() } else { None },
-            });
+            let target = crate::branch_picker::source_default(
+                list,
+                if is_remote { remote.clone() } else { None },
+            );
             source = source.child(
                 h_flex()
                     .id(SharedString::from(format!("base-source-{is_remote}")))

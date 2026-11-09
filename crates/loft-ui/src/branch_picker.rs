@@ -83,6 +83,40 @@ pub fn effective_base(workspace: &ThreadWorkspace, list: &BranchList) -> Option<
     Some(WorktreeBase { branch, remote })
 }
 
+/// The remote to offer: `origin`, else the first one.
+pub fn main_remote(list: &BranchList) -> Option<String> {
+    list.remote
+        .iter()
+        .find(|r| r.remote == "origin")
+        .or_else(|| list.remote.first())
+        .map(|r| r.remote.clone())
+}
+
+/// Branch names available from one source: the local copy (`None`) or a
+/// remote, main branch first.
+pub fn names_in(list: &BranchList, remote: Option<&str>) -> Vec<String> {
+    merged(list)
+        .into_iter()
+        .filter(|b| match remote {
+            None => b.local,
+            Some(r) => b.remotes.iter().any(|x| x == r),
+        })
+        .map(|b| b.name)
+        .collect()
+}
+
+/// The base for switching to a source: its main branch, else its most
+/// recent one.
+pub fn source_default(list: &BranchList, remote: Option<String>) -> Option<WorktreeBase> {
+    let names = names_in(list, remote.as_deref());
+    let branch = list
+        .default_branch
+        .clone()
+        .filter(|d| names.contains(d))
+        .or_else(|| names.first().cloned())?;
+    Some(WorktreeBase { branch, remote })
+}
+
 pub struct BranchPicker {
     store: Entity<AppStore>,
     thread_id: ThreadId,
@@ -158,8 +192,14 @@ impl BranchPicker {
             .map(|m| m.thread.workspace.clone())
             .unwrap_or_default();
         let base = effective_base(&workspace, &list);
+        // Only the chosen source's branches.
+        let remote = base.as_ref().and_then(|b| b.remote.clone());
         let rows = merged(&list)
             .into_iter()
+            .filter(|b| match &remote {
+                None => b.local,
+                Some(r) => b.remotes.contains(r),
+            })
             .filter(|b| self.query.is_empty() || b.name.to_lowercase().contains(&self.query))
             .collect();
         (rows, base, list)
@@ -170,16 +210,10 @@ impl BranchPicker {
         let Some(branch) = rows.get(ix) else {
             return;
         };
-        // Keep the current source when this branch has it.
-        let wants_remote = base.as_ref().is_none_or(|b| b.remote.is_some());
-        let remote = match (wants_remote, branch.remotes.first()) {
-            (true, Some(r)) => Some(r.clone()),
-            _ if branch.local => None,
-            (_, r) => r.cloned(),
-        };
+        // The list only holds the current source's branches.
         let base = WorktreeBase {
             branch: branch.name.clone(),
-            remote,
+            remote: base.and_then(|b| b.remote),
         };
         let t = self.thread_id.clone();
         self.store
@@ -205,6 +239,10 @@ impl Render for BranchPicker {
         if self.highlighted >= rows.len() {
             self.highlighted = rows.len().saturating_sub(1);
         }
+        let source = match base.as_ref().and_then(|b| b.remote.clone()) {
+            Some(r) => format!("Branches on {r}"),
+            None => "Local branches".to_owned(),
+        };
         let mut body = v_flex()
             .id("branch-list")
             .max_h(px(300.))
@@ -253,23 +291,6 @@ impl Render for BranchPicker {
                     )
                     .when(is_default, |d| d.child(badge("default", true, &p)))
                     .when(is_current, |d| d.child(badge("checked out", false, &p)))
-                    // Where it exists: this Mac, the remote.
-                    .child(
-                        Icon::new(IconName::Laptop)
-                            .xsmall()
-                            .text_color(if branch.local {
-                                p.muted_foreground
-                            } else {
-                                p.border
-                            }),
-                    )
-                    .child(Icon::new(IconName::Cloud).xsmall().text_color(
-                        if branch.remotes.is_empty() {
-                            p.border
-                        } else {
-                            p.muted_foreground
-                        },
-                    ))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
                         if this.highlighted != ix {
                             this.highlighted = ix;
@@ -312,6 +333,24 @@ impl Render for BranchPicker {
                             .appearance(false)
                             .small(),
                     ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .px_3()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(p.faint_foreground)
+                    .child(
+                        Icon::new(if source.starts_with("Local") {
+                            IconName::Laptop
+                        } else {
+                            IconName::Cloud
+                        })
+                        .xsmall(),
+                    )
+                    .child(source),
             )
             .child(body)
     }
@@ -363,6 +402,23 @@ mod tests {
         assert!(rows[0].local);
         assert_eq!(rows[0].remotes, ["origin", "upstream"]);
         assert!(!rows[2].local);
+    }
+
+    #[test]
+    fn switching_source_lands_on_its_main_branch() {
+        let l = list();
+        assert_eq!(names_in(&l, None), ["main", "feat/x"]);
+        assert_eq!(names_in(&l, Some("origin")), ["main", "release"]);
+        assert_eq!(main_remote(&l).as_deref(), Some("origin"));
+        let local = source_default(&l, None).unwrap();
+        assert_eq!((local.branch.as_str(), local.remote), ("main", None));
+        let mut no_main = l.clone();
+        no_main.default_branch = Some("feat/x".into());
+        let origin = source_default(&no_main, Some("origin".into())).unwrap();
+        assert_eq!(
+            origin.branch, "main",
+            "most recent on origin when it lacks the main branch"
+        );
     }
 
     #[test]
