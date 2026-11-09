@@ -49,6 +49,26 @@ impl Harness for CodexHarness {
         probe_models(&binary, env)
     }
 
+    fn list_commands(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        binary: Option<PathBuf>,
+        cwd: &str,
+    ) -> Result<Vec<loft_protocol::SlashCommandInfo>> {
+        let binary = match binary {
+            Some(b) => b,
+            None => loft_config::which("codex", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .context("`codex` not found on PATH")?,
+        };
+        let reply = app_server_call(
+            &binary,
+            env,
+            "skills/list",
+            serde_json::json!({ "cwds": [cwd] }),
+        )?;
+        Ok(translate::codex_commands(&translate::skills_from(&reply)))
+    }
+
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
         let binary = resolve_binary(&cfg)?;
         let mut cmd = Command::new(&binary);
@@ -274,6 +294,76 @@ fn probe_models(
             anyhow::bail!("model/list: {err}");
         }
         Ok(translate::models(&reply["result"]))
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// One request to a short-lived `codex app-server`: its `result`.
+fn app_server_call(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use std::io::{BufRead as _, Write as _};
+    let mut child = std::process::Command::new(binary)
+        .arg("app-server")
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let stdout = child.stdout.take().context("stdout")?;
+    // Read on a thread so a stuck CLI can't hang us past the deadline.
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let wait_for = |id: u64| -> Result<serde_json::Value> {
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx
+                .recv_timeout(left)
+                .context("codex app-server didn't answer")?;
+            if v["id"] == id {
+                return Ok(v);
+            }
+        }
+    };
+    let mut send = |v: serde_json::Value| -> Result<()> {
+        writeln!(stdin, "{v}")?;
+        Ok(stdin.flush()?)
+    };
+    let result = (|| {
+        send(
+            serde_json::json!({"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "agentloft", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"experimentalApi": true}
+            }}),
+        )?;
+        wait_for(1)?;
+        send(serde_json::json!({"method": "initialized"}))?;
+        send(serde_json::json!({"id": 2, "method": method, "params": params}))?;
+        let reply = wait_for(2)?;
+        if let Some(err) = reply.get("error") {
+            anyhow::bail!("{method}: {err}");
+        }
+        Ok(reply["result"].clone())
     })();
     let _ = child.kill();
     let _ = child.wait();

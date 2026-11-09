@@ -39,7 +39,14 @@ impl Completion {
     pub fn insertion(&self) -> Option<String> {
         let item = self.items.get(self.selected)?;
         Some(match self.kind {
-            Kind::Slash => format!("/{item} "),
+            Kind::Slash => match self
+                .info
+                .get(self.selected)
+                .filter(|i| !i.insert.is_empty())
+            {
+                Some(info) => format!("{} ", info.insert),
+                None => format!("/{item} "),
+            },
             Kind::File => format!("@{item} "),
         })
     }
@@ -133,7 +140,10 @@ pub fn popover(
                     IconName::WandSparkles
                 },
                 info.map(|i| i.description.clone()).unwrap_or_default(),
-                format!("/{item}"),
+                match info.filter(|i| !i.insert.is_empty()) {
+                    Some(i) => i.insert.clone(),
+                    None => format!("/{item}"),
+                },
             ),
             Kind::File => {
                 let (dir, name) = match item.rsplit_once('/') {

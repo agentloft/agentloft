@@ -1128,6 +1128,31 @@ impl WorkspaceView {
                 _ => None,
             }
         };
+        // Codex commands Agentloft runs itself.
+        if harness == loft_protocol::HarnessId::CODEX && pasted.is_empty() && notes.is_empty() {
+            let done = match typed.as_str() {
+                "/model" => {
+                    let picker = self.model_picker_for(thread_id, window, cx);
+                    picker.update(cx, |p, cx| p.reset(window, cx));
+                    self.picker_open = true;
+                    true
+                }
+                "/diff" => {
+                    self.open_tab(Tab::Changes, window, cx);
+                    true
+                }
+                "/new" => {
+                    self.new_thread(None, cx);
+                    true
+                }
+                _ => false,
+            };
+            if done {
+                composer.update(cx, |c, cx| c.set_value("", window, cx));
+                cx.notify();
+                return;
+            }
+        }
         if let Some(kind) = report.filter(|_| pasted.is_empty() && notes.is_empty())
             && let Some(thread) = self.store.read(cx).threads.get(thread_id).cloned()
         {
@@ -1683,9 +1708,31 @@ impl WorkspaceView {
                             t.command_info.clone()
                         }
                     })
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| {
+                        // Before its session reports them: what the agent
+                        // said when asked directly (Codex's skills), else
+                        // the commands Agentloft runs for it.
+                        let asked = thread.and_then(|t| {
+                            store
+                                .commands
+                                .get(&(t.harness.as_str().to_owned(), t.cwd.clone()))
+                                .cloned()
+                                .flatten()
+                        });
+                        match (asked, thread.map(|t| t.harness.as_str())) {
+                            (Some(list), _) if !list.is_empty() => list,
+                            (_, Some(loft_protocol::HarnessId::CODEX)) => {
+                                loft_protocol::codex_builtin_commands()
+                            }
+                            _ => Vec::new(),
+                        }
+                    });
                 let info = match_commands(&commands, &query);
                 let items: Vec<String> = info.iter().map(|c| c.name.clone()).collect();
+                // Keep the chosen row in view (a new list starts at the top).
+                if !items.is_empty() {
+                    scroll.scroll_to_item(previous.min(items.len() - 1));
+                }
                 self.completion = (!items.is_empty()).then(|| Completion {
                     thread_id: thread_id.clone(),
                     kind,
@@ -2550,6 +2597,18 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
+        // Codex's skills, asked up front so `/` lists them at once.
+        if self.rendering_focused {
+            let ask = thread.read(cx).model.as_ref().and_then(|m| {
+                (m.thread.harness.as_str() == loft_protocol::HarnessId::CODEX
+                    && m.thread.command_info.is_empty())
+                .then(|| (m.thread.harness.as_str().to_owned(), m.thread.cwd.clone()))
+            });
+            if let Some((harness, cwd)) = ask {
+                self.store
+                    .update(cx, |s, cx| s.ensure_commands(&harness, &cwd, cx));
+            }
+        }
         let tl_width = self
             .timeline_widths
             .entry(thread.read(cx).id.clone())

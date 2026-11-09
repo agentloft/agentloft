@@ -228,4 +228,14 @@ pub trait Harness: Send + Sync + 'static {
     ) -> anyhow::Result<Vec<loft_protocol::ModelInfo>> {
         Ok(Vec::new())
     }
+    /// Slash commands and skills for `cwd`, without a session. Blocking
+    /// (may start the CLI briefly). Empty = they come with the session.
+    fn list_commands(
+        &self,
+        _env: &HashMap<String, String>,
+        _binary: Option<PathBuf>,
+        _cwd: &str,
+    ) -> anyhow::Result<Vec<loft_protocol::SlashCommandInfo>> {
+        Ok(Vec::new())
+    }
 }

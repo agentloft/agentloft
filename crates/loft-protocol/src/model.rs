@@ -23,6 +23,48 @@ pub struct SlashCommandInfo {
     /// One of the agent's own commands (vs. a skill or plugin).
     #[serde(default)]
     pub builtin: bool,
+    /// What picking it puts in the composer when not `/name` (e.g. a
+    /// Codex skill's `$name`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub insert: String,
+}
+
+/// The commands Agentloft runs for Codex (through its app-server or the
+/// app itself); its skills come on top, once its session reports them.
+pub fn codex_builtin_commands() -> Vec<SlashCommandInfo> {
+    let c = |name: &str, hint: &str, description: &str| SlashCommandInfo {
+        name: name.into(),
+        description: description.into(),
+        argument_hint: hint.into(),
+        builtin: true,
+        insert: String::new(),
+    };
+    vec![
+        c(
+            "review",
+            "[instructions]",
+            "Review the uncommitted changes (or follow your instructions)",
+        ),
+        c(
+            "compact",
+            "",
+            "Free up context by summarizing the conversation so far",
+        ),
+        c(
+            "goal",
+            "[objective | pause | resume | clear]",
+            "Set a goal Codex keeps working toward until it is done (no argument: show it)",
+        ),
+        c(
+            "init",
+            "",
+            "Create an AGENTS.md with instructions for this repository",
+        ),
+        c("status", "", "Account, limits and this thread's token use"),
+        c("model", "", "Choose the model and reasoning effort"),
+        c("diff", "", "Show this thread's changes"),
+        c("new", "", "Start a new thread"),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

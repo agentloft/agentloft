@@ -56,6 +56,10 @@ pub struct McpBridge {
     pub home: PathBuf,
 }
 
+/// Slash commands per (harness, folder), with when they were asked.
+type CommandCache =
+    HashMap<(String, String), (std::time::Instant, Vec<loft_protocol::SlashCommandInfo>)>;
+
 pub struct CoreOptions {
     pub env: Arc<HashMap<String, String>>,
     pub config: loft_config::Config,
@@ -100,6 +104,8 @@ pub struct Core {
     config: std::sync::RwLock<loft_config::Config>,
     /// `ListModels` answers per harness (probing Codex starts its CLI).
     models: Mutex<HashMap<String, Vec<loft_protocol::ModelInfo>>>,
+    /// Slash commands per (harness, folder), with when they were asked.
+    commands: Mutex<CommandCache>,
     /// Worktree setup commands to run before a thread's first prompt.
     pending_setup: Mutex<HashMap<ThreadId, String>>,
     /// File lists per directory for `FindFiles`, briefly cached.
@@ -131,6 +137,7 @@ impl Core {
             worktree_lock: tokio::sync::Mutex::new(()),
             config: std::sync::RwLock::new(opts.config.clone()),
             models: Mutex::new(HashMap::new()),
+            commands: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
             file_index: Mutex::new(HashMap::new()),
             opts,
@@ -350,6 +357,37 @@ impl Core {
             lock(&self.models).insert(harness.as_str().to_owned(), models.clone());
         }
         Ok(Response::Models { models })
+    }
+
+    /// The commands `harness` offers in `cwd` (asked without a session;
+    /// kept for a few minutes, as skills can change on disk).
+    async fn list_commands(&self, harness: &HarnessId, cwd: String) -> CoreResult<Response> {
+        const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        let key = (harness.as_str().to_owned(), cwd.clone());
+        if let Some((at, commands)) = lock(&self.commands).get(&key)
+            && at.elapsed() < FRESH_FOR
+        {
+            return Ok(Response::Commands {
+                commands: commands.clone(),
+            });
+        }
+        let h = self.harness(harness).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::BadRequest,
+                format!("unknown harness `{harness}`"),
+            )
+        })?;
+        let hcfg = harness_config(&self.config(), harness);
+        let binary = (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path));
+        let env = agent_env(&self.opts.env, &hcfg);
+        let commands = tokio::task::spawn_blocking(move || h.list_commands(&env, binary, &cwd))
+            .await
+            .map_err(internal)?
+            .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
+        if !commands.is_empty() {
+            lock(&self.commands).insert(key, (std::time::Instant::now(), commands.clone()));
+        }
+        Ok(Response::Commands { commands })
     }
 
     fn reload_config(&self) -> CoreResult<Response> {
@@ -637,6 +675,7 @@ impl Core {
             }
             Request::ReloadConfig => self.reload_config(),
             Request::ListModels { harness } => self.list_models(&harness).await,
+            Request::ListCommands { harness, cwd } => self.list_commands(&harness, cwd).await,
             Request::ProbeHarness { harness } => self.probe_harness(&harness).await,
             Request::FindFiles { root, query, limit } => {
                 let dir = self.root_dir(&root)?;

@@ -540,6 +540,7 @@ impl Translator {
                         description: str_at(c, "description").unwrap_or_default().to_owned(),
                         argument_hint: str_at(c, "argumentHint").unwrap_or_default().to_owned(),
                         builtin: c.get("builtin").and_then(Value::as_bool).unwrap_or(false),
+                        insert: String::new(),
                     })
                 })
                 .collect();

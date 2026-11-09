@@ -805,6 +805,36 @@ impl ThreadActor {
                     }])?;
                 }
             }
+            // A turn the agent started itself (Codex working toward a goal):
+            // track it like one we started, without a message from the user.
+            HarnessEvent::TurnStarted if self.turn.is_none() && self.pending_start.is_none() => {
+                let now = now_ms();
+                let ordinal = self
+                    .core
+                    .with_store(|s| s.next_turn_ordinal(&self.thread.id))?;
+                let turn = Turn {
+                    id: TurnId::new(),
+                    thread_id: self.thread.id.clone(),
+                    ordinal,
+                    status: TurnStatus::Running,
+                    started_at_ms: now,
+                    ended_at_ms: None,
+                    usage: None,
+                    error: None,
+                    checkpoint_before: None,
+                    checkpoint_after: None,
+                    native_turn: None,
+                };
+                self.thread.status = ThreadStatus::Running;
+                self.thread.updated_at_ms = now;
+                self.core.commit(vec![
+                    Event::TurnStarted { turn: turn.clone() },
+                    Event::ThreadUpdated {
+                        thread: self.thread.clone(),
+                    },
+                ])?;
+                self.turn = Some(turn);
+            }
             HarnessEvent::TurnStarted => {}
             HarnessEvent::ItemStarted {
                 native_id,

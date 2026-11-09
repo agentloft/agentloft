@@ -231,6 +231,12 @@ pub enum Request {
     ListModels {
         harness: HarnessId,
     },
+    /// The slash commands (and skills) `harness` offers in `cwd`, asked of
+    /// the agent without a session (answers `Response::Commands`).
+    ListCommands {
+        harness: HarnessId,
+        cwd: String,
+    },
     /// Ask the daemon to exit (graceful shutdown or upgrade).
     Shutdown {
         reason: ShutdownReason,
@@ -421,6 +427,9 @@ pub enum Response {
     },
     Models {
         models: Vec<ModelInfo>,
+    },
+    Commands {
+        commands: Vec<SlashCommandInfo>,
     },
     HarnessStatus {
         status: HarnessStatus,

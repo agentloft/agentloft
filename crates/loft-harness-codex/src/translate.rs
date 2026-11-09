@@ -28,6 +28,14 @@ enum Pending {
     ThreadResume,
     ThreadFork,
     TurnStart,
+    /// The skills Codex has (`skills/list`).
+    Skills,
+    /// A request whose answer (or error) doesn't matter.
+    Quiet,
+    /// `/goal`: show the goal that comes back.
+    GoalShow,
+    /// `/goal pause|resume|clear`: say this once it's done.
+    GoalSay(&'static str),
     /// One part of a status query.
     Query {
         query: u64,
@@ -112,6 +120,77 @@ pub struct Translator {
     next_query: u64,
     /// The thread's latest `tokenUsage` (totals and the context window).
     token_usage: Option<Value>,
+    /// Skills by name → their SKILL.md (sent with a `$name` mention).
+    skills: Vec<(String, String)>,
+    /// We asked for a turn and its `turn/started` hasn't come yet (any other
+    /// `turn/started` is Codex starting one itself, e.g. to pursue a goal).
+    own_turn_pending: bool,
+    /// Set the goal active once our turn toward it has started.
+    activate_goal: bool,
+    next_note: u64,
+}
+
+/// What `/init` asks Codex to do (Codex's own command isn't available over
+/// the app-server).
+const INIT_PROMPT: &str = "Create an AGENTS.md file at the root of this repository with instructions for coding agents working here: a short overview of the project and its layout, how to build, run and test it, the code style and conventions in use, and anything easy to get wrong. Base it on the code itself (read the build files, README and a sample of the source), keep it concise, and don't invent commands that don't exist.";
+
+/// `(name, path, description)` of the enabled skills in a `skills/list`
+/// result.
+pub fn skills_from(result: &Value) -> Vec<(String, String, String)> {
+    let mut list: Vec<(String, String, String)> = Vec::new();
+    for entry in result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for s in entry
+            .get("skills")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if s.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let (Some(name), Some(path)) = (
+                s.get("name").and_then(Value::as_str),
+                s.get("path").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if list.iter().any(|(n, ..)| n == name) {
+                continue;
+            }
+            let description = s
+                .pointer("/interface/shortDescription")
+                .or_else(|| s.get("shortDescription"))
+                .or_else(|| s.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            list.push((name.to_owned(), path.to_owned(), description));
+        }
+    }
+    list
+}
+
+/// The commands the composer offers for Codex: the ones Agentloft runs
+/// (through the app-server or its own UI), then the skills.
+pub fn codex_commands(skills: &[(String, String, String)]) -> Vec<loft_protocol::SlashCommandInfo> {
+    let mut out = loft_protocol::codex_builtin_commands();
+    out.extend(
+        skills
+            .iter()
+            .map(|(name, _, description)| loft_protocol::SlashCommandInfo {
+                name: name.clone(),
+                description: description.clone(),
+                argument_hint: String::new(),
+                builtin: false,
+                insert: format!("${name}"),
+            }),
+    );
+    out
 }
 
 impl Translator {
@@ -238,8 +317,128 @@ impl Translator {
         }
     }
 
-    fn turn_start(&mut self, text: &str, images: &[String], thread: &str) -> Value {
+    fn turn_start(&mut self, text: &str, images: &[String], thread: &str) -> Vec<Out> {
+        let trimmed = text.trim();
+        if let Some(rest) = trimmed.strip_prefix("/goal")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return self.goal_command(rest.trim(), thread);
+        }
+        vec![Out::Send(self.turn_start_request(text, images, thread))]
+    }
+
+    /// `/goal [objective | pause | resume | clear]`.
+    fn goal_command(&mut self, args: &str, thread: &str) -> Vec<Out> {
+        let id = json!({ "threadId": thread });
+        let set = |status: &str| json!({ "threadId": thread, "status": status, "origin": "user" });
+        match args {
+            "" => vec![Out::Send(self.request(
+                Pending::GoalShow,
+                "thread/goal/get",
+                id,
+            ))],
+            "pause" => vec![Out::Send(self.request(
+                Pending::GoalSay("Goal paused."),
+                "thread/goal/set",
+                set("paused"),
+            ))],
+            "resume" => vec![Out::Send(self.request(
+                Pending::GoalSay("Goal resumed: Codex picks it back up."),
+                "thread/goal/set",
+                set("active"),
+            ))],
+            "clear" => vec![Out::Send(self.request(
+                Pending::GoalSay("Goal cleared."),
+                "thread/goal/clear",
+                json!({ "threadId": thread, "origin": "user" }),
+            ))],
+            objective => {
+                // Paused until our turn starts, so Codex can't start one first.
+                let clear = self.request(Pending::Quiet, "thread/goal/clear", id);
+                let goal = self.request(
+                    Pending::Quiet,
+                    "thread/goal/set",
+                    json!({ "threadId": thread, "objective": objective, "status": "paused", "origin": "user" }),
+                );
+                let prompt = format!(
+                    "This thread's goal is already set. Do not call create_goal. Start working on it now: {objective}"
+                );
+                self.activate_goal = true;
+                let turn = self.turn_start_request(&prompt, &[], thread);
+                vec![Out::Send(clear), Out::Send(goal), Out::Send(turn)]
+            }
+        }
+    }
+
+    /// A reply from Agentloft itself that ends the current turn.
+    fn say(&mut self, text: String) -> Vec<Out> {
+        self.own_turn_pending = false;
+        self.next_note += 1;
+        let native_id = format!("loft-note-{}", self.next_note);
+        vec![
+            Out::Event(HarnessEvent::ItemStarted {
+                parent: None,
+                native_id: native_id.clone(),
+                body: ItemBody::AssistantMessage {
+                    text: String::new(),
+                },
+            }),
+            Out::Event(HarnessEvent::ItemCompleted {
+                native_id,
+                body: Some(ItemBody::AssistantMessage { text }),
+                tool_result: None,
+                status: ItemStatus::Completed,
+            }),
+            Out::Event(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                usage: None,
+                error: None,
+            }),
+        ]
+    }
+
+    fn turn_start_request(&mut self, text: &str, images: &[String], thread: &str) -> Value {
+        // Codex commands, run through the app-server as turns of their own.
+        let trimmed = text.trim();
+        if trimmed == "/compact" {
+            return self.request(
+                Pending::TurnStart,
+                "thread/compact/start",
+                json!({ "threadId": thread }),
+            );
+        }
+        if let Some(rest) = trimmed.strip_prefix("/review")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let rest = rest.trim();
+            let target = if rest.is_empty() {
+                json!({ "type": "uncommittedChanges" })
+            } else {
+                json!({ "type": "custom", "instructions": rest })
+            };
+            return self.request(
+                Pending::TurnStart,
+                "review/start",
+                json!({ "threadId": thread, "target": target }),
+            );
+        }
+        let text = if trimmed == "/init" {
+            INIT_PROMPT
+        } else {
+            text
+        };
         let mut input = vec![json!({ "type": "text", "text": text })];
+        // `$skill` mentions bring the skill along.
+        for word in text.split_whitespace() {
+            let name = word
+                .trim_start_matches('$')
+                .trim_end_matches(|c: char| !c.is_alphanumeric());
+            if word.starts_with('$')
+                && let Some((_, path)) = self.skills.iter().find(|(n, _)| n == name)
+            {
+                input.push(json!({ "type": "skill", "name": name, "path": path }));
+            }
+        }
         input.extend(
             images
                 .iter()
@@ -271,9 +470,10 @@ impl Translator {
     pub fn start_turn_with(&mut self, text: &str, images: &[String]) -> Vec<Out> {
         self.interrupted = false;
         self.usage = None;
+        self.own_turn_pending = true;
         let mut out = vec![Out::Event(HarnessEvent::TurnStarted)];
         match self.thread_id.clone() {
-            Some(thread) => out.push(Out::Send(self.turn_start(text, images, &thread))),
+            Some(thread) => out.extend(self.turn_start(text, images, &thread)),
             None => self.queued.push_back((text.to_owned(), images.to_vec())),
         }
         out
@@ -350,6 +550,35 @@ impl Translator {
         let Some(kind) = id.as_u64().and_then(|id| self.pending.remove(&id)) else {
             return vec![];
         };
+        match kind {
+            Pending::Quiet => return vec![],
+            Pending::GoalSay(text) => {
+                return match v.get("error") {
+                    Some(err) => self.say(format!(
+                        "Codex: {}",
+                        err.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("goal request failed")
+                    )),
+                    None => self.say(text.to_owned()),
+                };
+            }
+            Pending::GoalShow => {
+                let goal = v.pointer("/result/goal").filter(|g| !g.is_null());
+                let text = match goal {
+                    None => "No goal is set. Start one with `/goal <objective>`.".to_owned(),
+                    Some(g) => format!(
+                        "**Goal:** {}\n\nStatus: {}",
+                        g.get("objective")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(none)"),
+                        g.get("status").and_then(Value::as_str).unwrap_or("unknown")
+                    ),
+                };
+                return self.say(text);
+            }
+            _ => {}
+        }
         if let Pending::Query { query, part } = kind {
             // A part that failed is just missing from the report.
             let value = v.get("result").cloned().unwrap_or(Value::Null);
@@ -394,6 +623,10 @@ impl Translator {
                         error: Some(format!("Codex: {msg}")),
                     })]
                 }
+                Pending::Skills => vec![Out::Event(HarnessEvent::CommandsAvailable(
+                    codex_commands(&[]),
+                ))],
+                Pending::Quiet | Pending::GoalShow | Pending::GoalSay(_) => vec![],
                 Pending::Other | Pending::Query { .. } => vec![Out::Event(HarnessEvent::Notice {
                     level: NoticeLevel::Warning,
                     text: format!("Codex: {msg}"),
@@ -427,18 +660,48 @@ impl Translator {
                         .map(str::to_owned),
                     slash_commands: vec![],
                 })];
+                let cwd = self.cwd.clone();
+                out.push(Out::Send(self.request(
+                    Pending::Skills,
+                    "skills/list",
+                    json!({ "cwds": [cwd] }),
+                )));
                 while let Some((text, images)) = self.queued.pop_front() {
-                    out.push(Out::Send(self.turn_start(&text, &images, &thread)));
+                    out.extend(self.turn_start(&text, &images, &thread));
                 }
                 out
+            }
+            Pending::Skills => {
+                let list = skills_from(result);
+                self.skills = list
+                    .iter()
+                    .map(|(n, p, _)| (n.clone(), p.clone()))
+                    .collect();
+                vec![Out::Event(HarnessEvent::CommandsAvailable(codex_commands(
+                    &list,
+                )))]
             }
             Pending::TurnStart => {
                 if let Some(turn) = result.pointer("/turn/id").and_then(Value::as_str) {
                     self.turn_id = Some(turn.to_owned());
                 }
+                // Our turn toward a new goal is running: let the goal go.
+                if std::mem::take(&mut self.activate_goal)
+                    && let Some(thread) = self.thread_id.clone()
+                {
+                    return vec![Out::Send(self.request(
+                        Pending::Quiet,
+                        "thread/goal/set",
+                        json!({ "threadId": thread, "status": "active", "origin": "user" }),
+                    ))];
+                }
                 vec![]
             }
-            Pending::Other | Pending::Query { .. } => vec![],
+            Pending::Other
+            | Pending::Query { .. }
+            | Pending::Quiet
+            | Pending::GoalShow
+            | Pending::GoalSay(_) => vec![],
         }
     }
 
@@ -448,11 +711,26 @@ impl Translator {
                 if let Some(turn) = p.pointer("/turn/id").and_then(Value::as_str) {
                     self.turn_id = Some(turn.to_owned());
                 }
-                vec![]
+                if std::mem::take(&mut self.own_turn_pending) {
+                    vec![]
+                } else {
+                    // Codex started this one itself (e.g. working toward a goal).
+                    self.interrupted = false;
+                    self.usage = None;
+                    vec![Out::Event(HarnessEvent::TurnStarted)]
+                }
             }
             "item/started" => item_started(p.get("item").unwrap_or(&Value::Null), &self.cwd)
                 .map(|e| vec![Out::Event(e)])
                 .unwrap_or_default(),
+            "item/completed"
+                if p.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction") =>
+            {
+                vec![Out::Event(HarnessEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text: "Conversation compacted: earlier turns are summarized for Codex.".into(),
+                })]
+            }
             "item/completed" => item_completed(p.get("item").unwrap_or(&Value::Null), &self.cwd)
                 .map(|e| vec![Out::Event(e)])
                 .unwrap_or_default(),
@@ -1431,6 +1709,90 @@ mod tests {
         assert_eq!(v["account"]["account"]["email"], "a@b");
         assert!(v["rateLimits"].is_null());
         assert_eq!(v["session"]["cwd"], "/w");
+    }
+
+    #[test]
+    fn commands_and_skills() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        let review = t.turn_start_request("/review", &[], "T1");
+        assert_eq!(review["method"], "review/start");
+        assert_eq!(review["params"]["target"]["type"], "uncommittedChanges");
+        let custom = t.turn_start_request("/review look at auth", &[], "T1");
+        assert_eq!(custom["params"]["target"]["instructions"], "look at auth");
+        assert_eq!(
+            t.turn_start_request("/compact", &[], "T1")["method"],
+            "thread/compact/start"
+        );
+        let init = t.turn_start_request("/init", &[], "T1");
+        assert!(
+            init["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("AGENTS.md")
+        );
+        // Skills arrive as commands that insert `$name`, and a mention sends the skill.
+        let id = t.request(Pending::Skills, "skills/list", json!({}))["id"]
+            .as_u64()
+            .unwrap();
+        let out = t.on_line(&format!(
+            r#"{{"id":{id},"result":{{"data":[{{"cwd":"/w","errors":[],"skills":[{{"name":"pdf","path":"/s/pdf/SKILL.md","description":"PDFs","enabled":true,"scope":"user"}}]}}]}}}}"#
+        ));
+        let [Out::Event(HarnessEvent::CommandsAvailable(cmds))] = out.as_slice() else {
+            panic!("expected the commands");
+        };
+        let pdf = cmds.iter().find(|c| c.name == "pdf").unwrap();
+        assert_eq!(pdf.insert, "$pdf");
+        assert!(cmds.iter().any(|c| c.name == "review" && c.builtin));
+        let turn = t.turn_start_request("use $pdf on this", &[], "T1");
+        assert_eq!(turn["params"]["input"][1]["type"], "skill");
+        assert_eq!(turn["params"]["input"][1]["path"], "/s/pdf/SKILL.md");
+    }
+
+    #[test]
+    fn goals_and_codex_started_turns() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        t.thread_id = Some("T1".into());
+        let sent = |out: &[Out]| -> Vec<(String, Value)> {
+            out.iter()
+                .filter_map(|o| match o {
+                    Out::Send(v) => {
+                        Some((v["method"].as_str().unwrap_or("").to_owned(), v.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // A new goal: cleared, set paused, then our turn; active once it runs.
+        let out = t.start_turn_with("/goal make the tests pass", &[]);
+        let s = sent(&out);
+        let methods: Vec<&str> = s.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            ["thread/goal/clear", "thread/goal/set", "turn/start"]
+        );
+        assert_eq!(s[1].1["params"]["status"], "paused");
+        let turn_id = s[2].1["id"].as_u64().unwrap();
+        let out = t.on_line(&format!(
+            r#"{{"id":{turn_id},"result":{{"turn":{{"id":"U1"}}}}}}"#
+        ));
+        assert_eq!(sent(&out)[0].1["params"]["status"], "active");
+        // Our own turn starting isn't reported again; one Codex starts is.
+        assert!(
+            events(&t.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"U1"}}}"#))
+                .is_empty()
+        );
+        let out = t.on_line(r#"{"method":"turn/started","params":{"turn":{"id":"U2"}}}"#);
+        assert!(matches!(events(&out)[0], HarnessEvent::TurnStarted));
+        // `/goal pause` answers itself and ends the turn.
+        let out = t.start_turn_with("/goal pause", &[]);
+        let id = sent(&out)[0].1["id"].as_u64().unwrap();
+        let out = t.on_line(&format!(r#"{{"id":{id},"result":{{"goal":null}}}}"#));
+        let ev = events(&out);
+        assert!(matches!(
+            ev.last(),
+            Some(HarnessEvent::TurnCompleted { .. })
+        ));
+        assert!(ev.iter().any(|e| matches!(e, HarnessEvent::ItemCompleted { body: Some(ItemBody::AssistantMessage { text }), .. } if text == "Goal paused.")));
     }
 
     #[test]

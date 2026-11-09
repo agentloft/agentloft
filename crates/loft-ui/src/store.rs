@@ -101,6 +101,9 @@ pub struct AppStore {
     pub panes: Vec<ThreadId>,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
+    /// Commands an agent offers in a folder, asked without a session
+    /// (Codex's skills), by (harness, folder); `None` while asking.
+    pub commands: HashMap<(String, String), Option<Vec<loft_protocol::SlashCommandInfo>>>,
     /// Harness for new threads (the last one the user picked).
     pub default_harness: HarnessId,
     /// Messages typed while a turn was running, sent when it ends.
@@ -144,6 +147,7 @@ impl AppStore {
             selected: None,
             panes: Vec::new(),
             next_in_new_pane: false,
+            commands: HashMap::new(),
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
             last_error: None,
@@ -572,6 +576,25 @@ impl AppStore {
         self.next_in_new_pane = false;
         self.selected = Some(id);
         cx.notify();
+    }
+
+    /// Ask (once) which commands `harness` offers in `cwd`.
+    pub fn ensure_commands(&mut self, harness: &str, cwd: &str, cx: &mut Context<Self>) {
+        let key = (harness.to_owned(), cwd.to_owned());
+        if self.commands.contains_key(&key) || self.client.is_none() {
+            return;
+        }
+        self.commands.insert(key.clone(), None);
+        let body = Request::ListCommands {
+            harness: HarnessId(harness.to_owned()),
+            cwd: cwd.to_owned(),
+        };
+        self.request(body, cx, move |s, response, cx| {
+            if let Response::Commands { commands } = response {
+                s.commands.insert(key, Some(commands));
+                cx.notify();
+            }
+        });
     }
 
     /// Show `thread` in a pane of its own beside the focused one.
