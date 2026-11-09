@@ -18,7 +18,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div,
     prelude::FluentBuilder as _, px,
 };
-use loft_protocol::{ProjectId, ThreadId, ThreadStatus};
+use loft_protocol::{HarnessId, ProjectId, ThreadId, ThreadStatus};
 use std::collections::HashMap;
 
 actions!(
@@ -113,6 +113,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 pub struct WorkspaceView {
     store: Entity<AppStore>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
+    composer_harness: HashMap<ThreadId, HarnessId>,
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
     query: String,
@@ -146,6 +147,7 @@ impl WorkspaceView {
         Self {
             store,
             composers: HashMap::new(),
+            composer_harness: HashMap::new(),
             observed: HashMap::new(),
             search,
             query: String::new(),
@@ -254,14 +256,34 @@ impl WorkspaceView {
             let sub = cx.observe(thread, |_, _, cx| cx.notify());
             self.observed.insert(id.clone(), sub);
         }
-        if let Some(c) = self.composers.get(&id) {
-            return c.clone();
+        let harness_now = thread
+            .read(cx)
+            .model
+            .as_ref()
+            .map(|m| m.thread.harness.clone());
+        if let Some(c) = self.composers.get(&id).cloned() {
+            // Keep the placeholder in sync after a harness switch.
+            if let Some(h) = harness_now
+                && self.composer_harness.get(&id) != Some(&h)
+            {
+                c.update(cx, |c, cx| {
+                    c.set_placeholder(placeholder_for(&h), window, cx)
+                });
+                self.composer_harness.insert(id.clone(), h);
+            }
+            return c;
         }
+        let thread_harness = thread
+            .read(cx)
+            .model
+            .as_ref()
+            .map(|m| m.thread.harness.clone())
+            .unwrap_or_else(HarnessId::claude);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 12)
                 .submit_on_enter(true)
-                .placeholder("Ask Claude to build, fix or explain something…")
+                .placeholder(placeholder_for(&thread_harness))
         });
         let thread_id = id.clone();
         let sub = cx.subscribe_in(&composer, window, move |this, state, event, window, cx| {
@@ -270,6 +292,7 @@ impl WorkspaceView {
             }
         });
         self._subs.push(sub);
+        self.composer_harness.insert(id.clone(), thread_harness);
         self.composers.insert(id, composer.clone());
         composer
     }
@@ -649,7 +672,7 @@ impl WorkspaceView {
             .model
             .clone()
             .map(|m| pretty_model(&m))
-            .unwrap_or_else(|| "Claude".into());
+            .unwrap_or_else(|| harness_name(&model.thread.harness).into());
         let mode = model
             .thread
             .permission_mode
@@ -671,10 +694,17 @@ impl WorkspaceView {
                         .text_color(p.foreground)
                         .child("What should we work on?"),
                 )
+                .child(harness_picker(
+                    &model.thread.id,
+                    &model.thread.harness,
+                    &self.store,
+                    p,
+                ))
                 .child(
                     div()
-                        .text_sm()
-                        .child(format!("Claude will work in {}", model.thread.cwd)),
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child(format!("Works in {}", model.thread.cwd)),
                 )
                 .into_any_element()
         } else {
@@ -733,7 +763,10 @@ impl WorkspaceView {
                                     .text_xs()
                                     .text_color(p.warning)
                                     .child(Icon::new(IconName::ShieldCheck).xsmall())
-                                    .child("Claude is waiting for your approval"),
+                                    .child(format!(
+                                        "{} is waiting for your approval",
+                                        harness_name(&model.thread.harness)
+                                    )),
                             )
                         })
                         .child(
@@ -858,7 +891,7 @@ impl Render for WorkspaceView {
             Some((
                 project,
                 model.thread.title.clone(),
-                model.thread.harness.to_string(),
+                harness_name(&model.thread.harness).to_owned(),
             ))
         });
 
@@ -1165,7 +1198,92 @@ fn thread_row(
 }
 
 /// `claude-opus-5-5` → `Opus 5.5`.
+pub fn harness_name(h: &HarnessId) -> &'static str {
+    match h.as_str() {
+        HarnessId::CLAUDE => "Claude",
+        HarnessId::CODEX => "Codex",
+        HarnessId::FAKE => "Echo",
+        _ => "Agent",
+    }
+}
+
+fn placeholder_for(h: &HarnessId) -> String {
+    format!(
+        "Ask {} to build, fix or explain something…",
+        harness_name(h)
+    )
+}
+
+/// Claude Code / Codex segmented picker for a thread that hasn't started.
+fn harness_picker(
+    thread_id: &ThreadId,
+    current: &HarnessId,
+    store: &Entity<AppStore>,
+    p: &Palette,
+) -> AnyElement {
+    let mut row = h_flex()
+        .mt_3()
+        .p(px(3.))
+        .gap(px(3.))
+        .rounded(px(10.))
+        .bg(p.muted);
+    for (id, label, icon) in [
+        (HarnessId::CLAUDE, "Claude Code", IconName::Sparkles),
+        (HarnessId::CODEX, "Codex", IconName::SquareTerminal),
+    ] {
+        let active = current.as_str() == id;
+        let store = store.clone();
+        let thread_id = thread_id.clone();
+        row = row.child(
+            h_flex()
+                .id(SharedString::from(format!("harness-{id}")))
+                .gap_1p5()
+                .items_center()
+                .px_3()
+                .py_1p5()
+                .rounded(px(8.))
+                .text_sm()
+                .cursor_pointer()
+                .when(active, |d| {
+                    d.bg(p.background)
+                        .text_color(p.foreground)
+                        .font_weight(FontWeight::MEDIUM)
+                        .shadow_sm()
+                })
+                .when(!active, |d| {
+                    d.text_color(p.muted_foreground)
+                        .hover(|d| d.text_color(p.foreground))
+                })
+                .child(Icon::new(icon).small())
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    if !active {
+                        let (t, h) = (thread_id.clone(), HarnessId(id.into()));
+                        store.update(cx, |s, cx| s.set_thread_harness(t, h, cx));
+                    }
+                }),
+        );
+    }
+    row.into_any_element()
+}
+
 fn pretty_model(id: &str) -> String {
+    if let Some(rest) = id.strip_prefix("gpt-") {
+        // gpt-5.1-codex → GPT-5.1 Codex
+        let mut parts = rest.split('-');
+        let version = parts.next().unwrap_or_default();
+        let tail: Vec<String> = parts
+            .map(|w| {
+                let mut c = w.chars();
+                c.next()
+                    .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                    .unwrap_or_default()
+            })
+            .collect();
+        return format!("GPT-{version} {}", tail.join(" "))
+            .trim()
+            .to_owned();
+    }
     let rest = id.strip_prefix("claude-").unwrap_or(id);
     let mut parts = rest.split('-');
     let Some(family) = parts.next() else {
@@ -1205,6 +1323,7 @@ mod tests {
     fn model_names() {
         assert_eq!(pretty_model("claude-opus-5-5"), "Opus 5.5");
         assert_eq!(pretty_model("claude-sonnet-5-5-20261001"), "Sonnet 5.5");
-        assert_eq!(pretty_model("gpt-5"), "Gpt 5");
+        assert_eq!(pretty_model("gpt-5"), "GPT-5");
+        assert_eq!(pretty_model("gpt-5.1-codex-max"), "GPT-5.1 Codex Max");
     }
 }

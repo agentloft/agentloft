@@ -17,6 +17,7 @@ loft-config = { path = "crates/loft-config" }
 loft-store = { path = "crates/loft-store" }
 loft-harness = { path = "crates/loft-harness" }
 loft-harness-claude = { path = "crates/loft-harness-claude" }
+loft-harness-codex = { path = "crates/loft-harness-codex" }
 loft-core = { path = "crates/loft-core" }
 loft-client = { path = "crates/loft-client" }
 loft-ui = { path = "crates/loft-ui" }

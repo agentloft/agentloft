@@ -77,6 +77,8 @@ pub struct AppStore {
     pub threads: HashMap<ThreadId, Entity<ThreadState>>,
     subs: HashMap<u64, ThreadId>,
     pub selected: Option<ThreadId>,
+    /// Harness for new threads (the last one the user picked).
+    pub default_harness: HarnessId,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
 }
@@ -93,6 +95,7 @@ impl AppStore {
             threads: HashMap::new(),
             subs: HashMap::new(),
             selected: None,
+            default_harness: HarnessId::claude(),
             last_error: None,
         };
         this.connect(cx);
@@ -300,7 +303,7 @@ impl AppStore {
         self.request(
             Request::CreateThread {
                 project_id,
-                harness: HarnessId::claude(),
+                harness: self.default_harness.clone(),
                 title: None,
             },
             cx,
@@ -309,6 +312,21 @@ impl AppStore {
                     store.select_thread(thread.id, cx);
                 }
             },
+        );
+    }
+
+    /// Switch an unstarted thread to another harness (and remember it).
+    pub fn set_thread_harness(
+        &mut self,
+        thread_id: ThreadId,
+        harness: HarnessId,
+        cx: &mut Context<Self>,
+    ) {
+        self.default_harness = harness.clone();
+        self.request(
+            Request::SetThreadHarness { thread_id, harness },
+            cx,
+            |_, _, _| {},
         );
     }
 

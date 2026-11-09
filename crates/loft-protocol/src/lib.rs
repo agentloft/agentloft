@@ -97,6 +97,11 @@ pub enum Request {
         thread_id: ThreadId,
         mode: Option<PermissionMode>,
     },
+    /// Change a thread's harness; only allowed before its first message.
+    SetThreadHarness {
+        thread_id: ThreadId,
+        harness: HarnessId,
+    },
     /// Ask the daemon to exit (graceful shutdown or upgrade).
     Shutdown {
         reason: ShutdownReason,

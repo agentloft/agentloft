@@ -17,6 +17,7 @@ loft-store.workspace = true
 loft-core.workspace = true
 loft-harness.workspace = true
 loft-harness-claude.workspace = true
+loft-harness-codex.workspace = true
 loft-client.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

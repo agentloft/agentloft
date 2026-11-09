@@ -169,6 +169,8 @@ impl SessionEnds {
 
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
+    /// The client may choose the native session id up front (Claude).
+    pub client_session_id: bool,
     pub steer: bool,
     pub live_model_switch: bool,
     pub live_mode_switch: bool,

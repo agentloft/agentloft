@@ -34,6 +34,7 @@ impl Harness for ClaudeHarness {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            client_session_id: true,
             steer: false,
             live_model_switch: true,
             live_mode_switch: true,

@@ -329,6 +329,9 @@ impl Core {
                     .await?;
                 Ok(Response::Json { value })
             }
+            Request::SetThreadHarness { thread_id, harness } => {
+                self.set_thread_harness(&thread_id, harness)
+            }
             Request::ListThreads { query, project_id } => Ok(Response::Json {
                 value: self.list_threads_json(query.as_deref(), project_id.as_ref())?,
             }),
@@ -368,6 +371,34 @@ impl Core {
             project: project.clone(),
         }])?;
         Ok(Response::Project { project })
+    }
+
+    fn set_thread_harness(&self, id: &ThreadId, harness: HarnessId) -> CoreResult<Response> {
+        if self.harness(&harness).is_none() {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                format!("unknown harness `{harness}`"),
+            ));
+        }
+        let (thread, turns) = self.with_store(|s| Ok((s.thread(id)?, s.turns(id)?)))?;
+        let mut thread =
+            thread.ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
+        if !turns.is_empty() {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "a thread keeps its harness once it has started; fork it instead",
+            ));
+        }
+        // Drop any idle actor holding the old thread state.
+        lock(&self.threads).remove(id);
+        thread.harness = harness;
+        thread.native_session_id = None;
+        thread.model = None;
+        thread.updated_at_ms = now_ms();
+        self.commit(vec![Event::ThreadUpdated {
+            thread: thread.clone(),
+        }])?;
+        Ok(Response::Thread { thread })
     }
 
     fn create_thread(

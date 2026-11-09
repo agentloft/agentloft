@@ -26,6 +26,7 @@ impl Harness for FakeHarness {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            client_session_id: true,
             live_model_switch: true,
             live_mode_switch: true,
             ..Default::default()

@@ -327,10 +327,8 @@ impl ThreadActor {
             "codex" => &opts.config.harness.codex,
             _ => &opts.config.harness.claude,
         };
-        let new_session_id = self
-            .thread
-            .native_session_id
-            .is_none()
+        let new_session_id = (self.thread.native_session_id.is_none()
+            && harness.capabilities().client_session_id)
             .then(|| uuid::Uuid::new_v4().to_string());
         let cfg = SessionConfig {
             thread_label: self.thread.id.to_string(),
