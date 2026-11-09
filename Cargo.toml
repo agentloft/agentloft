@@ -21,9 +21,15 @@ loft-core = { path = "crates/loft-core" }
 loft-client = { path = "crates/loft-client" }
 loft-ui = { path = "crates/loft-ui" }
 loft-testkit = { path = "crates/loft-testkit" }
+loft-terminal = { path = "crates/loft-terminal" }
 
 # UI — gpui-kit pins the matching gpui-pre release (ADR-0005)
 gpui-kit = "=0.9.0"
+
+# terminal (ADR-0007): Ghostty's libghostty-vt, built from the pinned Ghostty
+# 1.4.0 source tarball with Zig 0.17 (needs `zig` 0.17.x on PATH or in $ZIG)
+ghostty-vt = { version = "=0.8.0", default-features = false }
+portable-pty = "0.9"
 
 # async / io
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal", "fs"] }
