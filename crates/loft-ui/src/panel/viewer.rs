@@ -30,7 +30,9 @@ enum Content {
     Code(Entity<EditorState>),
     Markdown {
         preview: Entity<TextViewState>,
-        source: Entity<EditorState>,
+        /// The highlighted source, built the first time it's asked for.
+        source: Option<Entity<EditorState>>,
+        text: Arc<str>,
     },
     Image(Arc<Image>),
     Doc(Entity<DocPreview>),
@@ -121,12 +123,26 @@ impl FileViewer {
             Content::External(format!("Binary file ({}).", human_size(file.size)))
         } else {
             let text = String::from_utf8_lossy(&bytes).into_owned();
-            let markdown = matches!(ext.as_str(), "md" | "markdown" | "mdx");
-            let language = if markdown {
-                "markdown"
-            } else {
-                language_for(&self.rel_path)
-            };
+            if matches!(ext.as_str(), "md" | "markdown" | "mdx") {
+                // Rendered first; the highlighted source only when asked for.
+                let preview = cx.new(|cx| {
+                    TextViewState::markdown(&text, cx)
+                        .selectable(true)
+                        .scrollable(true)
+                });
+                self.content = Content::Markdown {
+                    preview,
+                    source: None,
+                    text: text.into(),
+                };
+                if self.show_source {
+                    self.build_source(window, cx);
+                }
+                self.pending = None;
+                cx.notify();
+                return;
+            }
+            let language = language_for(&self.rel_path);
             // Parse before showing, so the file appears already coloured
             // rather than plain and then repainted. The previous content stays
             // up meanwhile.
@@ -142,16 +158,7 @@ impl FileViewer {
                     let highlighter = parse.await;
                     let _ = this.update_in(cx, |this, window, cx| {
                         let source = code_editor(language, &text, highlighter, window, cx);
-                        this.content = if markdown {
-                            let preview = cx.new(|cx| {
-                                TextViewState::markdown(&text, cx)
-                                    .selectable(true)
-                                    .scrollable(true)
-                            });
-                            Content::Markdown { preview, source }
-                        } else {
-                            Content::Code(source)
-                        };
+                        this.content = Content::Code(source);
                         this.pending = None;
                         cx.notify();
                     });
@@ -161,6 +168,38 @@ impl FileViewer {
         };
         self.pending = None;
         cx.notify();
+    }
+
+    /// Highlight a Markdown file's source (off the main thread) for the
+    /// Source toggle.
+    fn build_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Content::Markdown {
+            source: None, text, ..
+        } = &self.content
+        else {
+            return;
+        };
+        let text = text.clone();
+        let rope = Rope::from(&*text);
+        let parse = cx.background_spawn(async move {
+            let mut highlighter = SyntaxHighlighter::new("markdown");
+            highlighter.update(None, &rope, None);
+            highlighter
+        });
+        self.pending = Some(cx.spawn_in(
+            window,
+            async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+                let highlighter = parse.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let editor = code_editor("markdown", &text, highlighter, window, cx);
+                    if let Content::Markdown { source, .. } = &mut this.content {
+                        *source = Some(editor);
+                    }
+                    this.pending = None;
+                    cx.notify();
+                });
+            },
+        ));
     }
 
     fn open_external(&self, cx: &mut Context<Self>) {
@@ -369,6 +408,27 @@ fn header_button(
         .child(label)
 }
 
+/// An icon-only header action, named in its tooltip.
+fn header_icon(
+    id: &'static str,
+    icon: IconName,
+    tooltip: &'static str,
+    p: &Palette,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .p(px(5.))
+        .rounded(px(6.))
+        .text_color(p.muted_foreground)
+        .cursor_pointer()
+        .hover(|d| d.bg(p.hover).text_color(p.foreground))
+        .child(Icon::new(icon).small())
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+        })
+}
+
 impl Render for FileViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
@@ -382,7 +442,7 @@ impl Render for FileViewer {
             .h(px(36.))
             .flex_shrink_0()
             .px_3()
-            .gap_2()
+            .gap_1()
             .items_center()
             .border_b_1()
             .border_color(p.border)
@@ -401,7 +461,8 @@ impl Render for FileViewer {
                     )
                     .child(
                         div()
-                            .flex_shrink_0()
+                            .min_w_0()
+                            .truncate()
                             .font_weight(FontWeight::MEDIUM)
                             .child(name),
                     ),
@@ -409,6 +470,7 @@ impl Render for FileViewer {
             .when(self.size > 0, |d| {
                 d.child(
                     div()
+                        .flex_none()
                         .text_xs()
                         .text_color(p.faint_foreground)
                         .child(human_size(self.size)),
@@ -416,7 +478,7 @@ impl Render for FileViewer {
             })
             .when(is_markdown, |d| {
                 d.child(
-                    header_button(
+                    header_icon(
                         "md-toggle",
                         if self.show_source {
                             IconName::Eye
@@ -424,29 +486,37 @@ impl Render for FileViewer {
                             IconName::Code
                         },
                         if self.show_source {
-                            "Preview"
+                            "Show preview"
                         } else {
-                            "Source"
+                            "Show source"
                         },
                         &p,
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         this.show_source = !this.show_source;
+                        if this.show_source {
+                            this.build_source(window, cx);
+                        }
                         cx.notify();
                     })),
                 )
             })
             .child(
-                header_button("reload", IconName::RefreshCw, "Reload", &p)
+                header_icon("reload", IconName::RefreshCw, "Reload", &p)
                     .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
             )
             .child(
-                header_button("reveal", IconName::FolderOpen, "Reveal", &p)
+                header_icon("reveal", IconName::FolderOpen, "Reveal in Finder", &p)
                     .on_click(cx.listener(|this, _, _, cx| this.reveal(cx))),
             )
             .child(
-                header_button("external", IconName::ExternalLink, "Open", &p)
-                    .on_click(cx.listener(|this, _, _, cx| this.open_external(cx))),
+                header_icon(
+                    "external",
+                    IconName::ExternalLink,
+                    "Open with default app",
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_external(cx))),
             );
 
         let body = match &self.content {
@@ -461,23 +531,36 @@ impl Render for FileViewer {
                 .min_h_0()
                 .child(Editor::new(editor).readonly(true).bordered(false).h_full())
                 .into_any_element(),
-            Content::Markdown { preview, source } => {
-                if self.show_source {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(Editor::new(source).readonly(true).bordered(false).h_full())
-                        .into_any_element()
-                } else {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .px_6()
-                        .py_4()
-                        .child(TextView::new(preview).size_full())
-                        .into_any_element()
-                }
-            }
+            Content::Markdown {
+                preview, source, ..
+            } => match (self.show_source, source) {
+                (true, Some(source)) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(Editor::new(source).readonly(true).bordered(false).h_full())
+                    .into_any_element(),
+                (true, None) => v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(Spinner::new().color(p.muted_foreground))
+                    .into_any_element(),
+                // Pinned to the panel's size so a long document scrolls
+                // inside it instead of stretching the window's layout.
+                (false, _) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .px_6()
+                            .py_4()
+                            .child(TextView::new(preview).size_full()),
+                    )
+                    .into_any_element(),
+            },
             Content::Image(image) => div()
                 .flex_1()
                 .min_h_0()
@@ -496,7 +579,8 @@ impl Render for FileViewer {
             Content::Doc(doc) => div()
                 .flex_1()
                 .min_h_0()
-                .child(doc.clone())
+                .relative()
+                .child(div().absolute().inset_0().child(doc.clone()))
                 .into_any_element(),
             Content::External(reason) => v_flex()
                 .flex_1()
@@ -531,6 +615,8 @@ impl Render for FileViewer {
         };
         v_flex()
             .size_full()
+            .min_h_0()
+            .overflow_hidden()
             .child(header)
             .when(self.truncated, |d| {
                 d.child(
