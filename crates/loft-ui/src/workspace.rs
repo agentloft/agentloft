@@ -1683,6 +1683,9 @@ impl WorkspaceView {
                         render_row(&thread, &store, &palette, ix, window, cx)
                     })
                     .with_bottom_fade(p.background)
+                    // Rows space themselves (`Palette::row_gap`); the
+                    // scroller's own 32px gap under each row is too much.
+                    .with_row_style(gpui_kit::StyleRefinement::default().pb(px(0.)))
                     .flex_1(),
                 )
                 .into_any_element()

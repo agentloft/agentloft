@@ -72,7 +72,7 @@ impl Palette {
             mono: theme.mono_font_family.clone(),
             mono_size: theme.mono_font_size,
             content_width: px(settings.content_width.clamp(560.0, 1400.0)),
-            row_gap: if compact { px(6.) } else { px(10.) },
+            row_gap: if compact { px(6.) } else { px(12.) },
         }
     }
 }

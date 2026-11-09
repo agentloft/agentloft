@@ -62,7 +62,7 @@ pub fn render_row(
                 // The footer sits right under the reply it belongs to (the
                 // Markdown view already ends with paragraph spacing).
                 .when(footer, |d| d.pt_0().pb(p.row_gap))
-                .when(after_prose, |d| d.mt(px(-22.)))
+                .when(after_prose, |d| d.mt(px(-2.)))
                 .when(!footer, |d| d.py(p.row_gap / 2.))
                 .child(content),
         )
@@ -101,25 +101,18 @@ pub(crate) fn render_item(
             v_flex()
                 .items_end()
                 .gap_1p5()
-                .pt_2()
+                .pt_5()
                 .when(!attachments.is_empty(), |d| d.child(images))
                 .when(!text.is_empty(), |d| {
                     let group = SharedString::from(format!("user-{}", item.id));
+                    let copy_id = format!("copy-user-{}", item.id);
+                    let pinned = just_copied(&copy_id);
                     d.child(
-                        h_flex()
+                        v_flex()
                             .group(group.clone())
                             .w_full()
-                            .justify_end()
-                            .items_center()
-                            .gap_1()
-                            .child(div().invisible().group_hover(group, |d| d.visible()).child(
-                                copy_button(
-                                    format!("copy-user-{}", item.id),
-                                    text.clone(),
-                                    "Copy message",
-                                    p,
-                                ),
-                            ))
+                            .items_end()
+                            .gap_0p5()
                             .child(
                                 div()
                                     .max_w(relative(0.82))
@@ -129,6 +122,13 @@ pub(crate) fn render_item(
                                     .bg(p.bubble)
                                     .text_color(p.foreground)
                                     .child(text.clone()),
+                            )
+                            // Under the bubble, on hover (and while it shows ✓).
+                            .child(
+                                div()
+                                    .when(!pinned, |d| d.invisible())
+                                    .group_hover(group, |d| d.visible())
+                                    .child(copy_button(copy_id, text.clone(), "Copy message", p)),
                             ),
                     )
                 })
@@ -236,7 +236,9 @@ fn render_tool_group(
         .filter(|r| r.status == RequestStatus::Open)
         .collect();
     let running = items.iter().any(|i| i.status == ItemStatus::InProgress);
-    let key = items[0].id.clone();
+    // The group's own open state: not the first tool's (they used to share
+    // a key, so opening one opened the other).
+    let key = loft_protocol::ItemId(format!("group:{}", items[0].id.0));
 
     let mut col = v_flex().gap_1();
     if items.len() == 1 {
@@ -736,20 +738,49 @@ fn render_turn_footer(
         .into_any_element()
 }
 
-/// A small copy-to-clipboard icon button.
+/// Which copy button was clicked last, and when (for its ✓).
+static COPIED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn just_copied(id: &str) -> bool {
+    COPIED
+        .lock()
+        .ok()
+        .and_then(|c| c.clone())
+        .is_some_and(|(last, at)| last == id && at.elapsed() < COPIED_FOR)
+}
+
+/// A small copy-to-clipboard icon button; it shows ✓ "Copied" briefly.
 fn copy_button(
     id: String,
     text: String,
     tooltip: &'static str,
-    _p: &Palette,
+    p: &Palette,
 ) -> gpui_kit::component::button::Button {
+    let copied = just_copied(&id);
+    let key = id.clone();
     Button::new(SharedString::from(id))
-        .icon(IconName::Copy)
+        .icon(if copied {
+            IconName::Check
+        } else {
+            IconName::Copy
+        })
         .ghost()
         .xsmall()
-        .tooltip(tooltip)
-        .on_click(move |_, _, cx| {
+        .when(copied, |b| b.text_color(p.success))
+        .tooltip(if copied { "Copied" } else { tooltip })
+        .on_click(move |_, window, cx| {
             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text.clone()));
+            if let Ok(mut c) = COPIED.lock() {
+                *c = Some((key.clone(), std::time::Instant::now()));
+            }
+            window.refresh();
+            // Back to the copy icon afterwards.
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(COPIED_FOR).await;
+                let _ = cx.update(|cx| cx.refresh_windows());
+            })
+            .detach();
         })
 }
 
