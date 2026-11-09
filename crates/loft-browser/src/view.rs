@@ -27,6 +27,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 actions!(
@@ -77,6 +78,27 @@ pub struct Annotation {
     pub url: String,
     #[serde(default)]
     pub title: String,
+    /// The pin number shown on the page.
+    #[serde(default)]
+    pub n: u32,
+    /// For a dragged area: where it is on the page (CSS px).
+    #[serde(default)]
+    pub rect: Option<AreaRect>,
+}
+
+impl Annotation {
+    /// A dragged-out area rather than one element.
+    pub fn is_area(&self) -> bool {
+        self.rect.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct AreaRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// A screen to emulate: the page lays out at this size (scaled to fit).
@@ -95,6 +117,7 @@ pub enum DeviceKind {
     Phone,
 }
 
+/// Current screens (CSS viewport sizes), checked November 2026.
 pub const DEVICES: &[Device] = &[
     Device {
         name: "Desktop",
@@ -109,49 +132,74 @@ pub const DEVICES: &[Device] = &[
         kind: DeviceKind::Desktop,
     },
     Device {
-        name: "iPad Pro",
-        width: 1024.,
-        height: 1366.,
+        name: "iPad Pro 13″",
+        width: 1032.,
+        height: 1376.,
         kind: DeviceKind::Tablet,
     },
     Device {
-        name: "iPad",
+        name: "iPad Pro 11″",
+        width: 834.,
+        height: 1210.,
+        kind: DeviceKind::Tablet,
+    },
+    Device {
+        name: "iPad Air",
         width: 820.,
         height: 1180.,
         kind: DeviceKind::Tablet,
     },
     Device {
-        name: "iPhone 16 Pro Max",
+        name: "iPad mini",
+        width: 744.,
+        height: 1133.,
+        kind: DeviceKind::Tablet,
+    },
+    Device {
+        name: "iPhone 18 Pro Max",
         width: 440.,
         height: 956.,
         kind: DeviceKind::Phone,
     },
     Device {
-        name: "iPhone 16 Pro",
+        name: "iPhone 18 Pro",
         width: 402.,
         height: 874.,
         kind: DeviceKind::Phone,
     },
     Device {
-        name: "iPhone SE",
-        width: 375.,
-        height: 667.,
+        name: "iPhone Air",
+        width: 420.,
+        height: 912.,
         kind: DeviceKind::Phone,
     },
     Device {
-        name: "Pixel 9",
-        width: 412.,
-        height: 915.,
+        name: "iPhone 17e",
+        width: 390.,
+        height: 844.,
+        kind: DeviceKind::Phone,
+    },
+    Device {
+        name: "Pixel 10 Pro",
+        width: 410.,
+        height: 914.,
+        kind: DeviceKind::Phone,
+    },
+    Device {
+        name: "Android compact",
+        width: 360.,
+        height: 800.,
         kind: DeviceKind::Phone,
     },
 ];
 
-const UA_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) \
-    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
-const UA_IPAD: &str = "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 \
-    (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
-const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 \
-    (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+// Safari on iOS 26 keeps reporting 18_6 as the OS; Chrome reduces Android's.
+const UA_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) \
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+const UA_IPAD: &str = "Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 \
+    (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36";
 
 /// The page width the mini preview lays out at.
 const PREVIEW_PAGE_WIDTH: f32 = 1280.;
@@ -186,6 +234,9 @@ pub struct BrowserView {
     annotating: bool,
     /// The screen-size menu is open (the native page is hidden meanwhile).
     device_menu_open: bool,
+    /// A picture of the page shown in its place while the device menu is
+    /// open (the native view would cover the menu).
+    frozen: Option<Arc<gpui_kit::Image>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -267,6 +318,7 @@ impl BrowserView {
             area: Rc::new(Cell::new(None)),
             annotating: false,
             device_menu_open: false,
+            frozen: None,
             _tasks: tasks,
             _subscriptions: subscriptions,
         }
@@ -322,7 +374,11 @@ impl BrowserView {
         let kind = device.map(|i| DEVICES[i]);
         if let Some(native) = &self.native {
             let agent = match kind {
-                Some(Device { name, .. }) if name.starts_with("Pixel") => Some(UA_ANDROID),
+                Some(Device { name, .. })
+                    if name.starts_with("Pixel") || name.starts_with("Android") =>
+                {
+                    Some(UA_ANDROID)
+                }
                 Some(Device {
                     kind: DeviceKind::Phone,
                     ..
@@ -367,9 +423,84 @@ impl BrowserView {
         self.annotating
     }
 
-    /// The page in the panel shows unless hidden or under the device menu.
+    /// The live page shows unless hidden or swapped for its picture.
     fn page_shown(&self) -> bool {
-        self.visible && !self.device_menu_open
+        self.visible && self.frozen.is_none()
+    }
+
+    /// The page: live, or its picture while a menu covers it.
+    fn page(&self, native: Rc<NativeWebView>) -> AnyElement {
+        self.page_zoomed(native, 1.)
+    }
+
+    fn page_zoomed(&self, native: Rc<NativeWebView>, zoom: f32) -> AnyElement {
+        use gpui_kit::StyledImage as _;
+        div()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(Surface::new(native, self.page_shown()).zoom(f64::from(zoom)))
+            .when_some(self.frozen.clone(), |d, image| {
+                d.child(
+                    gpui_kit::img(image)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(gpui_kit::ObjectFit::Fill),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Freeze the page into a picture (so a menu can open over it), or
+    /// bring the live page back.
+    fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.device_menu_open = open;
+        if !open {
+            self.frozen = None;
+            cx.notify();
+            return;
+        }
+        let Some(native) = self.native.clone() else {
+            return;
+        };
+        let rx = native.screenshot();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(shot)) = rx.await else {
+                return;
+            };
+            let image = Arc::new(gpui_kit::Image::from_bytes(
+                gpui_kit::ImageFormat::Png,
+                shot.png,
+            ));
+            let _ = this.update(cx, |this, cx| {
+                if this.device_menu_open {
+                    this.frozen = Some(image);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A PNG of the page as shown (pins included), for attaching.
+    pub fn capture(&self, cx: &mut Context<Self>) -> Option<gpui_kit::Task<Option<Vec<u8>>>> {
+        let rx = self.native.as_ref()?.screenshot();
+        Some(cx.background_spawn(async move { rx.await.ok()?.ok().map(|s| s.png) }))
+    }
+
+    /// Remove the numbered pins from the page (after the notes were sent).
+    pub fn clear_annotations(&mut self) {
+        if let Some(native) = &self.native {
+            drop(native.call_js(
+                "if (window.__loftAnnotate && window.__loftAnnotate.clear) window.__loftAnnotate.clear();",
+                JsWorld::Agent,
+            ));
+        }
     }
 
     /// The live page, small, for a floating preview `width` points wide:
@@ -858,7 +989,7 @@ impl Render for BrowserView {
                     .tooltip(if self.annotating {
                         "Stop annotating"
                     } else {
-                        "Annotate: click an element to leave a note for the agent"
+                        "Annotate: click an element or drag over an area to leave notes for the agent"
                     })
                     .disabled(self.native.is_none())
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -912,7 +1043,7 @@ impl Render for BrowserView {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .child(Surface::new(native.clone(), self.page_shown()))
+                    .child(self.page(native.clone()))
                     .into_any_element(),
                 Some(ix) => self.device_frame(native.clone(), DEVICES[ix], cx),
             },
@@ -945,8 +1076,8 @@ impl Render for BrowserView {
                         .xsmall()
                         .text_color(primary),
                 )
-                .child(div().flex_1().child(
-                    "Click an element and write what should change; notes go to the composer.",
+                .child(div().flex_1().min_w_0().child(
+                    "Click an element or drag over an area to leave a note. Notes wait in the composer until you send.",
                 ))
                 .child(
                     Button::new("loft-browser-annotate-done")
@@ -1042,10 +1173,7 @@ impl BrowserView {
             })
             .on_open_change(move |open, _, cx| {
                 let open = *open;
-                _ = on_open.update(cx, |this, cx| {
-                    this.device_menu_open = open;
-                    cx.notify();
-                });
+                _ = on_open.update(cx, |this, cx| this.set_menu_open(open, cx));
             })
             .into_any_element()
     }
@@ -1107,7 +1235,7 @@ impl BrowserView {
                             .shadow_lg()
                             .flex()
                             .flex_col()
-                            .child(Surface::new(native, self.page_shown()).zoom(f64::from(scale))),
+                            .child(self.page_zoomed(native, scale)),
                     )
                     .child(div().text_xs().text_color(muted_foreground).child(format!(
                         "{} · {} × {} · {:.0}%",

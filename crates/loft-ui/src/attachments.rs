@@ -42,6 +42,11 @@ impl PendingImage {
         })
     }
 
+    /// A PNG made by the app (e.g. a page screenshot).
+    pub fn png(name: &str, data: Vec<u8>) -> Option<Self> {
+        Self::new(name.to_owned(), ImageFormat::Png, data)
+    }
+
     pub fn to_attachment(&self) -> Attachment {
         Attachment {
             name: self.name.clone(),

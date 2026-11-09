@@ -135,6 +135,8 @@ pub struct WorkspaceView {
     attachments: HashMap<ThreadId, Vec<crate::attachments::PendingImage>>,
     /// Large pastes held as chips until sent, per thread.
     pasted: HashMap<ThreadId, Vec<String>>,
+    /// Notes left on the browser page, waiting to be sent.
+    page_notes: HashMap<ThreadId, Vec<loft_browser::Annotation>>,
     composer_harness: HashMap<ThreadId, HarnessId>,
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
@@ -206,6 +208,7 @@ impl WorkspaceView {
             composers: HashMap::new(),
             attachments: HashMap::new(),
             pasted: HashMap::new(),
+            page_notes: HashMap::new(),
             composer_harness: HashMap::new(),
             observed: HashMap::new(),
             search,
@@ -356,6 +359,15 @@ impl WorkspaceView {
                 let (t, h) = (thread_id.clone(), HarnessId(harness.into()));
                 self.store.update(cx, |s, cx| s.fork_thread(t, h, None, cx));
             }
+            Some(("annotate", url)) => {
+                self.panel
+                    .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
+                let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
+                browser.update(cx, |b, cx| {
+                    b.navigate(url, cx);
+                    b.set_annotating(true, cx);
+                });
+            }
             Some(("file", path)) => {
                 let path = path.to_owned();
                 self.panel
@@ -473,46 +485,162 @@ impl WorkspaceView {
         self._subs.push(sub);
     }
 
+    /// A note left on the page: it waits as a chip in the composer, and a
+    /// picture of the page with its numbered pins is attached.
     fn add_annotation(
         &mut self,
         note: &loft_browser::Annotation,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.store.read(cx).selected_thread() else {
+        let Some(thread_id) = self.store.read(cx).selected.clone() else {
             return;
         };
-        let composer = self.composer_for(&thread, window, cx);
-        let kind = match note.tag.as_str() {
-            "a" => "link",
-            "button" => "button",
-            "img" | "svg" | "picture" => "image",
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
-            "p" => "paragraph",
-            "input" | "textarea" | "select" => "field",
-            "li" => "list item",
-            "nav" => "navigation",
-            "header" => "header",
-            "footer" => "footer",
-            _ => "element",
+        self.page_notes
+            .entry(thread_id.clone())
+            .or_default()
+            .push(note.clone());
+        cx.notify();
+        let Some(browser) = self.panel.read(cx).existing_browser() else {
+            return;
         };
-        let what = if note.label.is_empty() {
-            format!("the {kind} `{}`", note.selector)
-        } else {
-            format!("the {kind} “{}” (`{}`)", note.label, note.selector)
+        let Some(task) = browser.update(cx, |b, cx| b.capture(cx)) else {
+            return;
         };
-        let line = format!("On {what} at {}: {}", note.url, note.note);
-        composer.update(cx, |c, cx| {
-            let current = c.value().to_string();
-            let text = if current.trim().is_empty() {
-                line
-            } else {
-                format!("{}\n{line}", current.trim_end())
+        cx.spawn(async move |this, cx| {
+            let Some(png) = task.await else {
+                return;
             };
-            let end = text.len();
-            c.set_value(text, window, cx);
-            c.set_selected_range(end..end, cx);
-        });
+            let _ = this.update(cx, |this, cx| {
+                // Only while the notes are still waiting.
+                if this.page_notes.get(&thread_id).is_none_or(|n| n.is_empty()) {
+                    return;
+                }
+                let Some(image) = crate::attachments::PendingImage::png(PAGE_NOTES_IMAGE, png)
+                else {
+                    return;
+                };
+                let list = this.attachments.entry(thread_id.clone()).or_default();
+                match list.iter().position(|a| a.name == PAGE_NOTES_IMAGE) {
+                    Some(ix) => list[ix] = image,
+                    None if list.len() < crate::attachments::MAX_IMAGES => list.push(image),
+                    None => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Chips for notes left on the page, each removable.
+    fn note_chips(
+        &self,
+        thread_id: &ThreadId,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let notes = self.page_notes.get(thread_id).filter(|v| !v.is_empty())?;
+        let mut row = h_flex().gap_1p5().flex_wrap().px_3().pt_2();
+        for (ix, note) in notes.iter().enumerate() {
+            let tid = thread_id.clone();
+            let what = if note.is_area() {
+                "Area".to_owned()
+            } else if note.label.is_empty() {
+                match note.tag.as_str() {
+                    "svg" => "Icon",
+                    "img" | "picture" => "Image",
+                    "video" => "Video",
+                    "a" => "Link",
+                    "button" => "Button",
+                    "input" | "textarea" | "select" => "Field",
+                    _ => "Element",
+                }
+                .to_owned()
+            } else {
+                note.label.chars().take(24).collect()
+            };
+            row = row.child(
+                h_flex()
+                    .id(SharedString::from(format!("note-{ix}")))
+                    .gap_1p5()
+                    .items_center()
+                    .max_w(px(300.))
+                    .pl_1()
+                    .pr_1()
+                    .py(px(3.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(p.accent.opacity(0.35))
+                    .bg(p.accent.opacity(0.08))
+                    .text_xs()
+                    .tooltip({
+                        let text = describe_note(note);
+                        move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                .build(window, cx)
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(16.))
+                            .rounded(px(8.))
+                            .bg(p.accent)
+                            .text_color(p.accent_foreground)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(note.n.max(1).to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .child(what),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(p.muted_foreground)
+                            .child(note.note.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("note-remove-{ix}")))
+                            .flex_none()
+                            .cursor_pointer()
+                            .p(px(2.))
+                            .rounded(px(5.))
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.bg(p.selected).text_color(p.foreground))
+                            .child(Icon::new(IconName::X).xsmall())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_note(&tid, ix, cx);
+                            })),
+                    ),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    fn remove_note(&mut self, thread_id: &ThreadId, ix: usize, cx: &mut Context<Self>) {
+        if let Some(list) = self.page_notes.get_mut(thread_id)
+            && ix < list.len()
+        {
+            list.remove(ix);
+            if list.is_empty() {
+                // No notes left: the picture of them goes too.
+                if let Some(images) = self.attachments.get_mut(thread_id) {
+                    images.retain(|a| a.name != PAGE_NOTES_IMAGE);
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn run_browser_call(
@@ -701,16 +829,30 @@ impl WorkspaceView {
             .get(thread_id)
             .is_some_and(|a| !a.is_empty());
         let pasted = self.pasted.get(thread_id).cloned().unwrap_or_default();
-        if typed.is_empty() && !has_images && pasted.is_empty() {
+        let notes = self.page_notes.get(thread_id).cloned().unwrap_or_default();
+        if typed.is_empty() && !has_images && pasted.is_empty() && notes.is_empty() {
             return;
         }
         self.pasted.remove(thread_id);
+        if !notes.is_empty() {
+            self.page_notes.remove(thread_id);
+            // Sent: take the pins off the page and leave annotation mode.
+            if let Some(browser) = self.panel.read(cx).existing_browser() {
+                browser.update(cx, |b, cx| {
+                    b.clear_annotations();
+                    b.set_annotating(false, cx);
+                });
+            }
+        }
         // Pasted blocks follow what was typed.
         let mut parts = Vec::new();
         if !typed.is_empty() {
             parts.push(typed);
         }
         parts.extend(pasted.into_iter().map(|p| p.trim_end().to_owned()));
+        if !notes.is_empty() {
+            parts.push(notes_block(&notes));
+        }
         let text = parts.join("\n\n");
         composer.update(cx, |c, cx| c.set_value("", window, cx));
         let attachments: Vec<loft_protocol::Attachment> = self
@@ -2028,6 +2170,7 @@ impl WorkspaceView {
                                     )
                                 })
                                 .children(strip)
+                                .children(self.note_chips(&thread_id, p, cx))
                                 .children(self.paste_chips(&thread_id, p, cx))
                                 .child(
                                     div()
@@ -2551,6 +2694,13 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        // Notes left on the page reach the composer however the browser
+        // was opened.
+        if !self.browser_subscribed
+            && let Some(browser) = self.panel.read(cx).existing_browser()
+        {
+            self.subscribe_browser(&browser, window, cx);
+        }
         if std::mem::take(&mut self.pending_add_project) {
             cx.defer_in(window, |this, window, cx| {
                 this.add_project(window, cx);
@@ -3182,6 +3332,75 @@ fn human_bytes(n: usize) -> String {
     } else {
         format!("{:.1} KB", n as f64 / 1024.)
     }
+}
+
+/// The picture attached with page notes (replaced as notes are added).
+const PAGE_NOTES_IMAGE: &str = "page-notes.png";
+
+/// What a page note refers to, in words: "the button “Sign in” (`#login`)".
+fn describe_note(note: &loft_browser::Annotation) -> String {
+    if let Some(r) = note.rect {
+        let mut out = format!(
+            "the area at {}, {} ({} × {} px)",
+            r.x as i64, r.y as i64, r.width as i64, r.height as i64
+        );
+        if !note.label.is_empty() {
+            out.push_str(&format!(" showing “{}”", note.label));
+        }
+        if !note.selector.is_empty() {
+            out.push_str(&format!(" (`{}`)", note.selector));
+        }
+        return out;
+    }
+    let kind = match note.tag.as_str() {
+        "a" => "link",
+        "button" => "button",
+        "svg" => "icon",
+        "img" | "picture" => "image",
+        "video" => "video",
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
+        "p" => "paragraph",
+        "input" | "textarea" | "select" => "field",
+        "li" => "list item",
+        "nav" => "navigation",
+        "header" => "header",
+        "footer" => "footer",
+        "body" | "html" => "page",
+        _ => "element",
+    };
+    if note.label.is_empty() {
+        format!("the {kind} `{}`", note.selector)
+    } else {
+        format!("the {kind} “{}” (`{}`)", note.label, note.selector)
+    }
+}
+
+/// Page notes as part of the message, numbered like the pins on the page.
+fn notes_block(notes: &[loft_browser::Annotation]) -> String {
+    let mut pages: Vec<&str> = Vec::new();
+    for n in notes {
+        if !pages.contains(&n.url.as_str()) {
+            pages.push(&n.url);
+        }
+    }
+    let mut out = if pages.len() == 1 {
+        format!(
+            "Notes on {} (the attached screenshot shows them as numbered pins):",
+            pages[0]
+        )
+    } else {
+        "Notes on pages in the browser (the attached screenshot shows the numbered pins):"
+            .to_owned()
+    };
+    for (i, n) in notes.iter().enumerate() {
+        let num = if n.n > 0 { n.n as usize } else { i + 1 };
+        out.push_str(&format!("\n{num}. On {}", describe_note(n)));
+        if pages.len() > 1 {
+            out.push_str(&format!(" at {}", n.url));
+        }
+        out.push_str(&format!(": {}", n.note));
+    }
+    out
 }
 
 /// The full pasted text, in a dialog.
