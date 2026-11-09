@@ -238,7 +238,7 @@ impl WorkspaceView {
             drafts_restored: Default::default(),
             sidebar_open: true,
             panel,
-            panel_open: true,
+            panel_open: false,
             window_title: String::new(),
             tabs_shown: false,
             dev_tab: take_dev_tab(),
