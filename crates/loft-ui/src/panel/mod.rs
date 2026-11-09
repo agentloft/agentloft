@@ -118,6 +118,8 @@ pub enum PanelEvent {
     Annotation(ThreadId, loft_browser::Annotation),
     /// A screenshot taken in `thread`'s browser (PNG), for its composer.
     Screenshot(ThreadId, Vec<u8>),
+    /// The panel was expanded to fill the window, or brought back.
+    Maximized(bool),
 }
 
 pub struct WorkbenchPanel {
@@ -128,6 +130,8 @@ pub struct WorkbenchPanel {
     /// The tab strip's scroll, kept on the active tab.
     tab_scroll: gpui_kit::ScrollHandle,
     shown: Option<(ThreadId, usize)>,
+    /// Filling the window (the conversation is hidden).
+    pub maximized: bool,
 }
 
 impl gpui_kit::EventEmitter<PanelEvent> for WorkbenchPanel {}
@@ -141,6 +145,7 @@ impl WorkbenchPanel {
             add_anchor: Rc::default(),
             tab_scroll: gpui_kit::ScrollHandle::new(),
             shown: None,
+            maximized: false,
         }
     }
 
@@ -569,6 +574,14 @@ impl WorkbenchPanel {
         cx.notify();
     }
 
+    pub fn set_maximized(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.maximized != on {
+            self.maximized = on;
+            cx.emit(PanelEvent::Maximized(on));
+            cx.notify();
+        }
+    }
+
     /// The kind of tab showing for the selected thread.
     pub fn active_tab(&self, cx: &gpui_kit::App) -> Option<Tab> {
         let id = self.store.read(cx).selected.clone()?;
@@ -682,7 +695,7 @@ impl Render for WorkbenchPanel {
 
         let mut tabs = h_flex()
             .id("panel-tabs")
-            .flex_1()
+            .flex_shrink(1.)
             .min_w_0()
             .h_full()
             .gap_1()
@@ -697,9 +710,9 @@ impl Render for WorkbenchPanel {
                 h_flex()
                     .id(SharedString::from(format!("panel-tab-{ix}")))
                     .group("panel-tab")
-                    .flex_1()
+                    .flex_shrink(1.)
+                    .w(px(180.))
                     .min_w(px(76.))
-                    .max_w(px(200.))
                     .h(px(26.))
                     .pl_2()
                     .pr_1()
@@ -785,7 +798,40 @@ impl Render for WorkbenchPanel {
             .border_color(p.border)
             .bg(p.sidebar)
             .child(tabs)
-            .child(add);
+            .child(add)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("panel-maximize")
+                    .flex_none()
+                    .p(px(5.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    .child(
+                        Icon::new(if self.maximized {
+                            IconName::Minimize2
+                        } else {
+                            IconName::Maximize2
+                        })
+                        .small(),
+                    )
+                    .tooltip({
+                        let label = if self.maximized {
+                            "Back beside the conversation"
+                        } else {
+                            "Fill the window"
+                        };
+                        move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                        }
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let on = !this.maximized;
+                        this.set_maximized(on, cx);
+                    })),
+            );
 
         let panel = self.threads.get(&thread_id).expect("ensured");
         let body: AnyElement = match panel.active_tab() {

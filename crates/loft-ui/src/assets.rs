@@ -68,6 +68,7 @@ gpui_kit::assets::icon_assets!(
         Tablet,
         Monitor,
         Maximize2,
+        Minimize2,
         Moon,
         PanelLeft,
         Paperclip,

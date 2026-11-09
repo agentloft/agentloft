@@ -21,10 +21,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub const BUILD: &str = env!("CARGO_PKG_VERSION");
 
 /// A message typed while a turn was running.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Queued {
     pub text: String,
-    pub attachments: Vec<Attachment>,
+    pub images: Vec<crate::attachments::PendingImage>,
 }
 
 /// App-wide UI events (e.g. a timeline row asking the panel to open a file).
@@ -895,6 +895,29 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Send a queued message now: it moves to the front and the running
+    /// turn stops, so it goes out as soon as the agent is idle.
+    pub fn send_queued_now(&mut self, thread_id: ThreadId, index: usize, cx: &mut Context<Self>) {
+        if let Some(q) = self.queued.get_mut(&thread_id)
+            && let Some(message) = q.remove(index)
+        {
+            q.push_front(message);
+        }
+        self.interrupt(thread_id, cx);
+    }
+
+    /// Take a queued message back out (to edit it).
+    pub fn take_queued(
+        &mut self,
+        thread_id: &ThreadId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<Queued> {
+        let message = self.queued.get_mut(thread_id)?.remove(index);
+        cx.notify();
+        message
+    }
+
     /// Send the next queued message once the thread is idle.
     fn flush_queue(&mut self, id: &ThreadId, thread: &Entity<ThreadState>, cx: &mut Context<Self>) {
         let idle = thread.read(cx).model.as_ref().is_some_and(|m| {
@@ -906,7 +929,8 @@ impl AppStore {
         let Some(next) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
             return;
         };
-        self.send_message(id.clone(), next.text, next.attachments, cx);
+        let attachments = next.images.iter().map(|i| i.to_attachment()).collect();
+        self.send_message(id.clone(), next.text, attachments, cx);
         cx.notify();
     }
 

@@ -197,6 +197,7 @@ impl WorkspaceView {
                 crate::panel::PanelEvent::Annotation(thread_id, note) => {
                     this.add_annotation(thread_id, note, window, cx)
                 }
+                crate::panel::PanelEvent::Maximized(_) => cx.notify(),
                 crate::panel::PanelEvent::Screenshot(thread_id, png) => {
                     if let Some(image) =
                         crate::attachments::PendingImage::png("screenshot.png", png.clone())
@@ -396,6 +397,15 @@ impl WorkspaceView {
                     });
                 }
             }
+            Some(("queue", text)) => {
+                self.panel_open = false;
+                let queued = crate::store::Queued {
+                    text: text.to_owned(),
+                    images: Vec::new(),
+                };
+                let id = thread_id.clone();
+                self.store.update(cx, |s, cx| s.enqueue(id, queued, cx));
+            }
             Some(("file", path)) => {
                 let path = path.to_owned();
                 self.panel
@@ -403,6 +413,11 @@ impl WorkspaceView {
             }
             _ => match dev {
                 "branches" => self.branch_picker_open = true,
+                "maximize" => {
+                    self.panel
+                        .update(cx, |p, cx| p.show(Tab::Files, window, cx));
+                    self.panel.update(cx, |p, cx| p.set_maximized(true, cx));
+                }
                 "details" => {
                     self.panel_open = false;
                     self.details_open = true;
@@ -962,17 +977,13 @@ impl WorkspaceView {
         }
         let text = parts.join("\n\n");
         composer.update(cx, |c, cx| c.set_value("", window, cx));
-        let attachments: Vec<loft_protocol::Attachment> = self
-            .attachments
-            .remove(thread_id)
-            .unwrap_or_default()
-            .iter()
-            .map(|a| a.to_attachment())
-            .collect();
+        let images = self.attachments.remove(thread_id).unwrap_or_default();
+        let attachments: Vec<loft_protocol::Attachment> =
+            images.iter().map(|a| a.to_attachment()).collect();
         let id = thread_id.clone();
         if self.is_running(thread_id, cx) {
             // Sent automatically when the current turn ends.
-            let queued = crate::store::Queued { text, attachments };
+            let queued = crate::store::Queued { text, images };
             self.store
                 .update(cx, |store, cx| store.enqueue(id, queued, cx));
         } else {
@@ -980,6 +991,140 @@ impl WorkspaceView {
                 store.send_message(id, text, attachments, cx)
             });
         }
+    }
+
+    /// Messages waiting for the current turn to end: dashed bubbles you can
+    /// send now (stopping the turn), take back to edit, or drop.
+    fn queued_list(
+        &self,
+        thread_id: &ThreadId,
+        queued: &[crate::store::Queued],
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use gpui_kit::StyledImage as _;
+        if queued.is_empty() {
+            return None;
+        }
+        let mut list = v_flex().gap_3().pb_2();
+        for (ix, q) in queued.iter().enumerate() {
+            let mut thumbs = h_flex().gap_1p5().flex_wrap().justify_end();
+            for (n, image) in q.images.iter().enumerate() {
+                thumbs = thumbs.child(
+                    div()
+                        .id(SharedString::from(format!("queued-{ix}-img-{n}")))
+                        .size(px(44.))
+                        .rounded(px(8.))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(p.border)
+                        .child(
+                            gpui_kit::img(image.preview.clone())
+                                .size_full()
+                                .object_fit(gpui_kit::ObjectFit::Cover),
+                        ),
+                );
+            }
+            let preview: String = q.text.chars().take(400).collect();
+            let action = |id: &str, icon: Option<IconName>, label: Option<&'static str>| {
+                h_flex()
+                    .id(SharedString::from(format!("{id}-{ix}")))
+                    .gap_1()
+                    .items_center()
+                    .px_1p5()
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    .children(icon.map(|i| Icon::new(i).xsmall()))
+                    .children(label)
+            };
+            let (t1, t2, t3) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
+            list = list.child(
+                v_flex()
+                    .items_end()
+                    .gap_1()
+                    .child(
+                        v_flex()
+                            .max_w(gpui_kit::relative(0.85))
+                            .gap_2()
+                            .px_4()
+                            .py_2p5()
+                            .rounded(px(16.))
+                            .border_1()
+                            .border_dashed()
+                            .border_color(p.border)
+                            .text_sm()
+                            .text_color(p.muted_foreground)
+                            .when(!q.images.is_empty(), |d| d.child(thumbs))
+                            .when(!preview.is_empty(), |d| {
+                                d.child(div().line_clamp(4).child(preview))
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .items_center()
+                            .child(
+                                action("queued-send", Some(IconName::ArrowUp), Some("Send now"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let id = t1.clone();
+                                        this.store
+                                            .update(cx, |s, cx| s.send_queued_now(id, ix, cx));
+                                    })),
+                            )
+                            .child(
+                                action("queued-edit", Some(IconName::SquarePen), None).on_click(
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.edit_queued(&t2, ix, window, cx)
+                                    }),
+                                ),
+                            )
+                            .child(action("queued-drop", Some(IconName::X), None).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    let id = t3.clone();
+                                    this.store.update(cx, |s, cx| s.dequeue(&id, ix, cx));
+                                }),
+                            )),
+                    ),
+            );
+        }
+        Some(list.into_any_element())
+    }
+
+    /// Put a queued message back in the composer (text and images).
+    fn edit_queued(
+        &mut self,
+        thread_id: &ThreadId,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(q) = self
+            .store
+            .update(cx, |s, cx| s.take_queued(thread_id, ix, cx))
+        else {
+            return;
+        };
+        let Some(thread) = self.store.read(cx).threads.get(thread_id).cloned() else {
+            return;
+        };
+        let composer = self.composer_for(&thread, window, cx);
+        composer.update(cx, |c, cx| {
+            let current = c.value().to_string();
+            let text = if current.trim().is_empty() {
+                q.text.clone()
+            } else {
+                format!("{}\n\n{}", q.text, current.trim_end())
+            };
+            let end = text.len();
+            c.set_value(text, window, cx);
+            c.set_selected_range(end..end, cx);
+            c.focus(window, cx);
+        });
+        self.add_images(thread_id, q.images, cx);
     }
 
     /// Chips for large pastes waiting in the composer.
@@ -1950,6 +2095,17 @@ impl WorkspaceView {
             .as_ref()
             .and_then(|m| m.thread.parent.clone());
         let fork_bar = fork_parent.map(|parent| self.fork_bar(parent, p, cx));
+        let queued_list = {
+            let id = thread.read(cx).id.clone();
+            let queued: Vec<crate::store::Queued> = self
+                .store
+                .read(cx)
+                .queued
+                .get(&id)
+                .map(|q| q.iter().cloned().collect())
+                .unwrap_or_default();
+            self.queued_list(&id, &queued, p, cx)
+        };
         let state = thread.read(cx);
         let Some(model) = state.model.as_ref() else {
             return v_flex()
@@ -1993,13 +2149,6 @@ impl WorkspaceView {
         let current_mode = model.thread.permission_mode;
         let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
-        let queued: Vec<crate::store::Queued> = self
-            .store
-            .read(cx)
-            .queued
-            .get(&thread_id)
-            .map(|q| q.iter().cloned().collect())
-            .unwrap_or_default();
         let pending = self
             .attachments
             .get(&thread_id)
@@ -2166,7 +2315,7 @@ impl WorkspaceView {
                         .w_full()
                         .max_w(p.content_width)
                         .gap_1()
-                        .children(queued_list(&thread_id, &queued, &self.store, p))
+                        .children(queued_list)
                         .when(waiting, |d| {
                             d.child(
                                 h_flex()
@@ -2854,6 +3003,7 @@ impl Render for WorkspaceView {
         };
         let body = self.with_details_dock(body, window, cx);
         let show_panel = self.panel_open && header_title.is_some();
+        let maximized = show_panel && self.panel.read(cx).maximized;
         let header = self.render_header(header_title, &p, cx);
         // Native tab group (⌘T): GPUI doesn't draw macOS's tab bar under our
         // transparent title bar, so we draw the tabs ourselves.
@@ -2937,23 +3087,28 @@ impl Render for WorkspaceView {
                                     .child("Lost connection to agentloftd — reconnecting…"),
                             )
                         })
-                        .child(
-                            h_resizable("workbench")
-                                .child(resizable_panel().child(body))
-                                .child(
-                                    resizable_panel()
-                                        .size(px(560.))
-                                        .size_range(px(340.)..px(1600.))
-                                        .visible(show_panel)
-                                        .child(
-                                            div()
-                                                .size_full()
-                                                .border_l_1()
-                                                .border_color(p.border)
-                                                .child(self.panel.clone()),
-                                        ),
-                                ),
-                        ),
+                        .when(maximized, |d| {
+                            d.child(div().flex_1().min_h_0().w_full().child(self.panel.clone()))
+                        })
+                        .when(!maximized, |d| {
+                            d.child(
+                                h_resizable("workbench")
+                                    .child(resizable_panel().child(body))
+                                    .child(
+                                        resizable_panel()
+                                            .size(px(560.))
+                                            .size_range(px(340.)..px(1600.))
+                                            .visible(show_panel)
+                                            .child(
+                                                div()
+                                                    .size_full()
+                                                    .border_l_1()
+                                                    .border_color(p.border)
+                                                    .child(self.panel.clone()),
+                                            ),
+                                    ),
+                            )
+                        }),
                 ),
             )
     }
@@ -3114,68 +3269,6 @@ fn pill_button(
 }
 
 /// Messages waiting for the current turn to end, each removable.
-fn queued_list(
-    thread_id: &ThreadId,
-    queued: &[crate::store::Queued],
-    store: &Entity<AppStore>,
-    p: &Palette,
-) -> Option<AnyElement> {
-    if queued.is_empty() {
-        return None;
-    }
-    let mut list = v_flex().gap_1().px_1();
-    for (ix, q) in queued.iter().enumerate() {
-        let text = match (q.text.is_empty(), q.attachments.len()) {
-            (_, 0) => q.text.clone(),
-            (true, n) => format!("{n} image{}", if n == 1 { "" } else { "s" }),
-            (false, n) => format!("{} · {n} image{}", q.text, if n == 1 { "" } else { "s" }),
-        };
-        let (store, thread_id) = (store.clone(), thread_id.clone());
-        list = list.child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .px_3()
-                .py_1p5()
-                .rounded(px(10.))
-                .bg(p.muted)
-                .text_sm()
-                .child(
-                    Icon::new(IconName::Clock)
-                        .xsmall()
-                        .text_color(p.muted_foreground),
-                )
-                .child(div().flex_1().min_w_0().truncate().child(text.clone()))
-                .child(
-                    div()
-                        .id(SharedString::from(format!("unqueue-{ix}")))
-                        .p(px(2.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .text_color(p.muted_foreground)
-                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                        .child(Icon::new(IconName::X).xsmall())
-                        .on_click(move |_, _, cx| {
-                            store.update(cx, |s, cx| s.dequeue(&thread_id, ix, cx));
-                        }),
-                ),
-        );
-    }
-    Some(
-        v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .text_color(p.faint_foreground)
-                    .child("Queued · sends when the current turn finishes"),
-            )
-            .child(list)
-            .into_any_element(),
-    )
-}
-
 pub(crate) fn mode_label(mode: Option<loft_protocol::PermissionMode>) -> &'static str {
     use loft_protocol::PermissionMode::*;
     match mode {
