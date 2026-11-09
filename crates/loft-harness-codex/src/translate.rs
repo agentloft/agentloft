@@ -50,6 +50,8 @@ pub struct Translator {
     /// Session settings applied at thread start / per turn.
     pub cwd: String,
     pub model: Option<String>,
+    /// Reasoning effort, sent with every `turn/start`.
+    pub effort: Option<String>,
     pub mode: Option<PermissionMode>,
     resume: Option<String>,
     thread_id: Option<String>,
@@ -148,6 +150,9 @@ impl Translator {
         });
         if let Some(model) = &self.model {
             params["model"] = json!(model);
+        }
+        if let Some(effort) = &self.effort {
+            params["effort"] = json!(effort);
         }
         if let Some(mode) = self.mode {
             let (approval, sandbox) = turn_policy(mode);
@@ -947,6 +952,14 @@ pub fn models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
                 display_name: m["displayName"].as_str().unwrap_or(id).to_owned(),
                 description: m["description"].as_str().map(str::to_owned),
                 is_default: m["isDefault"].as_bool().unwrap_or(false),
+                efforts: m["supportedReasoningEfforts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["reasoningEffort"].as_str().map(str::to_owned))
+                    .collect(),
+                default_effort: m["defaultReasoningEffort"].as_str().map(str::to_owned),
+                ..Default::default()
             })
         })
         .collect()
@@ -1005,6 +1018,35 @@ mod tests {
             events(&out)[0],
             HarnessEvent::SessionReady { native_session_id, .. } if native_session_id == "child"
         ));
+    }
+
+    #[test]
+    fn effort_rides_on_turn_start() {
+        let mut t = Translator::new("/tmp/probe".into(), None, None, None);
+        t.thread_id = Some("T1".into());
+        let Out::Send(turn) = t.start_turn("x").pop().unwrap() else {
+            panic!()
+        };
+        assert!(turn["params"].get("effort").is_none(), "model default");
+        t.effort = Some("high".into());
+        let Out::Send(turn) = t.start_turn("y").pop().unwrap() else {
+            panic!()
+        };
+        assert_eq!(turn["params"]["effort"], "high");
+    }
+
+    #[test]
+    fn model_list_carries_efforts() {
+        let models = models(&json!({"data": [{
+            "id": "gpt-6", "displayName": "GPT-6", "isDefault": true, "hidden": false,
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low", "description": "Fast"},
+                {"reasoningEffort": "medium", "description": "Balanced"}
+            ]
+        }]}));
+        assert_eq!(models[0].efforts, ["low", "medium"]);
+        assert_eq!(models[0].default_effort.as_deref(), Some("medium"));
     }
 
     #[test]

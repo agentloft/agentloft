@@ -159,6 +159,8 @@ impl Harness for AcpHarness {
             // ACP has no steering; `session/fork` is still unstable.
             steer: false,
             native_fork: false,
+            // ACP has no effort setting; nothing to apply or restart for.
+            live_effort_switch: true,
             // Only some agents advertise model/mode selectors (OpenCode does,
             // via `configOptions`); the session applies them when offered and
             // posts a notice otherwise, but the UI can't rely on them.
@@ -270,6 +272,7 @@ async fn run(
                         t.respond(&native_request_id, decision)
                     }
                     Some(SessionCommand::SetModel(model)) => t.set_model(model),
+                    Some(SessionCommand::SetEffort(_)) => vec![],
                     Some(SessionCommand::SetPermissionMode(mode)) => t.set_permission_mode(mode),
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 };
@@ -332,6 +335,7 @@ mod tests {
             cwd: ".".into(),
             model: None,
             permission_mode: None,
+            effort: None,
             resume: None,
             new_session_id: None,
             fork_from: None,

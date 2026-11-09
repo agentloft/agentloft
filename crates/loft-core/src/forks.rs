@@ -80,6 +80,7 @@ impl Core {
             cwd,
             model: same.then(|| parent.model.clone()).flatten(),
             permission_mode: same.then_some(parent.permission_mode).flatten(),
+            effort: same.then(|| parent.effort.clone()).flatten(),
             native_session_id: None,
             status: ThreadStatus::Idle,
             created_at_ms: now,

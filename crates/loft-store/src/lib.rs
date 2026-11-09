@@ -420,6 +420,7 @@ mod tests {
             cwd: project.root_path.clone(),
             model: None,
             permission_mode: None,
+            effort: None,
             native_session_id: None,
             status: ThreadStatus::Idle,
             created_at_ms: 1,

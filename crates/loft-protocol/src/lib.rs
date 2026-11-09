@@ -105,6 +105,12 @@ pub enum Request {
         thread_id: ThreadId,
         model: Option<String>,
     },
+    /// Set the reasoning effort (`None` = the model's default). Codex applies
+    /// it from the next turn; Claude restarts its process between turns.
+    SetEffort {
+        thread_id: ThreadId,
+        effort: Option<String>,
+    },
     /// Change a thread's harness; only allowed before its first message.
     SetThreadHarness {
         thread_id: ThreadId,

@@ -222,6 +222,13 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Fetch `harness`'s models unless they're already here.
+    pub fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if !self.models.get(&harness).is_some_and(|m| !m.is_empty()) {
+            self.fetch_models(harness, cx);
+        }
+    }
+
     fn fetch_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         let body = Request::ListModels {
             harness: harness.clone(),
@@ -824,6 +831,15 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) {
         self.request(Request::SetModel { thread_id, model }, cx, |_, _, _| {});
+    }
+
+    pub fn set_effort(
+        &mut self,
+        thread_id: ThreadId,
+        effort: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(Request::SetEffort { thread_id, effort }, cx, |_, _, _| {});
     }
 
     pub fn interrupt(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {

@@ -191,6 +191,7 @@ mod tests {
             cwd: "/r".into(),
             model: None,
             permission_mode: None,
+            effort: None,
             native_session_id: None,
             status: loft_protocol::ThreadStatus::Idle,
             created_at_ms: 0,

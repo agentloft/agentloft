@@ -1672,6 +1672,7 @@ fn offered_models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
         display_name: name.unwrap_or(id).to_owned(),
         description: None,
         is_default: current == Some(id),
+        ..Default::default()
     };
     if let Some(select) = result
         .get("configOptions")

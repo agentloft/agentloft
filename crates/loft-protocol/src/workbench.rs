@@ -145,8 +145,8 @@ mod tests {
     }
 }
 
-/// A model a harness offers (Codex `model/list`, Claude's aliases).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A model a harness offers (Codex `model/list`, Claude's `initialize`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelInfo {
     /// What to pass as the thread's model.
     pub id: String,
@@ -155,6 +155,15 @@ pub struct ModelInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub is_default: bool,
+    /// The concrete model an alias stands for (`opus` → `claude-opus-5-5`),
+    /// so a thread reporting either matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_id: Option<String>,
+    /// Reasoning efforts the model accepts, lowest first; empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
 
 /// Whether a harness's CLI is installed (Settings → Agents, onboarding).

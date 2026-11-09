@@ -7,6 +7,7 @@ mod attention;
 pub mod brand;
 mod completion;
 mod items;
+mod model_picker;
 mod palette;
 pub mod panel;
 pub mod settings;

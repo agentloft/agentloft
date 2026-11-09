@@ -44,6 +44,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Simple Icons
+
+- Project: Simple Icons, https://simpleicons.org (`simple-icons` 15.0.0)
+- License: CC0-1.0
+- Used in: `crates/loft-ui/assets/brand/` (`claude.svg`, `openai.svg`,
+  `gemini.svg`), shown to identify each agent. The marks are trademarks of
+  their owners (Anthropic, OpenAI, Google). `opencode.svg` is our own glyph.
+
 ## Ghostty (libghostty-vt)
 
 - Project: Ghostty, https://github.com/ghostty-org/ghostty

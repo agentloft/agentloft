@@ -31,6 +31,7 @@ impl Harness for CodexHarness {
             steer: true,
             live_model_switch: true,
             live_mode_switch: true,
+            live_effort_switch: true,
             native_fork: true,
         }
     }
@@ -75,6 +76,7 @@ impl Harness for CodexHarness {
             cfg.permission_mode,
             cfg.resume.clone(),
         );
+        translator.effort = cfg.effort.clone();
         // `mcp__agentloft` in allowed_tools → auto-approve that server's tools.
         translator.fork_from = cfg.fork_from.clone();
         translator.auto_allow_mcp = cfg
@@ -152,6 +154,10 @@ async fn run(
                         t.respond(&native_request_id, decision)
                     }
                     Some(SessionCommand::SetModel(model)) => t.set_model(model),
+                    Some(SessionCommand::SetEffort(effort)) => {
+                        t.effort = effort; // applied on the next turn/start
+                        vec![]
+                    }
                     Some(SessionCommand::SetPermissionMode(mode)) => t.set_permission_mode(mode),
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 };
@@ -297,6 +303,7 @@ mod tests {
             cwd: ".".into(),
             model: None,
             permission_mode: None,
+            effort: None,
             resume: None,
             new_session_id: None,
             fork_from: None,

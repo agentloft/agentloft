@@ -142,6 +142,10 @@ pub struct WorkspaceView {
     /// The open `/` or `@` completion popover.
     completion: Option<crate::completion::Completion>,
     completion_seq: u64,
+    /// The composer's model picker (for the selected thread) and whether
+    /// it's open.
+    model_picker: Option<Entity<crate::model_picker::ModelPicker>>,
+    picker_open: bool,
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
@@ -191,6 +195,8 @@ impl WorkspaceView {
             show_archived: false,
             completion: None,
             completion_seq: 0,
+            model_picker: None,
+            picker_open: false,
             sidebar_open: true,
             panel,
             panel_open: true,
@@ -324,6 +330,12 @@ impl WorkspaceView {
                     .update(cx, |p, cx| p.open_file(&thread_id, path, window, cx));
             }
             _ => match dev {
+                "models" => {
+                    self.panel_open = false;
+                    let picker = self.model_picker_for(&thread_id, window, cx);
+                    picker.update(cx, |p, cx| p.reset(window, cx));
+                    self.picker_open = true;
+                }
                 "changes" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Changes, window, cx)),
@@ -1221,7 +1233,22 @@ impl WorkspaceView {
                                 .child(title),
                         ),
                 )
-                .child(chip_label(IconName::Sparkles, chip, p))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .px_2()
+                        .py(px(3.))
+                        .rounded(px(7.))
+                        .text_xs()
+                        .text_color(p.muted_foreground)
+                        .child(crate::brand::agent_logo(
+                            thread.harness.as_str(),
+                            px(12.),
+                            p,
+                        ))
+                        .child(chip),
+                )
                 .children(branch_chip)
                 .child(thread_menu(&thread, &self.store))
             })
@@ -1352,21 +1379,27 @@ impl WorkspaceView {
             .get(&model.thread.harness)
             .cloned()
             .unwrap_or_default();
-        let model_name = model
+        // The model in use: the chosen one (by alias or resolved id), else
+        // the agent's default.
+        let model_name = match model.thread.model.clone() {
+            Some(m) => known_models
+                .iter()
+                .find(|k| k.id == m || k.resolved_id.as_deref() == Some(m.as_str()))
+                .map(|k| k.display_name.clone())
+                .unwrap_or_else(|| pretty_model(&m)),
+            None => known_models
+                .iter()
+                .find(|k| k.is_default)
+                .map(|k| k.display_name.clone())
+                .unwrap_or_else(|| harness_name(&model.thread.harness).into()),
+        };
+        let effort_name = model
             .thread
-            .model
-            .clone()
-            .map(|m| {
-                known_models
-                    .iter()
-                    .find(|k| k.id == m)
-                    .map(|k| k.display_name.clone())
-                    .unwrap_or_else(|| pretty_model(&m))
-            })
-            .unwrap_or_else(|| harness_name(&model.thread.harness).into());
+            .effort
+            .as_deref()
+            .map(|e| crate::model_picker::effort_label(e).to_owned());
         let mode = mode_label(model.thread.permission_mode).to_owned();
         let current_mode = model.thread.permission_mode;
-        let current_model = model.thread.model.clone();
         let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
         let queued: Vec<crate::store::Queued> = self
@@ -1670,13 +1703,14 @@ impl WorkspaceView {
                                                         }),
                                                     )
                                                 })
-                                                .child(model_menu(
+                                                .child(self.model_picker_button(
                                                     &thread_id,
                                                     &harness,
-                                                    current_model.as_deref(),
                                                     model_name,
-                                                    known_models,
-                                                    &self.store,
+                                                    effort_name,
+                                                    p,
+                                                    window,
+                                                    cx,
                                                 ))
                                                 .child(mode_menu(
                                                     &thread_id,
@@ -1703,6 +1737,97 @@ impl WorkspaceView {
                         ),
                 ),
             )
+            .into_any_element()
+    }
+
+    /// The picker for `thread_id`, made on first use and remade when the
+    /// selected thread changes.
+    fn model_picker_for(
+        &mut self,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::model_picker::ModelPicker> {
+        if let Some(picker) = &self.model_picker
+            && picker.read(cx).thread_id() == thread_id
+        {
+            return picker.clone();
+        }
+        let store = self.store.clone();
+        let id = thread_id.clone();
+        let picker = cx.new(|cx| crate::model_picker::ModelPicker::new(store, id, window, cx));
+        let sub = cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
+            crate::model_picker::PickerEvent::Close => {
+                this.picker_open = false;
+                if let Some(id) = this.store.read(cx).selected.clone()
+                    && let Some(composer) = this.composers.get(&id)
+                {
+                    composer.update(cx, |c, cx| c.focus(window, cx));
+                }
+                cx.notify();
+            }
+        });
+        self._subs.push(sub);
+        self.picker_open = false;
+        self.model_picker = Some(picker.clone());
+        picker
+    }
+
+    /// Composer chip showing the agent, model and effort; opens the picker.
+    #[allow(clippy::too_many_arguments)]
+    fn model_picker_button(
+        &mut self,
+        thread_id: &ThreadId,
+        harness: &HarnessId,
+        model_name: String,
+        effort_name: Option<String>,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::popover::Popover;
+        let picker = self.model_picker_for(thread_id, window, cx);
+        let focus = picker.read(cx).search_focus(cx);
+        let open = self.picker_open;
+        let trigger = Button::new("model-picker").ghost().xsmall().child(
+            h_flex()
+                .gap_1p5()
+                .items_center()
+                .child(crate::brand::agent_logo(harness.as_str(), px(13.), p))
+                .child(div().text_color(p.foreground).child(model_name))
+                .when_some(effort_name, |d, effort| {
+                    d.child(div().text_color(p.faint_foreground).child("·"))
+                        .child(div().text_color(p.muted_foreground).child(effort))
+                })
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .xsmall()
+                    .text_color(p.faint_foreground),
+                ),
+        );
+        Popover::new("model-picker-popover")
+            .anchor(gpui_kit::Anchor::BottomLeft)
+            .offset(px(8.))
+            .p_0()
+            .open(open)
+            .track_focus(&focus)
+            .on_open_change(cx.listener({
+                let picker = picker.clone();
+                move |this, open: &bool, window, cx| {
+                    this.picker_open = *open;
+                    if *open {
+                        picker.update(cx, |p, cx| p.reset(window, cx));
+                    }
+                    cx.notify();
+                }
+            }))
+            .trigger(trigger)
+            .content(move |_, _, _| picker.clone())
             .into_any_element()
     }
 
@@ -2207,77 +2332,6 @@ fn mode_menu(
         .into_any_element()
 }
 
-/// Model dropdown: the harness default plus what the harness offers
-/// (`ListModels`; a built-in list until that arrives).
-fn model_menu(
-    thread_id: &ThreadId,
-    harness: &HarnessId,
-    current: Option<&str>,
-    label: String,
-    known: Vec<loft_protocol::ModelInfo>,
-    store: &Entity<AppStore>,
-) -> AnyElement {
-    use gpui_kit::component::button::{Button, ButtonVariants as _};
-    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-    let fallback: &[(&str, &str)] = match harness.as_str() {
-        HarnessId::CLAUDE => &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")],
-        _ => &[],
-    };
-    let options: Vec<(String, String)> = if known.is_empty() {
-        fallback
-            .iter()
-            .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
-            .collect()
-    } else {
-        known
-            .iter()
-            .map(|m| {
-                let name = if m.is_default {
-                    format!("{} (default)", m.display_name)
-                } else {
-                    m.display_name.clone()
-                };
-                (m.id.clone(), name)
-            })
-            .collect()
-    };
-    let current = current.map(str::to_owned);
-    let store = store.clone();
-    let thread_id = thread_id.clone();
-    Button::new("model-menu")
-        .label(label)
-        .icon(IconName::Bot)
-        .ghost()
-        .xsmall()
-        .dropdown_menu(move |mut menu, _, _| {
-            let (s, t) = (store.clone(), thread_id.clone());
-            menu = menu
-                .item(
-                    PopupMenuItem::new("Harness default").on_click(move |_, _, cx| {
-                        let t = t.clone();
-                        s.update(cx, |s, cx| s.set_model(t, None, cx));
-                    }),
-                )
-                .separator();
-            for (id, name) in &options {
-                let (s, t, id) = (store.clone(), thread_id.clone(), id.clone());
-                let checked = current.as_deref().is_some_and(|c| {
-                    c == id
-                        || c.contains(&format!("-{id}-"))
-                        || c.starts_with(&format!("claude-{id}"))
-                });
-                menu = menu.item(PopupMenuItem::new(name.clone()).checked(checked).on_click(
-                    move |_, _, cx| {
-                        let (t, m) = (t.clone(), Some(id.clone()));
-                        s.update(cx, |s, cx| s.set_model(t, m, cx));
-                    },
-                ));
-            }
-            menu
-        })
-        .into_any_element()
-}
-
 fn chip_label(icon: IconName, label: impl Into<SharedString>, p: &Palette) -> AnyElement {
     h_flex()
         .gap_1()
@@ -2737,11 +2791,6 @@ fn harness_picker(
         .rounded(px(10.))
         .bg(p.muted);
     for (id, label) in choices {
-        let icon = match id {
-            HarnessId::CLAUDE => IconName::Sparkles,
-            HarnessId::CODEX => IconName::SquareTerminal,
-            _ => IconName::Bot,
-        };
         let active = current.as_str() == id;
         let store = store.clone();
         let thread_id = thread_id.clone();
@@ -2765,7 +2814,7 @@ fn harness_picker(
                     d.text_color(p.muted_foreground)
                         .hover(|d| d.text_color(p.foreground))
                 })
-                .child(Icon::new(icon).small())
+                .child(crate::brand::agent_logo(id, px(15.), p))
                 .child(label)
                 .on_click(move |_, _, cx| {
                     if !active {

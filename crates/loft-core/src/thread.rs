@@ -38,6 +38,10 @@ pub(crate) enum ThreadCmd {
         model: Option<String>,
         reply: Reply,
     },
+    SetEffort {
+        effort: Option<String>,
+        reply: Reply,
+    },
     Rename {
         title: String,
         reply: Reply,
@@ -79,6 +83,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
         thread,
         session: None,
         session_pid: None,
+        restart_session: false,
         turn: None,
         items: HashMap::new(),
         requests: HashMap::new(),
@@ -98,6 +103,9 @@ struct ThreadActor {
     thread: Thread,
     session: Option<SessionHandle>,
     session_pid: Option<u32>,
+    /// A setting the running session can't take live changed: restart it
+    /// (resuming the conversation) once it's idle.
+    restart_session: bool,
     turn: Option<Turn>,
     /// native item id → app item id (current session).
     items: HashMap<String, ItemId>,
@@ -130,6 +138,10 @@ impl ThreadActor {
                     None => self.on_session_lost(None, String::new()),
                 },
                 _ = flush.tick() => self.flush_dirty(),
+            }
+            if self.restart_session && self.turn.is_none() && self.pending_start.is_none() {
+                self.restart_session = false;
+                self.stop_session().await;
             }
         }
     }
@@ -202,6 +214,24 @@ impl ThreadActor {
                 if let Some(s) = &self.session {
                     let _ = s.commands.send(SessionCommand::SetModel(model));
                 }
+                let res = self.save_thread().map(|_| Response::Ok);
+                let _ = reply.send(res);
+            }
+            ThreadCmd::SetEffort { effort, reply } => {
+                let live = self
+                    .core
+                    .harness(&self.thread.harness)
+                    .is_some_and(|h| h.capabilities().live_effort_switch);
+                if self.thread.effort != effort
+                    && let Some(s) = &self.session
+                {
+                    if live {
+                        let _ = s.commands.send(SessionCommand::SetEffort(effort.clone()));
+                    } else {
+                        self.restart_session = true;
+                    }
+                }
+                self.thread.effort = effort;
                 let res = self.save_thread().map(|_| Response::Ok);
                 let _ = reply.send(res);
             }
@@ -550,6 +580,7 @@ impl ThreadActor {
             thread_label: self.thread.id.to_string(),
             cwd: self.thread.cwd.clone().into(),
             model: self.thread.model.clone(),
+            effort: self.thread.effort.clone(),
             permission_mode: self.thread.permission_mode,
             resume: self.thread.native_session_id.clone(),
             new_session_id: new_session_id.clone(),

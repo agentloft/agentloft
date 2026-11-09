@@ -215,6 +215,7 @@ mod tests {
             cwd: "/".into(),
             model: None,
             permission_mode: None,
+            effort: None,
             native_session_id: None,
             status: ThreadStatus::Running,
             created_at_ms: 0,

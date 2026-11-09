@@ -602,9 +602,71 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The model catalog in an `initialize` control response. Claude's
+/// `default` row only names the recommended model; it marks that model as
+/// the default instead of being listed itself.
+pub fn models(response: &Value) -> Vec<loft_protocol::ModelInfo> {
+    let rows: Vec<&Value> = response
+        .pointer("/response/response/models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| !m["disabled"].as_bool().unwrap_or(false))
+        .collect();
+    let default_model = rows
+        .iter()
+        .find(|m| m["value"] == "default")
+        .and_then(|m| m["resolvedModel"].as_str());
+    let mut default_marked = false;
+    rows.iter()
+        .filter(|m| m["value"] != "default")
+        .filter_map(|m| {
+            let id = m["value"].as_str()?;
+            let resolved = m["resolvedModel"].as_str();
+            let is_default =
+                !default_marked && default_model.is_some() && resolved == default_model;
+            default_marked |= is_default;
+            Some(loft_protocol::ModelInfo {
+                id: id.to_owned(),
+                display_name: m["displayName"].as_str().unwrap_or(id).to_owned(),
+                description: m["description"].as_str().map(str::to_owned),
+                is_default,
+                resolved_id: resolved.filter(|r| *r != id).map(str::to_owned),
+                efforts: m["supportedEffortLevels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.as_str().map(str::to_owned))
+                    .collect(),
+                default_effort: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_from_initialize() {
+        let v = json!({"type": "control_response", "response": {"subtype": "success", "request_id": "loft_1", "response": {"models": [
+            {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default (recommended)"},
+            {"value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5", "description": "Complex work",
+             "supportsEffort": true, "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+            {"value": "claude-haiku-4-5", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku 4.5"},
+            {"value": "old", "displayName": "Old", "disabled": true}
+        ]}}});
+        let models = models(&v);
+        assert_eq!(models.len(), 2, "default row folded in, disabled dropped");
+        assert_eq!(models[0].id, "opus");
+        assert!(models[0].is_default);
+        assert_eq!(models[0].resolved_id.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(models[0].efforts.len(), 5);
+        assert!(!models[1].is_default);
+        assert_eq!(models[1].resolved_id, None, "same as the id");
+        assert!(models[1].efforts.is_empty());
+    }
 
     fn replay(fixture: &str) -> (Translator, Vec<Out>) {
         let mut t = Translator::new();

@@ -38,29 +38,26 @@ impl Harness for ClaudeHarness {
             steer: false,
             live_model_switch: true,
             live_mode_switch: true,
+            // `apply_flag_settings` can't express `max`; restart instead.
+            live_effort_switch: false,
             native_fork: true,
         }
     }
 
     fn list_models(
         &self,
-        _env: &std::collections::HashMap<String, String>,
-        _binary: Option<PathBuf>,
+        env: &std::collections::HashMap<String, String>,
+        binary: Option<PathBuf>,
     ) -> Result<Vec<loft_protocol::ModelInfo>> {
-        // Claude Code resolves these aliases to the latest of each family.
-        Ok([
-            ("opus", "Opus", "Most capable, for complex work"),
-            ("sonnet", "Sonnet", "Fast and capable, for everyday work"),
-            ("haiku", "Haiku", "Fastest, for simple tasks"),
-        ]
-        .into_iter()
-        .map(|(id, name, description)| loft_protocol::ModelInfo {
-            id: id.into(),
-            display_name: name.into(),
-            description: Some(description.into()),
-            is_default: false,
+        let binary = match binary {
+            Some(b) => b,
+            None => loft_config::which("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .context("`claude` not found on PATH")?,
+        };
+        probe_models(&binary, env).or_else(|err| {
+            tracing::warn!("claude model probe failed, using aliases: {err:#}");
+            Ok(alias_models())
         })
-        .collect())
     }
 
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
@@ -160,6 +157,8 @@ async fn run(
                         t.respond(&native_request_id, decision)
                     }
                     Some(SessionCommand::SetModel(model)) => t.set_model(model.as_deref()),
+                    // The core restarts the session with `--effort` instead.
+                    Some(SessionCommand::SetEffort(_)) => vec![],
                     Some(SessionCommand::SetPermissionMode(mode)) => t.set_permission_mode(mode),
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 };
@@ -241,6 +240,9 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
     if let Some(model) = &cfg.model {
         args.extend(["--model".into(), model.clone()]);
     }
+    if let Some(effort) = &cfg.effort {
+        args.extend(["--effort".into(), effort.clone()]);
+    }
     // Only when the user chose one; otherwise Claude's own default applies.
     if let Some(mode) = cfg.permission_mode {
         args.extend(["--permission-mode".into(), permission_mode_arg(mode).into()]);
@@ -275,6 +277,90 @@ fn resolve_binary(cfg: &SessionConfig) -> Result<PathBuf> {
         .context("`claude` not found on PATH — install Claude Code or set harness.claude.path")
 }
 
+/// The family aliases, for when the CLI can't be asked.
+fn alias_models() -> Vec<loft_protocol::ModelInfo> {
+    [
+        ("opus", "Opus", "Most capable, for complex work"),
+        ("sonnet", "Sonnet", "Fast and capable, for everyday work"),
+        ("haiku", "Haiku", "Fastest, for simple tasks"),
+    ]
+    .into_iter()
+    .map(|(id, name, description)| loft_protocol::ModelInfo {
+        id: id.into(),
+        display_name: name.into(),
+        description: Some(description.into()),
+        ..Default::default()
+    })
+    .collect()
+}
+
+/// Ask a short-lived `claude` for its model catalog: the `initialize`
+/// control response lists each model with its effort levels. No prompt is
+/// sent, so this costs no tokens; hooks are off so the user's session hooks
+/// don't fire for it.
+fn probe_models(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<Vec<loft_protocol::ModelInfo>> {
+    use std::io::{BufRead as _, Write as _};
+    let mut child = std::process::Command::new(binary)
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+        ])
+        .current_dir(std::env::temp_dir())
+        .env_clear()
+        .envs(
+            env.iter()
+                .filter(|(k, _)| !SCRUBBED_ENV.contains(&k.as_str())),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let stdout = child.stdout.take().context("stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let result = (|| {
+        let init = Translator::new().initialize();
+        writeln!(stdin, "{init}")?;
+        stdin.flush()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx.recv_timeout(left).context("claude didn't answer")?;
+            if v["type"] == "control_response" {
+                let models = translate::models(&v);
+                anyhow::ensure!(!models.is_empty(), "no models in the initialize response");
+                return Ok(models);
+            }
+        }
+    })();
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 /// Generate a fresh session id for a new thread (Claude requires a UUID).
 pub fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -293,6 +379,7 @@ mod tests {
             cwd: ".".into(),
             model: None,
             permission_mode: None,
+            effort: None,
             resume: None,
             new_session_id: Some("abc".into()),
             fork_from: None,
@@ -329,6 +416,14 @@ mod tests {
         assert!(args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--permission-mode".to_owned()));
         assert!(!args.contains(&"--model".to_owned()));
+        assert!(!args.contains(&"--effort".to_owned()));
+    }
+
+    #[test]
+    fn effort_is_passed_at_launch() {
+        let mut c = cfg();
+        c.effort = Some("max".into());
+        assert!(build_args(&c).windows(2).any(|w| w == ["--effort", "max"]));
     }
 
     #[test]

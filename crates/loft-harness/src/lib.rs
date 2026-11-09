@@ -23,6 +23,8 @@ pub struct SessionConfig {
     pub thread_label: String,
     pub cwd: PathBuf,
     pub model: Option<String>,
+    /// Reasoning effort; `None` = the model's default.
+    pub effort: Option<String>,
     /// `None` = don't pass any mode; the harness's own default applies.
     pub permission_mode: Option<PermissionMode>,
     /// Resume this native session.
@@ -73,6 +75,7 @@ pub enum SessionCommand {
         decision: DecisionKind,
     },
     SetModel(Option<String>),
+    SetEffort(Option<String>),
     SetPermissionMode(Option<PermissionMode>),
     Shutdown,
 }
@@ -188,6 +191,9 @@ pub struct Capabilities {
     pub steer: bool,
     pub live_model_switch: bool,
     pub live_mode_switch: bool,
+    /// Effort changes reach a running session; otherwise the core restarts
+    /// the session (resuming it) before the next turn.
+    pub live_effort_switch: bool,
     pub native_fork: bool,
 }
 

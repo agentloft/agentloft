@@ -599,6 +599,10 @@ impl Core {
                 self.thread_call(&thread_id, |reply| ThreadCmd::SetModel { model, reply })
                     .await
             }
+            Request::SetEffort { thread_id, effort } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::SetEffort { effort, reply })
+                    .await
+            }
             Request::SetThreadHarness { thread_id, harness } => {
                 self.set_thread_harness(&thread_id, harness)
             }
@@ -703,6 +707,7 @@ impl Core {
         thread.harness = harness;
         thread.native_session_id = None;
         thread.model = model;
+        thread.effort = None;
         thread.permission_mode = mode;
         thread.updated_at_ms = now_ms();
         self.commit(vec![Event::ThreadUpdated {
@@ -737,6 +742,7 @@ impl Core {
             cwd: project.root_path,
             model,
             permission_mode,
+            effort: None,
             native_session_id: None,
             status: ThreadStatus::Idle,
             created_at_ms: now,

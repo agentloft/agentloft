@@ -16,8 +16,9 @@ gpui_kit::assets::icon_assets!(
         Brain,
         Check,
         ChevronDown,
-        ChevronRight,
+        ChevronUp,
         Clock,
+        ChevronRight,
         CircleAlert,
         CircleCheck,
         CircleStop,
@@ -74,6 +75,9 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(svg) = brand_svg(path) {
+            return Ok(Some(Cow::Borrowed(svg)));
+        }
         match AppIcons.load(path)? {
             Some(bytes) => Ok(Some(bytes)),
             None => gpui_kit::assets::Assets.load(path),
@@ -85,4 +89,16 @@ impl AssetSource for Assets {
         out.extend(gpui_kit::assets::Assets.list(path)?);
         Ok(out)
     }
+}
+
+/// Agent logos (Simple Icons, CC0; marks belong to their owners). OpenCode's
+/// is our own simple glyph.
+fn brand_svg(path: &str) -> Option<&'static [u8]> {
+    Some(match path {
+        "brand/claude.svg" => include_bytes!("../assets/brand/claude.svg"),
+        "brand/openai.svg" => include_bytes!("../assets/brand/openai.svg"),
+        "brand/gemini.svg" => include_bytes!("../assets/brand/gemini.svg"),
+        "brand/opencode.svg" => include_bytes!("../assets/brand/opencode.svg"),
+        _ => return None,
+    })
 }

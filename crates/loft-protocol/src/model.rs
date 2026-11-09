@@ -22,6 +22,9 @@ pub struct Thread {
     pub model: Option<String>,
     /// `None` = the harness's own default (decided; PLAN §2.7).
     pub permission_mode: Option<PermissionMode>,
+    /// Reasoning effort (`low` … `max`); `None` = the model's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Provider session id (Claude session UUID, Codex thread id, …).
     pub native_session_id: Option<String>,
     pub status: ThreadStatus,
