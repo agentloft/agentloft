@@ -701,6 +701,39 @@ mod tests {
     }
 
     #[test]
+    fn subagent_items_carry_their_parent() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        let mut agent_id = None;
+        let mut child_parent = None;
+        for line in include_str!("../fixtures/2.1.319-subagent.jsonl").lines() {
+            for out in t.on_line(line) {
+                let Out::Event(HarnessEvent::ItemStarted {
+                    native_id,
+                    body,
+                    parent,
+                }) = out
+                else {
+                    // Auto-allow any approval the subagent asks for.
+                    continue;
+                };
+                if let ItemBody::ToolCall {
+                    tool_kind, tool, ..
+                } = &body
+                {
+                    if *tool_kind == ToolKind::Subagent {
+                        agent_id = Some(native_id.clone());
+                    } else if tool == "Bash" {
+                        child_parent = parent.clone();
+                    }
+                }
+            }
+        }
+        let agent_id = agent_id.expect("an Agent tool call");
+        assert_eq!(child_parent.as_deref(), Some(agent_id.as_str()));
+    }
+
+    #[test]
     fn interrupt_marks_turn_interrupted() {
         let mut t = Translator::new();
         t.start_turn("x");
