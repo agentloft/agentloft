@@ -582,6 +582,7 @@ mod tests {
                 is_error: false,
             },
             updated_at_ms: 0,
+            parent_id: None,
         }
     }
 

@@ -196,6 +196,23 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
     if let Some(mode) = cfg.permission_mode {
         args.extend(["--permission-mode".into(), permission_mode_arg(mode).into()]);
     }
+    if !cfg.mcp_servers.is_empty() {
+        let servers: serde_json::Map<String, serde_json::Value> = cfg
+            .mcp_servers
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    serde_json::json!({"type": "stdio", "command": s.command, "args": s.args}),
+                )
+            })
+            .collect();
+        let config = serde_json::json!({ "mcpServers": servers });
+        args.extend(["--mcp-config".into(), config.to_string()]);
+    }
+    if !cfg.allowed_tools.is_empty() {
+        args.extend(["--allowedTools".into(), cfg.allowed_tools.join(",")]);
+    }
     args.extend(cfg.extra_args.iter().cloned());
     args
 }
@@ -232,7 +249,28 @@ mod tests {
             env: Arc::new(HashMap::new()),
             binary: None,
             extra_args: vec![],
+            mcp_servers: vec![],
+            allowed_tools: vec![],
         }
+    }
+
+    #[test]
+    fn mcp_servers_become_inline_config() {
+        let mut c = cfg();
+        c.mcp_servers.push(loft_harness::McpServer {
+            name: "agentloft".into(),
+            command: "/bin/agentloftd".into(),
+            args: vec!["mcp".into()],
+        });
+        c.allowed_tools.push("mcp__agentloft".into());
+        let args = build_args(&c);
+        let ix = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&args[ix + 1]).unwrap();
+        assert_eq!(v["mcpServers"]["agentloft"]["command"], "/bin/agentloftd");
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--allowedTools", "mcp__agentloft"])
+        );
     }
 
     #[test]

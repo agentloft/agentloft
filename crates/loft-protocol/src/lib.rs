@@ -6,9 +6,11 @@
 
 pub mod ids;
 pub mod model;
+pub mod workbench;
 
 pub use ids::*;
 pub use model::*;
+pub use workbench::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +28,22 @@ pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Hello(Hello),
-    Request { id: u64, body: Request },
-    Subscribe { sub_id: u64, topic: Topic },
-    Unsubscribe { sub_id: u64 },
+    Request {
+        id: u64,
+        body: Request,
+    },
+    Subscribe {
+        sub_id: u64,
+        topic: Topic,
+    },
+    Unsubscribe {
+        sub_id: u64,
+    },
+    /// Reply to a [`ServerMsg::ClientCall`].
+    ClientCallResult {
+        call_id: u64,
+        result: Result<serde_json::Value, ErrorBody>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +51,9 @@ pub struct Hello {
     pub protocol_version: u32,
     pub client_kind: ClientKind,
     pub client_build: String,
+    /// Optional client capabilities, e.g. `"browser"` (can run browser calls).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +101,54 @@ pub enum Request {
     Shutdown {
         reason: ShutdownReason,
     },
+    // -- workbench: files, diffs, terminals, browser, thread queries --------
+    ListDir {
+        root: FsRoot,
+        #[serde(default)]
+        rel_path: String,
+    },
+    ReadFile {
+        root: FsRoot,
+        rel_path: String,
+    },
+    GetDiff {
+        thread_id: ThreadId,
+        scope: DiffScope,
+    },
+    TerminalOpen {
+        root: FsRoot,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalInput {
+        id: TerminalId,
+        data: Bytes,
+    },
+    TerminalResize {
+        id: TerminalId,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalClose {
+        id: TerminalId,
+    },
+    /// Run a browser command in the user's browser panel (from an agent).
+    BrowserCall {
+        thread_id: ThreadId,
+        command: serde_json::Value,
+    },
+    /// Agent-facing thread queries (Agentloft MCP server, ADR-0013).
+    ListThreads {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        project_id: Option<ProjectId>,
+    },
+    ReadThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        detail: ReadDetail,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +165,8 @@ pub enum Topic {
     Workspace,
     /// Full timeline of one thread.
     Thread(ThreadId),
+    /// Output of one terminal (snapshot replays the scrollback buffer).
+    Terminal(TerminalId),
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +193,22 @@ pub enum ServerMsg {
         sub_id: u64,
         delta: Delta,
     },
+    TerminalOutput {
+        sub_id: u64,
+        id: TerminalId,
+        data: Bytes,
+    },
+    TerminalExited {
+        sub_id: u64,
+        id: TerminalId,
+        code: Option<i32>,
+    },
+    /// Daemon → client call (e.g. drive the browser panel); answer with
+    /// [`ClientMsg::ClientCallResult`].
+    ClientCall {
+        call_id: u64,
+        call: ClientCall,
+    },
     /// Connection-level error (bad handshake, unsupported version…).
     Fatal(ErrorBody),
 }
@@ -143,6 +227,12 @@ pub enum Response {
     Ok,
     Project { project: Project },
     Thread { thread: Thread },
+    DirListing { entries: Vec<DirEntry> },
+    File { file: FileContent },
+    Diff { diff: DiffResult },
+    Terminal { terminal: TerminalInfo },
+    Json { value: serde_json::Value },
+    Text { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +285,11 @@ pub enum Snapshot {
         turns: Vec<Turn>,
         items: Vec<Item>,
         requests: Vec<RuntimeRequest>,
+    },
+    Terminal {
+        seq: u64,
+        terminal: TerminalInfo,
+        replay: Bytes,
     },
 }
 
@@ -277,6 +372,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 client_kind: ClientKind::LocalUi,
                 client_build: "test".into(),
+                capabilities: vec!["browser".into()],
             }),
             ClientMsg::Request {
                 id: 7,

@@ -469,6 +469,8 @@ mod tests {
             ended_at_ms: None,
             usage: None,
             error: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
         };
         store
             .commit(vec![

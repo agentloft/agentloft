@@ -2,6 +2,7 @@
 //! clients connect to (ADR-0001, PLAN §1.6).
 
 mod conn;
+pub mod mcp;
 mod reaper;
 
 use anyhow::{Context as _, Result};
@@ -20,6 +21,8 @@ pub struct DaemonOptions {
     pub paths: Paths,
     pub harnesses: Vec<Arc<dyn Harness>>,
     pub capture_login_env: bool,
+    /// Attach `agentloftd mcp` to agent sessions (None in tests).
+    pub mcp_bridge: Option<loft_core::McpBridge>,
 }
 
 /// A running daemon. Dropping it does not stop it; call [`Daemon::shutdown`].
@@ -59,6 +62,7 @@ impl Daemon {
             CoreOptions {
                 env,
                 config,
+                mcp_bridge: opts.mcp_bridge,
                 ..CoreOptions::default()
             },
         );

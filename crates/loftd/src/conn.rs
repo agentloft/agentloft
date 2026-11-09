@@ -57,6 +57,7 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
     });
 
     // Handshake.
+    let browser_host;
     let hello = match source.next().await {
         Some(Ok(frame)) => serde_json::from_slice::<ClientMsg>(&frame).ok(),
         _ => None,
@@ -67,6 +68,7 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 || h.protocol_version + 1 == PROTOCOL_VERSION =>
         {
             tracing::debug!(kind = ?h.client_kind, build = %h.client_build, "client connected");
+            browser_host = h.capabilities.iter().any(|c| c == "browser");
             let _ = out_tx.send(ServerMsg::Welcome(Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_build: crate::BUILD.into(),
@@ -95,6 +97,26 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
             return;
         }
     }
+
+    static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn_id = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let call_relay = browser_host.then(|| {
+        let mut calls = core.clients().register_browser_host(conn_id);
+        let out = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some(c) = calls.recv().await {
+                if out
+                    .send(ServerMsg::ClientCall {
+                        call_id: c.call_id,
+                        call: c.call,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
 
     let mut subs: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     while let Some(frame) = source.next().await {
@@ -136,10 +158,17 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                     task.abort();
                 }
             }
+            ClientMsg::ClientCallResult { call_id, result } => {
+                core.clients().complete(call_id, result);
+            }
         }
     }
     for (_, task) in subs {
         task.abort();
+    }
+    core.clients().unregister(conn_id);
+    if let Some(relay) = call_relay {
+        relay.abort();
     }
     drop(out_tx);
     let _ = writer.await;
@@ -163,8 +192,10 @@ async fn forward(
                 return;
             }
         };
-        let seq = match &snapshot {
-            Snapshot::Workspace { seq, .. } | Snapshot::Thread { seq, .. } => *seq,
+        let mut seq = match &snapshot {
+            Snapshot::Workspace { seq, .. }
+            | Snapshot::Thread { seq, .. }
+            | Snapshot::Terminal { seq, .. } => *seq,
         };
         if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
             return;
@@ -186,6 +217,38 @@ async fn forward(
                         return;
                     }
                 }
+                Ok(BusMsg::TerminalOutput { id, offset, data }) => {
+                    if topic != Topic::Terminal(id.clone()) {
+                        continue;
+                    }
+                    // `seq` is the stream offset already delivered; trim overlap.
+                    let end = offset + data.len() as u64;
+                    if end <= seq {
+                        continue;
+                    }
+                    let skip = seq.saturating_sub(offset) as usize;
+                    seq = end;
+                    let chunk = data[skip..].to_vec();
+                    if out
+                        .send(ServerMsg::TerminalOutput {
+                            sub_id,
+                            id,
+                            data: chunk.into(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(BusMsg::TerminalExited { id, code }) => {
+                    if topic == Topic::Terminal(id.clone())
+                        && out
+                            .send(ServerMsg::TerminalExited { sub_id, id, code })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(n, sub_id, "subscriber lagged; resending snapshot");
                     break;
@@ -200,5 +263,6 @@ fn matches_topic(topic: &Topic, event: &loft_protocol::Event) -> bool {
     match topic {
         Topic::Workspace => event.is_workspace_event(),
         Topic::Thread(id) => event.thread_id() == Some(id),
+        Topic::Terminal(_) => false,
     }
 }

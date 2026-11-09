@@ -17,6 +17,7 @@ async fn start(paths: &Paths) -> Daemon {
         paths: paths.clone(),
         harnesses,
         capture_login_env: false,
+        mcp_bridge: None,
     })
     .await
     .unwrap()
@@ -49,6 +50,7 @@ async fn full_turn_over_socket_with_reconnect() {
         paths: paths.clone(),
         harnesses: vec![],
         capture_login_env: false,
+        mcp_bridge: None,
     })
     .await;
     assert!(second.is_err(), "single-instance lock");
@@ -189,6 +191,7 @@ async fn incompatible_protocol_is_refused() {
         protocol_version: PROTOCOL_VERSION + 5,
         client_kind: ClientKind::Test,
         client_build: "future".into(),
+        capabilities: vec![],
     });
     framed
         .send(bytes::Bytes::from(serde_json::to_vec(&hello).unwrap()))

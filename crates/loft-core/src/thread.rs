@@ -36,6 +36,12 @@ pub(crate) enum ThreadCmd {
     Shutdown {
         done: oneshot::Sender<()>,
     },
+    /// Internal: a checkpoint around a turn was captured (ADR-0008).
+    Checkpoint {
+        turn_id: TurnId,
+        before: bool,
+        sha: Option<String>,
+    },
 }
 
 pub(crate) type ThreadHandle = mpsc::UnboundedSender<ThreadCmd>;
@@ -43,6 +49,8 @@ pub(crate) type ThreadHandle = mpsc::UnboundedSender<ThreadCmd>;
 pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let actor = ThreadActor {
+        self_tx: tx.downgrade(),
+        pending_start: None,
         core,
         thread,
         session: None,
@@ -57,6 +65,9 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
 }
 
 struct ThreadActor {
+    self_tx: mpsc::WeakUnboundedSender<ThreadCmd>,
+    /// Prompt waiting for the "before" checkpoint before it is sent.
+    pending_start: Option<String>,
     core: Arc<Core>,
     thread: Thread,
     session: Option<SessionHandle>,
@@ -104,6 +115,19 @@ impl ThreadActor {
             ThreadCmd::SendMessage { text, reply } => {
                 let _ = reply.send(self.send_message(text));
             }
+            ThreadCmd::Interrupt { reply } if self.pending_start.is_some() => {
+                // The prompt never reached the agent; just end the turn.
+                self.pending_start = None;
+                let res = self
+                    .finish_turn(TurnStatus::Interrupted, None, None)
+                    .map(|_| Response::Ok);
+                let _ = reply.send(res);
+            }
+            ThreadCmd::Checkpoint {
+                turn_id,
+                before,
+                sha,
+            } => self.on_checkpoint(turn_id, before, sha),
             ThreadCmd::Interrupt { reply } => {
                 let res = match (&self.session, &self.turn) {
                     (Some(s), Some(_)) => {
@@ -155,6 +179,8 @@ impl ThreadActor {
             ended_at_ms: None,
             usage: None,
             error: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
         };
         let user_item = self.new_item(
             Some(turn.id.clone()),
@@ -175,12 +201,94 @@ impl ThreadActor {
         ])?;
         self.turn = Some(turn.clone());
 
-        let session = self.session.as_ref().expect("ensured above");
-        session
-            .commands
-            .send(SessionCommand::StartTurn(TurnInput { text }))
-            .map_err(|_| internal("harness session closed"))?;
+        // Snapshot the work tree first; the prompt goes out once that's done
+        // so the turn's diff covers exactly the agent's changes.
+        self.pending_start = Some(text);
+        self.capture_checkpoint(&turn, true);
         Ok(Response::Ok)
+    }
+
+    fn capture_checkpoint(&self, turn: &Turn, before: bool) {
+        let dir = std::path::PathBuf::from(&self.thread.cwd);
+        let ref_name = format!(
+            "{}/{}/{}-{}",
+            loft_git::REF_PREFIX,
+            self.thread.id,
+            turn.ordinal,
+            if before { "before" } else { "after" }
+        );
+        let message = format!(
+            "agentloft checkpoint: thread {} turn {} ({})",
+            self.thread.id,
+            turn.ordinal,
+            if before { "before" } else { "after" }
+        );
+        let tx = self.self_tx.clone();
+        let turn_id = turn.id.clone();
+        tokio::spawn(async move {
+            let sha = tokio::task::spawn_blocking(move || {
+                loft_git::repo_root(&dir)?;
+                match loft_git::checkpoint(&dir, &ref_name, &message) {
+                    Ok(sha) => Some(sha),
+                    Err(err) => {
+                        tracing::warn!(%err, "checkpoint failed");
+                        None
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(ThreadCmd::Checkpoint {
+                    turn_id,
+                    before,
+                    sha,
+                });
+            }
+        });
+    }
+
+    fn on_checkpoint(&mut self, turn_id: TurnId, before: bool, sha: Option<String>) {
+        if before {
+            let Some(turn) = self.turn.as_mut().filter(|t| t.id == turn_id) else {
+                return;
+            };
+            if sha.is_some() {
+                turn.checkpoint_before = sha;
+                let turn = turn.clone();
+                let _ = self.core.commit(vec![Event::TurnUpdated { turn }]);
+            }
+            let Some(text) = self.pending_start.take() else {
+                return;
+            };
+            let sent = self
+                .session
+                .as_ref()
+                .map(|s| {
+                    s.commands
+                        .send(SessionCommand::StartTurn(TurnInput { text }))
+                        .is_ok()
+                })
+                .unwrap_or(false);
+            if !sent {
+                let _ = self.finish_turn(
+                    TurnStatus::Failed,
+                    None,
+                    Some("The agent session closed before the turn started.".into()),
+                );
+            }
+        } else if let Some(sha) = sha {
+            let turn = self
+                .core
+                .with_store(|s| s.turns(&self.thread.id))
+                .ok()
+                .and_then(|turns| turns.into_iter().find(|t| t.id == turn_id));
+            if let Some(mut turn) = turn {
+                turn.checkpoint_after = Some(sha);
+                let _ = self.core.commit(vec![Event::TurnUpdated { turn }]);
+            }
+        }
     }
 
     fn respond(&mut self, request_id: RequestId, decision: DecisionKind) -> CoreResult<Response> {
@@ -234,6 +342,29 @@ impl ThreadActor {
             env: opts.env.clone(),
             binary: (hcfg.path != "auto").then(|| hcfg.path.clone().into()),
             extra_args: hcfg.extra_args.clone(),
+            mcp_servers: opts
+                .mcp_bridge
+                .as_ref()
+                .map(|b| {
+                    vec![loft_harness::McpServer {
+                        name: "agentloft".into(),
+                        command: b.exe.to_string_lossy().into_owned(),
+                        args: vec![
+                            "mcp".into(),
+                            "--thread".into(),
+                            self.thread.id.to_string(),
+                            "--home".into(),
+                            b.home.to_string_lossy().into_owned(),
+                        ],
+                    }]
+                })
+                .unwrap_or_default(),
+            // Our own tools (browser panel, thread reading) don't need prompts.
+            allowed_tools: if opts.mcp_bridge.is_some() {
+                vec!["mcp__agentloft".into()]
+            } else {
+                vec![]
+            },
         };
         let session = harness
             .open_session(cfg)
@@ -299,8 +430,13 @@ impl ThreadActor {
                 }
             }
             HarnessEvent::TurnStarted => {}
-            HarnessEvent::ItemStarted { native_id, body } => {
-                let item = self.new_item(self.turn_id(), body, ItemStatus::InProgress)?;
+            HarnessEvent::ItemStarted {
+                native_id,
+                body,
+                parent,
+            } => {
+                let mut item = self.new_item(self.turn_id(), body, ItemStatus::InProgress)?;
+                item.parent_id = parent.and_then(|p| self.items.get(&p).cloned());
                 self.items.insert(native_id, item.id.clone());
                 self.core.live().insert(item.id.clone(), item.clone());
                 self.core.commit(vec![Event::ItemUpserted { item }])?;
@@ -484,11 +620,14 @@ impl ThreadActor {
             )?;
             events.push(Event::ItemUpserted { item });
         }
+        self.pending_start = None;
+        let mut finished = None;
         if let Some(mut turn) = self.turn.take() {
             turn.status = status;
             turn.usage = usage;
             turn.error = error;
             turn.ended_at_ms = Some(now_ms());
+            finished = Some(turn.clone());
             events.push(Event::TurnUpdated { turn });
         }
         self.thread.status = ThreadStatus::Idle;
@@ -497,6 +636,9 @@ impl ThreadActor {
             thread: self.thread.clone(),
         });
         self.core.commit(events)?;
+        if let Some(turn) = finished.filter(|t| t.checkpoint_before.is_some()) {
+            self.capture_checkpoint(&turn, false);
+        }
         Ok(())
     }
 
@@ -532,6 +674,7 @@ impl ThreadActor {
             status,
             body,
             updated_at_ms: now_ms(),
+            parent_id: None,
         })
     }
 

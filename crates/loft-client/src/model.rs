@@ -228,6 +228,7 @@ mod tests {
             status: ItemStatus::InProgress,
             body: ItemBody::AssistantMessage { text: text.into() },
             updated_at_ms: 0,
+            parent_id: None,
         };
         let id = item.id.clone();
         let m = ThreadModel::from_snapshot(Snapshot::Thread {

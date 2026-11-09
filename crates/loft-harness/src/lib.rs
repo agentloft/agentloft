@@ -34,6 +34,18 @@ pub struct SessionConfig {
     /// Resolved binary path, or `None` to resolve via `env["PATH"]`.
     pub binary: Option<PathBuf>,
     pub extra_args: Vec<String>,
+    /// MCP servers to attach to the session (e.g. the Agentloft server).
+    pub mcp_servers: Vec<McpServer>,
+    /// Tools the harness may use without asking (e.g. `mcp__agentloft`).
+    pub allowed_tools: Vec<String>,
+}
+
+/// A stdio MCP server to attach to an agent session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +84,8 @@ pub enum HarnessEvent {
     ItemStarted {
         native_id: String,
         body: ItemBody,
+        /// Native id of the subagent tool call this item belongs to.
+        parent: Option<String>,
     },
     ItemDelta {
         native_id: String,

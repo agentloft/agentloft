@@ -25,6 +25,11 @@ enum Cmd {
     Run,
     /// Print build info as JSON.
     Version,
+    /// Run the Agentloft MCP server on stdio for one thread (spawned by agents).
+    Mcp {
+        #[arg(long)]
+        thread: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -40,6 +45,14 @@ fn main() -> Result<()> {
         Some(home) => Paths::new(home),
         None => Paths::from_env()?,
     };
+    if let Some(Cmd::Mcp { thread }) = cli.cmd {
+        // stdout carries the MCP protocol: log to a file only.
+        init_file_tracing(&paths, "mcp.log");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(loftd::mcp::run(paths, loft_protocol::ThreadId(thread)));
+    }
     paths.ensure_dirs()?;
     init_tracing(&paths, cli.foreground)?;
 
@@ -55,10 +68,17 @@ async fn run(paths: Paths) -> Result<()> {
         Arc::new(loft_harness_claude::ClaudeHarness),
         Arc::new(loft_harness::fake::FakeHarness),
     ];
+    let mcp_bridge = std::env::current_exe()
+        .ok()
+        .map(|exe| loft_core::McpBridge {
+            exe,
+            home: paths.home.clone(),
+        });
     let daemon = match Daemon::start(DaemonOptions {
         paths,
         harnesses,
         capture_login_env: true,
+        mcp_bridge,
     })
     .await
     {
@@ -78,6 +98,24 @@ async fn run(paths: Paths) -> Result<()> {
     }
     daemon.shutdown().await;
     Ok(())
+}
+
+fn init_file_tracing(paths: &Paths, file: &str) {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter =
+        EnvFilter::try_from_env("AGENTLOFT_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = std::fs::create_dir_all(paths.logs_dir());
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.logs_dir().join(file))
+    {
+        fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(f))
+            .init();
+    }
 }
 
 fn init_tracing(paths: &Paths, foreground: bool) -> Result<()> {

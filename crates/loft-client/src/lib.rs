@@ -36,6 +36,22 @@ pub enum ClientEvent {
         sub_id: u64,
         delta: Delta,
     },
+    TerminalOutput {
+        sub_id: u64,
+        id: loft_protocol::TerminalId,
+        data: Vec<u8>,
+    },
+    TerminalExited {
+        sub_id: u64,
+        id: loft_protocol::TerminalId,
+        code: Option<i32>,
+    },
+    /// The daemon asks this client to do something (answer with
+    /// [`Client::respond_call`]).
+    ClientCall {
+        call_id: u64,
+        call: loft_protocol::ClientCall,
+    },
     /// Connection-level error from the daemon.
     Fatal(ErrorBody),
     Disconnected,
@@ -64,6 +80,16 @@ impl Client {
         kind: ClientKind,
         build: &str,
     ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
+        Self::connect_with(socket, kind, build, &[]).await
+    }
+
+    /// Connect advertising `capabilities` (e.g. `"browser"`).
+    pub async fn connect_with(
+        socket: &Path,
+        kind: ClientKind,
+        build: &str,
+        capabilities: &[&str],
+    ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
         let stream = UnixStream::connect(socket)
             .await
             .with_context(|| format!("connect {}", socket.display()))?;
@@ -76,6 +102,7 @@ impl Client {
             protocol_version: PROTOCOL_VERSION,
             client_kind: kind,
             client_build: build.to_owned(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
         });
         sink.send(Bytes::from(serde_json::to_vec(&hello)?)).await?;
         let welcome = match source.next().await {
@@ -128,6 +155,17 @@ impl Client {
                     }
                     ServerMsg::Event { sub_id, event } => ClientEvent::Event { sub_id, event },
                     ServerMsg::Delta { sub_id, delta } => ClientEvent::Delta { sub_id, delta },
+                    ServerMsg::TerminalOutput { sub_id, id, data } => ClientEvent::TerminalOutput {
+                        sub_id,
+                        id,
+                        data: data.0,
+                    },
+                    ServerMsg::TerminalExited { sub_id, id, code } => {
+                        ClientEvent::TerminalExited { sub_id, id, code }
+                    }
+                    ServerMsg::ClientCall { call_id, call } => {
+                        ClientEvent::ClientCall { call_id, call }
+                    }
                     ServerMsg::Fatal(e) => ClientEvent::Fatal(e),
                     ServerMsg::Welcome(_) => continue,
                 };
@@ -191,6 +229,14 @@ impl Client {
         sub_id
     }
 
+    /// Answer a [`ClientEvent::ClientCall`].
+    pub fn respond_call(&self, call_id: u64, result: Result<serde_json::Value, ErrorBody>) {
+        let _ = self
+            .inner
+            .tx
+            .send(ClientMsg::ClientCallResult { call_id, result });
+    }
+
     pub fn unsubscribe(&self, sub_id: u64) {
         let _ = self.inner.tx.send(ClientMsg::Unsubscribe { sub_id });
     }
@@ -222,15 +268,16 @@ pub async fn connect_or_spawn(
     daemon_bin: &Path,
     kind: ClientKind,
     build: &str,
+    capabilities: &[&str],
 ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
     let socket = paths.socket_file();
-    if let Ok(conn) = Client::connect(&socket, kind, build).await {
+    if let Ok(conn) = Client::connect_with(&socket, kind, build, capabilities).await {
         return Ok(conn);
     }
     spawn_daemon(paths, daemon_bin)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match Client::connect(&socket, kind, build).await {
+        match Client::connect_with(&socket, kind, build, capabilities).await {
             Ok(conn) => return Ok(conn),
             Err(err) if tokio::time::Instant::now() >= deadline => {
                 return Err(err).context("agentloftd did not come up within 10s");

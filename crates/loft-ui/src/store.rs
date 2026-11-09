@@ -68,6 +68,7 @@ impl AppStore {
                 &loft_client::daemon_binary(),
                 ClientKind::LocalUi,
                 BUILD,
+                &["browser"],
             )
             .await
         });
@@ -161,6 +162,18 @@ impl AppStore {
                     && let Some(entity) = self.threads.get(id)
                 {
                     entity.update(cx, |t, cx| t.apply_delta(&delta, cx));
+                }
+            }
+            ClientEvent::TerminalOutput { .. } | ClientEvent::TerminalExited { .. } => {}
+            ClientEvent::ClientCall { call_id, .. } => {
+                if let Some(client) = &self.client {
+                    client.respond_call(
+                        call_id,
+                        Err(ErrorBody::new(
+                            loft_protocol::ErrorCode::Unsupported,
+                            "the browser panel is not available in this build",
+                        )),
+                    );
                 }
             }
             ClientEvent::Fatal(err) => {

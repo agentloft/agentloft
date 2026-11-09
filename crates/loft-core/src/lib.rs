@@ -2,7 +2,12 @@
 //! active thread that drives its harness session, persists domain events and
 //! fans them out on a broadcast bus together with ephemeral streaming deltas.
 
+mod clients;
+mod terminals;
 mod thread;
+mod workbench;
+
+pub use clients::{ClientRegistry, OutgoingCall};
 
 use anyhow::Result;
 use loft_harness::Harness;
@@ -24,6 +29,24 @@ use tokio::sync::{broadcast, oneshot};
 pub enum BusMsg {
     Event(EventEnvelope),
     Delta(Delta),
+    /// Terminal output; `offset` is the byte position of `data` in the
+    /// terminal's output stream (for de-duplication against replays).
+    TerminalOutput {
+        id: loft_protocol::TerminalId,
+        offset: u64,
+        data: Arc<Vec<u8>>,
+    },
+    TerminalExited {
+        id: loft_protocol::TerminalId,
+        code: Option<i32>,
+    },
+}
+
+/// How agent sessions reach the Agentloft MCP server (`agentloftd mcp`).
+#[derive(Debug, Clone)]
+pub struct McpBridge {
+    pub exe: PathBuf,
+    pub home: PathBuf,
 }
 
 pub struct CoreOptions {
@@ -31,6 +54,8 @@ pub struct CoreOptions {
     pub config: loft_config::Config,
     /// Snapshot cadence for streaming items (ADR-0006: ≈250 ms).
     pub flush_interval: Duration,
+    /// Attach the Agentloft MCP server to agent sessions.
+    pub mcp_bridge: Option<McpBridge>,
 }
 
 impl Default for CoreOptions {
@@ -39,6 +64,7 @@ impl Default for CoreOptions {
             env: Arc::new(std::env::vars().collect()),
             config: loft_config::Config::default(),
             flush_interval: Duration::from_millis(250),
+            mcp_bridge: None,
         }
     }
 }
@@ -50,6 +76,8 @@ pub struct Core {
     threads: Mutex<HashMap<ThreadId, ThreadHandle>>,
     /// In-progress items being streamed, overlaid on snapshots.
     live: Mutex<HashMap<ItemId, Item>>,
+    terminals: terminals::Terminals,
+    clients: ClientRegistry,
     opts: CoreOptions,
 }
 
@@ -72,12 +100,18 @@ impl Core {
             harnesses: harnesses.into_iter().map(|h| (h.id().0, h)).collect(),
             threads: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            terminals: terminals::Terminals::default(),
+            clients: ClientRegistry::default(),
             opts,
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusMsg> {
         self.bus.subscribe()
+    }
+
+    pub fn clients(&self) -> &ClientRegistry {
+        &self.clients
     }
 
     /// Append events, update projections and broadcast — atomically ordered.
@@ -161,6 +195,14 @@ impl Core {
     // -- queries ------------------------------------------------------------
 
     pub fn snapshot(&self, topic: &Topic) -> CoreResult<Snapshot> {
+        if let Topic::Terminal(id) = topic {
+            let (terminal, replay, end) = self.terminals.snapshot(id)?;
+            return Ok(Snapshot::Terminal {
+                seq: end,
+                terminal,
+                replay: replay.into(),
+            });
+        }
         // Read under the store lock so `seq` is consistent with the data.
         let snap = self.with_store(|s| {
             let seq = s.max_seq()?;
@@ -170,6 +212,7 @@ impl Core {
                     projects: s.projects()?,
                     threads: s.threads()?,
                 }),
+                Topic::Terminal(_) => None,
                 Topic::Thread(id) => match s.thread(id)? {
                     None => None,
                     Some(thread) => Some(Snapshot::Thread {
@@ -240,6 +283,58 @@ impl Core {
                 ErrorCode::Unsupported,
                 "shutdown is handled by the daemon",
             )),
+            Request::ListDir { root, rel_path } => {
+                let core = self.clone();
+                let entries = tokio::task::spawn_blocking(move || core.list_dir(&root, &rel_path))
+                    .await
+                    .map_err(internal)??;
+                Ok(Response::DirListing { entries })
+            }
+            Request::ReadFile { root, rel_path } => {
+                let core = self.clone();
+                let file = tokio::task::spawn_blocking(move || core.read_file(&root, &rel_path))
+                    .await
+                    .map_err(internal)??;
+                Ok(Response::File { file })
+            }
+            Request::GetDiff { thread_id, scope } => Ok(Response::Diff {
+                diff: self.diff(&thread_id, scope).await?,
+            }),
+            Request::TerminalOpen { root, cols, rows } => {
+                let dir = self.root_dir(&root)?;
+                let terminal =
+                    self.terminals
+                        .open(&dir, cols, rows, &self.opts.env, self.bus.clone())?;
+                Ok(Response::Terminal { terminal })
+            }
+            Request::TerminalInput { id, data } => {
+                self.terminals.input(&id, &data.0)?;
+                Ok(Response::Ok)
+            }
+            Request::TerminalResize { id, cols, rows } => {
+                self.terminals.resize(&id, cols, rows)?;
+                Ok(Response::Ok)
+            }
+            Request::TerminalClose { id } => {
+                self.terminals.close(&id)?;
+                Ok(Response::Ok)
+            }
+            Request::BrowserCall { thread_id, command } => {
+                let value = self
+                    .clients
+                    .call(
+                        loft_protocol::ClientCall::Browser { thread_id, command },
+                        Duration::from_secs(90),
+                    )
+                    .await?;
+                Ok(Response::Json { value })
+            }
+            Request::ListThreads { query, project_id } => Ok(Response::Json {
+                value: self.list_threads_json(query.as_deref(), project_id.as_ref())?,
+            }),
+            Request::ReadThread { thread_id, detail } => Ok(Response::Text {
+                text: self.read_thread_text(&thread_id, detail)?,
+            }),
         }
     }
 
@@ -337,8 +432,9 @@ impl Core {
         Ok(handle)
     }
 
-    /// Stop all harness sessions (daemon shutdown).
+    /// Stop all harness sessions and terminals (daemon shutdown).
     pub async fn shutdown(&self) {
+        self.terminals.shutdown();
         let handles: Vec<ThreadHandle> = lock(&self.threads).drain().map(|(_, h)| h).collect();
         let mut waits = Vec::new();
         for h in handles {

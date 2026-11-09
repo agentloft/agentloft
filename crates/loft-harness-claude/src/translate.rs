@@ -198,6 +198,7 @@ impl Translator {
             return vec![];
         };
         let msg_id = str_at(v, "api_message_id").unwrap_or_default().to_owned();
+        let parent = str_at(v, "parent_tool_use_id").map(str::to_owned);
         let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
         match str_at(event, "type") {
             Some("content_block_start") => {
@@ -221,7 +222,11 @@ impl Translator {
                 self.streamed_messages.insert(msg_id.clone());
                 self.open_blocks
                     .insert((msg_id, index), (native_id.clone(), channel));
-                vec![Out::Event(HarnessEvent::ItemStarted { native_id, body })]
+                vec![Out::Event(HarnessEvent::ItemStarted {
+                    native_id,
+                    body,
+                    parent,
+                })]
             }
             Some("content_block_delta") => {
                 let Some((native_id, channel)) = self.open_blocks.get(&(msg_id, index)) else {
@@ -258,6 +263,7 @@ impl Translator {
     fn on_assistant(&mut self, v: &Value) -> Vec<Out> {
         let message = v.get("message").unwrap_or(&Value::Null);
         let msg_id = str_at(message, "id").unwrap_or_default().to_owned();
+        let parent = str_at(v, "parent_tool_use_id").map(str::to_owned);
         let streamed = self.streamed_messages.contains(&msg_id);
         let mut out = Vec::new();
         let Some(content) = message.get("content").and_then(Value::as_array) else {
@@ -269,6 +275,7 @@ impl Translator {
                     let native_id = format!("{msg_id}:{i}");
                     let text = str_at(block, "text").unwrap_or_default().to_owned();
                     out.push(Out::Event(HarnessEvent::ItemStarted {
+                        parent: parent.clone(),
                         native_id: native_id.clone(),
                         body: ItemBody::AssistantMessage {
                             text: String::new(),
@@ -285,6 +292,7 @@ impl Translator {
                     let native_id = format!("{msg_id}:{i}");
                     let text = str_at(block, "thinking").unwrap_or_default().to_owned();
                     out.push(Out::Event(HarnessEvent::ItemStarted {
+                        parent: parent.clone(),
                         native_id: native_id.clone(),
                         body: ItemBody::Reasoning {
                             text: String::new(),
@@ -307,6 +315,7 @@ impl Translator {
                     let name = str_at(block, "name").unwrap_or("tool").to_owned();
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     out.push(Out::Event(HarnessEvent::ItemStarted {
+                        parent: parent.clone(),
                         native_id: id.to_owned(),
                         body: ItemBody::ToolCall {
                             title: tool_title(&name, &input),

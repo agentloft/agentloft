@@ -60,6 +60,11 @@ pub struct Turn {
     pub ended_at_ms: Option<i64>,
     pub usage: Option<Usage>,
     pub error: Option<String>,
+    /// Git checkpoint commits captured before/after the turn (ADR-0008).
+    #[serde(default)]
+    pub checkpoint_before: Option<String>,
+    #[serde(default)]
+    pub checkpoint_after: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +102,9 @@ pub struct Item {
     pub status: ItemStatus,
     pub body: ItemBody,
     pub updated_at_ms: i64,
+    /// The subagent (Task/Agent tool call) this item belongs to, if any.
+    #[serde(default)]
+    pub parent_id: Option<ItemId>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
