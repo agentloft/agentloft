@@ -158,6 +158,11 @@ impl WorkspaceView {
                 this.on_store_event(event, window, cx)
             }),
             cx.observe(&store, |_, _, cx| cx.notify()),
+            // The window title is the native tab label; hidden tabs don't
+            // render, so keep it current from store changes.
+            cx.observe_in(&store, window, |this, _, window, cx| {
+                this.update_window_title(window, cx)
+            }),
             cx.subscribe_in(&search, window, |this, state, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.query = state.read(cx).value().to_lowercase();
@@ -184,6 +189,31 @@ impl WorkspaceView {
             tabs_shown: false,
             dev_tab: take_dev_tab(),
             _subs: subs,
+        }
+    }
+
+    fn update_window_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let title = store
+            .selected
+            .as_ref()
+            .and_then(|id| store.workspace.threads.iter().find(|t| &t.id == id))
+            .map(|t| {
+                let project = store
+                    .workspace
+                    .projects
+                    .iter()
+                    .find(|p| p.id == t.project_id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("");
+                format!("{} — {project}", t.title)
+            })
+            .unwrap_or_else(|| "Agentloft".into());
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+            // Sibling tabs draw this title in their tab strips.
+            cx.defer(crate::windows::refresh_all);
         }
     }
 
@@ -712,7 +742,7 @@ impl WorkspaceView {
                 p,
                 cx.listener(|_, _, window, cx| {
                     let tab = crate::windows::Placement::TabOf(window.window_handle());
-                    crate::windows::open(None, tab, cx)
+                    crate::windows::open(None, tab, cx);
                 }),
             ))
             .into_any_element()
@@ -1469,15 +1499,6 @@ impl Render for WorkspaceView {
             Some(thread) => self.render_thread(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
         };
-        // The window title doubles as the native tab label.
-        let title = header_title
-            .as_ref()
-            .map(|(project, t)| format!("{} — {project}", t.title))
-            .unwrap_or_else(|| "Agentloft".into());
-        if title != self.window_title {
-            window.set_window_title(&title);
-            self.window_title = title;
-        }
         let show_panel = self.panel_open && header_title.is_some();
         let header = self.render_header(header_title, &p, cx);
         // Native tab group (⌘T): GPUI doesn't draw macOS's tab bar under our
@@ -1503,11 +1524,11 @@ impl Render for WorkspaceView {
                 crate::palette::open(cx.entity(), &this.store, window, cx)
             }))
             .on_action(cx.listener(|_, _: &NewWindow, _, cx| {
-                crate::windows::open(None, crate::windows::Placement::Window, cx)
+                crate::windows::open(None, crate::windows::Placement::Window, cx);
             }))
             .on_action(cx.listener(|_, _: &NewTab, window, cx| {
                 let tab = crate::windows::Placement::TabOf(window.window_handle());
-                crate::windows::open(None, tab, cx)
+                crate::windows::open(None, tab, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.sidebar_open = true;
@@ -2156,7 +2177,7 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                         .icon(IconName::SquarePen)
                         .on_click(move |_, window, cx| {
                             let tab = crate::windows::Placement::TabOf(window.window_handle());
-                            crate::windows::open(Some(t.clone()), tab, cx)
+                            crate::windows::open(Some(t.clone()), tab, cx);
                         }),
                 )
                 .separator();

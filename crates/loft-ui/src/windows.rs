@@ -16,11 +16,104 @@ use loft_protocol::ThreadId;
 pub struct AppEnv {
     pub runtime: tokio::runtime::Handle,
     pub paths: Paths,
+    /// Open workspace windows and their stores (for session restore).
+    open: Vec<(AnyWindowHandle, gpui_kit::WeakEntity<AppStore>)>,
 }
 impl Global for AppEnv {}
 
 pub fn init(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut App) {
-    cx.set_global(AppEnv { runtime, paths });
+    cx.set_global(AppEnv {
+        runtime,
+        paths,
+        open: Vec::new(),
+    });
+    // Remember the windows and tab groups for next launch.
+    cx.on_app_quit(|cx| {
+        save_session(cx);
+        async {}
+    })
+    .detach();
+}
+
+/// Re-render every workspace window (e.g. a tab's title changed).
+pub fn refresh_all(cx: &mut App) {
+    let handles: Vec<AnyWindowHandle> = cx
+        .try_global::<AppEnv>()
+        .map(|env| env.open.iter().map(|(h, _)| *h).collect())
+        .unwrap_or_default();
+    for handle in handles {
+        let _ = handle.update(cx, |_, window, _| window.refresh());
+    }
+}
+
+/// One window in the saved session: its thread and native tab group.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedWindow {
+    thread: Option<ThreadId>,
+    group: usize,
+}
+
+fn session_file(paths: &Paths) -> std::path::PathBuf {
+    paths.home.join("ui-session.json")
+}
+
+fn save_session(cx: &mut App) {
+    let Some(env) = cx.try_global::<AppEnv>() else {
+        return;
+    };
+    let file = session_file(&env.paths);
+    let open = env.open.clone();
+    let mut groups: Vec<Vec<gpui_kit::WindowId>> = Vec::new();
+    let mut saved = Vec::new();
+    for (handle, store) in open {
+        let Some(store) = store.upgrade() else {
+            continue;
+        };
+        // Windows sharing a native tab group share a group number.
+        let tabs = handle
+            .update(cx, |_, window, _| window.tabbed_windows())
+            .ok()
+            .flatten()
+            .map(|t| t.iter().map(|t| t.id).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![handle.window_id()]);
+        let group = match groups.iter().position(|g| g.contains(&handle.window_id())) {
+            Some(ix) => ix,
+            None => {
+                groups.push(tabs);
+                groups.len() - 1
+            }
+        };
+        saved.push(SavedWindow {
+            thread: store.read(cx).selected.clone(),
+            group,
+        });
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&saved) {
+        let _ = std::fs::write(file, json);
+    }
+}
+
+/// Reopen last session's windows and tabs; a single window if none.
+pub fn restore(cx: &mut App) {
+    let saved: Vec<SavedWindow> = cx
+        .try_global::<AppEnv>()
+        .and_then(|env| std::fs::read(session_file(&env.paths)).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if saved.is_empty() {
+        open(None, Placement::Window, cx);
+        return;
+    }
+    let mut leaders: std::collections::HashMap<usize, AnyWindowHandle> = Default::default();
+    for w in saved {
+        let placement = match leaders.get(&w.group) {
+            Some(leader) => Placement::TabOf(*leader),
+            None => Placement::Window,
+        };
+        if let Some(handle) = open(w.thread, placement, cx) {
+            leaders.entry(w.group).or_insert(handle);
+        }
+    }
 }
 
 /// Windows with this identifier can merge into one tabbed window.
@@ -35,10 +128,14 @@ pub enum Placement {
 }
 
 /// Open a workspace window, optionally showing `thread`.
-pub fn open(thread: Option<ThreadId>, placement: Placement, cx: &mut App) {
+pub fn open(
+    thread: Option<ThreadId>,
+    placement: Placement,
+    cx: &mut App,
+) -> Option<AnyWindowHandle> {
     let Some(env) = cx.try_global::<AppEnv>() else {
         tracing::error!("windows::init was not called");
-        return;
+        return None;
     };
     let (runtime, paths) = (env.runtime.clone(), env.paths.clone());
     let store = cx.new(|cx| AppStore::new(runtime, paths, cx));
@@ -59,7 +156,10 @@ pub fn open(thread: Option<ThreadId>, placement: Placement, cx: &mut App) {
             ..Default::default()
         },
         cx,
-        move |window, cx| cx.new(|cx| WorkspaceView::new(store.clone(), window, cx)),
+        {
+            let store = store.clone();
+            move |window, cx| cx.new(|cx| WorkspaceView::new(store.clone(), window, cx))
+        },
     );
     match opened {
         Ok((handle, _)) => {
@@ -68,8 +168,16 @@ pub fn open(thread: Option<ThreadId>, placement: Placement, cx: &mut App) {
             if let Placement::TabOf(parent) = placement {
                 cx.defer(move |cx| add_as_tab(parent, handle, cx));
             }
+            let weak = store.downgrade();
+            let env = cx.global_mut::<AppEnv>();
+            env.open.retain(|(_, s)| s.upgrade().is_some());
+            env.open.push((handle, weak));
+            Some(handle)
         }
-        Err(err) => tracing::error!("open window: {err:#}"),
+        Err(err) => {
+            tracing::error!("open window: {err:#}");
+            None
+        }
     }
 }
 

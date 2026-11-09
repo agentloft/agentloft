@@ -218,14 +218,16 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
             Some(Box::new(NewTab)),
             |_, window, cx| {
                 let tab = crate::windows::Placement::TabOf(window.window_handle());
-                crate::windows::open(None, tab, cx)
+                crate::windows::open(None, tab, cx);
             },
         ),
         entry(
             "New window",
             IconName::Plus,
             Some(Box::new(NewWindow)),
-            |_, _, cx| crate::windows::open(None, crate::windows::Placement::Window, cx),
+            |_, _, cx| {
+                crate::windows::open(None, crate::windows::Placement::Window, cx);
+            },
         ),
         entry(
             "Add project…",

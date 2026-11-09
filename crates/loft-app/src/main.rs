@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         .detach();
 
         windows::init(handle.clone(), paths.clone(), cx);
-        windows::open(None, windows::Placement::Window, cx);
+        windows::restore(cx);
         cx.activate(true);
     });
     drop(runtime);
