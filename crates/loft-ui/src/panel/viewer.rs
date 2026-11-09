@@ -552,12 +552,12 @@ impl Render for FileViewer {
                     .min_h_0()
                     .relative()
                     .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .px_6()
-                            .py_4()
-                            .child(TextView::new(preview).size_full()),
+                        div().absolute().inset_0().px_6().py_4().child(
+                            TextView::new(preview)
+                                .selectable(true)
+                                .scrollable(true)
+                                .size_full(),
+                        ),
                     )
                     .into_any_element(),
             },
