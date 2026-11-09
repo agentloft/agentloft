@@ -2,6 +2,7 @@
 //! [`store::AppStore`]; views never spawn processes or touch storage.
 
 mod agent_choice;
+mod app_icons;
 pub mod assets;
 mod attachments;
 mod attention;

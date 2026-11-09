@@ -37,6 +37,8 @@ pub enum Entry {
         disabled: bool,
         /// A letter that picks the item while the menu is open.
         shortcut: Option<char>,
+        /// A picture shown instead of the icon (e.g. an app's own icon).
+        image: Option<std::sync::Arc<gpui_kit::Image>>,
         action: Action,
     },
     Separator,
@@ -54,6 +56,7 @@ impl Entry {
             checked: false,
             disabled: false,
             shortcut: None,
+            image: None,
             action: Rc::new(action),
         }
     }
@@ -61,6 +64,13 @@ impl Entry {
     pub fn checked(mut self, on: bool) -> Self {
         if let Entry::Item { checked, .. } = &mut self {
             *checked = on;
+        }
+        self
+    }
+
+    pub fn image(mut self, picture: Option<std::sync::Arc<gpui_kit::Image>>) -> Self {
+        if let Entry::Item { image, .. } = &mut self {
+            *image = picture;
         }
         self
     }
@@ -182,6 +192,7 @@ impl Render for PopupMenu {
                     checked,
                     disabled,
                     shortcut,
+                    image,
                     action,
                 } => {
                     let action = action.clone();
@@ -205,11 +216,19 @@ impl Render for PopupMenu {
                                 this.hovered = if *on { Some(ix) } else { None };
                                 cx.notify();
                             }))
-                            .child(Icon::new(*icon).small().text_color(if checked {
-                                accent
-                            } else {
-                                muted
-                            }))
+                            .child(match image {
+                                Some(picture) => {
+                                    use gpui_kit::StyledImage as _;
+                                    gpui_kit::img(picture.clone())
+                                        .size(px(16.))
+                                        .object_fit(gpui_kit::ObjectFit::Contain)
+                                        .into_any_element()
+                                }
+                                None => Icon::new(*icon)
+                                    .small()
+                                    .text_color(if checked { accent } else { muted })
+                                    .into_any_element(),
+                            })
                             .child(
                                 div()
                                     .flex_1()

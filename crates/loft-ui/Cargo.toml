@@ -23,8 +23,8 @@ toml.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSApplication", "NSDockTile"] }
-objc2-foundation = { workspace = true, features = ["NSBundle", "NSString", "NSError"] }
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSDockTile", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-foundation = { workspace = true, features = ["NSBundle", "NSString", "NSError", "NSData", "NSDictionary", "NSGeometry"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
 block2 = "0.6"
 raw-window-handle = "0.6"

@@ -43,24 +43,29 @@ thread_local! {
     static EDITOR: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+/// Where editor `e` is installed, if it is.
+fn app_path(e: usize) -> Option<PathBuf> {
+    let name = format!("{}.app", EDITORS[e].0);
+    [
+        Some(PathBuf::from("/Applications")),
+        Some(PathBuf::from("/System/Applications/Utilities")),
+        std::env::home_dir().map(|h| h.join("Applications")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|dir| dir.join(&name))
+    .find(|path| path.exists())
+}
+
 fn installed_editors() -> Vec<usize> {
-    let home = std::env::home_dir();
-    EDITORS
-        .iter()
-        .enumerate()
-        .filter(|(_, (app, _))| {
-            let name = format!("{app}.app");
-            [
-                Some(PathBuf::from("/Applications")),
-                Some(PathBuf::from("/System/Applications/Utilities")),
-                home.as_ref().map(|h| h.join("Applications")),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|dir| dir.join(&name).exists())
-        })
-        .map(|(ix, _)| ix)
+    (0..EDITORS.len())
+        .filter(|&e| app_path(e).is_some())
         .collect()
+}
+
+/// Editor `e`'s own app icon.
+fn editor_icon(e: usize) -> Option<std::sync::Arc<gpui_kit::Image>> {
+    crate::app_icons::icon(&app_path(e)?)
 }
 
 fn open_in(editor: usize, folder: &str) {
@@ -408,7 +413,16 @@ impl Render for DetailsCard {
                 row("details-editor", &p)
                     .cursor_pointer()
                     .hover(|d| d.bg(p.hover))
-                    .child(icon(IconName::Code, &p))
+                    .child(match editor_icon(ed) {
+                        Some(picture) => {
+                            use gpui_kit::StyledImage as _;
+                            gpui_kit::img(picture)
+                                .size(px(16.))
+                                .object_fit(gpui_kit::ObjectFit::Contain)
+                                .into_any_element()
+                        }
+                        None => icon(IconName::Code, &p),
+                    })
                     .child(div().flex_1().child(format!("Open in {}", EDITORS[ed].1)))
                     .on_click(move |_, window, _| {
                         open_in(ed, &folder);
@@ -450,6 +464,7 @@ impl Render for DetailsCard {
                                                         },
                                                     )
                                                     .checked(Some(e) == editor)
+                                                    .image(editor_icon(e))
                                                 })
                                                 .collect();
                                             loft_browser::menu::open(window, at, entries, cx);
