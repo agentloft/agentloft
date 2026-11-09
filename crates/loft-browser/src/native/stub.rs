@@ -48,6 +48,12 @@ impl NativeWebView {
     pub fn load_progress(&self, _mark: LoadMark) -> LoadProgress {
         match self.never {}
     }
+    pub fn set_page_zoom(&self, _zoom: f64) {
+        match self.never {}
+    }
+    pub fn set_user_agent(&self, _agent: Option<&str>) {
+        match self.never {}
+    }
     pub fn set_frame(&self, _x: f64, _y: f64, _w: f64, _h: f64) {
         match self.never {}
     }

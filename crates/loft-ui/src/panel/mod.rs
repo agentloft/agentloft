@@ -268,6 +268,11 @@ impl WorkbenchPanel {
         cx.notify();
     }
 
+    /// The browser, if it was ever opened.
+    pub fn existing_browser(&self) -> Option<Entity<loft_browser::BrowserView>> {
+        self.browser.clone()
+    }
+
     pub fn active_tab(&self, cx: &gpui_kit::App) -> Option<Tab> {
         let id = self.store.read(cx).selected.clone()?;
         self.threads.get(&id).map(|p| p.active.clone())

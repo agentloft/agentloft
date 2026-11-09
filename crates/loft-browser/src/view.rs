@@ -17,12 +17,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, BackgroundExecutor, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render,
-    SharedString, Styled as _, Subscription, Task, Window, actions, div,
-    prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, AppContext as _, BackgroundExecutor, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
+    actions, canvas, div, prelude::FluentBuilder as _, px, relative,
 };
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::pin;
 use std::rc::Rc;
@@ -59,7 +60,103 @@ pub enum BrowserEvent {
     UrlChanged(String),
     TitleChanged(String),
     LoadingChanged(bool),
+    /// The user left a note on an element in annotation mode.
+    Annotation(Annotation),
 }
+
+/// A note the user pinned to an element of the page.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct Annotation {
+    pub selector: String,
+    pub note: String,
+    /// The element's visible text (trimmed), to recognise it by.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub tag: String,
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// A screen to emulate: the page lays out at this size (scaled to fit).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Device {
+    pub name: &'static str,
+    pub width: f32,
+    pub height: f32,
+    pub kind: DeviceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Desktop,
+    Tablet,
+    Phone,
+}
+
+pub const DEVICES: &[Device] = &[
+    Device {
+        name: "Desktop",
+        width: 1440.,
+        height: 900.,
+        kind: DeviceKind::Desktop,
+    },
+    Device {
+        name: "Laptop",
+        width: 1280.,
+        height: 800.,
+        kind: DeviceKind::Desktop,
+    },
+    Device {
+        name: "iPad Pro",
+        width: 1024.,
+        height: 1366.,
+        kind: DeviceKind::Tablet,
+    },
+    Device {
+        name: "iPad",
+        width: 820.,
+        height: 1180.,
+        kind: DeviceKind::Tablet,
+    },
+    Device {
+        name: "iPhone 16 Pro Max",
+        width: 440.,
+        height: 956.,
+        kind: DeviceKind::Phone,
+    },
+    Device {
+        name: "iPhone 16 Pro",
+        width: 402.,
+        height: 874.,
+        kind: DeviceKind::Phone,
+    },
+    Device {
+        name: "iPhone SE",
+        width: 375.,
+        height: 667.,
+        kind: DeviceKind::Phone,
+    },
+    Device {
+        name: "Pixel 9",
+        width: 412.,
+        height: 915.,
+        kind: DeviceKind::Phone,
+    },
+];
+
+const UA_IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) \
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+const UA_IPAD: &str = "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 \
+    (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+
+/// The page width the mini preview lays out at.
+const PREVIEW_PAGE_WIDTH: f32 = 1280.;
+
+const ANNOTATE_JS: &str = include_str!("js/annotate.js");
 
 /// An embedded browser: a gpui-kit toolbar over a native web view that an
 /// agent can drive with [`BrowserView::execute`].
@@ -80,6 +177,15 @@ pub struct BrowserView {
     /// The last host-initiated load, to explain it if it fails.
     host_load: Option<(LoadMark, String)>,
     search_template: String,
+    /// The emulated screen (`None` = fill the panel).
+    device: Option<usize>,
+    rotated: bool,
+    /// The content area's size at the last paint, to fit a device in.
+    area: Rc<Cell<Option<(f32, f32)>>>,
+    /// Annotation mode: clicks leave notes instead of acting on the page.
+    annotating: bool,
+    /// The device bar under the toolbar is showing.
+    devices_open: bool,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -156,6 +262,11 @@ impl BrowserView {
             notice: None,
             host_load: None,
             search_template: DEFAULT_SEARCH_TEMPLATE.to_owned(),
+            device: None,
+            rotated: false,
+            area: Rc::new(Cell::new(None)),
+            annotating: false,
+            devices_open: false,
             _tasks: tasks,
             _subscriptions: subscriptions,
         }
@@ -197,6 +308,99 @@ impl BrowserView {
             }
             cx.notify();
         }
+    }
+
+    /// Emulate `device` (an index into [`DEVICES`]; `None` = fill the
+    /// panel): the page lays out at its size and gets its user agent.
+    pub fn set_device(&mut self, device: Option<usize>, cx: &mut Context<Self>) {
+        if self.device == device {
+            return;
+        }
+        let before = self.device.map(|i| DEVICES[i].kind);
+        self.device = device;
+        self.rotated = false;
+        let kind = device.map(|i| DEVICES[i]);
+        if let Some(native) = &self.native {
+            let agent = match kind {
+                Some(Device { name, .. }) if name.starts_with("Pixel") => Some(UA_ANDROID),
+                Some(Device {
+                    kind: DeviceKind::Phone,
+                    ..
+                }) => Some(UA_IPHONE),
+                Some(Device {
+                    kind: DeviceKind::Tablet,
+                    ..
+                }) => Some(UA_IPAD),
+                _ => None,
+            };
+            native.set_user_agent(agent);
+            // Sites pick layouts from the user agent: reload when it changes.
+            if before != kind.map(|d| d.kind) && self.page.url.is_some() {
+                native.reload();
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn rotate(&mut self, cx: &mut Context<Self>) {
+        self.rotated = !self.rotated;
+        cx.notify();
+    }
+
+    /// Turn annotation mode on or off.
+    pub fn set_annotating(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.annotating == on {
+            return;
+        }
+        self.annotating = on;
+        if !on && let Some(native) = &self.native {
+            // Fire and forget: nothing to wait for.
+            drop(native.call_js(
+                "if (window.__loftAnnotate) window.__loftAnnotate.stop();",
+                JsWorld::Agent,
+            ));
+        }
+        cx.notify();
+    }
+
+    pub fn is_annotating(&self) -> bool {
+        self.annotating
+    }
+
+    /// The live page, small, for a floating preview `width` points wide:
+    /// it lays out as a desktop page and is scaled down to fit.
+    pub fn preview_surface(&self, width: f32) -> Option<AnyElement> {
+        let native = self.native.clone()?;
+        Some(
+            Surface::new(native, self.visible)
+                .zoom(f64::from(width / PREVIEW_PAGE_WIDTH))
+                .into_any_element(),
+        )
+    }
+
+    /// Collect notes left in annotation mode (and keep the mode installed
+    /// across page loads).
+    fn poll_annotations(&mut self, native: &NativeWebView, cx: &mut Context<Self>) {
+        let body = format!(
+            "{ANNOTATE_JS}\nwindow.__loftAnnotate.start();\n\
+             return JSON.stringify(window.__loftAnnotate.take());"
+        );
+        let rx = native.call_js(&body, JsWorld::Agent);
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(text))) = rx.await else {
+                return;
+            };
+            let notes: Vec<Annotation> = serde_json::from_str(&text).unwrap_or_default();
+            if notes.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |_, cx| {
+                for note in notes {
+                    cx.emit(BrowserEvent::Annotation(note));
+                }
+            });
+        })
+        .detach();
     }
 
     /// The search URL template for bare words; `{}` is the encoded query.
@@ -503,6 +707,9 @@ impl BrowserView {
                 self.host_load = Some((mark, url));
             }
         }
+        if self.annotating && !self.page.loading {
+            self.poll_annotations(&native, cx);
+        }
         // Clicking into the page gives it AppKit key focus; mirror that in
         // GPUI so the address bar blurs and the browser's shortcuts apply.
         if native.is_focused() && !self.focus_handle.is_focused(window) {
@@ -632,6 +839,24 @@ impl Render for BrowserView {
                         .disabled(self.native.is_none()),
                 ),
             )
+            .child(self.device_menu(cx))
+            .child(
+                Button::new("loft-browser-annotate")
+                    .small()
+                    .icon(IconName::MessageSquarePlus)
+                    .when(self.annotating, |b| b.primary())
+                    .when(!self.annotating, |b| b.ghost())
+                    .tooltip(if self.annotating {
+                        "Stop annotating"
+                    } else {
+                        "Annotate: click an element to leave a note for the agent"
+                    })
+                    .disabled(self.native.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let on = !this.annotating;
+                        this.set_annotating(on, cx);
+                    })),
+            )
             .when(loading, |d| {
                 d.child(
                     div()
@@ -671,13 +896,16 @@ impl Render for BrowserView {
         });
 
         let content = match &self.native {
-            Some(native) => div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .child(Surface::new(native.clone(), self.visible))
-                .into_any_element(),
+            Some(native) => match self.device {
+                None => div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(Surface::new(native.clone(), self.visible))
+                    .into_any_element(),
+                Some(ix) => self.device_frame(native.clone(), DEVICES[ix], cx),
+            },
             None => v_flex()
                 .flex_1()
                 .items_center()
@@ -690,6 +918,34 @@ impl Render for BrowserView {
                 .child(self.unavailable.clone().unwrap_or_default())
                 .into_any_element(),
         };
+
+        let annotate_bar = self.annotating.then(|| {
+            h_flex()
+                .flex_shrink_0()
+                .px_3()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(border)
+                .bg(primary.opacity(0.12))
+                .text_xs()
+                .child(
+                    Icon::new(IconName::MousePointerClick)
+                        .xsmall()
+                        .text_color(primary),
+                )
+                .child(div().flex_1().child(
+                    "Click an element and write what should change; notes go to the composer.",
+                ))
+                .child(
+                    Button::new("loft-browser-annotate-done")
+                        .ghost()
+                        .xsmall()
+                        .label("Done")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_annotating(false, cx))),
+                )
+        });
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -714,8 +970,185 @@ impl Render for BrowserView {
                 this.focus_address_bar(window, cx)
             }))
             .child(toolbar)
+            .when(self.devices_open, |d| d.child(self.device_bar(cx)))
             .children(notice)
+            .children(annotate_bar)
             .child(content)
+    }
+}
+
+impl BrowserView {
+    /// The toolbar button: shows the current screen, toggles the device
+    /// bar (a bar, not a menu: menus would open under the native page).
+    fn device_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (icon, label) = match self.device.map(|i| DEVICES[i]) {
+            None => (IconName::Expand, "Responsive".to_owned()),
+            Some(d) => (device_icon(d.kind), d.name.to_owned()),
+        };
+        Button::new("loft-browser-device")
+            .small()
+            .icon(icon)
+            .when(self.devices_open || self.device.is_some(), |b| b.primary())
+            .when(!(self.devices_open || self.device.is_some()), |b| b.ghost())
+            .tooltip(format!("Screen size: {label}"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.devices_open = !this.devices_open;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Responsive plus every device, as chips; rotate on the right.
+    fn device_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (border, muted, foreground, muted_foreground, primary) = (
+            theme.border,
+            theme.muted,
+            theme.foreground,
+            theme.muted_foreground,
+            theme.primary,
+        );
+        let chip = |id: SharedString,
+                    icon: IconName,
+                    label: String,
+                    active: bool,
+                    pick: Option<usize>,
+                    cx: &mut Context<Self>| {
+            h_flex()
+                .id(id)
+                .flex_none()
+                .gap_1()
+                .items_center()
+                .px_2()
+                .py(px(3.))
+                .rounded(px(6.))
+                .text_xs()
+                .cursor_pointer()
+                .when(active, |d| {
+                    d.bg(primary.opacity(0.16)).text_color(foreground)
+                })
+                .when(!active, |d| {
+                    d.text_color(muted_foreground)
+                        .hover(|d| d.bg(muted).text_color(foreground))
+                })
+                .child(Icon::new(icon).xsmall())
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_device(pick, cx)))
+        };
+        let mut row = h_flex()
+            .id("loft-browser-devices")
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .overflow_x_scroll()
+            .child(chip(
+                "device-responsive".into(),
+                IconName::Expand,
+                "Responsive".into(),
+                self.device.is_none(),
+                None,
+                cx,
+            ));
+        for (ix, d) in DEVICES.iter().enumerate() {
+            row = row.child(chip(
+                SharedString::from(format!("device-{ix}")),
+                device_icon(d.kind),
+                d.name.to_owned(),
+                self.device == Some(ix),
+                Some(ix),
+                cx,
+            ));
+        }
+        h_flex()
+            .flex_shrink_0()
+            .h(px(34.))
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(border)
+            .child(row)
+            .when(self.device.is_some(), |d| {
+                d.child(
+                    Button::new("loft-browser-rotate")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::RotateCwSquare)
+                        .tooltip("Rotate")
+                        .on_click(cx.listener(|this, _, _, cx| this.rotate(cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The page at the device's size, scaled down to fit the panel.
+    fn device_frame(
+        &self,
+        native: Rc<NativeWebView>,
+        device: Device,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, border, muted_foreground) = (theme.muted, theme.border, theme.muted_foreground);
+        let (w, h) = if self.rotated {
+            (device.height, device.width)
+        } else {
+            (device.width, device.height)
+        };
+        let (aw, ah) = self.area.get().unwrap_or((w, h));
+        let scale = ((aw - 32.) / w).min((ah - 56.) / h).clamp(0.1, 1.0);
+        let area = self.area.clone();
+        let measure = canvas(
+            move |bounds, window, _| {
+                let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                if area.get() != Some(size) {
+                    area.set(Some(size));
+                    window.refresh();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let radius = match device.kind {
+            DeviceKind::Phone => 22.,
+            DeviceKind::Tablet => 14.,
+            DeviceKind::Desktop => 6.,
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .bg(muted)
+            .child(measure)
+            .child(
+                v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(w * scale))
+                            .h(px(h * scale))
+                            .rounded(px(radius * scale.max(0.5)))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(border)
+                            .shadow_lg()
+                            .flex()
+                            .flex_col()
+                            .child(Surface::new(native, self.visible).zoom(f64::from(scale))),
+                    )
+                    .child(div().text_xs().text_color(muted_foreground).child(format!(
+                        "{} · {} × {} · {:.0}%",
+                        device.name,
+                        w as u32,
+                        h as u32,
+                        scale * 100.
+                    ))),
+            )
+            .into_any_element()
     }
 }
 
@@ -924,6 +1357,14 @@ async fn eval(
     }
     serde_json::from_str(&reply)
         .map_err(|e| BrowserError::Script(format!("the result is not valid JSON: {e}")))
+}
+
+fn device_icon(kind: DeviceKind) -> IconName {
+    match kind {
+        DeviceKind::Desktop => IconName::Monitor,
+        DeviceKind::Tablet => IconName::Tablet,
+        DeviceKind::Phone => IconName::Smartphone,
+    }
 }
 
 #[cfg(test)]

@@ -22,11 +22,22 @@ pub(crate) struct Surface {
     native: Rc<NativeWebView>,
     /// The owner's `set_visible` flag.
     visible: bool,
+    /// Page zoom to apply while painted here.
+    zoom: f64,
 }
 
 impl Surface {
     pub fn new(native: Rc<NativeWebView>, visible: bool) -> Self {
-        Self { native, visible }
+        Self {
+            native,
+            visible,
+            zoom: 1.0,
+        }
+    }
+
+    pub fn zoom(mut self, zoom: f64) -> Self {
+        self.zoom = zoom;
+        self
     }
 }
 
@@ -137,6 +148,7 @@ impl Element for Surface {
             let w = snap(bounds.origin.x + bounds.size.width) - x;
             let h = snap(bounds.origin.y + bounds.size.height) - y;
             self.native.set_frame(x, y, w, h);
+            self.native.set_page_zoom(self.zoom);
         }
         self.native.set_hidden(!show);
 

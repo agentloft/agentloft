@@ -145,6 +145,11 @@ pub struct WorkspaceView {
     /// Open the folder browser on the next render (asked for without a
     /// window at hand).
     pending_add_project: bool,
+    /// The floating mini browser, shown when an agent drives the browser
+    /// while the panel isn't showing it.
+    browser_preview: bool,
+    /// Whether we listen to the browser's events yet (annotations).
+    browser_subscribed: bool,
     /// The composer's model picker (for the selected thread) and whether
     /// it's open.
     model_picker: Option<Entity<crate::model_picker::ModelPicker>>,
@@ -206,6 +211,8 @@ impl WorkspaceView {
             completion: None,
             completion_seq: 0,
             pending_add_project: false,
+            browser_preview: false,
+            browser_subscribed: false,
             model_picker: None,
             picker_open: false,
             branch_picker: None,
@@ -440,6 +447,71 @@ impl WorkspaceView {
     }
 
     /// An agent drives the browser: show it, run the command, answer.
+    fn browser_in_panel(&self, cx: &gpui_kit::App) -> bool {
+        self.panel_open && self.panel.read(cx).active_tab(cx) == Some(Tab::Browser)
+    }
+
+    /// Listen for annotations: each note goes into the composer.
+    fn subscribe_browser(
+        &mut self,
+        browser: &Entity<loft_browser::BrowserView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser_subscribed {
+            return;
+        }
+        self.browser_subscribed = true;
+        let sub = cx.subscribe_in(browser, window, |this, _, event, window, cx| {
+            if let loft_browser::BrowserEvent::Annotation(note) = event {
+                this.add_annotation(note, window, cx);
+            }
+        });
+        self._subs.push(sub);
+    }
+
+    fn add_annotation(
+        &mut self,
+        note: &loft_browser::Annotation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.store.read(cx).selected_thread() else {
+            return;
+        };
+        let composer = self.composer_for(&thread, window, cx);
+        let kind = match note.tag.as_str() {
+            "a" => "link",
+            "button" => "button",
+            "img" | "svg" | "picture" => "image",
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
+            "p" => "paragraph",
+            "input" | "textarea" | "select" => "field",
+            "li" => "list item",
+            "nav" => "navigation",
+            "header" => "header",
+            "footer" => "footer",
+            _ => "element",
+        };
+        let what = if note.label.is_empty() {
+            format!("the {kind} `{}`", note.selector)
+        } else {
+            format!("the {kind} “{}” (`{}`)", note.label, note.selector)
+        };
+        let line = format!("On {what} at {}: {}", note.url, note.note);
+        composer.update(cx, |c, cx| {
+            let current = c.value().to_string();
+            let text = if current.trim().is_empty() {
+                line
+            } else {
+                format!("{}\n{line}", current.trim_end())
+            };
+            let end = text.len();
+            c.set_value(text, window, cx);
+            c.set_selected_range(end..end, cx);
+        });
+    }
+
     fn run_browser_call(
         &mut self,
         call_id: u64,
@@ -463,11 +535,13 @@ impl WorkspaceView {
                 return;
             }
         };
-        // Let the user watch: bring the browser tab forward.
-        self.panel_open = true;
-        self.panel
-            .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
+        // Let the user watch: in the panel if it shows the browser, else in
+        // a floating mini preview.
+        if !self.browser_in_panel(cx) {
+            self.browser_preview = true;
+        }
         let browser = self.panel.update(cx, |p, cx| p.browser(window, cx));
+        self.subscribe_browser(&browser, window, cx);
         let task = browser.update(cx, |b, cx| b.execute(command, window, cx));
         cx.spawn(async move |_, _| {
             let result = task.await.map_err(|err| {
@@ -1448,6 +1522,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
+        let preview = self.browser_preview_card(p, window, cx);
         // Put a saved draft back, once, when the thread first loads.
         let saved = thread.read(cx).model.as_ref().map(|m| {
             (
@@ -1719,6 +1794,7 @@ impl WorkspaceView {
         };
 
         v_flex()
+            .relative()
             .flex_1()
             .min_h_0()
             .child(div().flex_1().min_h_0().flex().flex_col().child(timeline))
@@ -1902,6 +1978,8 @@ impl WorkspaceView {
                         ),
                 ),
             )
+            // Last, so it floats over the conversation.
+            .children(preview)
             .into_any_element()
     }
 
@@ -2046,6 +2124,106 @@ impl WorkspaceView {
             .child(branch_popover)
             .child(source)
             .into_any_element()
+    }
+
+    /// The floating mini browser (bottom right of the conversation).
+    fn browser_preview_card(
+        &mut self,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.browser_preview || self.browser_in_panel(cx) {
+            return None;
+        }
+        let browser = self.panel.read(cx).existing_browser()?;
+        self.subscribe_browser(&browser, window, cx);
+        const W: f32 = 340.;
+        const H: f32 = 212.;
+        let (title, surface) = {
+            let b = browser.read(cx);
+            let title = b
+                .title()
+                .map(str::to_owned)
+                .or_else(|| b.url().map(str::to_owned))
+                .unwrap_or_else(|| "Browser".into());
+            (title, b.preview_surface(W)?)
+        };
+        let loading = browser.read(cx).is_loading();
+        Some(
+            v_flex()
+                .absolute()
+                .right(px(20.))
+                .bottom(px(150.))
+                .w(px(W + 2.))
+                .rounded(px(12.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(p.border)
+                .bg(p.elevated)
+                .shadow_lg()
+                .child(
+                    h_flex()
+                        .h(px(30.))
+                        .px_2()
+                        .gap_1p5()
+                        .items_center()
+                        .text_xs()
+                        .border_b_1()
+                        .border_color(p.border)
+                        .child(if loading {
+                            Spinner::new()
+                                .xsmall()
+                                .color(p.muted_foreground)
+                                .into_any_element()
+                        } else {
+                            Icon::new(IconName::Globe)
+                                .xsmall()
+                                .text_color(p.muted_foreground)
+                                .into_any_element()
+                        })
+                        .child(div().flex_1().min_w_0().truncate().child(title))
+                        .child(
+                            div()
+                                .id("preview-expand")
+                                .p(px(3.))
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .text_color(p.muted_foreground)
+                                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                .child(Icon::new(IconName::Maximize2).xsmall())
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(
+                                        "Open in the side panel",
+                                    )
+                                    .build(window, cx)
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.browser_preview = false;
+                                    this.panel_open = true;
+                                    this.panel
+                                        .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("preview-close")
+                                .p(px(3.))
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .text_color(p.muted_foreground)
+                                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                .child(Icon::new(IconName::X).xsmall())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browser_preview = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(div().w(px(W)).h(px(H)).flex().flex_col().child(surface))
+                .into_any_element(),
+        )
     }
 
     /// The picker for `thread_id`, made on first use and remade when the

@@ -59,6 +59,7 @@ impl Demo {
                 BrowserEvent::TitleChanged(title) => format!("title: {title}"),
                 BrowserEvent::LoadingChanged(true) => "loading…".into(),
                 BrowserEvent::LoadingChanged(false) => "loaded".into(),
+                BrowserEvent::Annotation(a) => format!("note on {}: {}", a.selector, a.note),
             }
             .into();
             println!("event: {}", this.status);

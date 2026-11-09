@@ -76,6 +76,6 @@ pub use snapshot::{
     Viewport, format_snapshot,
 };
 pub use view::{
-    BrowserEvent, BrowserView, FocusAddressBar, GoBack, GoForward, ReloadPage, StopLoading,
-    bind_keys,
+    Annotation, BrowserEvent, BrowserView, DEVICES, Device, DeviceKind, FocusAddressBar, GoBack,
+    GoForward, ReloadPage, StopLoading, bind_keys,
 };

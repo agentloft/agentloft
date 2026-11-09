@@ -39,6 +39,8 @@ pub(crate) struct NativeWebView {
     hidden: Cell<bool>,
     /// `[x, y, w, h, parent_height]` last applied, to skip no-op frames.
     last_frame: Cell<Option<[f64; 5]>>,
+    /// The page zoom last applied (1.0 = 100%).
+    zoom: Cell<f64>,
     /// Paint generation for the surface element's drop guard.
     pub(crate) paint_token: Cell<u64>,
 }
@@ -110,6 +112,7 @@ impl NativeWebView {
             nav,
             hidden: Cell::new(true),
             last_frame: Cell::new(None),
+            zoom: Cell::new(1.0),
             paint_token: Cell::new(0),
         })
     }
@@ -203,6 +206,25 @@ impl NativeWebView {
         self.wk
             .setFrame(NSRect::new(NSPoint::new(x, origin_y), NSSize::new(w, h)));
         self.last_frame.set(Some(key));
+    }
+
+    /// Scales the page: CSS pixels per point. Below 1.0 a page lays out
+    /// wider than the view (device emulation, the mini preview).
+    pub fn set_page_zoom(&self, zoom: f64) {
+        let zoom = zoom.clamp(0.1, 3.0);
+        if (self.zoom.get() - zoom).abs() < 1e-3 {
+            return;
+        }
+        // SAFETY: main-thread property write (macOS 11+).
+        unsafe { self.wk.setPageZoom(zoom) };
+        self.zoom.set(zoom);
+    }
+
+    /// A custom user agent (`None` = WebKit's own); applies to new loads.
+    pub fn set_user_agent(&self, agent: Option<&str>) {
+        let agent = agent.map(NSString::from_str);
+        // SAFETY: main-thread property write.
+        unsafe { self.wk.setCustomUserAgent(agent.as_deref()) };
     }
 
     pub fn set_hidden(&self, hidden: bool) {
