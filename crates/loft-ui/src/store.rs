@@ -18,6 +18,47 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 pub const BUILD: &str = env!("CARGO_PKG_VERSION");
 
+/// App-wide UI events (e.g. a timeline row asking the panel to open a file).
+#[derive(Debug, Clone)]
+pub enum StoreEvent {
+    OpenFile {
+        thread_id: ThreadId,
+        rel_path: String,
+    },
+    OpenAgent {
+        thread_id: ThreadId,
+        item_id: ItemId,
+    },
+    /// A browser call arrived from an agent; the panel should show the browser.
+    BrowserActivity,
+}
+
+impl gpui_kit::EventEmitter<StoreEvent> for AppStore {}
+
+/// Issue a daemon request from any view entity and handle the result there.
+pub fn request_in<T: 'static>(
+    store: &Entity<AppStore>,
+    body: Request,
+    cx: &mut Context<T>,
+    then: impl FnOnce(&mut T, Result<Response, ErrorBody>, &mut Context<T>) + 'static,
+) {
+    let fut: std::pin::Pin<Box<dyn Future<Output = Result<Response, ErrorBody>>>> =
+        match store.read(cx).client.clone() {
+            Some(client) => Box::pin(client.request(body)),
+            None => Box::pin(async {
+                Err(ErrorBody::new(
+                    loft_protocol::ErrorCode::Internal,
+                    "not connected to agentloftd",
+                ))
+            }),
+        };
+    cx.spawn(async move |this: WeakEntity<T>, cx: &mut AsyncApp| {
+        let result = fut.await;
+        let _ = this.update(cx, |this, cx| then(this, result, cx));
+    })
+    .detach();
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnState {
     Connecting,
@@ -203,6 +244,21 @@ impl AppStore {
         &self.paths
     }
 
+    pub fn client(&self) -> Option<Client> {
+        self.client.clone()
+    }
+
+    pub fn open_file(&mut self, thread_id: ThreadId, rel_path: String, cx: &mut Context<Self>) {
+        cx.emit(StoreEvent::OpenFile {
+            thread_id,
+            rel_path,
+        });
+    }
+
+    pub fn open_agent(&mut self, thread_id: ThreadId, item_id: ItemId, cx: &mut Context<Self>) {
+        cx.emit(StoreEvent::OpenAgent { thread_id, item_id });
+    }
+
     pub fn selected_thread(&self) -> Option<Entity<ThreadState>> {
         self.selected
             .as_ref()
@@ -308,8 +364,13 @@ async fn pump(
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     Item(usize),
-    ToolGroup { start: usize, len: usize },
-    TurnFooter { turn_ix: usize },
+    /// A run of top-level tool calls (item indices).
+    ToolGroup {
+        members: Vec<usize>,
+    },
+    TurnFooter {
+        turn_ix: usize,
+    },
 }
 
 /// One open thread: its mirrored model plus view-side state (display rows,
@@ -357,7 +418,7 @@ impl ThreadState {
         let ix = model.items.iter().position(|i| &i.id == id)?;
         self.rows.iter().position(|r| match r {
             Row::Item(i) => *i == ix,
-            Row::ToolGroup { start, len } => (*start..start + len).contains(&ix),
+            Row::ToolGroup { members } => members.contains(&ix),
             Row::TurnFooter { .. } => false,
         })
     }
@@ -368,23 +429,37 @@ impl ThreadState {
         };
         let mut rows = Vec::with_capacity(model.items.len());
         let items = &model.items;
+        // Subagent activity lives in its own panel tab, not the main timeline.
+        // Claude's internal deferred-tool loading is noise in the timeline.
+        let hidden = |i: usize| matches!(&items[i].body, ItemBody::ToolCall { tool, .. } if tool == "ToolSearch");
+        let top = |i: usize| items[i].parent_id.is_none() && !hidden(i);
+        let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. });
         let mut i = 0;
         while i < items.len() {
-            if matches!(items[i].body, ItemBody::ToolCall { .. }) {
-                let start = i;
-                while i < items.len() && matches!(items[i].body, ItemBody::ToolCall { .. }) {
+            if !top(i) {
+                i += 1;
+                continue;
+            }
+            if is_tool(i) {
+                // A run of top-level tool calls; nested subagent items in
+                // between are skipped over.
+                let mut members = Vec::new();
+                while i < items.len() && (!top(i) || is_tool(i)) {
+                    if top(i) {
+                        members.push(i);
+                    }
                     i += 1;
                 }
-                rows.push(Row::ToolGroup {
-                    start,
-                    len: i - start,
-                });
+                rows.push(Row::ToolGroup { members });
             } else {
                 rows.push(Row::Item(i));
                 i += 1;
             }
             // Footer after the last item of a finished turn.
-            let turn_id = &items[i - 1].turn_id;
+            let Some(last) = (0..i).rev().find(|&j| top(j)) else {
+                continue;
+            };
+            let turn_id = &items[last].turn_id;
             let next_turn = items.get(i).map(|n| &n.turn_id);
             if turn_id.is_some()
                 && next_turn != Some(turn_id)

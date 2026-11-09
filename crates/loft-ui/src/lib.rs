@@ -4,6 +4,7 @@
 pub mod assets;
 pub mod brand;
 mod items;
+pub mod panel;
 pub mod store;
 pub mod theme;
 pub mod workspace;

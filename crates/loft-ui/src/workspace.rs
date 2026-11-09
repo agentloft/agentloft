@@ -3,11 +3,13 @@
 //! composer.
 
 use crate::items::render_row;
-use crate::store::{AppStore, ConnState, ThreadState};
+use crate::panel::{Tab, WorkbenchPanel};
+use crate::store::{AppStore, ConnState, StoreEvent, ThreadState};
 use crate::theme::{self, Palette, relative_time};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::message_scroller::MessageScroller;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -30,7 +32,12 @@ actions!(
         AddProject,
         FocusSearch,
         About,
-        Quit
+        Quit,
+        TogglePanel,
+        ShowFiles,
+        ShowChanges,
+        ShowTerminal,
+        ShowBrowser
     ]
 );
 
@@ -50,6 +57,11 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
         KeyBinding::new("cmd-o", AddProject, Some(CONTEXT)),
         KeyBinding::new("cmd-k", FocusSearch, Some(CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-j", TogglePanel, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-e", ShowFiles, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-g", ShowChanges, Some(CONTEXT)),
+        KeyBinding::new("ctrl-`", ShowTerminal, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-b", ShowBrowser, Some(CONTEXT)),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
@@ -83,6 +95,13 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action("Toggle Panel", TogglePanel),
+            MenuItem::separator(),
+            MenuItem::action("Files", ShowFiles),
+            MenuItem::action("Changes", ShowChanges),
+            MenuItem::action("Terminal", ShowTerminal),
+            MenuItem::action("Browser", ShowBrowser),
+            MenuItem::separator(),
             MenuItem::action("Search Threads", FocusSearch),
             MenuItem::separator(),
             MenuItem::action("Toggle Light/Dark", ToggleTheme),
@@ -98,13 +117,22 @@ pub struct WorkspaceView {
     search: Entity<InputState>,
     query: String,
     sidebar_open: bool,
+    pub panel: Entity<WorkbenchPanel>,
+    panel_open: bool,
+    /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>`
+    /// opens a panel tab once the first thread has loaded.
+    dev_tab: Option<String>,
     _subs: Vec<Subscription>,
 }
 
 impl WorkspaceView {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads"));
+        let panel = cx.new(|cx| WorkbenchPanel::new(store.clone(), window, cx));
         let subs = vec![
+            cx.subscribe_in(&store, window, |this, _, event, window, cx| {
+                this.on_store_event(event, window, cx)
+            }),
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe_in(&search, window, |this, state, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -122,8 +150,97 @@ impl WorkspaceView {
             search,
             query: String::new(),
             sidebar_open: true,
+            panel,
+            panel_open: true,
+            dev_tab: std::env::var("AGENTLOFT_DEV_TAB")
+                .ok()
+                .filter(|v| !v.is_empty()),
             _subs: subs,
         }
+    }
+
+    fn on_store_event(&mut self, event: &StoreEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            StoreEvent::OpenFile {
+                thread_id,
+                rel_path,
+            } => {
+                self.panel_open = true;
+                let (t, r) = (thread_id.clone(), rel_path.clone());
+                self.panel
+                    .update(cx, |panel, cx| panel.open_file(&t, r, window, cx));
+            }
+            StoreEvent::OpenAgent { thread_id, item_id } => {
+                self.panel_open = true;
+                let (t, i) = (thread_id.clone(), item_id.clone());
+                self.panel
+                    .update(cx, |panel, cx| panel.open_agent(&t, i, window, cx));
+            }
+            StoreEvent::BrowserActivity => {
+                if !self.panel_open || self.panel.read(cx).active_tab(cx) != Some(Tab::Browser) {
+                    self.show_tab(Tab::Browser, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_dev_tab(
+        &mut self,
+        dev: &str,
+        thread: &Entity<ThreadState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (thread_id, agent) = {
+            let state = thread.read(cx);
+            let model = state.model.as_ref().expect("checked");
+            let agent = model.items.iter().find(|i| {
+                matches!(&i.body, loft_protocol::ItemBody::ToolCall { tool_kind, .. }
+                    if *tool_kind == loft_protocol::ToolKind::Subagent)
+            });
+            (model.thread.id.clone(), agent.map(|i| i.id.clone()))
+        };
+        self.panel_open = true;
+        match dev.split_once(':') {
+            Some(("file", path)) => {
+                let path = path.to_owned();
+                self.panel
+                    .update(cx, |p, cx| p.open_file(&thread_id, path, window, cx));
+            }
+            _ => match dev {
+                "changes" => self
+                    .panel
+                    .update(cx, |p, cx| p.show(Tab::Changes, window, cx)),
+                "terminal" => self
+                    .panel
+                    .update(cx, |p, cx| p.show(Tab::Terminal, window, cx)),
+                "browser" => self
+                    .panel
+                    .update(cx, |p, cx| p.show(Tab::Browser, window, cx)),
+                "agent" => {
+                    if let Some(item) = agent {
+                        self.panel
+                            .update(cx, |p, cx| p.open_agent(&thread_id, item, window, cx));
+                    }
+                }
+                _ => self
+                    .panel
+                    .update(cx, |p, cx| p.show(Tab::Files, window, cx)),
+            },
+        }
+    }
+
+    fn show_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        let already = self.panel_open && self.panel.read(cx).active_tab(cx).as_ref() == Some(&tab);
+        if already {
+            self.panel_open = false;
+        } else {
+            self.panel_open = true;
+            self.panel
+                .update(cx, |panel, cx| panel.show(tab, window, cx));
+        }
+        cx.notify();
     }
 
     fn composer_for(
@@ -421,12 +538,15 @@ impl WorkspaceView {
 
     // -- main pane ----------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn render_header(
         &mut self,
         title: Option<(String, String, String)>,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let has_thread = title.is_some();
+        let active_tab = self.panel.read(cx).active_tab(cx);
         h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_shrink_0()
@@ -468,6 +588,37 @@ impl WorkspaceView {
                         ),
                 )
                 .child(chip_label(IconName::Sparkles, chip, p))
+            })
+            .when(has_thread, |d| {
+                let active = if self.panel_open { active_tab } else { None };
+                let mut tools = h_flex().gap_0p5().pl_2();
+                for (tab, icon, id) in [
+                    (Tab::Files, IconName::FolderTree, "hdr-files"),
+                    (Tab::Changes, IconName::GitCompare, "hdr-changes"),
+                    (Tab::Terminal, IconName::SquareTerminal, "hdr-terminal"),
+                    (Tab::Browser, IconName::Globe, "hdr-browser"),
+                ] {
+                    let on = active.as_ref() == Some(&tab);
+                    tools = tools.child(toggle_button(
+                        id,
+                        icon,
+                        on,
+                        p,
+                        cx.listener(move |this, _, window, cx| {
+                            this.show_tab(tab.clone(), window, cx)
+                        }),
+                    ));
+                }
+                d.child(tools).child(toggle_button(
+                    "hdr-panel",
+                    IconName::PanelRight,
+                    self.panel_open,
+                    p,
+                    cx.listener(|this, _, _, cx| {
+                        this.panel_open = !this.panel_open;
+                        cx.notify();
+                    }),
+                ))
             })
             .into_any_element()
     }
@@ -686,6 +837,12 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         let selected = self.store.read(cx).selected_thread();
+        if let Some(thread) = &selected
+            && thread.read(cx).model.is_some()
+            && let Some(dev) = self.dev_tab.take()
+        {
+            self.apply_dev_tab(&dev, thread, window, cx);
+        }
         let disconnected = matches!(self.store.read(cx).conn, ConnState::Disconnected(_));
 
         let header_title = selected.as_ref().and_then(|t| {
@@ -709,6 +866,7 @@ impl Render for WorkspaceView {
             Some(thread) => self.render_thread(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
         };
+        let show_panel = self.panel_open && header_title.is_some();
         let header = self.render_header(header_title, &p, cx);
         let sidebar = self.sidebar_open.then(|| self.render_sidebar(&p, cx));
 
@@ -728,6 +886,20 @@ impl Render for WorkspaceView {
                 this.sidebar_open = true;
                 this.search.update(cx, |s, cx| s.focus(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &TogglePanel, _, cx| {
+                this.panel_open = !this.panel_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ShowFiles, w, cx| this.show_tab(Tab::Files, w, cx)))
+            .on_action(
+                cx.listener(|this, _: &ShowChanges, w, cx| this.show_tab(Tab::Changes, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowTerminal, w, cx| this.show_tab(Tab::Terminal, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowBrowser, w, cx| this.show_tab(Tab::Browser, w, cx)),
+            )
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
@@ -751,7 +923,23 @@ impl Render for WorkspaceView {
                                 .child("Lost connection to agentloftd — reconnecting…"),
                         )
                     })
-                    .child(body),
+                    .child(
+                        h_resizable("workbench")
+                            .child(resizable_panel().child(body))
+                            .child(
+                                resizable_panel()
+                                    .size(px(560.))
+                                    .size_range(px(340.)..px(1600.))
+                                    .visible(show_panel)
+                                    .child(
+                                        div()
+                                            .size_full()
+                                            .border_l_1()
+                                            .border_color(p.border)
+                                            .child(self.panel.clone()),
+                                    ),
+                            ),
+                    ),
             )
     }
 }
@@ -818,6 +1006,31 @@ fn icon_button(
         .hover(|d| d.bg(p.hover).text_color(p.foreground))
         .child(Icon::new(icon).small())
         .on_click(move |e, w, cx| handler(e, w, cx))
+        .into_any_element()
+}
+
+fn toggle_button(
+    id: &'static str,
+    icon: IconName,
+    on: bool,
+    p: &Palette,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(7.))
+        .cursor_pointer()
+        .when(on, |d| d.bg(p.selected).text_color(p.foreground))
+        .when(!on, |d| {
+            d.text_color(p.muted_foreground)
+                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+        })
+        .child(Icon::new(icon).small())
+        .on_click(on_click)
         .into_any_element()
 }
 

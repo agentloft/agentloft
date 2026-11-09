@@ -35,14 +35,10 @@ pub fn render_row(
     };
     let content = match row {
         Row::Item(i) => render_item(thread, state, &model.items[*i], p),
-        Row::ToolGroup { start, len } => render_tool_group(
-            thread,
-            store,
-            state,
-            model,
-            &model.items[*start..start + len],
-            p,
-        ),
+        Row::ToolGroup { members } => {
+            let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();
+            render_tool_group(thread, store, state, model, &items, p)
+        }
         Row::TurnFooter { turn_ix } => render_turn_footer(model, *turn_ix, p),
     };
     div()
@@ -60,7 +56,7 @@ pub fn render_row(
         .into_any_element()
 }
 
-fn render_item(
+pub(crate) fn render_item(
     thread: &Entity<ThreadState>,
     state: &ThreadState,
     item: &Item,
@@ -173,7 +169,7 @@ fn render_tool_group(
     store: &Entity<AppStore>,
     state: &ThreadState,
     model: &ThreadModel,
-    items: &[Item],
+    items: &[&Item],
     p: &Palette,
 ) -> AnyElement {
     let cwd = model.thread.cwd.as_str();
@@ -187,7 +183,7 @@ fn render_tool_group(
 
     let mut col = v_flex().gap_1();
     if items.len() == 1 {
-        col = col.child(tool_line(thread, state, &items[0], p, cwd));
+        col = col.child(tool_line(thread, store, state, model, items[0], p));
     } else {
         let open = state.is_expanded(&key, running);
         let thread_h = thread.clone();
@@ -217,7 +213,7 @@ fn render_tool_group(
                 .border_l_1()
                 .border_color(p.border);
             for item in items {
-                list = list.child(tool_line(thread, state, item, p, cwd));
+                list = list.child(tool_line(thread, store, state, model, item, p));
             }
             col = col.child(list);
         }
@@ -228,76 +224,122 @@ fn render_tool_group(
     col.into_any_element()
 }
 
-fn tool_line(
+/// One tool call. Subagents render as agent cards; file tools open the file.
+pub(crate) fn tool_line(
     thread: &Entity<ThreadState>,
+    store: &Entity<AppStore>,
     state: &ThreadState,
+    model: &ThreadModel,
     item: &Item,
     p: &Palette,
-    cwd: &str,
 ) -> AnyElement {
     let ItemBody::ToolCall {
         tool,
+        tool_kind,
         title,
+        input,
         output,
         is_error,
-        ..
     } = &item.body
     else {
         return div().into_any_element();
     };
+    if *tool_kind == ToolKind::Subagent {
+        return agent_card(store, model, item, title, p);
+    }
+    let cwd = model.thread.cwd.as_str();
     let running = item.status == ItemStatus::InProgress;
     let failed = matches!(item.status, ItemStatus::Failed) || *is_error;
     let declined = item.status == ItemStatus::Declined;
     let output = output.as_ref().filter(|o| !o.trim().is_empty());
-    let open = output.is_some() && state.is_expanded(&item.id, false);
-    let key = item.id.clone();
-    let thread = thread.clone();
-    // Older items stored "Tool detail"; the tool name is shown separately.
-    let detail = relative_to(
+    // Read/Edit/Write open the file in the panel; others expand their output.
+    let file = matches!(tool_kind, ToolKind::FileRead | ToolKind::FileChange)
+        .then(|| {
+            ["file_path", "notebook_path", "path"]
+                .iter()
+                .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+        })
+        .flatten()
+        .map(|f| relative_to(f, cwd))
+        .filter(|f| !f.starts_with('/'));
+    let open = file.is_none() && output.is_some() && state.is_expanded(&item.id, false);
+    let mut detail = relative_to(
         title.strip_prefix(&format!("{tool} ")).unwrap_or(title),
         cwd,
     );
+    if detail == *tool {
+        // MCP tools have no natural title: show their arguments instead.
+        detail = match input {
+            serde_json::Value::Object(map) if !map.is_empty() => map
+                .iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::String(s) => format!("{k}: {s}"),
+                    other => format!("{k}: {other}"),
+                })
+                .collect::<Vec<_>>()
+                .join("  "),
+            _ => String::new(),
+        };
+    }
+    let clickable = file.is_some() || output.is_some();
+
+    let row = h_flex()
+        .id(SharedString::from(format!("tool-{}", item.id)))
+        .gap_1p5()
+        .items_center()
+        .text_sm()
+        .min_w_0()
+        .rounded(px(6.))
+        .child(status_icon(running, failed, declined, p))
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.foreground)
+                .child(tool_label(tool)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(p.mono.clone())
+                .text_size(p.mono_size)
+                .text_color(if file.is_some() {
+                    p.accent
+                } else {
+                    p.muted_foreground
+                })
+                .child(detail),
+        )
+        .when(declined, |d| {
+            d.child(div().text_xs().text_color(p.warning).child("denied"))
+        });
+    let row = if clickable {
+        let thread = thread.clone();
+        let store = store.clone();
+        let key = item.id.clone();
+        let thread_id = model.thread.id.clone();
+        row.cursor_pointer()
+            .hover(|d| d.bg(p.hover))
+            .on_click(move |_, _, cx| match &file {
+                Some(path) => {
+                    let (thread_id, path) = (thread_id.clone(), path.clone());
+                    store.update(cx, |s, cx| s.open_file(thread_id, path, cx));
+                }
+                None => {
+                    let key = key.clone();
+                    thread.update(cx, |t, cx| t.toggle(key, false, cx));
+                }
+            })
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    };
 
     v_flex()
         .gap_1()
-        .child(
-            h_flex()
-                .id(SharedString::from(format!("tool-{}", item.id)))
-                .gap_1p5()
-                .items_center()
-                .text_sm()
-                .min_w_0()
-                .rounded(px(6.))
-                .when(output.is_some(), |d| {
-                    d.cursor_pointer()
-                        .hover(|d| d.bg(p.hover))
-                        .on_click(move |_, _, cx| {
-                            let key = key.clone();
-                            thread.update(cx, |t, cx| t.toggle(key, false, cx));
-                        })
-                })
-                .child(status_icon(running, failed, declined, p))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(p.foreground)
-                        .child(tool_label(tool)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(p.mono.clone())
-                        .text_size(p.mono_size)
-                        .text_color(p.muted_foreground)
-                        .child(detail),
-                )
-                .when(declined, |d| {
-                    d.child(div().text_xs().text_color(p.warning).child("denied"))
-                }),
-        )
+        .child(row)
         .when_some(output.filter(|_| open), |d, out| {
             let lines: Vec<&str> = out.lines().collect();
             let shown = lines
@@ -327,6 +369,91 @@ fn tool_line(
                         )
                     }),
             )
+        })
+        .into_any_element()
+}
+
+/// A subagent (Task/Agent tool call): description, live progress, open button.
+fn agent_card(
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    item: &Item,
+    title: &str,
+    p: &Palette,
+) -> AnyElement {
+    let running = item.status == ItemStatus::InProgress;
+    let children = model
+        .items
+        .iter()
+        .filter(|i| i.parent_id.as_ref() == Some(&item.id))
+        .count();
+    let latest = model
+        .items
+        .iter()
+        .rev()
+        .filter(|i| i.parent_id.as_ref() == Some(&item.id))
+        .find_map(|i| match &i.body {
+            ItemBody::ToolCall { tool, title, .. } => Some(format!("{tool} {title}")),
+            _ => None,
+        });
+    let status = if running {
+        latest.unwrap_or_else(|| "Starting…".into())
+    } else {
+        format!("{children} action{}", if children == 1 { "" } else { "s" })
+    };
+    let store = store.clone();
+    let (thread_id, item_id) = (model.thread.id.clone(), item.id.clone());
+    h_flex()
+        .id(SharedString::from(format!("agent-{}", item.id)))
+        .gap_3()
+        .items_center()
+        .px_3()
+        .py_2()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.elevated)
+        .cursor_pointer()
+        .hover(|d| d.border_color(p.accent.opacity(0.5)))
+        .child(
+            div()
+                .size(px(28.))
+                .rounded(px(8.))
+                .bg(p.accent_soft)
+                .text_color(p.accent)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(IconName::Bot).small()),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .truncate()
+                        .child(format!("Agent · {title}")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(p.muted_foreground)
+                        .truncate()
+                        .child(status),
+                ),
+        )
+        .child(status_icon(running, false, false, p))
+        .child(
+            Icon::new(IconName::ChevronRight)
+                .xsmall()
+                .text_color(p.muted_foreground),
+        )
+        .on_click(move |_, _, cx| {
+            let (thread_id, item_id) = (thread_id.clone(), item_id.clone());
+            store.update(cx, |s, cx| s.open_agent(thread_id, item_id, cx));
         })
         .into_any_element()
 }
@@ -498,7 +625,7 @@ fn chevron(open: bool) -> AnyElement {
 }
 
 /// "Ran 2 commands, read 3 files" for a run of tool calls.
-pub fn summarize(items: &[Item]) -> String {
+pub fn summarize(items: &[&Item]) -> String {
     let mut counts: Vec<(ToolKind, usize)> = Vec::new();
     for item in items {
         if let ItemBody::ToolCall { tool_kind, .. } = &item.body {
@@ -588,13 +715,14 @@ mod tests {
 
     #[test]
     fn summaries_read_naturally() {
-        let items = vec![
+        let items = [
             tool(ToolKind::Command),
             tool(ToolKind::FileRead),
             tool(ToolKind::Command),
         ];
-        assert_eq!(summarize(&items), "Ran 2 commands, read 1 file");
-        assert_eq!(summarize(&[tool(ToolKind::FileChange)]), "Edited 1 file");
+        let refs: Vec<&Item> = items.iter().collect();
+        assert_eq!(summarize(&refs), "Ran 2 commands, read 1 file");
+        assert_eq!(summarize(&[&tool(ToolKind::FileChange)]), "Edited 1 file");
     }
 
     #[test]

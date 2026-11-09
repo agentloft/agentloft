@@ -24,7 +24,7 @@ loft-testkit = { path = "crates/loft-testkit" }
 loft-git = { path = "crates/loft-git" }
 
 # UI — gpui-kit pins the matching gpui-pre release (ADR-0005)
-gpui-kit = "=0.9.0"
+gpui-kit = { version = "=0.9.0", features = ["tree-sitter-languages"] }
 
 # async / io
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "sync", "time", "signal", "fs"] }
