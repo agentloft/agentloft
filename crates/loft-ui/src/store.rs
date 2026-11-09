@@ -575,6 +575,25 @@ impl AppStore {
         });
     }
 
+    pub fn rename_thread(&mut self, thread_id: ThreadId, title: String, cx: &mut Context<Self>) {
+        let body = Request::RenameThread { thread_id, title };
+        self.request_result(body, cx, |store, result, cx| {
+            if let Err(err) = result {
+                store.notify_result(Err(err), cx);
+            }
+        });
+    }
+
+    pub fn unarchive_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let body = Request::UnarchiveThread {
+            thread_id: thread_id.clone(),
+        };
+        self.request_result(body, cx, move |store, result, cx| match result {
+            Ok(_) => store.select_thread(thread_id, cx),
+            Err(err) => store.notify_result(Err(err), cx),
+        });
+    }
+
     /// Restore the thread's files to before `turn_id`.
     pub fn revert_turn(
         &mut self,

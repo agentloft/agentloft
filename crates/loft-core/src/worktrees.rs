@@ -281,6 +281,34 @@ impl Core {
         .map(|url| Response::Text { text: url })
     }
 
+    pub(crate) async fn unarchive_thread(self: &Arc<Self>, id: &ThreadId) -> CoreResult<Response> {
+        let mut thread = self.load_thread(id)?;
+        if thread.status != ThreadStatus::Archived {
+            return Ok(Response::Thread { thread });
+        }
+        if let ThreadWorkspace::Worktree { path, branch, .. } = &thread.workspace
+            && !Path::new(path).exists()
+        {
+            let project = self
+                .with_store(|s| s.project(&thread.project_id))?
+                .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+            let (repo, dir, branch) = (
+                PathBuf::from(project.root_path),
+                PathBuf::from(path),
+                branch.clone(),
+            );
+            blocking(move || {
+                wt::prune(&repo)?;
+                wt::add_existing(&repo, &dir, &branch)
+            })
+            .await?;
+        }
+        thread.status = ThreadStatus::Idle;
+        thread.updated_at_ms = now_ms();
+        self.save_thread(&thread)?;
+        Ok(Response::Thread { thread })
+    }
+
     pub(crate) async fn archive_thread(
         self: &Arc<Self>,
         id: &ThreadId,

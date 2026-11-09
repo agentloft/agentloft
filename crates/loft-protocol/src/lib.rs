@@ -144,6 +144,15 @@ pub enum Request {
         thread_id: ThreadId,
         turn_id: TurnId,
     },
+    RenameThread {
+        thread_id: ThreadId,
+        title: String,
+    },
+    /// Bring an archived thread back (its worktree is re-created from the
+    /// kept branch).
+    UnarchiveThread {
+        thread_id: ThreadId,
+    },
     /// Push a worktree thread's branch and open a GitHub pull request into
     /// its base with `gh`. Answers `Response::Text` with the PR URL.
     CreatePullRequest {

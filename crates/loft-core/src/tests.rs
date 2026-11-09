@@ -474,6 +474,35 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
         branch,
         "branch kept"
     );
+
+    // Unarchive re-creates the worktree from the kept branch.
+    let Response::Thread { thread } = core
+        .handle(Request::UnarchiveThread {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert_eq!(git(&wt, &["branch", "--show-current"]), branch);
+    assert!(wt.join("greet.py").exists(), "merged work is on the branch");
+
+    // Renames go through the actor, so they stick.
+    let Response::Thread { thread } = core
+        .handle(Request::RenameThread {
+            thread_id: thread.id.clone(),
+            title: "  Greeting work ".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.title, "Greeting work");
+    let (thread, ..) = thread_snapshot(&core, &thread.id);
+    assert_eq!(thread.title, "Greeting work");
 }
 
 #[tokio::test]

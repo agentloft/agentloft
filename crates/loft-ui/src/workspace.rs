@@ -8,6 +8,7 @@ use crate::store::{AppStore, ConnState, StoreEvent, ThreadState};
 use crate::theme::{self, Palette, relative_time};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::spinner::Spinner;
@@ -136,6 +137,8 @@ pub struct WorkspaceView {
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
     query: String,
+    /// The sidebar lists archived threads too.
+    show_archived: bool,
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
@@ -182,6 +185,7 @@ impl WorkspaceView {
             observed: HashMap::new(),
             search,
             query: String::new(),
+            show_archived: false,
             sidebar_open: true,
             panel,
             panel_open: true,
@@ -317,6 +321,16 @@ impl WorkspaceView {
                         .update(cx, |s, cx| s.archive_thread(t, false, cx));
                 }
                 "palette" => crate::palette::open(cx.entity(), &self.store, window, cx),
+                "archived" => self.show_archived = true,
+                "rename" => {
+                    let title = thread
+                        .read(cx)
+                        .model
+                        .as_ref()
+                        .map(|m| m.thread.title.clone())
+                        .unwrap_or_default();
+                    rename_dialog(self.store.clone(), thread_id.clone(), title, window, cx);
+                }
                 "undo" => {
                     let last = thread
                         .read(cx)
@@ -798,6 +812,7 @@ impl WorkspaceView {
             let mut rows = v_flex().gap_px();
             for (thread, depth) in nest_forks(threads) {
                 rows = rows.child(thread_row(
+                    &self.store,
                     thread,
                     depth,
                     selected.as_ref() == Some(&thread.id),
@@ -807,6 +822,76 @@ impl WorkspaceView {
                 ));
             }
             list = list.child(v_flex().gap_1().child(header).child(rows));
+        }
+
+        // Archived threads: hidden unless asked for; each can be restored.
+        let archived: Vec<_> = all_threads
+            .iter()
+            .filter(|t| t.status == ThreadStatus::Archived)
+            .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        if !archived.is_empty() {
+            let open = self.show_archived;
+            let mut section = v_flex().gap_px().child(
+                h_flex()
+                    .id("archived-toggle")
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.bg(p.hover))
+                    .child(Icon::new(IconName::Archive).xsmall())
+                    .child(format!("Archived ({})", archived.len()))
+                    .child(div().flex_1())
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_archived = !this.show_archived;
+                        cx.notify();
+                    })),
+            );
+            if open {
+                for t in archived {
+                    let id = t.id.clone();
+                    section = section.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .pl(px(26.))
+                            .pr_2()
+                            .py(px(5.))
+                            .text_sm()
+                            .text_color(p.muted_foreground)
+                            .child(div().flex_1().min_w_0().truncate().child(t.title.clone()))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("unarchive-{}", t.id)))
+                                    .px_1p5()
+                                    .rounded(px(5.))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                    .child("Restore")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let id = id.clone();
+                                        this.store.update(cx, |s, cx| s.unarchive_thread(id, cx));
+                                    })),
+                            ),
+                    );
+                }
+            }
+            list = list.child(section);
         }
 
         let (dot, status): (_, SharedString) = match &conn {
@@ -1984,7 +2069,9 @@ fn nest_forks(threads: Vec<&loft_protocol::Thread>) -> Vec<(&loft_protocol::Thre
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn thread_row(
+    store: &Entity<AppStore>,
     thread: &loft_protocol::Thread,
     depth: usize,
     active: bool,
@@ -2063,7 +2150,97 @@ fn thread_row(
             let id = id.clone();
             this.store.update(cx, |s, cx| s.select_thread(id, cx));
         }))
+        .context_menu({
+            let store = store.clone();
+            let id = thread.id.clone();
+            let title = thread.title.clone();
+            move |menu, _, _| {
+                use gpui_kit::component::menu::PopupMenuItem;
+                let (s1, i1, t1) = (store.clone(), id.clone(), title.clone());
+                let i2 = id.clone();
+                let mut menu = menu
+                    .item(
+                        PopupMenuItem::new("Rename…")
+                            .icon(IconName::SquarePen)
+                            .on_click(move |_, window, cx| {
+                                rename_dialog(s1.clone(), i1.clone(), t1.clone(), window, cx)
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Open in New Tab")
+                            .icon(IconName::Plus)
+                            .on_click(move |_, window, cx| {
+                                let tab = crate::windows::Placement::TabOf(window.window_handle());
+                                crate::windows::open(Some(i2.clone()), tab, cx);
+                            }),
+                    )
+                    .separator();
+                for (h, name) in [
+                    (HarnessId::CLAUDE, "Claude Code"),
+                    (HarnessId::CODEX, "Codex"),
+                ] {
+                    let (s, i) = (store.clone(), id.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("Fork with {name}"))
+                            .icon(IconName::GitFork)
+                            .on_click(move |_, _, cx| {
+                                let i = i.clone();
+                                s.update(cx, |s, cx| s.fork_thread(i, HarnessId(h.into()), cx));
+                            }),
+                    );
+                }
+                let (s, i) = (store.clone(), id.clone());
+                menu.separator().item(
+                    PopupMenuItem::new("Archive")
+                        .icon(IconName::Archive)
+                        .on_click(move |_, _, cx| {
+                            let i = i.clone();
+                            s.update(cx, |s, cx| s.archive_thread(i, false, cx));
+                        }),
+                )
+            }
+        })
         .into_any_element()
+}
+
+fn rename_dialog(
+    store: Entity<AppStore>,
+    thread_id: ThreadId,
+    title: String,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    let input = cx.new(|cx| {
+        let mut s = InputState::new(window, cx);
+        s.set_value(title, window, cx);
+        s
+    });
+    let focus = input.clone();
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (store, thread_id, input) = (store.clone(), thread_id.clone(), input.clone());
+        dialog
+            .title("Rename thread")
+            .w(px(420.))
+            .child(Input::new(&input))
+            .footer(
+                DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
+                    .child(DialogAction::new().child(Button::new("ok").primary().label("Rename"))),
+            )
+            .on_ok(move |_, _, cx| {
+                let title = input.read(cx).value().trim().to_owned();
+                if title.is_empty() {
+                    return false;
+                }
+                let id = thread_id.clone();
+                store.update(cx, |s, cx| s.rename_thread(id, title, cx));
+                true
+            })
+    });
+    focus.update(cx, |s, cx| s.focus(window, cx));
 }
 
 /// `claude-opus-5-5` → `Opus 5.5`.

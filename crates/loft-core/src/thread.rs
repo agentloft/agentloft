@@ -38,6 +38,10 @@ pub(crate) enum ThreadCmd {
         model: Option<String>,
         reply: Reply,
     },
+    Rename {
+        title: String,
+        reply: Reply,
+    },
     /// The worktree setup command finished (internal).
     SetupDone {
         turn_id: TurnId,
@@ -154,6 +158,14 @@ impl ThreadActor {
                 before,
                 sha,
             } => self.on_checkpoint(turn_id, before, sha),
+            ThreadCmd::Rename { title, reply } => {
+                self.thread.title = title;
+                self.thread.updated_at_ms = now_ms();
+                let res = self.save_thread().map(|_| Response::Thread {
+                    thread: self.thread.clone(),
+                });
+                let _ = reply.send(res);
+            }
             ThreadCmd::SetupDone {
                 turn_id,
                 item_id,

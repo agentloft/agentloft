@@ -517,6 +517,15 @@ impl Core {
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await
             }
+            Request::RenameThread { thread_id, title } => {
+                let title = title.trim().to_owned();
+                if title.is_empty() {
+                    return Err(ErrorBody::new(ErrorCode::BadRequest, "empty title"));
+                }
+                self.thread_call(&thread_id, |reply| ThreadCmd::Rename { title, reply })
+                    .await
+            }
+            Request::UnarchiveThread { thread_id } => self.unarchive_thread(&thread_id).await,
             Request::ArchiveThread { thread_id, force } => {
                 self.archive_thread(&thread_id, force).await
             }

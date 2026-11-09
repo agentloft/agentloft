@@ -69,6 +69,16 @@ pub fn add(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git worktree add <path> <branch>` for an existing branch (unarchive).
+pub fn add_existing(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path = path.to_string_lossy();
+    run(git(repo).args(["worktree", "add", "-q", &path, branch]))?;
+    Ok(())
+}
+
 /// Copy untracked files matching `patterns` (paths relative to the repo,
 /// `*`/`?` in the last component) from the main checkout into a new
 /// worktree — the secrets and local config git doesn't carry.
