@@ -36,7 +36,7 @@ Goal: visual quality on par with Codex and Claude Desktop, plus appearance custo
 - [~] Floating composer card: model and mode chips, round send/stop button (attachments M1)
 - [~] Approval card as a first-class prompt with the exact command (keyboard shortcuts pending)
 - [x] Empty states: welcome, empty thread, reconnecting banner
-- [~] Performance: palette computed once per frame, incremental row splicing; 10k-item benchmark pending
+- [x] Performance: palette computed once per frame, incremental row splicing, virtualized timeline. 10k-item thread (2,500 turns with Markdown, code and tools): daemon snapshot 144 ms (5.4 MB), opens at the latest turn, 0% CPU idle, ~320 MB RSS (debug build)
 
 ## Workbench (branch `feat/workbench`)
 
