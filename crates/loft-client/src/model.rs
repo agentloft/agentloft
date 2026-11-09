@@ -219,6 +219,7 @@ mod tests {
             status: ThreadStatus::Running,
             created_at_ms: 0,
             updated_at_ms: 0,
+            workspace: Default::default(),
         };
         let item = Item {
             id: ItemId::new(),

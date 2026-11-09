@@ -108,6 +108,28 @@ pub enum Request {
         thread_id: ThreadId,
         harness: HarnessId,
     },
+    /// Work in the project checkout or in a new worktree (created on the
+    /// first message); only allowed before the first message.
+    SetThreadWorkspace {
+        thread_id: ThreadId,
+        worktree: bool,
+    },
+    /// Squash-merge a worktree thread's branch into its base branch in the
+    /// project checkout (uncommitted work is committed to the branch first).
+    /// Answers `Response::Text` with a summary.
+    MergeThread {
+        thread_id: ThreadId,
+        /// Commit message; defaults to the thread title.
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Stop the thread's agent and terminal and remove its worktree (the
+    /// branch is kept). A dirty worktree needs `force`.
+    ArchiveThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        force: bool,
+    },
     /// Ask the daemon to exit (graceful shutdown or upgrade).
     Shutdown {
         reason: ShutdownReason,

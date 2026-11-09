@@ -47,6 +47,7 @@ Built ahead of the PLAN's milestone order, by request.
 | Codex harness (M2) | [x] | `codex app-server`; approvals follow `availableDecisions`; MCP elicitations; resume verified live (`live_codex`) |
 | Harness picker / model / permission menus | [x] | Picker on empty threads; model + mode dropdowns in the composer |
 | Checkpoints + diffs (M3 subset) | [x] | Hidden refs per turn; Changes tab: this thread / last turn / uncommitted |
+| Per-thread worktrees (M3) | [x] | Local / New worktree picker. The worktree is created on the first message (`agentloft/<slug-from-prompt>` under `~/.agentloft/worktrees`, `.env*` copied in). Squash merge-back runs a `merge-tree` conflict pre-check. Archive removes the worktree (confirms if dirty) and keeps the branch. Verified live with Claude. **Not yet done:** setup script, `gh` PR, revert to checkpoint |
 | File explorer + viewer | [x] | .gitignore-aware tree; tree-sitter highlighting; Markdown preview; images |
 | Subagent view | [x] | Agent cards in the timeline; subagent tab with steps and report |
 | Agentloft MCP server | [x] | `browser_*`, `list_threads`, `read_thread`, `get_thread_diff`; verified with Claude and Codex |

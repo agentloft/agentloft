@@ -424,6 +424,7 @@ mod tests {
             status: ThreadStatus::Idle,
             created_at_ms: 1,
             updated_at_ms: 1,
+            workspace: Default::default(),
         }
     }
 

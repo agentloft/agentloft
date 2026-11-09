@@ -18,7 +18,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div,
     prelude::FluentBuilder as _, px,
 };
-use loft_protocol::{HarnessId, ProjectId, ThreadId, ThreadStatus};
+use loft_protocol::{HarnessId, ProjectId, ThreadId, ThreadStatus, ThreadWorkspace};
 use std::collections::HashMap;
 
 actions!(
@@ -188,6 +188,26 @@ impl WorkspaceView {
             StoreEvent::BrowserCall { call_id, command } => {
                 self.run_browser_call(*call_id, command.clone(), window, cx);
             }
+            StoreEvent::Notify { message, error } => {
+                use gpui_kit::component::WindowExt as _;
+                use gpui_kit::component::notification::Notification;
+                let note = Notification::new().message(message.clone());
+                let note = if *error {
+                    note.with_type(gpui_kit::component::notification::NotificationType::Error)
+                } else {
+                    note.with_type(gpui_kit::component::notification::NotificationType::Success)
+                };
+                window.push_notification(note, cx);
+            }
+            StoreEvent::ConfirmArchive { thread_id, reason } => {
+                confirm_archive(
+                    thread_id.clone(),
+                    reason.clone(),
+                    self.store.clone(),
+                    window,
+                    cx,
+                );
+            }
         }
         cx.notify();
     }
@@ -225,6 +245,16 @@ impl WorkspaceView {
                 "browser" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx)),
+                // Exercise the thread menu's actions (screenshots/tests).
+                "merge" => {
+                    let t = thread_id.clone();
+                    self.store.update(cx, |s, cx| s.merge_thread(t, cx));
+                }
+                "archive" => {
+                    let t = thread_id.clone();
+                    self.store
+                        .update(cx, |s, cx| s.archive_thread(t, false, cx));
+                }
                 "agent" => {
                     if let Some(item) = agent {
                         self.panel
@@ -494,7 +524,7 @@ impl WorkspaceView {
             let project_id = project.id.clone();
             let threads: Vec<_> = all_threads
                 .iter()
-                .filter(|t| t.project_id == project.id)
+                .filter(|t| t.project_id == project.id && t.status != ThreadStatus::Archived)
                 .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
                 .collect();
             if !query.is_empty() && threads.is_empty() {
@@ -657,7 +687,7 @@ impl WorkspaceView {
     #[allow(clippy::too_many_arguments)]
     fn render_header(
         &mut self,
-        title: Option<(String, String, String)>,
+        title: Option<(String, loft_protocol::Thread)>,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -682,7 +712,20 @@ impl WorkspaceView {
                     }),
                 ))
             })
-            .when_some(title, |d, (project, title, chip)| {
+            .when_some(title, |d, (project, thread)| {
+                let chip = harness_name(&thread.harness).to_owned();
+                let title = thread.title.clone();
+                let branch_chip = match &thread.workspace {
+                    ThreadWorkspace::Worktree { branch, .. } => {
+                        Some(chip_label(IconName::GitBranch, branch.clone(), p))
+                    }
+                    ThreadWorkspace::NewWorktree => Some(chip_label(
+                        IconName::GitBranch,
+                        "New worktree".to_owned(),
+                        p,
+                    )),
+                    ThreadWorkspace::Local => None,
+                };
                 d.child(
                     h_flex()
                         .flex_1()
@@ -704,6 +747,8 @@ impl WorkspaceView {
                         ),
                 )
                 .child(chip_label(IconName::Sparkles, chip, p))
+                .children(branch_chip)
+                .child(thread_menu(&thread, &self.store))
             })
             .when(has_thread, |d| {
                 let active = if self.panel_open { active_tab } else { None };
@@ -799,11 +844,25 @@ impl WorkspaceView {
                     &self.store,
                     p,
                 ))
+                .child(workspace_picker(
+                    &model.thread.id,
+                    &model.thread.workspace,
+                    &self.store,
+                    p,
+                ))
                 .child(
                     div()
+                        .max_w(px(520.))
+                        .truncate()
                         .text_xs()
                         .text_color(p.faint_foreground)
-                        .child(format!("Works in {}", model.thread.cwd)),
+                        .child(match model.thread.workspace {
+                            ThreadWorkspace::NewWorktree => {
+                                "Your first message creates an isolated worktree on a new branch"
+                                    .to_owned()
+                            }
+                            _ => format!("Works in {}", tilde(&model.thread.cwd)),
+                        }),
                 )
                 .into_any_element()
         } else {
@@ -999,11 +1058,7 @@ impl Render for WorkspaceView {
                 .find(|p| p.id == model.thread.project_id)
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
-            Some((
-                project,
-                model.thread.title.clone(),
-                harness_name(&model.thread.harness).to_owned(),
-            ))
+            Some((project, model.thread.clone()))
         });
 
         let body = match selected {
@@ -1480,6 +1535,13 @@ fn thread_row(
                 .truncate()
                 .child(thread.title.clone()),
         )
+        .when(thread.workspace.branch().is_some(), |d| {
+            d.child(
+                Icon::new(IconName::GitBranch)
+                    .xsmall()
+                    .text_color(p.faint_foreground),
+            )
+        })
         .child(trailing)
         .on_click(cx.listener(move |this, _, _, cx| {
             let id = id.clone();
@@ -1503,6 +1565,165 @@ fn placeholder_for(h: &HarnessId) -> String {
         "Ask {} to build, fix or explain something…",
         harness_name(h)
     )
+}
+
+/// `/Users/me/x` → `~/x`.
+fn tilde(path: &str) -> String {
+    match std::env::home_dir() {
+        Some(home) => match std::path::Path::new(path).strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.to_owned(),
+        },
+        None => path.to_owned(),
+    }
+}
+
+/// The header's thread menu: worktree actions and archive.
+fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+    let store = store.clone();
+    let id = thread.id.clone();
+    let worktree = match &thread.workspace {
+        ThreadWorkspace::Worktree { path, branch, base } => {
+            Some((path.clone(), branch.clone(), base.clone()))
+        }
+        _ => None,
+    };
+    let running = matches!(
+        thread.status,
+        ThreadStatus::Running | ThreadStatus::WaitingApproval
+    );
+    Button::new("thread-menu")
+        .icon(IconName::Ellipsis)
+        .ghost()
+        .xsmall()
+        .dropdown_menu(move |mut menu, _, _| {
+            if let Some((path, branch, base)) = &worktree {
+                let (s, t) = (store.clone(), id.clone());
+                menu = menu
+                    .item(
+                        PopupMenuItem::new(format!("Merge into {base}"))
+                            .icon(IconName::GitMerge)
+                            .disabled(running)
+                            .on_click(move |_, _, cx| {
+                                let t = t.clone();
+                                s.update(cx, |s, cx| s.merge_thread(t, cx));
+                            }),
+                    )
+                    .item({
+                        let path = path.clone();
+                        PopupMenuItem::new("Reveal worktree in Finder")
+                            .icon(IconName::FolderOpen)
+                            .on_click(move |_, _, cx| {
+                                cx.reveal_path(std::path::Path::new(&path));
+                            })
+                    })
+                    .item({
+                        let branch = branch.clone();
+                        PopupMenuItem::new("Copy branch name")
+                            .icon(IconName::Copy)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                                    branch.clone(),
+                                ));
+                            })
+                    })
+                    .separator();
+            }
+            let (s, t) = (store.clone(), id.clone());
+            menu.item(
+                PopupMenuItem::new("Archive thread")
+                    .icon(IconName::Archive)
+                    .on_click(move |_, _, cx| {
+                        let t = t.clone();
+                        s.update(cx, |s, cx| s.archive_thread(t, false, cx));
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
+fn confirm_archive(
+    thread_id: ThreadId,
+    reason: String,
+    store: Entity<AppStore>,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (store, thread_id) = (store.clone(), thread_id.clone());
+        dialog
+            .title("Archive thread?")
+            .child(format!(
+                "{reason}. Archiving removes the worktree and discards them; the branch is kept."
+            ))
+            .footer(
+                DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("cancel").label("Cancel")))
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").danger().label("Archive anyway")),
+                    ),
+            )
+            .on_ok(move |_, _, cx| {
+                let t = thread_id.clone();
+                store.update(cx, |s, cx| s.archive_thread(t, true, cx));
+                true
+            })
+    });
+}
+
+/// Local checkout vs. a new worktree, for a thread that hasn't started.
+fn workspace_picker(
+    thread_id: &ThreadId,
+    current: &ThreadWorkspace,
+    store: &Entity<AppStore>,
+    p: &Palette,
+) -> AnyElement {
+    let wants = matches!(current, ThreadWorkspace::NewWorktree);
+    let mut row = h_flex().gap_1().text_xs();
+    for (worktree, label, icon) in [
+        (false, "Local", IconName::Laptop),
+        (true, "New worktree", IconName::GitBranch),
+    ] {
+        let active = wants == worktree;
+        let store = store.clone();
+        let thread_id = thread_id.clone();
+        row = row.child(
+            h_flex()
+                .id(SharedString::from(format!("workspace-{worktree}")))
+                .gap_1()
+                .items_center()
+                .px_2()
+                .py_1()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .border_1()
+                .when(active, |d| {
+                    d.border_color(p.border)
+                        .bg(p.elevated)
+                        .text_color(p.foreground)
+                })
+                .when(!active, |d| {
+                    d.border_color(gpui_kit::transparent_black())
+                        .text_color(p.muted_foreground)
+                        .hover(|d| d.text_color(p.foreground))
+                })
+                .child(Icon::new(icon).xsmall())
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    if !active {
+                        let t = thread_id.clone();
+                        store.update(cx, |s, cx| s.set_thread_workspace(t, worktree, cx));
+                    }
+                }),
+        );
+    }
+    row.into_any_element()
 }
 
 /// Claude Code / Codex segmented picker for a thread that hasn't started.

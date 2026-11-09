@@ -6,6 +6,8 @@ use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod worktree;
+
 pub const REF_PREFIX: &str = "refs/agentloft/checkpoints";
 
 /// The empty tree object, used as the base when a repo has no commits.

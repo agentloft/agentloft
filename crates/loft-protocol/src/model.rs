@@ -27,6 +27,37 @@ pub struct Thread {
     pub status: ThreadStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Where the agent works: the project checkout or its own worktree.
+    #[serde(default)]
+    pub workspace: ThreadWorkspace,
+}
+
+/// A thread's workspace (ADR-0008, PLAN §5.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThreadWorkspace {
+    /// The project checkout itself.
+    #[default]
+    Local,
+    /// A worktree is created when the first message is sent, on a branch
+    /// named after it.
+    NewWorktree,
+    /// A git worktree on its own `agentloft/<slug>` branch.
+    Worktree {
+        path: String,
+        branch: String,
+        /// Branch (or commit) it was created from; merge-back target.
+        base: String,
+    },
+}
+
+impl ThreadWorkspace {
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            ThreadWorkspace::Worktree { branch, .. } => Some(branch),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

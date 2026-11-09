@@ -44,6 +44,8 @@ struct ThreadPanel {
     active: Tab,
     /// Last finished turn we refreshed for.
     seen_turn: Option<TurnId>,
+    /// The thread's working directory; changes when its worktree is created.
+    cwd: String,
     _subs: Vec<Subscription>,
 }
 
@@ -102,6 +104,12 @@ impl WorkbenchPanel {
                 .and_then(|m| m.last_turn())
                 .filter(|t| t.status.is_terminal())
                 .map(|t| t.id.clone());
+            let cwd = thread
+                .read(cx)
+                .model
+                .as_ref()
+                .map(|m| m.thread.cwd.clone())
+                .unwrap_or_default();
             self.threads.insert(
                 thread_id.clone(),
                 ThreadPanel {
@@ -112,6 +120,7 @@ impl WorkbenchPanel {
                     terminal: None,
                     active: Tab::Files,
                     seen_turn,
+                    cwd,
                     _subs: subs,
                 },
             );
@@ -126,18 +135,27 @@ impl WorkbenchPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let finished = thread
-            .read(cx)
-            .model
-            .as_ref()
-            .and_then(|m| m.last_turn())
+        let Some(model) = thread.read(cx).model.as_ref() else {
+            return;
+        };
+        let finished = model
+            .last_turn()
             .filter(|t| t.status.is_terminal())
             .map(|t| t.id.clone());
+        let cwd = model.thread.cwd.clone();
         let Some(panel) = self.threads.get_mut(id) else {
             return;
         };
-        if finished.is_some() && finished != panel.seen_turn {
-            panel.seen_turn = finished;
+        // The thread moved into its new worktree: re-root everything.
+        let moved = !panel.cwd.is_empty() && panel.cwd != cwd;
+        panel.cwd = cwd;
+        if moved && let Some(term) = &panel.terminal {
+            term.update(cx, |t, cx| t.restart(cx));
+        }
+        if moved || (finished.is_some() && finished != panel.seen_turn) {
+            if finished.is_some() {
+                panel.seen_turn = finished;
+            }
             panel.files.update(cx, |f, cx| f.refresh(cx));
             panel.changes.update(cx, |c, cx| c.refresh(cx));
             for (_, viewer) in &panel.viewers {

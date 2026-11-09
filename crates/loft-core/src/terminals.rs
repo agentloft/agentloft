@@ -189,6 +189,14 @@ impl Terminals {
         Ok(())
     }
 
+    /// Close the terminal opened under `key`, if any.
+    pub fn close_key(&self, key: &str) {
+        let id = lock(&self.keys).get(key).cloned();
+        if let Some(id) = id {
+            let _ = self.close(&id);
+        }
+    }
+
     /// Info plus the replay buffer and the byte offset where it ends.
     pub fn snapshot(&self, id: &TerminalId) -> Result<(TerminalInfo, Vec<u8>, u64), ErrorBody> {
         let term = self.get(id)?;

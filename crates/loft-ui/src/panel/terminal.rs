@@ -150,7 +150,7 @@ impl TerminalPane {
         cx.notify();
     }
 
-    fn restart(&mut self, cx: &mut Context<Self>) {
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
         if self.opening {
             return;
         }

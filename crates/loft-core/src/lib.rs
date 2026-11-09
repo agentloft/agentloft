@@ -6,6 +6,7 @@ mod clients;
 mod terminals;
 mod thread;
 mod workbench;
+mod worktrees;
 
 pub use clients::{ClientRegistry, OutgoingCall};
 
@@ -56,6 +57,8 @@ pub struct CoreOptions {
     pub flush_interval: Duration,
     /// Attach the Agentloft MCP server to agent sessions.
     pub mcp_bridge: Option<McpBridge>,
+    /// Where per-thread worktrees go (`~/.agentloft/worktrees`).
+    pub worktrees_dir: PathBuf,
 }
 
 impl Default for CoreOptions {
@@ -65,6 +68,7 @@ impl Default for CoreOptions {
             config: loft_config::Config::default(),
             flush_interval: Duration::from_millis(250),
             mcp_bridge: None,
+            worktrees_dir: std::env::temp_dir().join("agentloft-worktrees"),
         }
     }
 }
@@ -78,6 +82,8 @@ pub struct Core {
     live: Mutex<HashMap<ItemId, Item>>,
     terminals: terminals::Terminals,
     clients: ClientRegistry,
+    /// Serializes worktree creation (two first messages racing).
+    worktree_lock: tokio::sync::Mutex<()>,
     opts: CoreOptions,
 }
 
@@ -102,6 +108,7 @@ impl Core {
             live: Mutex::new(HashMap::new()),
             terminals: terminals::Terminals::default(),
             clients: ClientRegistry::default(),
+            worktree_lock: tokio::sync::Mutex::new(()),
             opts,
         })
     }
@@ -269,6 +276,7 @@ impl Core {
                 if text.trim().is_empty() {
                     return Err(ErrorBody::new(ErrorCode::BadRequest, "empty message"));
                 }
+                self.ensure_workspace(&thread_id, &text).await?;
                 self.thread_call(&thread_id, |reply| ThreadCmd::SendMessage { text, reply })
                     .await
             }
@@ -363,6 +371,16 @@ impl Core {
             Request::SetThreadHarness { thread_id, harness } => {
                 self.set_thread_harness(&thread_id, harness)
             }
+            Request::SetThreadWorkspace {
+                thread_id,
+                worktree,
+            } => self.set_thread_workspace(&thread_id, worktree),
+            Request::MergeThread { thread_id, message } => {
+                self.merge_thread(&thread_id, message).await
+            }
+            Request::ArchiveThread { thread_id, force } => {
+                self.archive_thread(&thread_id, force).await
+            }
             Request::ListThreads { query, project_id } => Ok(Response::Json {
                 value: self.list_threads_json(query.as_deref(), project_id.as_ref())?,
             }),
@@ -448,6 +466,7 @@ impl Core {
             .with_store(|s| s.project(&project_id))?
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let now = now_ms();
+        let workspace = self.default_workspace(&project.root_path);
         let thread = Thread {
             id: ThreadId::new(),
             project_id,
@@ -460,6 +479,7 @@ impl Core {
             status: ThreadStatus::Idle,
             created_at_ms: now,
             updated_at_ms: now,
+            workspace,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

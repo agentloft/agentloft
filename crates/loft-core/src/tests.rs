@@ -1,6 +1,6 @@
 use super::*;
 use loft_harness::fake::FakeHarness;
-use loft_protocol::{DecisionKind, ItemBody, RequestStatus, Snapshot};
+use loft_protocol::{DecisionKind, ItemBody, RequestStatus, Snapshot, ThreadWorkspace};
 use std::time::Duration;
 
 struct Fixture {
@@ -330,4 +330,137 @@ async fn unknown_harness_and_missing_thread_are_errors() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::BadRequest);
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+async fn worktree_thread_created_on_first_message_merged_and_archived() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let worktrees = dir.path().join("worktrees");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: worktrees.clone(),
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, &repo).await;
+    assert_eq!(
+        thread.workspace,
+        ThreadWorkspace::Local,
+        "mode `ask` starts local"
+    );
+
+    let Response::Thread { thread } = core
+        .handle(Request::SetThreadWorkspace {
+            thread_id: thread.id.clone(),
+            worktree: true,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.workspace, ThreadWorkspace::NewWorktree);
+
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "Add a greet() function!".into(),
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    let (thread, turns, _, _) = thread_snapshot(&core, &thread.id);
+    let ThreadWorkspace::Worktree { path, branch, base } = thread.workspace.clone() else {
+        panic!("{:?}", thread.workspace)
+    };
+    assert_eq!(branch, "agentloft/add-a-greet-function");
+    assert_eq!(base, "main");
+    assert_eq!(thread.cwd, path);
+    let wt = PathBuf::from(&path);
+    assert!(wt.starts_with(worktrees.join("repo")), "{path}");
+    assert_eq!(git(&wt, &["branch", "--show-current"]), branch);
+    assert!(
+        turns[0].checkpoint_before.is_some(),
+        "checkpoints in the worktree"
+    );
+
+    // The workspace is fixed once the thread has started.
+    assert!(
+        core.handle(Request::SetThreadWorkspace {
+            thread_id: thread.id.clone(),
+            worktree: false,
+        })
+        .await
+        .is_err()
+    );
+
+    // The agent's (uncommitted) edits merge back into main as one commit.
+    std::fs::write(wt.join("greet.py"), "def greet(): ...\n").unwrap();
+    let Response::Text { text } = core
+        .handle(Request::MergeThread {
+            thread_id: thread.id.clone(),
+            message: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(text.starts_with("Merged 1 file into main"), "{text}");
+    assert!(repo.join("greet.py").exists());
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s"]),
+        "Add a greet() function!"
+    );
+
+    // Archiving refuses a dirty worktree unless forced, then removes it.
+    std::fs::write(wt.join("wip.txt"), "x").unwrap();
+    let err = core
+        .handle(Request::ArchiveThread {
+            thread_id: thread.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    let Response::Thread { thread } = core
+        .handle(Request::ArchiveThread {
+            thread_id: thread.id.clone(),
+            force: true,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.status, ThreadStatus::Archived);
+    assert!(!wt.exists());
+    assert_eq!(
+        git(&repo, &["branch", "--list", &branch]).trim_start_matches("* "),
+        branch,
+        "branch kept"
+    );
 }

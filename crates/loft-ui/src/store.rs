@@ -35,6 +35,10 @@ pub enum StoreEvent {
         call_id: u64,
         command: serde_json::Value,
     },
+    /// A transient message for the user (toast).
+    Notify { message: String, error: bool },
+    /// Archiving needs confirmation (e.g. the worktree is dirty).
+    ConfirmArchive { thread_id: ThreadId, reason: String },
 }
 
 impl gpui_kit::EventEmitter<StoreEvent> for AppStore {}
@@ -252,7 +256,11 @@ impl AppStore {
                     self.workspace.apply_snapshot(snapshot);
                     // Reopen the most recently active thread on launch.
                     if self.selected.is_none()
-                        && let Some(first) = self.workspace.threads.first()
+                        && let Some(first) = self
+                            .workspace
+                            .threads
+                            .iter()
+                            .find(|t| t.status != loft_protocol::ThreadStatus::Archived)
                     {
                         let id = first.id.clone();
                         self.select_thread(id, cx);
@@ -406,6 +414,109 @@ impl AppStore {
             cx,
             |_, _, _| {},
         );
+    }
+
+    /// Like [`Self::request`], but the callback also gets errors.
+    fn request_result(
+        &mut self,
+        body: Request,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Result<Response, ErrorBody>, &mut Context<Self>) + 'static,
+    ) {
+        let fut: std::pin::Pin<Box<dyn Future<Output = Result<Response, ErrorBody>>>> =
+            match self.client.clone() {
+                Some(client) => Box::pin(client.request(body)),
+                None => Box::pin(async {
+                    Err(ErrorBody::new(
+                        loft_protocol::ErrorCode::Internal,
+                        "not connected to agentloftd",
+                    ))
+                }),
+            };
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = fut.await;
+            let _ = this.update(cx, |store, cx| then(store, result, cx));
+        })
+        .detach();
+    }
+
+    fn notify_result(&mut self, result: Result<String, ErrorBody>, cx: &mut Context<Self>) {
+        let (message, error) = match result {
+            Ok(message) => (message, false),
+            Err(err) => (err.message, true),
+        };
+        cx.emit(StoreEvent::Notify { message, error });
+    }
+
+    /// Project checkout or a new worktree (before the first message).
+    pub fn set_thread_workspace(
+        &mut self,
+        thread_id: ThreadId,
+        worktree: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let body = Request::SetThreadWorkspace {
+            thread_id,
+            worktree,
+        };
+        self.request_result(body, cx, |store, result, cx| {
+            if let Err(err) = result {
+                store.notify_result(Err(err), cx);
+            }
+        });
+    }
+
+    /// Squash-merge a worktree thread back into its base branch.
+    pub fn merge_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let body = Request::MergeThread {
+            thread_id,
+            message: None,
+        };
+        self.request_result(body, cx, |store, result, cx| {
+            let result = result.map(|r| match r {
+                Response::Text { text } => text,
+                _ => "Merged".into(),
+            });
+            store.notify_result(result, cx);
+        });
+    }
+
+    pub fn archive_thread(&mut self, thread_id: ThreadId, force: bool, cx: &mut Context<Self>) {
+        let body = Request::ArchiveThread {
+            thread_id: thread_id.clone(),
+            force,
+        };
+        self.request_result(body, cx, move |store, result, cx| match result {
+            Ok(_) => {
+                store.on_archived(&thread_id, cx);
+                store.notify_result(Ok("Thread archived".into()), cx);
+            }
+            Err(err) if err.code == loft_protocol::ErrorCode::Conflict && !force => {
+                cx.emit(StoreEvent::ConfirmArchive {
+                    thread_id,
+                    reason: err.message,
+                });
+            }
+            Err(err) => store.notify_result(Err(err), cx),
+        });
+    }
+
+    /// Move the selection off an archived thread.
+    fn on_archived(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
+        if self.selected.as_ref() != Some(thread_id) {
+            return;
+        }
+        let next = self
+            .workspace
+            .threads
+            .iter()
+            .find(|t| &t.id != thread_id && t.status != loft_protocol::ThreadStatus::Archived)
+            .map(|t| t.id.clone());
+        self.selected = None;
+        if let Some(id) = next {
+            self.select_thread(id, cx);
+        }
+        cx.notify();
     }
 
     /// Queue a message for when the current turn ends.

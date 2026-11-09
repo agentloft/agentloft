@@ -128,6 +128,27 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 pub struct Config {
     pub ui: UiConfig,
     pub harness: HarnessConfigs,
+    pub worktrees: WorktreeConfig,
+}
+
+/// `[worktrees]` in config.toml (PLAN §5.2).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorktreeConfig {
+    /// New threads: `ask` (pick per thread, local preselected) | `local` |
+    /// `worktree`.
+    pub mode: String,
+    /// Branch prefix for worktree branches.
+    pub branch_prefix: String,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            mode: "ask".into(),
+            branch_prefix: "agentloft".into(),
+        }
+    }
 }
 
 /// Appearance settings (`[ui]` in config.toml). Reloaded live by the app.
