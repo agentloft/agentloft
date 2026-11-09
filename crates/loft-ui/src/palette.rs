@@ -94,6 +94,7 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Vec<E
         .threads
         .iter()
         .filter(|t| t.status != ThreadStatus::Archived)
+        .filter(|t| t.is_started() || t.parent.is_some() || t.draft_text().is_some())
         .map(|t| {
             let project = store
                 .workspace

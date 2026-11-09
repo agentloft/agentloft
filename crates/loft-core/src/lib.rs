@@ -634,6 +634,11 @@ impl Core {
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await
             }
+            Request::SetDraft { thread_id, text } => {
+                let draft = (!text.trim().is_empty()).then_some(text);
+                self.thread_call(&thread_id, |reply| ThreadCmd::SetDraft { draft, reply })
+                    .await
+            }
             Request::RenameThread { thread_id, title } => {
                 let title = title.trim().to_owned();
                 if title.is_empty() {
@@ -752,6 +757,8 @@ impl Core {
             workspace,
             parent: None,
             slash_commands: Vec::new(),
+            started_at_ms: None,
+            draft: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

@@ -11,7 +11,7 @@ use loft_client::{Client, ClientEvent};
 use loft_config::Paths;
 use loft_protocol::{
     Attachment, ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId,
-    ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId, Topic,
+    ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId, ThreadStatus, Topic,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -562,7 +562,26 @@ impl AppStore {
         self.request(Request::AddProject { path, name: None }, cx, |_, _, _| {});
     }
 
+    /// Open a new thread in `project_id`. It isn't really started until the
+    /// first message, so an untouched one (no messages, no draft) is reused
+    /// rather than piling up empty threads.
     pub fn new_thread(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        let blank = self
+            .workspace
+            .threads
+            .iter()
+            .find(|t| {
+                t.project_id == project_id
+                    && t.status != ThreadStatus::Archived
+                    && t.parent.is_none()
+                    && !t.is_started()
+                    && t.draft_text().is_none()
+            })
+            .map(|t| t.id.clone());
+        if let Some(id) = blank {
+            self.select_thread(id, cx);
+            return;
+        }
         self.request(
             Request::CreateThread {
                 project_id,
@@ -872,6 +891,11 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) {
         self.request(Request::SetEffort { thread_id, effort }, cx, |_, _, _| {});
+    }
+
+    /// Save a thread's unsent composer text (empty clears it).
+    pub fn set_draft(&mut self, thread_id: ThreadId, text: String, cx: &mut Context<Self>) {
+        self.request(Request::SetDraft { thread_id, text }, cx, |_, _, _| {});
     }
 
     pub fn interrupt(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {

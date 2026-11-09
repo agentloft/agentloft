@@ -39,6 +39,26 @@ pub struct Thread {
     /// Slash commands the agent reported (composer completions).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slash_commands: Vec<String>,
+    /// When the first message was sent. Unstarted threads stay out of the
+    /// sidebar unless they hold a draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    /// Unsent composer text, kept across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
+}
+
+impl Thread {
+    /// Whether a message was ever sent (threads from before
+    /// `started_at_ms` have a native session by then).
+    pub fn is_started(&self) -> bool {
+        self.started_at_ms.is_some() || self.native_session_id.is_some()
+    }
+
+    /// The draft, if it has anything in it.
+    pub fn draft_text(&self) -> Option<&str> {
+        self.draft.as_deref().filter(|d| !d.trim().is_empty())
+    }
 }
 
 /// Where a fork came from (ADR-0011).

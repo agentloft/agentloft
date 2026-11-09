@@ -146,6 +146,10 @@ pub struct WorkspaceView {
     /// it's open.
     model_picker: Option<Entity<crate::model_picker::ModelPicker>>,
     picker_open: bool,
+    /// Pending debounced draft saves, per thread.
+    draft_saves: HashMap<ThreadId, gpui_kit::Task<()>>,
+    /// Threads whose saved draft has been put back in their composer.
+    drafts_restored: std::collections::HashSet<ThreadId>,
     /// The new-worktree branch chooser and whether it's open.
     branch_picker: Option<Entity<crate::branch_picker::BranchPicker>>,
     branch_picker_open: bool,
@@ -202,6 +206,8 @@ impl WorkspaceView {
             picker_open: false,
             branch_picker: None,
             branch_picker_open: false,
+            draft_saves: HashMap::new(),
+            drafts_restored: Default::default(),
             sidebar_open: true,
             panel,
             panel_open: true,
@@ -529,7 +535,10 @@ impl WorkspaceView {
                 InputEvent::PressEnter { shift: false, .. } => {
                     this.submit(&thread_id, state, window, cx);
                 }
-                InputEvent::Change => this.refresh_completion(&thread_id, state, cx),
+                InputEvent::Change => {
+                    this.refresh_completion(&thread_id, state, cx);
+                    this.queue_draft_save(&thread_id, state, cx);
+                }
                 InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
                 _ => {}
             }
@@ -545,6 +554,44 @@ impl WorkspaceView {
         self.composer_harness.insert(id.clone(), thread_harness);
         self.composers.insert(id, composer.clone());
         composer
+    }
+
+    /// Save the composer's text as the thread's draft once typing pauses.
+    fn queue_draft_save(
+        &mut self,
+        thread_id: &ThreadId,
+        composer: &Entity<TextareaState>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = thread_id.clone();
+        let composer = composer.downgrade();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.draft_saves.remove(&id);
+                let Some(composer) = composer.upgrade() else {
+                    return;
+                };
+                let text = composer.read(cx).value().to_string();
+                let saved = this
+                    .store
+                    .read(cx)
+                    .workspace
+                    .threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.draft.clone())
+                    .unwrap_or_default();
+                if text.trim() != saved.trim() {
+                    this.store
+                        .update(cx, |s, cx| s.set_draft(id.clone(), text, cx));
+                }
+            });
+        });
+        // Replacing the task cancels the previous wait.
+        self.draft_saves.insert(thread_id.clone(), task);
     }
 
     fn submit(
@@ -940,6 +987,14 @@ impl WorkspaceView {
             let threads: Vec<_> = all_threads
                 .iter()
                 .filter(|t| t.project_id == project.id && t.status != ThreadStatus::Archived)
+                // A new thread shows once it has a message or a draft (or
+                // while it's open).
+                .filter(|t| {
+                    t.is_started()
+                        || t.parent.is_some()
+                        || t.draft_text().is_some()
+                        || selected.as_ref() == Some(&t.id)
+                })
                 .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
                 .collect();
             if !query.is_empty() && threads.is_empty() {
@@ -1358,6 +1413,20 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let composer = self.composer_for(&thread, window, cx);
+        // Put a saved draft back, once, when the thread first loads.
+        let saved = thread.read(cx).model.as_ref().map(|m| {
+            (
+                m.thread.id.clone(),
+                m.thread.draft_text().map(str::to_owned),
+            )
+        });
+        if let Some((tid, draft)) = saved
+            && self.drafts_restored.insert(tid)
+            && let Some(draft) = draft
+            && composer.read(cx).value().is_empty()
+        {
+            composer.update(cx, |c, cx| c.set_value(draft, window, cx));
+        }
         // Where a pending worktree starts, and the controls to change it.
         let pending = thread.read(cx).model.as_ref().and_then(|m| {
             (m.items.is_empty()
@@ -2580,11 +2649,26 @@ fn thread_row(
             .rounded_full()
             .bg(p.accent)
             .into_any_element(),
+        _ if !thread.is_started() && thread.parent.is_none() => h_flex()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .text_color(p.faint_foreground)
+            .child(Icon::new(IconName::SquarePen).xsmall())
+            .child("Draft")
+            .into_any_element(),
         _ => div()
             .text_xs()
             .text_color(p.faint_foreground)
             .child(relative_time(thread.updated_at_ms))
             .into_any_element(),
+    };
+    // An unsent draft names a new thread until it has a real title.
+    let title = match thread.draft_text() {
+        Some(draft) if !thread.is_started() && thread.title == "New thread" => {
+            draft.lines().next().unwrap_or(draft).trim().to_owned()
+        }
+        _ => thread.title.clone(),
     };
     h_flex()
         .id(SharedString::from(format!("thread-{}", thread.id)))
@@ -2610,13 +2694,7 @@ fn thread_row(
                     .text_color(p.faint_foreground),
             )
         })
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(thread.title.clone()),
-        )
+        .child(div().flex_1().min_w_0().truncate().child(title))
         .when(thread.workspace.branch().is_some(), |d| {
             d.child(
                 Icon::new(IconName::GitBranch)

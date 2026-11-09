@@ -100,6 +100,8 @@ impl Core {
             } else {
                 Vec::new()
             },
+            started_at_ms: None,
+            draft: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

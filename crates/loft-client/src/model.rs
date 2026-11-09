@@ -223,6 +223,8 @@ mod tests {
             workspace: Default::default(),
             parent: None,
             slash_commands: Vec::new(),
+            started_at_ms: None,
+            draft: None,
         };
         let item = Item {
             id: ItemId::new(),

@@ -133,6 +133,39 @@ async fn message_streams_and_completes() {
 }
 
 #[tokio::test]
+async fn drafts_persist_until_the_first_message() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    assert!(!thread.is_started());
+    f.core
+        .handle(Request::SetDraft {
+            thread_id: thread.id.clone(),
+            text: "half a thought".into(),
+        })
+        .await
+        .unwrap();
+    let (t, _, _, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(t.draft_text(), Some("half a thought"));
+    assert_eq!(
+        t.updated_at_ms, thread.updated_at_ms,
+        "drafts don't re-sort"
+    );
+
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "half a thought, finished".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (t, _, _, _) = thread_snapshot(&f.core, &thread.id);
+    assert!(t.is_started());
+    assert_eq!(t.draft, None, "sending clears the draft");
+}
+
+#[tokio::test]
 async fn second_turn_rejected_while_running_then_interrupt() {
     let f = fixture();
     let thread = new_thread(&f.core, f._dir.path()).await;

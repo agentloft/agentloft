@@ -46,6 +46,10 @@ pub(crate) enum ThreadCmd {
         title: String,
         reply: Reply,
     },
+    SetDraft {
+        draft: Option<String>,
+        reply: Reply,
+    },
     /// The worktree setup command finished (internal).
     SetupDone {
         turn_id: TurnId,
@@ -170,6 +174,16 @@ impl ThreadActor {
                 before,
                 sha,
             } => self.on_checkpoint(turn_id, before, sha),
+            ThreadCmd::SetDraft { draft, reply } => {
+                // Not a change worth re-sorting the sidebar for.
+                let res = if self.thread.draft == draft {
+                    Ok(Response::Ok)
+                } else {
+                    self.thread.draft = draft;
+                    self.save_thread().map(|_| Response::Ok)
+                };
+                let _ = reply.send(res);
+            }
             ThreadCmd::Rename { title, reply } => {
                 self.thread.title = title;
                 self.thread.updated_at_ms = now_ms();
@@ -282,6 +296,11 @@ impl ThreadActor {
             ));
         }
         self.ensure_session()?;
+        if self.thread.started_at_ms.is_none() || self.thread.draft.is_some() {
+            self.thread.started_at_ms.get_or_insert_with(now_ms);
+            self.thread.draft = None;
+            self.save_thread()?;
+        }
 
         let now = now_ms();
         let ordinal = self

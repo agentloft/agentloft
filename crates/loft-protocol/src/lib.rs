@@ -161,6 +161,11 @@ pub enum Request {
         thread_id: ThreadId,
         title: String,
     },
+    /// Save the composer's unsent text (empty clears it).
+    SetDraft {
+        thread_id: ThreadId,
+        text: String,
+    },
     /// Bring an archived thread back (its worktree is re-created from the
     /// kept branch).
     UnarchiveThread {
