@@ -169,6 +169,13 @@ pub struct WorkspaceView {
     pub(crate) panel_open: bool,
     /// Where the details button is (its card opens under it).
     details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    sidebar_slide: Slide,
+    /// How far open the sidebar is drawn this frame (0–1).
+    sidebar_amount: f32,
+    panel_slide: Slide,
+    details_slide: Slide,
+    /// The side panel's width as last laid out (it slides at this width).
+    panel_width: std::rc::Rc<std::cell::Cell<f32>>,
     /// The turn-map tick being hovered (its peek card shows).
     peek: Option<usize>,
     /// The details card is docked open (shown while the window is wide).
@@ -252,6 +259,11 @@ impl WorkspaceView {
             details_anchor: Default::default(),
             details_open: false,
             peek: None,
+            sidebar_slide: Slide::default(),
+            sidebar_amount: 1.,
+            panel_slide: Slide::default(),
+            details_slide: Slide::default(),
+            panel_width: std::rc::Rc::new(std::cell::Cell::new(560.)),
             details_card: None,
             details_room: Default::default(),
             window_title: String::new(),
@@ -420,6 +432,20 @@ impl WorkspaceView {
             }
             _ => match dev {
                 "branches" => self.branch_picker_open = true,
+                "closesidebar" => {
+                    // Shut the sidebar a moment after launch (animation tests).
+                    self.panel_open = false;
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(5))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.sidebar_open = false;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
                 "maximize" => {
                     self.panel
                         .update(cx, |p, cx| p.show(Tab::Files, window, cx));
@@ -747,7 +773,10 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.store.read(cx).selected.clone();
-        let dock = match (&selected, self.details_open && self.can_dock()) {
+        let amount = self
+            .details_slide
+            .update(self.details_open && self.can_dock(), window);
+        let dock = match (&selected, amount > 0.) {
             (Some(id), true) => {
                 if self
                     .details_card
@@ -798,11 +827,10 @@ impl WorkspaceView {
             .children(dock.map(|card| {
                 div()
                     .flex_none()
-                    .w(px(DOCK_WIDTH))
+                    .w(px(DOCK_WIDTH * amount))
                     .h_full()
-                    .pt_3()
-                    .pr_3()
-                    .child(card)
+                    .overflow_hidden()
+                    .child(div().w(px(DOCK_WIDTH)).pt_3().pr_3().child(card))
                     .into_any_element()
             }))
             .into_any_element()
@@ -2007,17 +2035,22 @@ impl WorkspaceView {
             .items_center()
             .border_b_1()
             .border_color(p.border)
+            // Room for the traffic lights, growing as the sidebar slides shut.
+            .when(!self.tabs_shown && self.sidebar_amount < 1., |d| {
+                d.pl(px(
+                    16. + (TRAFFIC_LIGHTS_INSET - 16.) * (1. - self.sidebar_amount)
+                ))
+            })
             .when(!self.sidebar_open, |d| {
-                d.when(!self.tabs_shown, |d| d.pl(px(TRAFFIC_LIGHTS_INSET)))
-                    .child(icon_button(
-                        "show-sidebar",
-                        IconName::PanelLeft,
-                        p,
-                        cx.listener(|this, _, _, cx| {
-                            this.sidebar_open = true;
-                            cx.notify();
-                        }),
-                    ))
+                d.child(icon_button(
+                    "show-sidebar",
+                    IconName::PanelLeft,
+                    p,
+                    cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = true;
+                        cx.notify();
+                    }),
+                ))
             })
             .when_some(title, |d, (project, thread)| {
                 let chip = harness_name(&thread.harness).to_owned();
@@ -3172,15 +3205,28 @@ impl Render for WorkspaceView {
             None => self.render_welcome(&p, cx),
         };
         let body = self.with_details_dock(body, window, cx);
+        let mut body_slot = Some(body);
         let show_panel = self.panel_open && header_title.is_some();
         let maximized = show_panel && self.panel.read(cx).maximized;
+        let side = self.sidebar_slide.update(self.sidebar_open, window);
+        self.sidebar_amount = side;
         let header = self.render_header(header_title, &p, cx);
         // Native tab group (⌘T): GPUI doesn't draw macOS's tab bar under our
         // transparent title bar, so we draw the tabs ourselves.
         let window_tabs = window.tabbed_windows().filter(|tabs| tabs.len() > 1);
         self.tabs_shown = window_tabs.is_some();
         let tab_strip = window_tabs.map(|tabs| self.render_tab_strip(tabs, window, &p, cx));
-        let sidebar = self.sidebar_open.then(|| self.render_sidebar(&p, cx));
+        let sidebar = (side > 0.).then(|| {
+            div()
+                .flex_none()
+                .h_full()
+                .w(px(SIDEBAR_WIDTH * side))
+                .overflow_hidden()
+                .child(self.render_sidebar(&p, cx))
+        });
+        let panel_amount = self.panel_slide.update(show_panel && !maximized, window);
+        let panel_sliding = panel_amount > 0. && panel_amount < 1.;
+        let panel_width = self.panel_width.clone();
 
         v_flex()
             .key_context(CONTEXT)
@@ -3260,10 +3306,35 @@ impl Render for WorkspaceView {
                         .when(maximized, |d| {
                             d.child(div().flex_1().min_h_0().w_full().child(self.panel.clone()))
                         })
-                        .when(!maximized, |d| {
+                        .when(!maximized && panel_sliding, |d| {
+                            // Mid-slide: a plain row at the panel's width.
+                            d.child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h_full()
+                                            .children(body_slot.take()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .h_full()
+                                            .w(px(self.panel_width.get() * panel_amount))
+                                            .overflow_hidden()
+                                            .border_l_1()
+                                            .border_color(p.border)
+                                            .child(self.panel.clone()),
+                                    ),
+                            )
+                        })
+                        .when(!maximized && !panel_sliding, |d| {
                             d.child(
                                 h_resizable("workbench")
-                                    .child(resizable_panel().child(body))
+                                    .child(resizable_panel().children(body_slot.take()))
                                     .child(
                                         resizable_panel()
                                             .size(px(560.))
@@ -3272,9 +3343,22 @@ impl Render for WorkspaceView {
                                             .child(
                                                 div()
                                                     .size_full()
+                                                    .relative()
                                                     .border_l_1()
                                                     .border_color(p.border)
-                                                    .child(self.panel.clone()),
+                                                    .child(self.panel.clone())
+                                                    .child(
+                                                        gpui_kit::canvas(
+                                                            move |bounds, _, _| {
+                                                                panel_width.set(f32::from(
+                                                                    bounds.size.width,
+                                                                ))
+                                                            },
+                                                            |_, _, _, _| {},
+                                                        )
+                                                        .absolute()
+                                                        .size_full(),
+                                                    ),
                                             ),
                                     ),
                             )
@@ -3723,6 +3807,55 @@ fn human_bytes(n: usize) -> String {
         format!("{n} B")
     } else {
         format!("{:.1} KB", n as f64 / 1024.)
+    }
+}
+
+/// How long the sidebars take to slide open or shut.
+const SLIDE: std::time::Duration = std::time::Duration::from_millis(180);
+
+/// A sidebar's slide: 0 = shut, 1 = open, eased in between.
+#[derive(Default)]
+struct Slide {
+    open: bool,
+    seen: bool,
+    started: Option<std::time::Instant>,
+}
+
+impl Slide {
+    /// Follow `open`, returning how far open to draw it (asks for frames
+    /// while moving). The first call just takes the state, unanimated.
+    fn update(&mut self, open: bool, window: &mut Window) -> f32 {
+        if !self.seen {
+            self.seen = true;
+            self.open = open;
+        } else if open != self.open {
+            // Reversing mid-way starts from where it is.
+            let now = self.linear();
+            let from = if open { now } else { 1. - now };
+            self.open = open;
+            self.started = Some(std::time::Instant::now() - SLIDE.mul_f32(from));
+        }
+        let t = self.linear_progress();
+        if t < 1. {
+            window.request_animation_frame();
+        } else {
+            self.started = None;
+        }
+        let eased = 1. - (1. - t).powi(3);
+        if self.open { eased } else { 1. - eased }
+    }
+
+    /// Progress of the current move, 0..1 (1 when still).
+    fn linear_progress(&self) -> f32 {
+        self.started
+            .map(|t| (t.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).min(1.))
+            .unwrap_or(1.)
+    }
+
+    /// How open it is, before easing.
+    fn linear(&self) -> f32 {
+        let t = self.linear_progress();
+        if self.open { t } else { 1. - t }
     }
 }
 
