@@ -92,6 +92,9 @@ pub struct DiffFileStat {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TerminalInfo {
     pub id: TerminalId,
+    /// The reattach key it was opened with, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub cwd: String,
     pub shell: String,
     pub cols: u16,

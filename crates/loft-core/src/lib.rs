@@ -488,6 +488,9 @@ impl Core {
                 self.terminals.resize(&id, cols, rows)?;
                 Ok(Response::Ok)
             }
+            Request::ListTerminals { key_prefix } => Ok(Response::Terminals {
+                terminals: self.terminals.list_prefix(&key_prefix),
+            }),
             Request::TerminalClose { id } => {
                 self.terminals.close(&id)?;
                 Ok(Response::Ok)

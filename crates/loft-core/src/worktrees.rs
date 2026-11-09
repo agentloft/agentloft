@@ -342,7 +342,8 @@ impl Core {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
             }
         }
-        self.terminals.close_key(&format!("thread:{}", id.as_str()));
+        self.terminals
+            .close_prefix(&format!("thread:{}", id.as_str()));
         if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace
             && !shared
         {

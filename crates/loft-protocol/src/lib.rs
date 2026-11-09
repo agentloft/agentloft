@@ -211,6 +211,11 @@ pub enum Request {
     TerminalClose {
         id: TerminalId,
     },
+    /// Live terminals whose key starts with `key_prefix` (a UI rebuilding a
+    /// thread's terminal tabs after a restart).
+    ListTerminals {
+        key_prefix: String,
+    },
     /// Run a browser command in the user's browser panel (from an agent).
     BrowserCall {
         thread_id: ThreadId,
@@ -333,6 +338,9 @@ pub enum Response {
     },
     Terminal {
         terminal: TerminalInfo,
+    },
+    Terminals {
+        terminals: Vec<TerminalInfo>,
     },
     Json {
         value: serde_json::Value,

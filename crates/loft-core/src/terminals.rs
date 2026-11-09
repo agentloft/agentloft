@@ -96,6 +96,7 @@ impl Terminals {
         let id = TerminalId::new();
         let info = TerminalInfo {
             id: id.clone(),
+            key: key.clone(),
             cwd: cwd.to_string_lossy().into_owned(),
             shell: shell.clone(),
             cols,
@@ -189,12 +190,32 @@ impl Terminals {
         Ok(())
     }
 
-    /// Close the terminal opened under `key`, if any.
-    pub fn close_key(&self, key: &str) {
-        let id = lock(&self.keys).get(key).cloned();
-        if let Some(id) = id {
+    /// Close every terminal whose key starts with `prefix`.
+    pub fn close_prefix(&self, prefix: &str) {
+        let ids: Vec<TerminalId> = lock(&self.keys)
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(_, id)| id.clone())
+            .collect();
+        for id in ids {
             let _ = self.close(&id);
         }
+    }
+
+    /// Live terminals whose key starts with `prefix`, ordered by key.
+    pub fn list_prefix(&self, prefix: &str) -> Vec<TerminalInfo> {
+        let mut found: Vec<(String, TerminalId)> = lock(&self.keys)
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, id)| (k.clone(), id.clone()))
+            .collect();
+        found.sort();
+        found
+            .into_iter()
+            .filter_map(|(_, id)| self.get(&id).ok())
+            .map(|t| lock(&t.info).clone())
+            .filter(|info| info.exited.is_none())
+            .collect()
     }
 
     /// Bytes from stream offset `from` to the end, and that end. `None` if

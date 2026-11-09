@@ -314,6 +314,32 @@ async fn terminals_stream_output_and_accept_input() {
     assert_eq!(again.id, terminal.id);
     assert_eq!((again.cols, again.rows), (90, 20));
 
+    // A second tab under the same prefix; both are listed, in key order.
+    let Response::Terminal { terminal: second } = late
+        .request(Request::TerminalOpen {
+            root: FsRoot::Project(env.project.id.clone()),
+            cols: 80,
+            rows: 24,
+            key: Some("main#2".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Response::Terminals { terminals } = late
+        .request(Request::ListTerminals {
+            key_prefix: "main".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let keys: Vec<_> = terminals.iter().map(|t| t.key.clone().unwrap()).collect();
+    assert_eq!(keys, vec!["main", "main#2"]);
+    assert_eq!(terminals[1].id, second.id);
+
     env.client
         .request(Request::TerminalClose { id: terminal.id })
         .await

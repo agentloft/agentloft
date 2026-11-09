@@ -8,7 +8,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use loft_protocol::{FsRoot, Request, Response, TerminalId};
@@ -193,6 +193,22 @@ impl TerminalPane {
         }
     }
 
+    /// Tab label: the program's title, else the shell's name.
+    pub fn label(&self) -> String {
+        match &self.title {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => "Shell".into(),
+        }
+    }
+
+    /// Close the shell for good (its tab is going away).
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.id.take() {
+            self.store.update(cx, |s, _| s.forget_terminal(&id));
+            self.send(Request::TerminalClose { id }, cx);
+        }
+    }
+
     // -- fed by the store ---------------------------------------------------
 
     pub fn on_replay(&mut self, bytes: &[u8], exited: Option<i32>, cx: &mut Context<Self>) {
@@ -285,5 +301,184 @@ impl Render for TerminalPane {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.view.clone()))
+    }
+}
+
+/// A thread's terminal tabs: the main shell (`thread:<id>`) plus extra
+/// ones (`thread:<id>#n`), each a reattachable daemon PTY.
+pub struct TerminalTabs {
+    store: Entity<AppStore>,
+    root: FsRoot,
+    thread_key: String,
+    tabs: Vec<(String, Entity<TerminalPane>)>,
+    active: usize,
+    _subs: Vec<Subscription>,
+}
+
+impl TerminalTabs {
+    pub fn new(
+        store: Entity<AppStore>,
+        root: FsRoot,
+        thread_key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self {
+            store: store.clone(),
+            root,
+            thread_key: thread_key.clone(),
+            tabs: Vec::new(),
+            active: 0,
+            _subs: Vec::new(),
+        };
+        this.push(thread_key.clone(), window, cx);
+        // Extra tabs still running in the daemon (after a UI restart).
+        if let Some(client) = store.read(cx).client() {
+            let body = Request::ListTerminals {
+                key_prefix: format!("{thread_key}#"),
+            };
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(Response::Terminals { terminals }) = client.request(body).await {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        for key in terminals.into_iter().filter_map(|t| t.key) {
+                            if !this.tabs.iter().any(|(k, _)| *k == key) {
+                                this.push(key, window, cx);
+                            }
+                        }
+                        this.active = 0;
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        this
+    }
+
+    fn push(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (store, root) = (self.store.clone(), self.root.clone());
+        let pane = cx.new(|cx| TerminalPane::new(store, root, key.clone(), window, cx));
+        self._subs.push(cx.observe(&pane, |_, _, cx| cx.notify()));
+        self.tabs.push((key, pane));
+        self.active = self.tabs.len() - 1;
+    }
+
+    pub fn active_pane(&self) -> Entity<TerminalPane> {
+        self.tabs[self.active.min(self.tabs.len() - 1)].1.clone()
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut gpui_kit::App) {
+        let view = self.active_pane().read(cx).view.clone();
+        let handle = gpui_kit::Focusable::focus_handle(&view, cx);
+        window.focus(&handle, cx);
+    }
+
+    fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = self
+            .tabs
+            .iter()
+            .filter_map(|(k, _)| k.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()))
+            .max()
+            .unwrap_or(1)
+            + 1;
+        self.push(format!("{}#{next}", self.thread_key), window, cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.len() == 1 {
+            // The last tab: start over with a fresh shell.
+            self.tabs[0].1.update(cx, |p, cx| p.restart(cx));
+            return;
+        }
+        let (_, pane) = self.tabs.remove(ix);
+        pane.update(cx, |p, cx| p.close(cx));
+        if self.active >= self.tabs.len() || self.active > ix {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// The thread moved (new worktree): every shell restarts there.
+    pub fn restart_all(&mut self, cx: &mut Context<Self>) {
+        for (_, pane) in &self.tabs {
+            pane.update(cx, |p, cx| p.restart(cx));
+        }
+    }
+}
+
+impl Render for TerminalTabs {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        let mut strip = h_flex()
+            .h(px(30.))
+            .flex_shrink_0()
+            .px_1p5()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(p.border)
+            .bg(p.sidebar);
+        for (ix, (_, pane)) in self.tabs.iter().enumerate() {
+            let active = ix == self.active;
+            let label = pane.read(cx).label();
+            strip = strip.child(
+                h_flex()
+                    .id(SharedString::from(format!("term-tab-{ix}")))
+                    .group("term-tab")
+                    .max_w(px(180.))
+                    .h(px(22.))
+                    .pl_2()
+                    .pr_1()
+                    .gap_1()
+                    .items_center()
+                    .rounded(px(6.))
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(p.background).text_color(p.foreground))
+                    .when(!active, |d| {
+                        d.text_color(p.muted_foreground)
+                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    })
+                    .child(Icon::new(IconName::SquareTerminal).xsmall())
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("term-tab-x-{ix}")))
+                            .p(px(1.))
+                            .rounded(px(4.))
+                            .invisible()
+                            .group_hover("term-tab", |d| d.visible())
+                            .hover(|d| d.bg(p.border))
+                            .child(Icon::new(IconName::X).xsmall())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(ix, window, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.active = ix;
+                        this.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        strip = strip.child(
+            div()
+                .id("term-tab-new")
+                .p(px(3.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_color(p.muted_foreground)
+                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                .child(Icon::new(IconName::Plus).xsmall())
+                .on_click(cx.listener(|this, _, window, cx| this.add_tab(window, cx))),
+        );
+        v_flex()
+            .size_full()
+            .child(strip)
+            .child(div().flex_1().min_h_0().child(self.active_pane()))
     }
 }

@@ -40,7 +40,7 @@ struct ThreadPanel {
     viewers: Vec<(String, Entity<FileViewer>)>,
     agents: Vec<(ItemId, Entity<AgentView>)>,
     /// The thread's shell, created when the Terminal tab is first shown.
-    terminal: Option<Entity<terminal::TerminalPane>>,
+    terminal: Option<Entity<terminal::TerminalTabs>>,
     active: Tab,
     /// Last finished turn we refreshed for.
     seen_turn: Option<TurnId>,
@@ -150,7 +150,7 @@ impl WorkbenchPanel {
         let moved = !panel.cwd.is_empty() && panel.cwd != cwd;
         panel.cwd = cwd;
         if moved && let Some(term) = &panel.terminal {
-            term.update(cx, |t, cx| t.restart(cx));
+            term.update(cx, |t, cx| t.restart_all(cx));
         }
         if moved || (finished.is_some() && finished != panel.seen_turn) {
             if finished.is_some() {
@@ -185,20 +185,19 @@ impl WorkbenchPanel {
         };
         self.ensure(&id, &thread, window, cx).active = tab.clone();
         if tab == Tab::Terminal {
-            let pane = self.ensure_terminal(&id, window, cx);
-            let handle = gpui_kit::Focusable::focus_handle(&pane.read(cx).view, cx);
-            window.focus(&handle, cx);
+            let tabs = self.ensure_terminal(&id, window, cx);
+            tabs.update(cx, |t, cx| t.focus(window, cx));
         }
         cx.notify();
     }
 
-    /// The thread's terminal pane (one reattachable shell per thread).
+    /// The thread's terminal tabs (reattachable daemon shells).
     fn ensure_terminal(
         &mut self,
         thread_id: &ThreadId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<terminal::TerminalPane> {
+    ) -> Entity<terminal::TerminalTabs> {
         let store = self.store.clone();
         let panel = self.threads.get_mut(thread_id).expect("ensured");
         panel
@@ -206,7 +205,7 @@ impl WorkbenchPanel {
             .get_or_insert_with(|| {
                 let root = FsRoot::Thread(thread_id.clone());
                 let key = format!("thread:{}", thread_id.as_str());
-                cx.new(|cx| terminal::TerminalPane::new(store, root, key, window, cx))
+                cx.new(|cx| terminal::TerminalTabs::new(store, root, key, window, cx))
             })
             .clone()
     }
