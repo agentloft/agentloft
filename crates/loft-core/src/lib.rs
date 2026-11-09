@@ -329,6 +329,10 @@ impl Core {
                     .await?;
                 Ok(Response::Json { value })
             }
+            Request::SetModel { thread_id, model } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::SetModel { model, reply })
+                    .await
+            }
             Request::SetThreadHarness { thread_id, harness } => {
                 self.set_thread_harness(&thread_id, harness)
             }

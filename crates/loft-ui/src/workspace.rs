@@ -673,11 +673,10 @@ impl WorkspaceView {
             .clone()
             .map(|m| pretty_model(&m))
             .unwrap_or_else(|| harness_name(&model.thread.harness).into());
-        let mode = model
-            .thread
-            .permission_mode
-            .map(|m| format!("{m:?}"))
-            .unwrap_or_else(|| "Default permissions".into());
+        let mode = mode_label(model.thread.permission_mode).to_owned();
+        let current_mode = model.thread.permission_mode;
+        let current_model = model.thread.model.clone();
+        let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
 
         let timeline = if empty {
@@ -791,8 +790,19 @@ impl WorkspaceView {
                                         .child(
                                             h_flex()
                                                 .gap_1()
-                                                .child(chip_label(IconName::Bot, model_name, p))
-                                                .child(chip_label(IconName::ShieldCheck, mode, p)),
+                                                .child(model_menu(
+                                                    &thread_id,
+                                                    &harness,
+                                                    current_model.as_deref(),
+                                                    model_name,
+                                                    &self.store,
+                                                ))
+                                                .child(mode_menu(
+                                                    &thread_id,
+                                                    current_mode,
+                                                    mode,
+                                                    &self.store,
+                                                )),
                                         )
                                         .child(
                                             h_flex()
@@ -1120,6 +1130,119 @@ fn pill_button(
                 .child(shortcut),
         )
         .on_click(on_click)
+        .into_any_element()
+}
+
+fn mode_label(mode: Option<loft_protocol::PermissionMode>) -> &'static str {
+    use loft_protocol::PermissionMode::*;
+    match mode {
+        None => "Default permissions",
+        Some(ReadOnly) => "Read-only (plan)",
+        Some(AskAll) => "Ask before acting",
+        Some(AcceptEdits) => "Auto-accept edits",
+        Some(Auto) => "Auto",
+        Some(FullAccess) => "Full access",
+    }
+}
+
+/// Permission-mode dropdown in the composer footer (PLAN §2.7).
+fn mode_menu(
+    thread_id: &ThreadId,
+    current: Option<loft_protocol::PermissionMode>,
+    label: String,
+    store: &Entity<AppStore>,
+) -> AnyElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+    use loft_protocol::PermissionMode::*;
+    let store = store.clone();
+    let thread_id = thread_id.clone();
+    Button::new("mode-menu")
+        .label(label)
+        .icon(IconName::ShieldCheck)
+        .ghost()
+        .xsmall()
+        .dropdown_menu(move |mut menu, _, _| {
+            for mode in [
+                None,
+                Some(ReadOnly),
+                Some(AskAll),
+                Some(AcceptEdits),
+                Some(Auto),
+                Some(FullAccess),
+            ] {
+                let (store, thread_id) = (store.clone(), thread_id.clone());
+                menu = menu.item(
+                    PopupMenuItem::new(mode_label(mode))
+                        .checked(mode == current)
+                        .on_click(move |_, _, cx| {
+                            let t = thread_id.clone();
+                            store.update(cx, |s, cx| s.set_permission_mode(t, mode, cx));
+                        }),
+                );
+                if mode.is_none() {
+                    menu = menu.separator();
+                }
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// Model dropdown: harness default plus well-known models.
+fn model_menu(
+    thread_id: &ThreadId,
+    harness: &HarnessId,
+    current: Option<&str>,
+    label: String,
+    store: &Entity<AppStore>,
+) -> AnyElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+    let options: &[(&str, &str)] = match harness.as_str() {
+        HarnessId::CLAUDE => &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")],
+        HarnessId::CODEX => &[
+            ("gpt-6.1-sol", "GPT-6.1 Sol"),
+            ("gpt-6-astra", "GPT-6 Astra"),
+            ("gpt-6.1-terra", "GPT-6.1 Terra"),
+            ("gpt-6-luna", "GPT-6 Luna"),
+        ],
+        _ => &[],
+    };
+    let current = current.map(str::to_owned);
+    let store = store.clone();
+    let thread_id = thread_id.clone();
+    Button::new("model-menu")
+        .label(label)
+        .icon(IconName::Bot)
+        .ghost()
+        .xsmall()
+        .dropdown_menu(move |mut menu, _, _| {
+            let (s, t) = (store.clone(), thread_id.clone());
+            menu = menu
+                .item(
+                    PopupMenuItem::new("Harness default").on_click(move |_, _, cx| {
+                        let t = t.clone();
+                        s.update(cx, |s, cx| s.set_model(t, None, cx));
+                    }),
+                )
+                .separator();
+            for (id, name) in options {
+                let (s, t, id) = (store.clone(), thread_id.clone(), (*id).to_owned());
+                let checked = current.as_deref().is_some_and(|c| {
+                    c == id
+                        || c.contains(&format!("-{id}-"))
+                        || c.starts_with(&format!("claude-{id}"))
+                });
+                menu = menu.item(PopupMenuItem::new(*name).checked(checked).on_click(
+                    move |_, _, cx| {
+                        let (t, m) = (t.clone(), Some(id.clone()));
+                        s.update(cx, |s, cx| s.set_model(t, m, cx));
+                    },
+                ));
+            }
+            menu
+        })
         .into_any_element()
 }
 

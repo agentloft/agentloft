@@ -334,6 +334,28 @@ impl AppStore {
         self.request(Request::SendMessage { thread_id, text }, cx, |_, _, _| {});
     }
 
+    pub fn set_permission_mode(
+        &mut self,
+        thread_id: ThreadId,
+        mode: Option<loft_protocol::PermissionMode>,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            Request::SetPermissionMode { thread_id, mode },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    pub fn set_model(
+        &mut self,
+        thread_id: ThreadId,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(Request::SetModel { thread_id, model }, cx, |_, _, _| {});
+    }
+
     pub fn interrupt(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         self.request(Request::Interrupt { thread_id }, cx, |_, _, _| {});
     }

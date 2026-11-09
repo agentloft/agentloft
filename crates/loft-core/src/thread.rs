@@ -33,6 +33,10 @@ pub(crate) enum ThreadCmd {
         mode: Option<PermissionMode>,
         reply: Reply,
     },
+    SetModel {
+        model: Option<String>,
+        reply: Reply,
+    },
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -149,6 +153,14 @@ impl ThreadActor {
                 self.thread.permission_mode = mode;
                 if let Some(s) = &self.session {
                     let _ = s.commands.send(SessionCommand::SetPermissionMode(mode));
+                }
+                let res = self.save_thread().map(|_| Response::Ok);
+                let _ = reply.send(res);
+            }
+            ThreadCmd::SetModel { model, reply } => {
+                self.thread.model = model.clone();
+                if let Some(s) = &self.session {
+                    let _ = s.commands.send(SessionCommand::SetModel(model));
                 }
                 let res = self.save_thread().map(|_| Response::Ok);
                 let _ = reply.send(res);

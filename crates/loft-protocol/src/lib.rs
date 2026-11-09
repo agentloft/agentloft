@@ -97,6 +97,12 @@ pub enum Request {
         thread_id: ThreadId,
         mode: Option<PermissionMode>,
     },
+    /// Switch the model (`None` = the harness default). Applies from the
+    /// next turn (Claude switches live).
+    SetModel {
+        thread_id: ThreadId,
+        model: Option<String>,
+    },
     /// Change a thread's harness; only allowed before its first message.
     SetThreadHarness {
         thread_id: ThreadId,
