@@ -962,3 +962,11 @@ async fn worktree_setup_runs_before_the_first_prompt() {
         .collect();
     assert!(echoed.contains("setup command failed"), "{echoed}");
 }
+
+#[test]
+fn ansi_codes_are_stripped() {
+    assert_eq!(
+        crate::strip_ansi("\u{1b}[1;32mname\u{1b}[0m = 1"),
+        "name = 1"
+    );
+}

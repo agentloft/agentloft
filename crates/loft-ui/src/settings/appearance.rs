@@ -32,6 +32,9 @@ pub(super) struct Studio {
     themes: Vec<Theme>,
     editing: Option<Editing>,
     describe: Option<Entity<InputState>>,
+    /// Which agent and model designs it.
+    choice: Option<Entity<crate::agent_choice::AgentChoice>>,
+    choice_open: bool,
     generating: bool,
     note: Option<(bool, String)>,
 }
@@ -50,6 +53,8 @@ impl Studio {
             themes: themes::all(home),
             editing: None,
             describe: None,
+            choice: None,
+            choice_open: false,
             generating: false,
             note: None,
         }
@@ -258,10 +263,19 @@ impl SettingsView {
             self.studio.note = Some((true, "Not connected to agentloftd.".into()));
             return;
         };
+        let (harness, model) = match &self.studio.choice {
+            Some(c) => {
+                let c = c.read(cx);
+                (Some(c.harness.clone()), c.model.clone())
+            }
+            None => (None, None),
+        };
         self.studio.generating = true;
         self.studio.note = None;
         let fut = client.request(Request::AskOnce {
             prompt: themes::generation_prompt(&description),
+            harness,
+            model,
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = fut.await;
@@ -391,30 +405,41 @@ impl SettingsView {
                 h_flex()
                     .gap_2()
                     .child(
-                        pill_button("design-theme", IconName::Sparkles, "Design with Claude", p)
+                        pill_button("design-theme", IconName::Sparkles, "Design with AI", p)
                             .on_click(cx.listener(|this, _, window, cx| {
-                            if this.studio.describe.is_none() {
-                                let input = cx.new(|cx| {
-                                    InputState::new(window, cx).placeholder(
+                                if this.studio.describe.is_none() {
+                                    let input = cx.new(|cx| {
+                                        InputState::new(window, cx).placeholder(
                                         "e.g. “amber terminal on warm charcoal”, “Nordic winter”",
                                     )
-                                });
-                                this._subs.push(cx.subscribe_in(
-                                    &input,
-                                    window,
-                                    |this, _, event, window, cx| {
-                                        if let InputEvent::PressEnter { .. } = event {
-                                            this.generate_theme(window, cx);
-                                        }
-                                    },
-                                ));
-                                input.update(cx, |s, cx| s.focus(window, cx));
-                                this.studio.describe = Some(input);
-                            } else {
-                                this.studio.describe = None;
-                            }
-                            cx.notify();
-                        })),
+                                    });
+                                    this._subs.push(cx.subscribe_in(
+                                        &input,
+                                        window,
+                                        |this, _, event, window, cx| {
+                                            if let InputEvent::PressEnter { .. } = event {
+                                                this.generate_theme(window, cx);
+                                            }
+                                        },
+                                    ));
+                                    input.update(cx, |s, cx| s.focus(window, cx));
+                                    this.studio.describe = Some(input);
+                                    if this.studio.choice.is_none() {
+                                        let store = this.store.clone();
+                                        let choice = cx.new(|cx| {
+                                            crate::agent_choice::AgentChoice::new(store, cx)
+                                        });
+                                        this._subs.push(cx.subscribe(&choice, |this, _, _, cx| {
+                                            this.studio.choice_open = false;
+                                            cx.notify();
+                                        }));
+                                        this.studio.choice = Some(choice);
+                                    }
+                                } else {
+                                    this.studio.describe = None;
+                                }
+                                cx.notify();
+                            })),
                     )
                     .child(
                         pill_button("new-theme", IconName::Plus, "New theme", p).on_click(
@@ -434,6 +459,22 @@ impl SettingsView {
                     ),
             );
 
+        let chooser = self.studio.choice.clone().map(|choice| {
+            use gpui_kit::component::button::{Button, ButtonVariants as _};
+            use gpui_kit::component::popover::Popover;
+            let chip = crate::agent_choice::chip(choice.read(cx), p, cx);
+            Popover::new("theme-agent")
+                .anchor(gpui_kit::Anchor::TopRight)
+                .offset(px(6.))
+                .p_0()
+                .open(self.studio.choice_open)
+                .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                    this.studio.choice_open = *open;
+                    cx.notify();
+                }))
+                .trigger(Button::new("theme-agent-chip").ghost().small().child(chip))
+                .content(move |_, _, _| choice.clone())
+        });
         let describe = self.studio.describe.clone().map(|input| {
             let generating = self.studio.generating;
             h_flex()
@@ -447,6 +488,7 @@ impl SettingsView {
                 .bg(p.accent_soft)
                 .child(Icon::new(IconName::Sparkles).small().text_color(p.accent))
                 .child(div().flex_1().child(Input::new(&input).small()))
+                .children(chooser)
                 .child(if generating {
                     h_flex()
                         .gap_2()
@@ -454,7 +496,7 @@ impl SettingsView {
                         .text_xs()
                         .text_color(p.muted_foreground)
                         .child(Spinner::new().xsmall())
-                        .child("Claude is mixing colours…")
+                        .child("Mixing colours…")
                         .into_any_element()
                 } else {
                     pill_button("generate-theme", IconName::ArrowRight, "Design", p)

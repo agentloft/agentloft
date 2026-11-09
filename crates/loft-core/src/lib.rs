@@ -639,7 +639,14 @@ impl Core {
                 self.revert_turn(&thread_id, &turn_id).await
             }
             Request::DeleteThread { thread_id } => self.delete_thread(&thread_id).await,
-            Request::AskOnce { prompt } => self.ask_once(prompt).await,
+            Request::AskOnce {
+                prompt,
+                harness,
+                model,
+            } => {
+                self.ask_once(prompt, harness.unwrap_or_else(HarnessId::claude), model)
+                    .await
+            }
             Request::SetDraft { thread_id, text } => {
                 let draft = (!text.trim().is_empty()).then_some(text);
                 self.thread_call(&thread_id, |reply| ThreadCmd::SetDraft { draft, reply })
@@ -832,49 +839,130 @@ impl Core {
 
 /// `[harness.<id>]` settings for a harness (defaults when unknown).
 impl Core {
-    /// `claude -p` with no tools, hooks or session: a one-off answer.
-    async fn ask_once(&self, prompt: String) -> CoreResult<Response> {
-        let hcfg = harness_config(&self.config(), &HarnessId::claude());
+    /// A one-off answer from an agent's CLI: no tools, no session, low
+    /// effort (Claude `-p`, `codex exec`, `opencode run`, `gemini -p`).
+    async fn ask_once(
+        &self,
+        prompt: String,
+        harness: HarnessId,
+        model: Option<String>,
+    ) -> CoreResult<Response> {
+        let hcfg = harness_config(&self.config(), &harness);
         let env = self.opts.env.clone();
+        let name = match harness.as_str() {
+            HarnessId::CLAUDE => "claude",
+            HarnessId::CODEX => "codex",
+            HarnessId::OPENCODE => "opencode",
+            HarnessId::GEMINI => "gemini",
+            other => {
+                return Err(ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    format!("`{other}` can't answer one-off questions"),
+                ));
+            }
+        };
         let binary = match (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path)) {
             Some(b) => b,
-            None => loft_config::which("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
-                .ok_or_else(|| ErrorBody::new(ErrorCode::Harness, "Claude Code isn't installed"))?,
+            None => loft_config::which(name, env.get("PATH").map(String::as_str).unwrap_or(""))
+                .ok_or_else(|| {
+                    ErrorBody::new(ErrorCode::Harness, format!("`{name}` isn't installed"))
+                })?,
         };
+        let kind = harness.clone();
         let run = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             use anyhow::Context as _;
-            let out = std::process::Command::new(&binary)
-                .args([
-                    "-p",
-                    &prompt,
-                    "--output-format",
-                    "text",
-                    "--model",
-                    "sonnet",
-                ])
-                // A user default of high effort would take minutes here.
-                .args(["--effort", "low"])
-                .args(["--tools", "", "--settings", r#"{"disableAllHooks":true}"#])
-                .current_dir(std::env::temp_dir())
+            let dir = std::env::temp_dir();
+            let answer_file = dir.join(format!("agentloft-ask-{}.txt", uuid::Uuid::new_v4()));
+            let mut cmd = std::process::Command::new(&binary);
+            match kind.as_str() {
+                HarnessId::CLAUDE => {
+                    cmd.args(["-p", &prompt, "--output-format", "text"]);
+                    if let Some(m) = &model {
+                        cmd.args(["--model", m]);
+                    }
+                    // A user default of high effort would take minutes here.
+                    cmd.args(["--effort", "low"]).args([
+                        "--tools",
+                        "",
+                        "--settings",
+                        r#"{"disableAllHooks":true}"#,
+                    ]);
+                }
+                HarnessId::CODEX => {
+                    cmd.args(["exec", "--skip-git-repo-check", "--ephemeral"])
+                        .args(["-s", "read-only", "-c", "model_reasoning_effort=low"])
+                        .arg("-o")
+                        .arg(&answer_file);
+                    if let Some(m) = &model {
+                        cmd.args(["-m", m]);
+                    }
+                    cmd.arg(&prompt);
+                }
+                HarnessId::OPENCODE => {
+                    cmd.arg("run");
+                    if let Some(m) = &model {
+                        cmd.args(["-m", m]);
+                    }
+                    cmd.arg(&prompt);
+                }
+                _ => {
+                    cmd.args(["-p", &prompt]);
+                    if let Some(m) = &model {
+                        cmd.args(["-m", m]);
+                    }
+                }
+            }
+            let out = cmd
+                .current_dir(&dir)
                 .env_clear()
                 .envs(env.iter())
+                .env("NO_COLOR", "1")
                 .stdin(std::process::Stdio::null())
                 .output()
                 .with_context(|| format!("run {}", binary.display()))?;
             anyhow::ensure!(
                 out.status.success(),
-                "claude failed: {}",
+                "{} failed: {}",
+                binary.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            let text = match std::fs::read_to_string(&answer_file) {
+                Ok(text) => {
+                    let _ = std::fs::remove_file(&answer_file);
+                    text
+                }
+                Err(_) => String::from_utf8_lossy(&out.stdout).into_owned(),
+            };
+            Ok(strip_ansi(&text))
         });
-        let text = tokio::time::timeout(std::time::Duration::from_secs(180), run)
+        let text = tokio::time::timeout(std::time::Duration::from_secs(240), run)
             .await
-            .map_err(|_| ErrorBody::new(ErrorCode::Harness, "Claude took too long"))?
+            .map_err(|_| ErrorBody::new(ErrorCode::Harness, "The agent took too long"))?
             .map_err(internal)?
             .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
         Ok(Response::Text { text })
     }
+}
+
+/// Drop terminal colour codes from CLI output.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 pub(crate) fn harness_config(

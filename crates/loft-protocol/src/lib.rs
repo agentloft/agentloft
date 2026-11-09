@@ -164,10 +164,16 @@ pub enum Request {
         thread_id: ThreadId,
         title: String,
     },
-    /// One self-contained question to Claude, without tools or a thread
+    /// One self-contained question to an agent, without tools or a thread
     /// (e.g. "design a colour theme"). Answers `Response::Text`.
     AskOnce {
         prompt: String,
+        /// Defaults to Claude Code.
+        #[serde(default)]
+        harness: Option<HarnessId>,
+        /// The agent's default when unset.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Save the composer's unsent text (empty clears it).
     SetDraft {

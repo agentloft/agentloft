@@ -1,6 +1,7 @@
 //! Agentloft GPUI views. All state comes from `agentloftd` through
 //! [`store::AppStore`]; views never spawn processes or touch storage.
 
+mod agent_choice;
 pub mod assets;
 mod attachments;
 mod attention;
