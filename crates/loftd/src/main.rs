@@ -67,6 +67,8 @@ async fn run(paths: Paths) -> Result<()> {
     let harnesses: Vec<Arc<dyn Harness>> = vec![
         Arc::new(loft_harness_claude::ClaudeHarness),
         Arc::new(loft_harness_codex::CodexHarness),
+        Arc::new(loft_harness_acp::AcpHarness::opencode()),
+        Arc::new(loft_harness_acp::AcpHarness::gemini()),
         Arc::new(loft_harness::fake::FakeHarness),
     ];
     let mcp_bridge = std::env::current_exe()

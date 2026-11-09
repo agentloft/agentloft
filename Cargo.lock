@@ -4242,6 +4242,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "loft-harness-acp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "loft-config",
+ "loft-harness",
+ "loft-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "loft-harness-claude"
 version = "0.0.1"
 dependencies = [
@@ -4333,6 +4346,7 @@ dependencies = [
  "loft-config",
  "loft-core",
  "loft-harness",
+ "loft-harness-acp",
  "loft-harness-claude",
  "loft-harness-codex",
  "loft-protocol",

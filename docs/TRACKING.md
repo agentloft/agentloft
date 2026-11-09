@@ -45,6 +45,7 @@ Built ahead of the PLAN's milestone order, by request.
 | Area | Status | Notes |
 |---|---|---|
 | Codex harness (M2) | [x] | `codex app-server`; approvals follow `availableDecisions`; MCP elicitations; resume verified live (`live_codex`) |
+| ACP harnesses (M6 subset) | [~] | `loft-harness-acp`: OpenCode (`opencode acp`) and Gemini (`gemini --acp`, falls back to `--experimental-acp`). Covers streaming, reasoning, tool calls with diffs, plan, permissions (`allow_once/always`, `reject_*`), `session/cancel`, `session/load` with the history replay suppressed, and model/mode via `configOptions`. OpenCode 2.2.5 verified live (`live_opencode`): approval, interrupt, MCP, resume. **Not yet done:** Gemini untested (not installed); client `fs/*` and `terminal/*`; `[[harness.acp]]` custom agents in config; per-harness config lookup in `loft-core` (non-Codex harnesses read `[harness.claude]`); UI picker |
 | Harness picker / model / permission menus | [x] | Picker on empty threads; model + mode dropdowns in the composer |
 | Checkpoints + diffs (M3 subset) | [x] | Hidden refs per turn; Changes tab: this thread / last turn / uncommitted |
 | File explorer + viewer | [x] | .gitignore-aware tree; tree-sitter highlighting; Markdown preview; images |
