@@ -166,6 +166,34 @@ pub struct Config {
     pub projects: ProjectsConfig,
     pub web: WebConfig,
     pub browser: BrowserConfig,
+    pub titles: TitlesConfig,
+}
+
+/// `[titles]` in config.toml: how a new thread gets its name.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TitlesConfig {
+    /// Ask an agent for a short title after the first message; off = the
+    /// first line of the message is the title.
+    pub generate: bool,
+    /// Which agent writes it: `thread` (the thread's own) or a harness id.
+    pub agent: String,
+    /// Its model; `auto` = a small one (Claude: haiku), else the agent's
+    /// default.
+    pub model: String,
+    /// Added to the prompt (style, language, …).
+    pub instructions: String,
+}
+
+impl Default for TitlesConfig {
+    fn default() -> Self {
+        Self {
+            generate: true,
+            agent: "thread".into(),
+            model: "auto".into(),
+            instructions: String::new(),
+        }
+    }
 }
 
 /// `[browser]` in config.toml: the browser panel.

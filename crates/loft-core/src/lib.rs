@@ -10,6 +10,7 @@ mod remote;
 mod settings;
 mod terminals;
 mod thread;
+mod titles;
 mod workbench;
 mod worktrees;
 
@@ -1319,7 +1320,10 @@ impl Core {
             .map_err(|_| internal("thread actor dropped request"))?
     }
 
-    fn thread_handle(self: &Arc<Self>, thread_id: &ThreadId) -> CoreResult<ThreadHandle> {
+    pub(crate) fn thread_handle(
+        self: &Arc<Self>,
+        thread_id: &ThreadId,
+    ) -> CoreResult<ThreadHandle> {
         let mut threads = lock(&self.threads);
         if let Some(h) = threads.get(thread_id).filter(|h| !h.is_closed()) {
             return Ok(h.clone());
@@ -1368,7 +1372,7 @@ impl Core {
 impl Core {
     /// A one-off answer from an agent's CLI: no tools, no session, low
     /// effort (Claude `-p`, `codex exec`, `opencode run`, `gemini -p`).
-    async fn ask_once(
+    pub(crate) async fn ask_once(
         &self,
         prompt: String,
         harness: HarnessId,
@@ -1408,7 +1412,9 @@ impl Core {
                         cmd.args(["--model", m]);
                     }
                     // A user default of high effort would take minutes here.
+                    // No session: these don't belong in `claude --resume`.
                     cmd.args(["--effort", "low"]).args([
+                        "--no-session-persistence",
                         "--tools",
                         "",
                         "--settings",

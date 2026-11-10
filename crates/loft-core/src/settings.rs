@@ -129,6 +129,26 @@ const KEYS: &[Key] = &[
         about: "Path of the Chromium-family browser run for the web client's browser tab; null = the first of Chrome, Chromium, Edge or Brave installed",
     },
     Key {
+        key: "titles.generate",
+        kind: Kind::Bool,
+        about: "Name new threads with a short title an agent writes after the first message; false = the message's first line",
+    },
+    Key {
+        key: "titles.agent",
+        kind: Kind::OneOf(&["thread", "claude", "codex", "opencode", "gemini"]),
+        about: "Which agent writes thread titles; \"thread\" = the thread's own",
+    },
+    Key {
+        key: "titles.model",
+        kind: Kind::Text,
+        about: "Model for thread titles; \"auto\" = haiku for Claude, the agent's default otherwise",
+    },
+    Key {
+        key: "titles.instructions",
+        kind: Kind::Text,
+        about: "Extra instructions for thread titles (style, language…); null = none",
+    },
+    Key {
         key: "projects.new_dir",
         kind: Kind::Text,
         about: "Where new projects go; null = ~/.agentloft/projects",

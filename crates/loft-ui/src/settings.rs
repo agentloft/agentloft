@@ -22,6 +22,7 @@ mod appearance;
 mod browser;
 mod projects;
 mod shortcuts;
+mod threads;
 mod web;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
@@ -259,6 +260,21 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Projects,
     },
     Findable {
+        label: "Generate thread titles",
+        keywords: "threads titles names rename auto generate summary",
+        section: Section::Threads,
+    },
+    Findable {
+        label: "Title agent and model",
+        keywords: "threads titles agent model haiku claude codex",
+        section: Section::Threads,
+    },
+    Findable {
+        label: "Title instructions",
+        keywords: "threads titles instructions prompt language style",
+        section: Section::Threads,
+    },
+    Findable {
         label: "New threads: worktree or local",
         keywords: "worktrees ask local",
         section: Section::Worktrees,
@@ -319,6 +335,8 @@ pub const FINDABLE: &[Findable] = &[
 pub enum Section {
     Appearance,
     Agents,
+    /// How threads are named.
+    Threads,
     Projects,
     Worktrees,
     /// The browser panel: search engine, home page, which browser.
@@ -337,9 +355,10 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s) || sec.slug() == s)
     }
 
-    const ALL: [Section; 8] = [
+    const ALL: [Section; 9] = [
         Section::Appearance,
         Section::Agents,
+        Section::Threads,
         Section::Projects,
         Section::Worktrees,
         Section::Browser,
@@ -361,6 +380,7 @@ impl Section {
         match self {
             Section::Appearance => "appearance",
             Section::Agents => "agents",
+            Section::Threads => "threads",
             Section::Projects => "projects",
             Section::Worktrees => "worktrees",
             Section::Browser => "browser",
@@ -374,6 +394,7 @@ impl Section {
         match self {
             Section::Appearance => "Appearance",
             Section::Agents => "Agents",
+            Section::Threads => "Threads",
             Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
             Section::Browser => "Browser",
@@ -387,6 +408,7 @@ impl Section {
         match self {
             Section::Appearance => IconName::Sun,
             Section::Agents => IconName::Bot,
+            Section::Threads => IconName::MessageSquare,
             Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
             Section::Browser => IconName::Globe,
@@ -414,6 +436,8 @@ pub(super) enum Field {
     BrowserSearch,
     BrowserHome,
     BrowserApp,
+    TitleModel,
+    TitleInstructions,
 }
 
 impl Field {
@@ -432,6 +456,8 @@ impl Field {
             Field::BrowserSearch => &["browser", "search"],
             Field::BrowserHome => &["browser", "home"],
             Field::BrowserApp => &["browser", "executable"],
+            Field::TitleModel => &["titles", "model"],
+            Field::TitleInstructions => &["titles", "instructions"],
         }
     }
 
@@ -455,6 +481,8 @@ impl Field {
             },
             Field::BrowserHome => c.browser.home.clone().unwrap_or_default(),
             Field::BrowserApp => c.browser.executable.clone().unwrap_or_default(),
+            Field::TitleModel => c.titles.model.clone(),
+            Field::TitleInstructions => c.titles.instructions.clone(),
         }
     }
 
@@ -473,6 +501,8 @@ impl Field {
             Field::BrowserSearch => "https://example.com/search?q=%s",
             Field::BrowserHome => "A blank tab",
             Field::BrowserApp => "Chrome, Chromium, Edge or Brave",
+            Field::TitleModel => "Automatic",
+            Field::TitleInstructions => "None",
         }
     }
 
@@ -482,6 +512,7 @@ impl Field {
         match self {
             Field::WebBind => "127.0.0.1",
             Field::WebPort => "4780",
+            Field::TitleModel => "auto",
             _ => "",
         }
     }
@@ -501,6 +532,7 @@ impl Field {
             (Field::BrowserSearch | Field::BrowserHome | Field::BrowserApp, true) => {
                 SettingValue::Unset
             }
+            (Field::TitleModel | Field::TitleInstructions, true) => SettingValue::Unset,
             // Not a port: left as it was (the field shows the old value again).
             (Field::WebPort, false) => match text.parse::<u16>() {
                 Ok(port) => SettingValue::Int(i64::from(port)),
@@ -587,6 +619,8 @@ impl SettingsView {
             Field::BrowserSearch,
             Field::BrowserHome,
             Field::BrowserApp,
+            Field::TitleModel,
+            Field::TitleInstructions,
         ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
@@ -877,6 +911,7 @@ impl Render for SettingsView {
         let body = match self.section {
             Section::Appearance => self.appearance(&p, window, cx),
             Section::Agents => self.agents_page(&p, window, cx),
+            Section::Threads => self.threads_page(&p, cx),
             Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
             Section::Browser => self.browser_page(&p, cx),

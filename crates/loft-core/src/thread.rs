@@ -65,6 +65,12 @@ pub(crate) enum ThreadCmd {
         draft: Option<String>,
         reply: Reply,
     },
+    /// Internal: an agent named the thread. Applied only while the title
+    /// is still `placeholder` (a rename in between wins).
+    GeneratedTitle {
+        placeholder: String,
+        title: String,
+    },
     /// The worktree setup command finished (internal).
     SetupDone {
         turn_id: TurnId,
@@ -223,6 +229,18 @@ impl ThreadActor {
                     thread: self.thread.clone(),
                 });
                 let _ = reply.send(res);
+            }
+            ThreadCmd::GeneratedTitle { placeholder, title } => {
+                if self.thread.title == placeholder && title != placeholder {
+                    self.thread.title = title;
+                    // Keep `updated_at_ms`: a new name mustn't re-sort the
+                    // sidebar.
+                    if let Err(err) = self.core.commit(vec![Event::ThreadUpdated {
+                        thread: self.thread.clone(),
+                    }]) {
+                        tracing::warn!(?err, "save generated title");
+                    }
+                }
             }
             ThreadCmd::SetupDone {
                 turn_id,
@@ -416,6 +434,7 @@ impl ThreadActor {
         )?;
         if ordinal == 1 && self.thread.title == "New thread" {
             self.thread.title = title_from(&text);
+            self.generate_title(&text, &attachments);
         }
         self.thread.status = ThreadStatus::Running;
         self.thread.updated_at_ms = now;
@@ -1330,6 +1349,36 @@ async fn next_event(session: &mut Option<SessionHandle>) -> Option<HarnessEvent>
     match session {
         Some(s) => s.events.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+impl ThreadActor {
+    /// Ask an agent for a title in the background (`[titles]`); the
+    /// first-line title stays until it answers, and if it can't.
+    fn generate_title(&self, text: &str, attachments: &[AttachmentRef]) {
+        let cfg = self.core.config().titles;
+        let Some((harness, model)) = crate::titles::writer(&cfg, &self.thread.harness) else {
+            return;
+        };
+        let prompt = crate::titles::prompt(text, attachments, &cfg.instructions);
+        let placeholder = self.thread.title.clone();
+        let (core, thread_id) = (self.core.clone(), self.thread.id.clone());
+        tokio::spawn(async move {
+            let title = match core.ask_once(prompt, harness.clone(), model).await {
+                Ok(Response::Text { text }) => crate::titles::clean(&text),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(harness = %harness.as_str(), err = %err.message, "title generation failed");
+                    None
+                }
+            };
+            // The thread's actor may have stopped meanwhile; this wakes it.
+            if let Some(title) = title
+                && let Ok(handle) = core.thread_handle(&thread_id)
+            {
+                let _ = handle.send(ThreadCmd::GeneratedTitle { placeholder, title });
+            }
+        });
     }
 }
 
