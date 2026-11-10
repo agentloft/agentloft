@@ -569,14 +569,14 @@ impl WorkspaceView {
                 self.store
                     .update(cx, |s, cx| s.send_message(id, text, Vec::new(), cx));
             }
+            // `queue:first|second|…` queues each.
             Some(("queue", text)) => {
                 self.panel_open = false;
-                let queued = crate::store::Queued {
-                    text: text.to_owned(),
-                    images: Vec::new(),
-                };
-                let id = thread_id.clone();
-                self.store.update(cx, |s, cx| s.enqueue(id, queued, cx));
+                for part in text.split('|') {
+                    let queued = crate::store::Queued::new(part.to_owned(), Vec::new());
+                    let id = thread_id.clone();
+                    self.store.update(cx, |s, cx| s.enqueue(id, queued, cx));
+                }
             }
             Some(("file", path)) => {
                 let path = path.to_owned();
@@ -1351,7 +1351,7 @@ impl WorkspaceView {
             images.iter().map(|a| a.to_attachment()).collect();
         let id = thread_id.clone();
         if self.is_running(thread_id, cx) {
-            let message = crate::store::Queued { text, images };
+            let message = crate::store::Queued::new(text, images);
             self.store.update(cx, |store, cx| {
                 if steer {
                     store.steer(id, message, None, cx);
@@ -1551,8 +1551,9 @@ impl WorkspaceView {
         )
     }
 
-    /// Messages waiting for the current turn to end: dashed bubbles you can
-    /// send now (stopping the turn), take back to edit, or drop.
+    /// Messages waiting for the current turn to end, the top one next:
+    /// dashed bubbles you can send now (into the running turn), reorder
+    /// (drag, or the arrows), take back to edit, or drop.
     fn queued_list(
         &self,
         thread_id: &ThreadId,
@@ -1565,6 +1566,7 @@ impl WorkspaceView {
             return None;
         }
         let mut list = v_flex().gap_3().pb_2();
+        let count = queued.len();
         for (ix, q) in queued.iter().enumerate() {
             let mut thumbs = h_flex().gap_1p5().flex_wrap().justify_end();
             for (n, image) in q.images.iter().enumerate() {
@@ -1600,6 +1602,21 @@ impl WorkspaceView {
                     .children(label)
             };
             let (t1, t2, t3) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
+            let (t_up, t_down, t_drop) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
+            let my_id = q.id;
+            let prev_id = ix.checked_sub(1).map(|i| queued[i].id);
+            let next_id = queued.get(ix + 1).map(|m| m.id);
+            let drag = DraggedQueued {
+                thread_id: thread_id.clone(),
+                id: my_id,
+                text: q
+                    .text
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("Image")
+                    .to_owned(),
+            };
+            let drop_accent = p.accent;
             let steer_tip = match crate::keymap::hint("steer", cx) {
                 k if k.is_empty() => "Send into the running turn now".to_owned(),
                 k => format!("Send into the running turn now ({k} while typing)"),
@@ -1610,6 +1627,7 @@ impl WorkspaceView {
                     .gap_1()
                     .child(
                         v_flex()
+                            .id(SharedString::from(format!("queued-bubble-{ix}")))
                             .max_w(gpui_kit::relative(0.85))
                             .gap_2()
                             .px_4()
@@ -1620,6 +1638,22 @@ impl WorkspaceView {
                             .border_color(p.border)
                             .text_sm()
                             .text_color(p.muted_foreground)
+                            // Drag one onto another to put it there.
+                            .when(count > 1, |d| {
+                                d.cursor_grab()
+                                    .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+                                    .drag_over::<DraggedQueued>(move |d, _, _, _| {
+                                        d.border_color(drop_accent).border_2()
+                                    })
+                                    .on_drop(cx.listener(move |this, d: &DraggedQueued, _, cx| {
+                                        if d.thread_id == t_drop {
+                                            let id = t_drop.clone();
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_queued(&id, d.id, my_id, cx)
+                                            });
+                                        }
+                                    }))
+                            })
                             .when(!q.images.is_empty(), |d| d.child(thumbs))
                             .when(!preview.is_empty(), |d| {
                                 d.child(div().line_clamp(4).child(preview))
@@ -1629,6 +1663,45 @@ impl WorkspaceView {
                         h_flex()
                             .gap_0p5()
                             .items_center()
+                            .when(count > 1 && ix == 0, |d| {
+                                d.child(
+                                    div()
+                                        .px_1p5()
+                                        .text_xs()
+                                        .text_color(p.faint_foreground)
+                                        .child("Next"),
+                                )
+                            })
+                            .when_some(prev_id, |d, prev_id| {
+                                d.child(
+                                    action("queued-up", Some(IconName::ChevronUp), None)
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new("Move up")
+                                                .build(window, cx)
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let id = t_up.clone();
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_queued(&id, my_id, prev_id, cx)
+                                            });
+                                        })),
+                                )
+                            })
+                            .when_some(next_id, |d, next_id| {
+                                d.child(
+                                    action("queued-down", Some(IconName::ChevronDown), None)
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new("Move down")
+                                                .build(window, cx)
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let id = t_down.clone();
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_queued(&id, my_id, next_id, cx)
+                                            });
+                                        })),
+                                )
+                            })
                             .child(
                                 action("queued-send", Some(IconName::ArrowUp), Some("Send now"))
                                     .tooltip(move |window, cx| {
@@ -1640,20 +1713,20 @@ impl WorkspaceView {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let id = t1.clone();
                                         this.store
-                                            .update(cx, |s, cx| s.send_queued_now(id, ix, cx));
+                                            .update(cx, |s, cx| s.send_queued_now(id, my_id, cx));
                                     })),
                             )
                             .child(
                                 action("queued-edit", Some(IconName::SquarePen), None).on_click(
                                     cx.listener(move |this, _, window, cx| {
-                                        this.edit_queued(&t2, ix, window, cx)
+                                        this.edit_queued(&t2, my_id, window, cx)
                                     }),
                                 ),
                             )
                             .child(action("queued-drop", Some(IconName::X), None).on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     let id = t3.clone();
-                                    this.store.update(cx, |s, cx| s.dequeue(&id, ix, cx));
+                                    this.store.update(cx, |s, cx| s.dequeue(&id, my_id, cx));
                                 }),
                             )),
                     ),
@@ -1666,13 +1739,13 @@ impl WorkspaceView {
     fn edit_queued(
         &mut self,
         thread_id: &ThreadId,
-        ix: usize,
+        id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(q) = self
             .store
-            .update(cx, |s, cx| s.take_queued(thread_id, ix, cx))
+            .update(cx, |s, cx| s.take_queued(thread_id, id, cx))
         else {
             return;
         };
@@ -5649,6 +5722,33 @@ impl Render for DraggedThread {
             .text_sm()
             .child(Icon::new(IconName::Columns2).xsmall().text_color(p.accent))
             .child(div().truncate().child(self.title.clone()))
+    }
+}
+
+/// A queued message being dragged to a new place in line.
+#[derive(Clone)]
+pub(crate) struct DraggedQueued {
+    thread_id: ThreadId,
+    id: u64,
+    text: String,
+}
+
+impl Render for DraggedQueued {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        div()
+            .max_w(px(320.))
+            .px_3()
+            .py_1p5()
+            .rounded(px(12.))
+            .bg(p.elevated)
+            .border_1()
+            .border_dashed()
+            .border_color(p.accent.opacity(0.6))
+            .shadow_lg()
+            .text_sm()
+            .text_color(p.muted_foreground)
+            .child(div().truncate().child(self.text.clone()))
     }
 }
 

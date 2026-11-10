@@ -23,8 +23,76 @@ pub const BUILD: &str = env!("CARGO_PKG_VERSION");
 /// A message typed while a turn was running.
 #[derive(Clone)]
 pub struct Queued {
+    /// Stays the same while others are sent or moved around it.
+    pub id: u64,
     pub text: String,
     pub images: Vec<crate::attachments::PendingImage>,
+}
+
+impl Queued {
+    pub fn new(text: String, images: Vec<crate::attachments::PendingImage>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            text,
+            images,
+        }
+    }
+}
+
+/// Move message `id` to where `to` is: after it when moving down, before
+/// it when moving up. Whether anything moved.
+fn move_in_line(q: &mut std::collections::VecDeque<Queued>, id: u64, to: u64) -> bool {
+    let (Some(from), Some(at)) = (
+        q.iter().position(|m| m.id == id),
+        q.iter().position(|m| m.id == to),
+    ) else {
+        return false;
+    };
+    if from == at {
+        return false;
+    }
+    let Some(message) = q.remove(from) else {
+        return false;
+    };
+    q.insert(at, message);
+    true
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn texts(q: &std::collections::VecDeque<Queued>) -> Vec<&str> {
+        q.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn queued_messages_move_by_id() {
+        let mut q: std::collections::VecDeque<Queued> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|t| Queued::new(t.into(), vec![]))
+            .collect();
+        let id = |q: &std::collections::VecDeque<Queued>, t: &str| {
+            q.iter().find(|m| m.text == t).unwrap().id
+        };
+        // Down onto "c": lands after it.
+        let (a, c) = (id(&q, "a"), id(&q, "c"));
+        assert!(move_in_line(&mut q, a, c));
+        assert_eq!(texts(&q), ["b", "c", "a", "d"]);
+        // Up onto "b": lands before it, first in line.
+        let (d, b) = (id(&q, "d"), id(&q, "b"));
+        assert!(move_in_line(&mut q, d, b));
+        assert_eq!(texts(&q), ["d", "b", "c", "a"]);
+        // One sent meanwhile: the ids still find the right ones.
+        q.pop_front();
+        let (a, b) = (id(&q, "a"), id(&q, "b"));
+        assert!(move_in_line(&mut q, a, b));
+        assert_eq!(texts(&q), ["a", "b", "c"]);
+        // Gone, or onto itself: nothing moves.
+        assert!(!move_in_line(&mut q, d, a));
+        assert!(!move_in_line(&mut q, a, a));
+    }
 }
 
 /// App-wide UI events (e.g. a timeline row asking the panel to open a file).
@@ -1424,8 +1492,15 @@ impl AppStore {
         cx.notify();
     }
 
-    pub fn dequeue(&mut self, thread_id: &ThreadId, index: usize, cx: &mut Context<Self>) {
-        if let Some(q) = self.queued.get_mut(thread_id) {
+    /// Where queued message `id` is in line now.
+    fn queued_index(&self, thread_id: &ThreadId, id: u64) -> Option<usize> {
+        self.queued.get(thread_id)?.iter().position(|m| m.id == id)
+    }
+
+    pub fn dequeue(&mut self, thread_id: &ThreadId, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.queued_index(thread_id, id)
+            && let Some(q) = self.queued.get_mut(thread_id)
+        {
             q.remove(index);
         }
         cx.notify();
@@ -1433,7 +1508,10 @@ impl AppStore {
 
     /// Send a queued message now, into the running turn (the agent reads
     /// it at its next step; nothing stops). The rest stay queued.
-    pub fn send_queued_now(&mut self, thread_id: ThreadId, index: usize, cx: &mut Context<Self>) {
+    pub fn send_queued_now(&mut self, thread_id: ThreadId, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.queued_index(&thread_id, id) else {
+            return;
+        };
         let Some(message) = self
             .queued
             .get_mut(&thread_id)
@@ -1494,13 +1572,25 @@ impl AppStore {
         }
     }
 
+    /// Move queued message `id` to where message `to` is (moving down, it
+    /// lands after it; up, before). The first in line goes next. By id, so
+    /// a message sent meanwhile doesn't shift the wrong one.
+    pub fn move_queued(&mut self, thread_id: &ThreadId, id: u64, to: u64, cx: &mut Context<Self>) {
+        if let Some(q) = self.queued.get_mut(thread_id)
+            && move_in_line(q, id, to)
+        {
+            cx.notify();
+        }
+    }
+
     /// Take a queued message back out (to edit it).
     pub fn take_queued(
         &mut self,
         thread_id: &ThreadId,
-        index: usize,
+        id: u64,
         cx: &mut Context<Self>,
     ) -> Option<Queued> {
+        let index = self.queued_index(thread_id, id)?;
         let message = self.queued.get_mut(thread_id)?.remove(index);
         cx.notify();
         message
