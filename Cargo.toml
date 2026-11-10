@@ -93,3 +93,14 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 4
+
+# The browser client (`cargo xtask web --release`): size matters most, since
+# every byte is downloaded.
+[profile.web-release]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "debuginfo"
+panic = "abort"

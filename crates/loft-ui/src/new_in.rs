@@ -339,32 +339,40 @@ fn rows(
 ) -> Vec<Row> {
     match step {
         Step::Projects => project_rows(store, cx),
-        Step::Sources => vec![
-            Row::plain(
-                Target::Source(Source::New),
-                "New project",
-                "Start a new git repository from a name",
-                IconName::FolderGit2,
-            ),
-            Row::plain(
-                Target::Source(Source::Folder),
-                "Local folder",
-                "Browse a folder on disk",
-                IconName::FolderPlus,
-            ),
-            Row::plain(
-                Target::Source(Source::Url),
-                "Git URL",
-                "Clone from a remote URL",
-                IconName::Link,
-            ),
-            Row::plain(
-                Target::Source(Source::GitHub),
-                "GitHub repository",
-                "Clone GitHub owner/repo",
-                IconName::Github,
-            ),
-        ],
+        Step::Sources => {
+            let mut rows = vec![
+                Row::plain(
+                    Target::Source(Source::New),
+                    "New project",
+                    "Start a new git repository from a name",
+                    IconName::FolderGit2,
+                ),
+                Row::plain(
+                    Target::Source(Source::Folder),
+                    "Local folder",
+                    "Browse a folder on disk",
+                    IconName::FolderPlus,
+                ),
+                Row::plain(
+                    Target::Source(Source::Url),
+                    "Git URL",
+                    "Clone from a remote URL",
+                    IconName::Link,
+                ),
+                Row::plain(
+                    Target::Source(Source::GitHub),
+                    "GitHub repository",
+                    "Clone GitHub owner/repo",
+                    IconName::Github,
+                ),
+            ];
+            // Browsing folders is the desktop app's: a browser session only
+            // adds projects where projects are kept (ADR-0016).
+            if crate::host::IS_WEB {
+                rows.retain(|row| !matches!(row.target, Target::Source(Source::Folder)));
+            }
+            rows
+        }
         Step::Enter(Source::New) => {
             let dir = crate::workspace::tilde_path_str(
                 &store.read(cx).new_projects_dir().to_string_lossy(),

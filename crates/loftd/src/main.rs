@@ -30,6 +30,16 @@ enum Cmd {
         #[arg(long)]
         thread: String,
     },
+    /// Show web access as the running daemon has it: where it listens, the
+    /// pairing link, and the browsers signed in.
+    Web {
+        /// Replace the pairing link and sign every browser out.
+        #[arg(long)]
+        new_link: bool,
+        /// Sign every browser out.
+        #[arg(long)]
+        sign_out_all: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -52,6 +62,16 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?;
         return runtime.block_on(loftd::mcp::run(paths, loft_protocol::ThreadId(thread)));
+    }
+    if let Some(Cmd::Web {
+        new_link,
+        sign_out_all,
+    }) = cli.cmd
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(web_status(paths, new_link, sign_out_all));
     }
     paths.ensure_dirs()?;
     init_tracing(&paths, cli.foreground)?;
@@ -104,6 +124,65 @@ async fn run(paths: Paths) -> Result<()> {
         _ = daemon.wait_for_shutdown_request() => {}
     }
     daemon.shutdown().await;
+    Ok(())
+}
+
+/// `agentloftd web`: ask the running daemon (over its Unix socket, so only
+/// this user can) and print what it says.
+async fn web_status(paths: Paths, new_link: bool, sign_out_all: bool) -> Result<()> {
+    use loft_protocol::{ClientKind, Request, Response};
+    let (client, _events) =
+        loft_client::Client::connect(&paths.socket_file(), ClientKind::Cli, loftd::BUILD)
+            .await
+            .map_err(|err| anyhow::anyhow!("agentloftd isn't running for this home ({err:#})"))?;
+    let request = if new_link {
+        Request::WebRotateToken
+    } else if sign_out_all {
+        Request::WebRevokeAllSessions
+    } else {
+        Request::WebStatus
+    };
+    let Response::WebStatus { status } = client
+        .request(request)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+    else {
+        anyhow::bail!("unexpected answer from the daemon");
+    };
+    if !status.enabled {
+        println!("Web access is off. Turn it on with `[web] enabled = true` in config.toml.");
+        return Ok(());
+    }
+    match (&status.url, &status.error) {
+        (Some(url), _) => println!("Listening at {url}"),
+        (None, Some(error)) => println!("Not running: {error}"),
+        (None, None) => println!("Not running."),
+    }
+    if status.insecure_remote {
+        println!("Warning: reachable from other devices over plain HTTP.");
+    } else if status.remote {
+        println!("Reachable from other devices.");
+    }
+    if !status.bundle && status.running {
+        println!("The web client's files weren't found (build them with `cargo xtask web`).");
+    }
+    if let Some(link) = &status.pairing_url {
+        println!("Pairing link (keep it secret): {link}");
+    }
+    println!("Signed-in browsers: {}", status.sessions.len());
+    for session in &status.sessions {
+        println!(
+            "  {}  {}  {}{}",
+            session.id,
+            session.label,
+            session.addr,
+            if session.connections > 0 {
+                "  (connected)"
+            } else {
+                ""
+            }
+        );
+    }
     Ok(())
 }
 

@@ -534,19 +534,22 @@ impl Render for FileViewer {
                 header_icon("reload", IconName::RefreshCw, "Reload", &p)
                     .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
             )
-            .child(
-                header_icon("reveal", IconName::FolderOpen, "Reveal in Finder", &p)
-                    .on_click(cx.listener(|this, _, _, cx| this.reveal(cx))),
-            )
-            .child(
-                header_icon(
-                    "external",
-                    IconName::ExternalLink,
-                    "Open with default app",
-                    &p,
+            // Finder and other apps are on the computer the file is on.
+            .when(!crate::host::IS_WEB, |d| {
+                d.child(
+                    header_icon("reveal", IconName::FolderOpen, "Reveal in Finder", &p)
+                        .on_click(cx.listener(|this, _, _, cx| this.reveal(cx))),
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.open_external(cx))),
-            );
+                .child(
+                    header_icon(
+                        "external",
+                        IconName::ExternalLink,
+                        "Open with default app",
+                        &p,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.open_external(cx))),
+                )
+            });
 
         let body = match &self.content {
             Content::Loading => v_flex()
@@ -633,15 +636,17 @@ impl Render for FileViewer {
                 .text_color(p.muted_foreground)
                 .child(Icon::new(IconName::File).large())
                 .child(reason.clone())
-                .child(
-                    header_button(
-                        "external-big",
-                        IconName::ExternalLink,
-                        "Open with default app",
-                        &p,
+                .when(!crate::host::IS_WEB, |d| {
+                    d.child(
+                        header_button(
+                            "external-big",
+                            IconName::ExternalLink,
+                            "Open with default app",
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.open_external(cx))),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| this.open_external(cx))),
-                )
+                })
                 .into_any_element(),
             Content::Error(err) => v_flex()
                 .flex_1()

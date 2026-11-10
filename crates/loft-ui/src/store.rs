@@ -1037,7 +1037,13 @@ impl AppStore {
     }
 
     pub fn projects_parent(&self) -> String {
-        self.projects_base().to_string_lossy().into_owned()
+        // A browser session may only clone where projects are kept.
+        let parent = if crate::host::IS_WEB {
+            self.new_projects_dir()
+        } else {
+            self.projects_base()
+        };
+        parent.to_string_lossy().into_owned()
     }
 
     /// Ask (once) which GitHub account `gh` is signed in to.

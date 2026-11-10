@@ -3981,16 +3981,18 @@ impl WorkspaceView {
                                         .child(
                                             h_flex()
                                                 .gap_1()
-                                                .child({
+                                                // Picking files uses this
+                                                // computer's file dialog.
+                                                .when(!crate::host::IS_WEB, |d| {
                                                     let id = thread_id.clone();
-                                                    icon_button(
+                                                    d.child(icon_button(
                                                         "attach",
                                                         IconName::Paperclip,
                                                         p,
                                                         cx.listener(move |this, _, _, cx| {
                                                             this.pick_images(id.clone(), cx)
                                                         }),
-                                                    )
+                                                    ))
                                                 })
                                                 .child(self.model_picker_button(
                                                     &thread_id,

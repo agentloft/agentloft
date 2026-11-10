@@ -112,11 +112,29 @@ fn web() -> Result<()> {
         out.join("icon.png"),
     )
     .context("copy the icon")?;
+    // The daemon serves `<file>.gz` to browsers that accept gzip: the wasm
+    // module shrinks to about a third.
+    for name in ["loft_web_bg.wasm", "loft_web.js"] {
+        gzip(&out.join(name))?;
+    }
     println!("{}", out.display());
     Ok(())
 }
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+/// Write `<file>.gz` next to `file`.
+fn gzip(file: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let mut name = file.as_os_str().to_owned();
+    name.push(".gz");
+    let out = std::fs::File::create(&name)?;
+    let mut encoder = flate2::write::GzEncoder::new(out, flate2::Compression::new(6));
+    encoder.write_all(&bytes)?;
+    encoder.finish()?;
+    Ok(())
+}
 
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
@@ -182,6 +200,14 @@ fn bundle() -> Result<()> {
         info_plist(env!("CARGO_PKG_VERSION")),
     )?;
     std::fs::write(contents.join("PkgInfo"), "APPL????")?;
+    // The web client (`cargo xtask web --release`), if it has been built:
+    // agentloftd looks for it in Resources/web.
+    let web = target.join("web");
+    if web.join("index.html").is_file() {
+        copy_dir(&web, &contents.join("Resources/web")).context("copy the web client")?;
+    } else {
+        eprintln!("note: no web client in the bundle (build it with `cargo xtask web --release`)");
+    }
 
     // Ad-hoc signature so Gatekeeper treats the local build consistently.
     let signed = Command::new("codesign")
