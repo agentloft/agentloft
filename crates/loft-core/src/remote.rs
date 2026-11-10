@@ -25,6 +25,8 @@ use std::sync::Arc;
 pub struct RemotePolicy {
     /// Terminals: a shell on the daemon's machine.
     pub allow_terminal: bool,
+    /// The daemon's browser: pages loaded on its machine.
+    pub allow_browser: bool,
 }
 
 fn forbidden(what: &str) -> ErrorBody {
@@ -40,6 +42,15 @@ fn terminals_off() -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Forbidden,
         "Terminals are off for browsers. Turn them on in the desktop app: Settings ▸ Web access.",
+    )
+}
+
+/// The daemon's browser asked for by a session that isn't given it (`[web]
+/// allow_browser`).
+fn browser_off() -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Forbidden,
+        "The browser panel is off here. Turn it on in the desktop app: Settings ▸ Web access.",
     )
 }
 
@@ -298,6 +309,19 @@ impl Core {
                 }
             }
 
+            Request::PageOpen { .. }
+            | Request::PageNavigate { .. }
+            | Request::PageInput { .. }
+            | Request::PageResize { .. }
+            | Request::PageSelection { .. }
+            | Request::PageClose { .. } => {
+                if policy.allow_browser {
+                    Ok(())
+                } else {
+                    Err(browser_off())
+                }
+            }
+
             Request::Shutdown { .. } => Err(forbidden("Stopping Agentloft")),
             Request::WebStatus
             | Request::WebRotateToken
@@ -346,12 +370,12 @@ impl Core {
         policy: &RemotePolicy,
     ) -> Option<CoreResult<Response>> {
         match req {
-            Request::TerminalInput { .. } | Request::TerminalResize { .. } => {
-                Some(match self.check_remote(req, policy) {
-                    Ok(()) => self.handle_inline(req)?,
-                    Err(e) => Err(e),
-                })
-            }
+            Request::TerminalInput { .. }
+            | Request::TerminalResize { .. }
+            | Request::PageInput { .. } => Some(match self.check_remote(req, policy) {
+                Ok(()) => self.handle_inline(req)?,
+                Err(e) => Err(e),
+            }),
             _ => None,
         }
     }
@@ -362,6 +386,8 @@ impl Core {
             Topic::Workspace | Topic::Thread(_) => Ok(()),
             Topic::Terminal(_) if policy.allow_terminal => Ok(()),
             Topic::Terminal(_) => Err(terminals_off()),
+            Topic::Page(_) if policy.allow_browser => Ok(()),
+            Topic::Page(_) => Err(browser_off()),
         }
     }
 }
@@ -459,6 +485,7 @@ mod tests {
 
     const WEB: RemotePolicy = RemotePolicy {
         allow_terminal: false,
+        allow_browser: false,
     };
 
     async fn remote(f: &Fixture, req: Request) -> CoreResult<Response> {
@@ -833,6 +860,7 @@ mod tests {
         // Allowed once `[web] allow_terminal` is on.
         let with_terminal = RemotePolicy {
             allow_terminal: true,
+            ..WEB
         };
         assert!(f.core.check_remote(&open(), &with_terminal).is_ok());
         assert!(
@@ -871,6 +899,84 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn the_daemons_browser_is_refused_unless_allowed() {
+        let (f, thread) = fixture().await;
+        let id = loft_protocol::PageId::new();
+        let asks = || {
+            [
+                Request::PageOpen {
+                    thread_id: thread.clone(),
+                    url: Some("https://example.com".into()),
+                    width: 800,
+                    height: 600,
+                    scale: 1.0,
+                },
+                Request::PageNavigate {
+                    id: id.clone(),
+                    nav: loft_protocol::PageNav::Reload,
+                },
+                Request::PageInput {
+                    id: id.clone(),
+                    input: loft_protocol::PageInput::Text { text: "x".into() },
+                },
+                Request::PageResize {
+                    id: id.clone(),
+                    width: 800,
+                    height: 600,
+                    scale: 1.0,
+                },
+                Request::PageSelection { id: id.clone() },
+                Request::PageClose { id: id.clone() },
+            ]
+        };
+        for req in asks() {
+            assert!(
+                is_forbidden(&f.core.check_remote(&req, &WEB)),
+                "{req:?} without the right"
+            );
+        }
+        // Input takes the ordered path; the check is on it too.
+        let typed = f.core.handle_inline_remote(&asks()[2], &WEB);
+        assert!(matches!(&typed, Some(r) if is_forbidden(r)), "{typed:?}");
+        assert!(
+            f.core
+                .check_remote_topic(&Topic::Page(id.clone()), &WEB)
+                .is_err()
+        );
+
+        // Allowed once `[web] allow_browser` is on. Nothing is open, so
+        // what goes through finds no page, which is not "forbidden".
+        let with_browser = RemotePolicy {
+            allow_browser: true,
+            ..WEB
+        };
+        for req in asks() {
+            assert!(f.core.check_remote(&req, &with_browser).is_ok(), "{req:?}");
+        }
+        assert!(
+            f.core
+                .check_remote_topic(&Topic::Page(id.clone()), &with_browser)
+                .is_ok()
+        );
+        let missing = f
+            .core
+            .handle_remote(Request::PageSelection { id: id.clone() }, &with_browser)
+            .await;
+        assert!(
+            matches!(&missing, Err(e) if e.code == ErrorCode::NotFound),
+            "{missing:?}"
+        );
+        // A terminal's right is not the browser's.
+        let with_terminal = RemotePolicy {
+            allow_terminal: true,
+            ..WEB
+        };
+        assert!(is_forbidden(
+            &f.core.check_remote(&asks()[0], &with_terminal)
+        ));
     }
 
     #[test]

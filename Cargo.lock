@@ -1200,6 +1200,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "command-fds"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
+dependencies = [
+ "nix 0.31.3",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4308,6 +4319,8 @@ name = "loft-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "command-fds",
  "ignore",
  "loft-config",
  "loft-git",
@@ -4445,6 +4458,7 @@ dependencies = [
  "block2 0.6.2",
  "chrono",
  "gpui-kit",
+ "image",
  "imagesize 0.14.0",
  "loft-browser",
  "loft-client",

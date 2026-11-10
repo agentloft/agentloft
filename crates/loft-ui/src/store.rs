@@ -212,6 +212,9 @@ pub struct AppStore {
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
+    /// Pages of the daemon's browser being shown, and their subscriptions.
+    pages: HashMap<loft_protocol::PageId, WeakEntity<crate::panel::page::PageView>>,
+    page_subs: HashMap<u64, loft_protocol::PageId>,
     /// Daemon pid of the current connection: a new pid means the daemon
     /// restarted and its PTYs are gone.
     daemon_pid: Option<u32>,
@@ -255,6 +258,8 @@ impl AppStore {
             hidden_models: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
+            pages: HashMap::new(),
+            page_subs: HashMap::new(),
             daemon_pid: None,
         };
         this.reload_agent_prefs(cx);
@@ -360,6 +365,23 @@ impl AppStore {
             HarnessId::GEMINI,
         ] {
             self.fetch_models(HarnessId(harness.into()), cx);
+        }
+        // Pages: the ones the daemon still has are watched again; after a
+        // restart its browser is gone, and each view opens a new page.
+        self.page_subs.clear();
+        self.pages.retain(|_, view| view.upgrade().is_some());
+        let pages_allowed = self.pages_allowed();
+        for (id, view) in std::mem::take(&mut self.pages) {
+            if restarted {
+                let _ = view.update(cx, |v, cx| v.on_lost(cx));
+            } else if pages_allowed {
+                self.subscribe_page(id, view);
+            } else {
+                // A browser session whose browser was turned off: the page
+                // lives on in the daemon, and a later connection that may
+                // use it picks it up again here.
+                self.pages.insert(id, view);
+            }
         }
         let allowed = self.terminals_allowed();
         for (id, pane) in terminals {
@@ -494,6 +516,49 @@ impl AppStore {
         self.terminals.insert(id, pane);
     }
 
+    /// Watch a page of the daemon's browser for `view`.
+    pub fn subscribe_page(
+        &mut self,
+        id: loft_protocol::PageId,
+        view: WeakEntity<crate::panel::page::PageView>,
+    ) {
+        self.page_subs.retain(|_, page| *page != id);
+        if let Some(client) = &self.client {
+            let sub = client.subscribe(Topic::Page(id.clone()));
+            self.page_subs.insert(sub, id.clone());
+        }
+        self.pages.insert(id, view);
+    }
+
+    pub fn forget_page(&mut self, id: &loft_protocol::PageId) {
+        self.pages.remove(id);
+        let subs: Vec<u64> = self
+            .page_subs
+            .iter()
+            .filter(|(_, page)| *page == id)
+            .map(|(sub, _)| *sub)
+            .collect();
+        for sub in subs {
+            self.page_subs.remove(&sub);
+            if let Some(client) = &self.client {
+                client.unsubscribe(sub);
+            }
+        }
+    }
+
+    fn page_view(&self, sub_id: u64) -> Option<WeakEntity<crate::panel::page::PageView>> {
+        self.pages.get(self.page_subs.get(&sub_id)?).cloned()
+    }
+
+    /// Whether this client may use the daemon's browser (a browser session
+    /// only when the daemon allows it: `[web] allow_browser`, ADR-0017).
+    pub fn pages_allowed(&self) -> bool {
+        self.client
+            .as_ref()
+            .and_then(|client| client.welcome().remote.as_ref())
+            .is_none_or(|remote| remote.browser)
+    }
+
     pub fn forget_terminal(&mut self, id: &TerminalId) {
         self.terminals.remove(id);
         let subs: Vec<u64> = self
@@ -540,6 +605,15 @@ impl AppStore {
                     if let Some(pane) = self.terminal_pane(sub_id) {
                         let _ =
                             pane.update(cx, |p, cx| p.on_replay(&replay.0, terminal.exited, cx));
+                    }
+                } else if let Snapshot::Page { page, frame, .. } = snapshot {
+                    if let Some(view) = self.page_view(sub_id) {
+                        let _ = view.update(cx, |v, cx| {
+                            v.on_state(page, cx);
+                            if let Some(frame) = frame {
+                                v.on_frame(sub_id, frame.seq, frame.jpeg.0, cx);
+                            }
+                        });
                     }
                 } else if Some(sub_id) == self.ws_sub {
                     self.workspace.apply_snapshot(snapshot);
@@ -622,6 +696,31 @@ impl AppStore {
             ClientEvent::TerminalExited { sub_id, code, .. } => {
                 if let Some(pane) = self.terminal_pane(sub_id) {
                     let _ = pane.update(cx, |p, cx| p.on_exit(code, cx));
+                }
+            }
+            ClientEvent::PageFrame {
+                sub_id, seq, jpeg, ..
+            } => match self.page_view(sub_id) {
+                Some(view) => {
+                    let _ = view.update(cx, |v, cx| v.on_frame(sub_id, seq, jpeg, cx));
+                }
+                // Nobody to show it to: don't hold the stream up.
+                None => {
+                    if let Some(client) = &self.client {
+                        client.ack_page_frame(sub_id, seq);
+                    }
+                }
+            },
+            ClientEvent::PageState { sub_id, page } => {
+                if let Some(view) = self.page_view(sub_id) {
+                    let _ = view.update(cx, |v, cx| v.on_state(page, cx));
+                }
+            }
+            ClientEvent::PageClosed { sub_id, id, reason } => {
+                let view = self.page_view(sub_id);
+                self.forget_page(&id);
+                if let Some(view) = view {
+                    let _ = view.update(cx, |v, cx| v.on_closed(reason, cx));
                 }
             }
             ClientEvent::ClientCall { call_id, call } => match call {

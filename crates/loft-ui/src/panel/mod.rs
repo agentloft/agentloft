@@ -7,6 +7,7 @@ pub mod changes;
 pub mod dock;
 pub mod docs;
 pub mod files;
+pub mod page;
 pub mod terminal;
 pub mod viewer;
 
@@ -53,6 +54,11 @@ enum Open {
     Browser {
         view: Entity<BrowserView>,
     },
+    /// A page of the daemon's own browser, streamed (the browser tab where
+    /// there is no native web view: the web client).
+    Page {
+        view: Entity<page::PageView>,
+    },
     File {
         path: String,
         viewer: Entity<FileViewer>,
@@ -69,7 +75,7 @@ impl Open {
             Open::Files => Tab::Files,
             Open::Changes => Tab::Changes,
             Open::Terminal { .. } => Tab::Terminal,
-            Open::Browser { .. } => Tab::Browser,
+            Open::Browser { .. } | Open::Page { .. } => Tab::Browser,
             Open::File { path, .. } => Tab::File(path.clone()),
             Open::Agent { id, .. } => Tab::Agent(id.clone()),
         }
@@ -302,10 +308,42 @@ impl WorkbenchPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<BrowserView>> {
+        // The native web view is the desktop app's; a browser tab has the
+        // streamed page instead (`page`).
+        if crate::host::IS_WEB {
+            return None;
+        }
         if let Some(view) = self.ensure_id(thread_id, window, cx)?.browser() {
             return Some(view);
         }
         Some(self.new_browser(thread_id, window, cx))
+    }
+
+    /// The selected thread's streamed page (the web client's browser tab),
+    /// opened if it has none.
+    pub fn page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<page::PageView>> {
+        let (id, _) = self.selected(cx)?;
+        self.ensure_id(&id, window, cx)?;
+        let find = |this: &Self| {
+            this.threads
+                .get(&id)?
+                .tabs
+                .iter()
+                .rev()
+                .find_map(|tab| match tab {
+                    Open::Page { view } => Some(view.clone()),
+                    _ => None,
+                })
+        };
+        if let Some(view) = find(self) {
+            return Some(view);
+        }
+        self.add(&id, Tab::Browser, window, cx);
+        find(self)
     }
 
     /// `thread_id`'s browser tab, if it has one.
@@ -504,6 +542,21 @@ impl WorkbenchPanel {
                 panel.active = panel.tabs.len() - 1;
             }
             Tab::Terminal => self.new_terminal(thread_id, false, true, window, cx),
+            // No native web view in a browser tab: a streamed page of the
+            // daemon's own browser instead.
+            Tab::Browser if crate::host::IS_WEB => {
+                let store = self.store.clone();
+                let thread = thread_id.clone();
+                let view = cx.new(|cx| page::PageView::new(store, thread, window, cx));
+                // Titles and loading state show on the tab.
+                let sub = cx.observe(&view, |_, _, cx| cx.notify());
+                if let Some(panel) = self.threads.get_mut(thread_id) {
+                    panel._subs.push(sub);
+                    panel.tabs.push(Open::Page { view: view.clone() });
+                    panel.active = panel.tabs.len() - 1;
+                }
+                view.update(cx, |v, cx| v.focus_address_bar(window, cx));
+            }
             Tab::Browser => {
                 let view = self.new_browser(thread_id, window, cx);
                 view.update(cx, |b, cx| b.focus_address_bar(window, cx));
@@ -550,6 +603,9 @@ impl WorkbenchPanel {
         let tab = panel.tabs.remove(ix);
         if let Open::Terminal { pane, .. } = &tab {
             pane.update(cx, |p, cx| p.close(cx));
+        }
+        if let Open::Page { view } = &tab {
+            view.update(cx, |v, cx| v.close(cx));
         }
         if panel.active > ix || panel.active >= panel.tabs.len() {
             panel.active = panel.active.saturating_sub(1);
@@ -723,19 +779,12 @@ impl WorkbenchPanel {
             })
             .shortcut(key)
         };
-        let mut entries = Vec::new();
-        // The embedded browser is the desktop app's.
-        if !crate::host::IS_WEB {
-            entries.push(item("Browser", IconName::Globe, 'b', Tab::Browser));
-        }
-        entries.push(item(
-            "Terminal",
-            IconName::SquareTerminal,
-            't',
-            Tab::Terminal,
-        ));
-        entries.push(item("Files", IconName::FolderTree, 'f', Tab::Files));
-        entries.push(item("Changes", IconName::GitCompare, 'd', Tab::Changes));
+        let entries = vec![
+            item("Browser", IconName::Globe, 'b', Tab::Browser),
+            item("Terminal", IconName::SquareTerminal, 't', Tab::Terminal),
+            item("Files", IconName::FolderTree, 'f', Tab::Files),
+            item("Changes", IconName::GitCompare, 'd', Tab::Changes),
+        ];
         menu::open(window, at, entries, cx);
     }
 }
@@ -799,6 +848,24 @@ fn tab_face(tab: &Open, p: &Palette, cx: &gpui_kit::App) -> (AnyElement, String)
                 .or_else(|| b.url().and_then(host))
                 .unwrap_or_else(|| "New Tab".into());
             let face = if b.is_loading() {
+                Spinner::new()
+                    .xsmall()
+                    .color(p.muted_foreground)
+                    .into_any_element()
+            } else {
+                icon(IconName::Globe)
+            };
+            (face, title)
+        }
+        Open::Page { view } => {
+            let v = view.read(cx);
+            let title = v
+                .title()
+                .filter(|t| !t.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| v.url().and_then(host))
+                .unwrap_or_else(|| "New Tab".into());
+            let face = if v.is_loading() {
                 Spinner::new()
                     .xsmall()
                     .color(p.muted_foreground)
@@ -1000,6 +1067,7 @@ impl Render for WorkbenchPanel {
                 crate::host_ui::not_in_browser(IconName::Globe, "Browser", &p)
             }
             Some(Open::Browser { view }) => view.clone().into_any_element(),
+            Some(Open::Page { view }) => view.clone().into_any_element(),
             Some(Open::File { viewer, .. }) => viewer.clone().into_any_element(),
             Some(Open::Agent { view, .. }) => view.clone().into_any_element(),
             None => empty_state(&thread_id, &p, cx),
@@ -1022,10 +1090,6 @@ fn empty_state(thread_id: &ThreadId, p: &Palette, cx: &mut Context<WorkbenchPane
         (Tab::Files, IconName::FolderTree, "Files", "F"),
         (Tab::Changes, IconName::GitCompare, "Changes", "D"),
     ] {
-        // The embedded browser is the desktop app's.
-        if crate::host::IS_WEB && matches!(kind, Tab::Browser) {
-            continue;
-        }
         let id = thread_id.clone();
         list = list.child(
             h_flex()

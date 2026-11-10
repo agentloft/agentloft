@@ -51,6 +51,23 @@ pub enum ClientEvent {
         id: loft_protocol::TerminalId,
         code: Option<i32>,
     },
+    /// A new picture of a page of the daemon's browser (acknowledge it
+    /// with [`Client::ack_page_frame`] once shown).
+    PageFrame {
+        sub_id: u64,
+        id: loft_protocol::PageId,
+        seq: u64,
+        jpeg: Vec<u8>,
+    },
+    PageState {
+        sub_id: u64,
+        page: loft_protocol::PageInfo,
+    },
+    PageClosed {
+        sub_id: u64,
+        id: loft_protocol::PageId,
+        reason: String,
+    },
     /// The daemon asks this client to do something (answer with
     /// [`Client::respond_call`]).
     ClientCall {
@@ -106,6 +123,16 @@ pub(crate) fn dispatch(
         },
         ServerMsg::TerminalExited { sub_id, id, code } => {
             ClientEvent::TerminalExited { sub_id, id, code }
+        }
+        ServerMsg::PageFrame { sub_id, id, frame } => ClientEvent::PageFrame {
+            sub_id,
+            id,
+            seq: frame.seq,
+            jpeg: frame.jpeg.0,
+        },
+        ServerMsg::PageState { sub_id, page } => ClientEvent::PageState { sub_id, page },
+        ServerMsg::PageClosed { sub_id, id, reason } => {
+            ClientEvent::PageClosed { sub_id, id, reason }
         }
         ServerMsg::ClientCall { call_id, call } => ClientEvent::ClientCall { call_id, call },
         ServerMsg::Fatal(e) => ClientEvent::Fatal(e),
@@ -168,6 +195,12 @@ impl Client {
         let sub_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let _ = self.inner.tx.send(ClientMsg::Subscribe { sub_id, topic });
         sub_id
+    }
+
+    /// This viewer has shown picture `seq` of the page it watches on
+    /// `sub_id`, and can take the next.
+    pub fn ack_page_frame(&self, sub_id: u64, seq: u64) {
+        let _ = self.inner.tx.send(ClientMsg::PageFrameAck { sub_id, seq });
     }
 
     /// Answer a [`ClientEvent::ClientCall`].

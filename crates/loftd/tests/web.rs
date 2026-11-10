@@ -1144,6 +1144,69 @@ async fn terminals_follow_who_can_reach_the_listener() {
 }
 
 #[tokio::test]
+async fn the_daemons_browser_follows_who_can_reach_the_listener() {
+    // Asking about a page that isn't open starts no browser: "not found"
+    // means the request got past the gate, "forbidden" that it didn't.
+    let ask = || Request::PageSelection { id: PageId::new() };
+    let code = |r: Result<Response, ErrorBody>| r.unwrap_err().code;
+
+    // Only this machine can reach it: allowed, and the session is told.
+    let f = start().await;
+    let (mut socket, _, access) = f.greeted().await;
+    assert!(access.browser);
+    assert_eq!(code(socket.request(1, ask()).await), ErrorCode::NotFound);
+    f.daemon.shutdown().await;
+
+    // Turned off: refused, pictures included.
+    let f = start_with("allow_browser = false").await;
+    let (mut socket, _, access) = f.greeted().await;
+    assert!(!access.browser && access.terminal);
+    assert_eq!(code(socket.request(1, ask()).await), ErrorCode::Forbidden);
+    socket
+        .send(&ClientMsg::Subscribe {
+            sub_id: 9,
+            topic: Topic::Page(PageId::new()),
+        })
+        .await;
+    assert!(matches!(socket.recv().await, ServerMsg::Fatal(e) if e.code == ErrorCode::Forbidden));
+    f.daemon.shutdown().await;
+
+    // A proxy's or tunnel's name in front of it: not unless asked for.
+    let f = start_with("allowed_hosts = [\"desk.example\"]").await;
+    let (mut socket, _, access) = f.greeted().await;
+    assert!(!access.browser);
+    assert_eq!(code(socket.request(1, ask()).await), ErrorCode::Forbidden);
+    f.daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_page_that_is_not_open_says_so_to_its_viewer() {
+    let f = start().await;
+    let (mut socket, _) = f.connected().await;
+    let id = PageId::new();
+    socket
+        .send(&ClientMsg::Subscribe {
+            sub_id: 4,
+            topic: Topic::Page(id.clone()),
+        })
+        .await;
+    // Not an error for the whole connection: just this page, closed.
+    match socket.recv().await {
+        ServerMsg::PageClosed {
+            sub_id, id: got, ..
+        } => assert_eq!((sub_id, got), (4, id)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(socket.request(1, Request::Ping).await, Ok(Response::Pong));
+    // An acknowledgement for nothing is ignored.
+    socket
+        .send(&ClientMsg::PageFrameAck { sub_id: 4, seq: 7 })
+        .await;
+    assert_eq!(socket.request(2, Request::Ping).await, Ok(Response::Pong));
+    f.daemon.shutdown().await;
+}
+
+#[tokio::test]
 async fn only_local_clients_manage_web_access() {
     let f = start().await;
     let local = f.local().await;

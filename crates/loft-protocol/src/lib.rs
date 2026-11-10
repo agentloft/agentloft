@@ -6,10 +6,12 @@
 
 pub mod ids;
 pub mod model;
+pub mod pages;
 pub mod workbench;
 
 pub use ids::*;
 pub use model::*;
+pub use pages::*;
 pub use workbench::*;
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,13 @@ pub enum ClientMsg {
     ClientCallResult {
         call_id: u64,
         result: Result<serde_json::Value, ErrorBody>,
+    },
+    /// This viewer has shown [`ServerMsg::PageFrame`] `seq` and is ready for
+    /// the next. One frame is in flight per subscription, so a slow link
+    /// gets fewer frames instead of a growing queue.
+    PageFrameAck {
+        sub_id: u64,
+        seq: u64,
     },
 }
 
@@ -359,6 +368,40 @@ pub enum Request {
     ListTerminals {
         key_prefix: String,
     },
+    /// Open the thread's tab in the daemon's browser, or return the one it
+    /// has (ADR-0017). `url` only applies to a new tab. Answers
+    /// `Response::Page`; subscribe to [`Topic::Page`] for its pictures.
+    PageOpen {
+        thread_id: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        width: u32,
+        height: u32,
+        scale: f32,
+    },
+    PageNavigate {
+        id: PageId,
+        nav: PageNav,
+    },
+    PageInput {
+        id: PageId,
+        input: PageInput,
+    },
+    /// The viewer's size changed: the page lays out to it.
+    PageResize {
+        id: PageId,
+        width: u32,
+        height: u32,
+        scale: f32,
+    },
+    /// The page's selected text (`Response::Text`), for the viewer's
+    /// clipboard.
+    PageSelection {
+        id: PageId,
+    },
+    PageClose {
+        id: PageId,
+    },
     /// Run a browser command in the user's browser panel (from an agent).
     BrowserCall {
         thread_id: ThreadId,
@@ -485,6 +528,8 @@ pub enum Topic {
     Thread(ThreadId),
     /// Output of one terminal (snapshot replays the scrollback buffer).
     Terminal(TerminalId),
+    /// Pictures and state of one tab of the daemon's browser.
+    Page(PageId),
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +566,24 @@ pub enum ServerMsg {
         id: TerminalId,
         code: Option<i32>,
     },
+    /// A new picture of a page. Acknowledge it with
+    /// [`ClientMsg::PageFrameAck`] to get the next.
+    PageFrame {
+        sub_id: u64,
+        id: PageId,
+        frame: PageFrame,
+    },
+    /// A page's address, title, loading state or size changed.
+    PageState {
+        sub_id: u64,
+        page: PageInfo,
+    },
+    /// The page is gone (closed, or the browser stopped).
+    PageClosed {
+        sub_id: u64,
+        id: PageId,
+        reason: String,
+    },
     /// Daemon → client call (e.g. drive the browser panel); answer with
     /// [`ClientMsg::ClientCallResult`].
     ClientCall {
@@ -554,6 +617,9 @@ pub struct RemoteAccess {
     /// Terminals (a shell on the daemon's machine) are allowed.
     #[serde(default)]
     pub terminal: bool,
+    /// The daemon's browser (pages it loads on its machine) is allowed.
+    #[serde(default)]
+    pub browser: bool,
 }
 
 fn default_search_limit() -> u32 {
@@ -600,6 +666,9 @@ pub enum Response {
     },
     Terminals {
         terminals: Vec<TerminalInfo>,
+    },
+    Page {
+        page: PageInfo,
     },
     Branches {
         branches: BranchList,
@@ -699,6 +768,14 @@ pub enum Snapshot {
         seq: u64,
         terminal: TerminalInfo,
         replay: Bytes,
+    },
+    /// A page as it is now, with its latest picture if it has one (`seq`
+    /// is that picture's).
+    Page {
+        seq: u64,
+        page: PageInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<PageFrame>,
     },
 }
 

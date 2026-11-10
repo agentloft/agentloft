@@ -122,6 +122,7 @@ Built ahead of the PLAN's milestone order, by request.
 - Approvals: by click and by ⌘↩.
 - Settings, inside the window: appearance and themes (a change lands in `config.toml` on the daemon's machine and applies), agents' defaults and models, projects, worktrees, shortcuts, sign out.
 - Side panel: Changes (diffs) and Files with the file viewer; menus draw in-window.
+- A browser tab in the side panel ([ADR-0017](adr/0017-streamed-browser.md)): the daemon runs the Chrome installed on its machine, headless, and streams the page; the web client shows it and sends mouse and keys back. Tried: address bar (addresses and searches), clicking, typing and editing, links, back and reload, a new-window link opening in place, wheel scrolling, a two-line paste, resizing with the panel, the tab's title, turning it off and on for a connected browser. The web client holds 60 fps while the page scrolls (median and p99 frame 16.7 / 16.8 ms).
 - Terminals, in the dock under the conversation and as side-panel tabs: the same widget and emulator as the desktop app (libghostty-vt built for wasm), on the daemon's PTYs. Tried: zsh with colours, CJK and emoji, vim, Ctrl+C, scrollback, a two-line paste (bracketed), select all and copy, two shells at once, the shell surviving a reconnect.
 - Images in replies that point at files in the project: fetched through the daemon. A path outside the project stays empty.
 - Light and dark themes; a 2× (HiDPI) screen; the tab title follows the thread; reconnecting after the daemon restarts.
@@ -147,6 +148,7 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 **What's left**
 - Sending images from the browser (paste, drop, pick), and the image preview's Copy / Save.
 - Images in replies that point at other websites: the page's Content-Security-Policy allows no third-party requests, so they stay empty in the browser.
+- In the streamed browser tab: agents can't drive it yet (they drive the desktop app's panel), and the desktop app doesn't show the same tabs; script dialogs are answered for the page, downloads and file choosers are refused; one tab per thread; the pointer keeps its arrow shape; text an input method is composing shows only once committed; needs Chrome, Chromium, Edge or Brave on the daemon's machine.
 - In the browser's terminal: keys the browser keeps for itself (⌘W / Ctrl+W, ⌘T, ⌘N) never reach the shell; prompt glyphs from icon fonts are missing (the client ships JetBrains Mono); a paste has to be the browser's own (⌘V, Ctrl+Shift+V or its menu).
 - Adding a project by browsing folders (the browser can make a new project or clone one, only where projects are kept).
 - Phone-sized layout: it is the desktop layout.
@@ -165,11 +167,12 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 7. A fix that also touches the desktop app: an open Settings window read the store while the store was updating whenever `config.toml` changed (a panic). It now refreshes after the update.
 8. Terminals in the browser: on while only this computer can reach Agentloft (a loopback address, no proxy names), off until you turn them on once other devices can. Settings ▸ Web access ▸ Terminals, or `[web] allow_terminal`.
 9. `vendor/ghostty-vt-sys`: a copy of the published bindings crate with a wasm32 build added, patched in for every target. It goes away when the published crate can do the same.
+10. The web client's browser is a Chrome the daemon runs (the installed one, with a profile of its own), while the desktop app keeps its native panel: two browsers until the desktop shows the daemon's pages too. It follows the terminal's rule for who gets it (`[web] allow_browser`).
 
 | # | Item | Status | Evidence |
 |---|---|---|---|
 | 0 | Spike: a gpui-kit view as wasm in a real browser | [x] | Rendered, clicked, typed, IME; `gpui-pre-web` 0.3.11 is viable |
-| 1 | HTTP + WebSocket listener, off by default, loopback by default | [x] | `loftd/src/web/`; `loftd/tests/web.rs` (30 tests) |
+| 1 | HTTP + WebSocket listener, off by default, loopback by default | [x] | `loftd/src/web/`; `loftd/tests/web.rs` (32 tests) |
 | 1 | Non-loopback refused without TLS or `allow_insecure_remote` | [x] | `loft-config` tests; `a_remote_address_without_tls_is_refused` |
 | 1 | Token (256-bit, 0600, constant-time, rotatable), fragment pairing, HttpOnly SameSite=Strict cookie, expiry, revocation | [x] | `web/auth.rs` (15 tests); pairing, cookie, revocation and rotation tests |
 | 1 | Rate limiting of wrong tokens | [x] | `wrong_tokens_are_rate_limited`, limiter unit tests |
@@ -180,7 +183,8 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 | 2 | Transport abstraction in `loft-client` | [x] | `native.rs` (Unix socket), `web.rs` (WebSocket) |
 | 2 | `loft-ui` compiles for wasm32; CI job | [x] | `cargo xtask web`; CI `web` job (build and clippy) |
 | 2 | Disk access through the daemon in the browser | [x] | `loft-ui/src/host.rs`; `UiFiles`, `PutUiState`, `DeleteTheme`, `ProjectIcon`, `ReadPath` |
-| 2 | Native-only pieces get a placeholder, not a crash | [~] | Embedded browser: placeholder. Folder browser, file dialogs, Finder, editors: left out. Docs viewer (Word, Excel…) and image attachments: untested in the browser |
+| 2 | Native-only pieces get a placeholder, not a crash | [~] | Folder browser, file dialogs, Finder, editors: left out. Docs viewer (Word, Excel…) and image attachments: untested in the browser |
+| 2 | A browser tab in the browser | [x] | The daemon's own Chrome, streamed (`loft-core/src/pages`, `loft-ui/src/panel/page.rs`); `pages::tests::live_a_page_is_pictured_and_takes_input` (needs Chrome, run with `--ignored`), `the_daemons_browser_follows_who_can_reach_the_listener`, `the_daemons_browser_is_refused_unless_allowed` |
 | 2 | The terminal in the browser | [x] | `loft-terminal` unchanged on libghostty-vt for wasm32 (`vendor/ghostty-vt-sys`); allowed per session by `[web] allow_terminal` (`web_terminals_follow_who_can_reach_the_listener`, `terminals_follow_who_can_reach_the_listener`, `loft-core/src/remote.rs` tests) |
 | 3 | Sidebar, thread view, composer, approvals, settings, diff panel in a browser | [x] | Screenshots during development (not checked in: they show local paths) |
 | 3 | IME, shortcuts, scrolling, light/dark | [x] | See the summary |

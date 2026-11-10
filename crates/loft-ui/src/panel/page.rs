@@ -1,0 +1,1110 @@
+//! A page of the daemon's own browser (ADR-0017), shown as the pictures the
+//! daemon streams and driven by sending the viewer's mouse and keys back.
+//! This is the browser tab of the web client, where there is no native web
+//! view to embed; nothing in it is specific to the web.
+
+use crate::store::{AppStore, request_in};
+use crate::theme::Palette;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::{
+    App, AppContext as _, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
+    KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollEvent, Styled as _,
+    Subscription, Task, UTF16Selection, Window, canvas, div, img, px,
+};
+use loft_protocol::{
+    PageButton, PageInfo, PageInput, PageMouse, PageNav, Request, Response, ThreadId,
+    page_modifiers,
+};
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use web_time::Instant;
+
+gpui_kit::actions!(page_view, [CopySelection, CutSelection, PasteClipboard]);
+
+const KEY_CONTEXT: &str = "PageView";
+const TOOLBAR_HEIGHT: f32 = 40.;
+/// Mouse moves are sent at most this often.
+const MOVE_EVERY: Duration = Duration::from_millis(16);
+/// A resize is sent once the size has held this long.
+const RESIZE_AFTER: Duration = Duration::from_millis(120);
+
+struct Initialized;
+impl gpui_kit::Global for Initialized {}
+
+fn init(cx: &mut App) {
+    if cx.has_global::<Initialized>() {
+        return;
+    }
+    cx.set_global(Initialized);
+    let ctx = Some(KEY_CONTEXT);
+    // Copy and cut go through the viewer's own clipboard. Paste has a key
+    // only where the app can read the clipboard itself: in a browser, the
+    // browser's own paste brings the text (`EntityInputHandler::paste`).
+    let mut bindings = vec![
+        KeyBinding::new("cmd-c", CopySelection, ctx),
+        KeyBinding::new("ctrl-c", CopySelection, ctx),
+        KeyBinding::new("cmd-x", CutSelection, ctx),
+        KeyBinding::new("ctrl-x", CutSelection, ctx),
+    ];
+    if !crate::host::IS_WEB {
+        bindings.push(KeyBinding::new("cmd-v", PasteClipboard, ctx));
+        bindings.push(KeyBinding::new("ctrl-v", PasteClipboard, ctx));
+    }
+    cx.bind_keys(bindings);
+}
+
+pub struct PageView {
+    store: Entity<AppStore>,
+    thread: ThreadId,
+    focus: FocusHandle,
+    address: Entity<InputState>,
+    editing_address: bool,
+    /// The address to show once the field isn't being typed in.
+    pending_address: Option<String>,
+    info: Option<PageInfo>,
+    /// Where the page last was, to return there if it has to be reopened
+    /// (the daemon restarted, or its browser stopped).
+    last_url: Option<String>,
+    opening: bool,
+    /// Why there is no page (it closed, or wouldn't open).
+    note: Option<String>,
+    /// The page as last pictured, and the subscription it came on.
+    picture: Option<Arc<RenderImage>>,
+    /// A picture is being decoded; the newest to arrive meanwhile waits.
+    decoding: bool,
+    waiting: Option<(u64, u64, Vec<u8>)>,
+    /// Where the page is drawn (set while painting).
+    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The size last asked of the daemon, and the scale it was asked at.
+    asked: Option<(u32, u32, f32)>,
+    resize: Option<Task<()>>,
+    held: PageButton,
+    /// Keys sent down and not yet up, by `code`.
+    keys_down: HashSet<String>,
+    /// The keystroke whose text the platform is about to commit.
+    text_key: Option<Keystroke>,
+    marked: Option<String>,
+    last_move: Option<Instant>,
+    last_point: Point<Pixels>,
+    _subs: Vec<Subscription>,
+}
+
+impl Focusable for PageView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl PageView {
+    pub fn new(
+        store: Entity<AppStore>,
+        thread: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        init(cx);
+        let address =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter an address"));
+        let subs = vec![
+            cx.subscribe_in(&address, window, Self::on_address_event),
+            // The view going away (its thread's panel closed) closes the
+            // page: nothing else would.
+            cx.on_release(|this, cx| {
+                if let Some(info) = this.info.take() {
+                    this.store.update(cx, |store, _| {
+                        store.forget_page(&info.id);
+                        if let Some(client) = store.client() {
+                            drop(client.request(Request::PageClose { id: info.id }));
+                        }
+                    });
+                }
+                if let Some(picture) = this.picture.take() {
+                    cx.drop_image(picture, None);
+                }
+            }),
+        ];
+        Self {
+            store,
+            thread,
+            focus: cx.focus_handle(),
+            address,
+            editing_address: false,
+            pending_address: None,
+            info: None,
+            last_url: None,
+            opening: false,
+            note: None,
+            picture: None,
+            decoding: false,
+            waiting: None,
+            bounds: Rc::default(),
+            asked: None,
+            resize: None,
+            held: PageButton::None,
+            keys_down: HashSet::new(),
+            text_key: None,
+            marked: None,
+            last_move: None,
+            last_point: Point::default(),
+            _subs: subs,
+        }
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.info.as_ref().map(|i| i.title.as_str())
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.info.as_ref().map(|i| i.url.as_str())
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.opening || self.info.as_ref().is_some_and(|i| i.loading)
+    }
+
+    pub fn focus_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.address.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    /// Send the page to `url` (a link someone clicked elsewhere in the app).
+    pub fn go(&mut self, url: &str, cx: &mut Context<Self>) {
+        if self.info.is_some() {
+            self.navigate(
+                PageNav::Url {
+                    url: url.to_owned(),
+                },
+                cx,
+            );
+        } else {
+            // Not open yet: it opens there.
+            self.last_url = Some(url.to_owned());
+        }
+    }
+
+    /// Close the page for good (its tab is going away).
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Some(info) = self.info.take() {
+            self.store.update(cx, |s, _| s.forget_page(&info.id));
+            self.send(Request::PageClose { id: info.id }, cx);
+        }
+        self.drop_picture(cx);
+    }
+
+    // -- the daemon's side ----------------------------------------------------
+
+    fn send(&self, body: Request, cx: &mut Context<Self>) {
+        if let Some(client) = self.store.read(cx).client() {
+            let sent = client.request(body);
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = sent.await;
+                })
+                .detach();
+        }
+    }
+
+    fn input(&self, input: PageInput, cx: &mut Context<Self>) {
+        if let Some(info) = &self.info {
+            self.send(
+                Request::PageInput {
+                    id: info.id.clone(),
+                    input,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn navigate(&mut self, nav: PageNav, cx: &mut Context<Self>) {
+        let Some(info) = &self.info else {
+            return;
+        };
+        let body = Request::PageNavigate {
+            id: info.id.clone(),
+            nav,
+        };
+        request_in(&self.store, body, cx, |this, result, cx| {
+            if let Err(err) = result {
+                this.store.update(cx, |_, cx| {
+                    cx.emit(crate::store::StoreEvent::Notify {
+                        message: err.message,
+                        error: true,
+                    })
+                });
+            }
+        });
+    }
+
+    /// The size the page should have: the area it is drawn in.
+    fn wanted_size(&self, window: &Window) -> Option<(u32, u32, f32)> {
+        let bounds = self.bounds.get()?;
+        let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        (w >= 1. && h >= 1.).then(|| {
+            (
+                w.round() as u32,
+                h.round() as u32,
+                window.scale_factor().clamp(1., 2.),
+            )
+        })
+    }
+
+    fn open(&mut self, size: (u32, u32, f32), cx: &mut Context<Self>) {
+        self.opening = true;
+        self.note = None;
+        self.asked = Some(size);
+        let body = Request::PageOpen {
+            thread_id: self.thread.clone(),
+            url: self.last_url.clone(),
+            width: size.0,
+            height: size.1,
+            scale: size.2,
+        };
+        request_in(&self.store, body, cx, |this, result, cx| {
+            this.opening = false;
+            match result {
+                Ok(Response::Page { page }) => {
+                    let weak = cx.entity().downgrade();
+                    this.store
+                        .update(cx, |s, _| s.subscribe_page(page.id.clone(), weak));
+                    this.on_state(page, cx);
+                }
+                Ok(other) => this.note = Some(format!("unexpected response: {other:?}")),
+                Err(err) => this.note = Some(err.message),
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Open the page once its size is known, and keep the daemon's page the
+    /// size of this view.
+    fn follow_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(size) = self.wanted_size(window) else {
+            return;
+        };
+        if self.info.is_none() {
+            if !self.opening && self.note.is_none() {
+                self.open(size, cx);
+            }
+            return;
+        }
+        if self.asked == Some(size) {
+            return;
+        }
+        self.asked = Some(size);
+        // Dragging a divider changes the size every frame: send the last.
+        self.resize = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESIZE_AFTER).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.asked == Some(size)
+                    && let Some(info) = &this.info
+                {
+                    this.send(
+                        Request::PageResize {
+                            id: info.id.clone(),
+                            width: size.0,
+                            height: size.1,
+                            scale: size.2,
+                        },
+                        cx,
+                    );
+                }
+            });
+        }));
+    }
+
+    // -- fed by the store -------------------------------------------------------
+
+    pub fn on_state(&mut self, page: PageInfo, cx: &mut Context<Self>) {
+        if self.info.as_ref().is_none_or(|old| old.url != page.url) {
+            self.pending_address = Some(page.url.clone());
+        }
+        if !page.url.is_empty() {
+            self.last_url = Some(page.url.clone());
+        }
+        self.info = Some(page);
+        self.note = None;
+        cx.notify();
+    }
+
+    /// A new picture. One is decoded at a time; while that happens only the
+    /// newest to arrive is kept, and the daemon sends no more until this
+    /// one is acknowledged.
+    pub fn on_frame(&mut self, sub_id: u64, seq: u64, jpeg: Vec<u8>, cx: &mut Context<Self>) {
+        if self.decoding {
+            if let Some((old_sub, old_seq, _)) = self.waiting.replace((sub_id, seq, jpeg)) {
+                self.ack(old_sub, old_seq, cx);
+            }
+            return;
+        }
+        self.decoding = true;
+        let decoded = crate::host::decode_jpeg(jpeg, cx);
+        cx.spawn(async move |this, cx| {
+            let picture = decoded.await;
+            let _ = this.update(cx, |this, cx| {
+                this.decoding = false;
+                if let Some(picture) = picture {
+                    this.drop_picture(cx);
+                    this.picture = Some(picture);
+                    cx.notify();
+                }
+                this.ack(sub_id, seq, cx);
+                if let Some((sub_id, seq, jpeg)) = this.waiting.take() {
+                    this.on_frame(sub_id, seq, jpeg, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn ack(&self, sub_id: u64, seq: u64, cx: &mut Context<Self>) {
+        if let Some(client) = self.store.read(cx).client() {
+            client.ack_page_frame(sub_id, seq);
+        }
+    }
+
+    /// Free the old picture's texture; each one is a new image to GPUI.
+    fn drop_picture(&mut self, cx: &mut Context<Self>) {
+        if let Some(old) = self.picture.take() {
+            cx.drop_image(old, None);
+        }
+    }
+
+    pub fn on_closed(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.info = None;
+        self.asked = None;
+        self.held = PageButton::None;
+        self.keys_down.clear();
+        self.note = Some(reason);
+        cx.notify();
+    }
+
+    /// The daemon restarted and its browser with it: open a new page. Called
+    /// while the store is updating, so the reopen runs on the next tick.
+    pub fn on_lost(&mut self, cx: &mut Context<Self>) {
+        self.info = None;
+        self.asked = None;
+        self.note = None;
+        cx.notify();
+    }
+
+    // -- the address bar -------------------------------------------------------
+
+    fn on_address_event(
+        &mut self,
+        state: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::PressEnter { .. } => {
+                let typed = state.read(cx).value().to_string();
+                self.editing_address = false;
+                if typed.trim().is_empty() {
+                    return;
+                }
+                match loft_browser::normalize_address(&typed, loft_browser::DEFAULT_SEARCH_TEMPLATE)
+                {
+                    Ok(url) => self.navigate(
+                        PageNav::Url {
+                            url: url.to_string(),
+                        },
+                        cx,
+                    ),
+                    Err(err) => self.store.update(cx, |_, cx| {
+                        cx.emit(crate::store::StoreEvent::Notify {
+                            message: err.to_string(),
+                            error: true,
+                        })
+                    }),
+                }
+                // Once this key press is over: focused now, the page would
+                // get the Enter that sent it here.
+                let focus = self.focus.clone();
+                window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+            }
+            InputEvent::Focus => {
+                self.editing_address = true;
+                state.update(cx, |state, cx| state.select_all(window, cx));
+            }
+            InputEvent::Blur => {
+                self.editing_address = false;
+                cx.notify();
+            }
+            InputEvent::Change => {}
+        }
+    }
+
+    // -- mouse -----------------------------------------------------------------
+
+    /// A window position as a point in the page, if the page is showing.
+    fn page_point(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let bounds = self.bounds.get()?;
+        self.info.as_ref()?;
+        Some((
+            f32::from(position.x - bounds.origin.x),
+            f32::from(position.y - bounds.origin.y),
+        ))
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        let Some((x, y)) = self.page_point(event.position) else {
+            return;
+        };
+        self.last_point = event.position;
+        self.held = button(event.button);
+        self.input(
+            PageInput::Mouse {
+                action: PageMouse::Down,
+                x,
+                y,
+                button: self.held,
+                click_count: event.click_count.min(3) as u8,
+                modifiers: modifiers(&event.modifiers),
+            },
+            cx,
+        );
+        cx.stop_propagation();
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((x, y)) = self.page_point(event.position) else {
+            return;
+        };
+        self.held = PageButton::None;
+        self.input(
+            PageInput::Mouse {
+                action: PageMouse::Up,
+                x,
+                y,
+                button: button(event.button),
+                click_count: event.click_count.min(3) as u8,
+                modifiers: modifiers(&event.modifiers),
+            },
+            cx,
+        );
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if self
+            .last_move
+            .is_some_and(|at| now.duration_since(at) < MOVE_EVERY)
+        {
+            return;
+        }
+        let Some((x, y)) = self.page_point(event.position) else {
+            return;
+        };
+        self.last_move = Some(now);
+        // A button let go outside the page never reached us.
+        if event.pressed_button.is_none() {
+            self.held = PageButton::None;
+        }
+        self.input(
+            PageInput::Mouse {
+                action: PageMouse::Move,
+                x,
+                y,
+                button: self.held,
+                click_count: 0,
+                modifiers: modifiers(&event.modifiers),
+            },
+            cx,
+        );
+    }
+
+    fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((x, y)) = self.page_point(event.position) else {
+            return;
+        };
+        let delta = event.delta.pixel_delta(window.line_height());
+        self.input(
+            PageInput::Wheel {
+                x,
+                y,
+                dx: -f32::from(delta.x),
+                dy: -f32::from(delta.y),
+                modifiers: modifiers(&event.modifiers),
+            },
+            cx,
+        );
+        cx.stop_propagation();
+    }
+
+    // -- keys ------------------------------------------------------------------
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_some() || self.info.is_none() {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        let m = &keystroke.modifiers;
+        self.text_key = None;
+        // The browser's own paste (see `init`): let it through.
+        if crate::host::IS_WEB && (m.platform || m.control) && keystroke.key == "v" {
+            return;
+        }
+        let types_text = keystroke.key_char.as_deref().is_some_and(is_text)
+            && !m.platform
+            && !m.control
+            && keystroke.key != "enter"
+            && keystroke.key != "tab";
+        if types_text && !event.is_held {
+            // The platform's text input commits it next (so input methods
+            // and dead keys work); the key goes with the text then.
+            self.text_key = Some(keystroke.clone());
+            return;
+        }
+        let (key, code) = dom_key(keystroke);
+        self.keys_down.insert(code.clone());
+        self.input(
+            PageInput::Key {
+                down: true,
+                text: types_text.then(|| keystroke.key_char.clone()).flatten(),
+                key,
+                code,
+                modifiers: modifiers(m),
+                repeat: event.is_held,
+            },
+            cx,
+        );
+        cx.stop_propagation();
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let (key, code) = dom_key(&event.keystroke);
+        if !self.keys_down.remove(&code) {
+            return;
+        }
+        self.input(
+            PageInput::Key {
+                down: false,
+                text: None,
+                key,
+                code,
+                modifiers: modifiers(&event.keystroke.modifiers),
+                repeat: false,
+            },
+            cx,
+        );
+    }
+
+    /// Text the platform committed: one typed character goes as its key
+    /// (pages listen for keys), anything else as text.
+    fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let key = self.text_key.take();
+        if text.is_empty() {
+            return;
+        }
+        match key {
+            Some(keystroke) if keystroke.key_char.as_deref() == Some(text) => {
+                let (key, code) = dom_key(&keystroke);
+                let modifiers = modifiers(&keystroke.modifiers);
+                for down in [true, false] {
+                    self.input(
+                        PageInput::Key {
+                            down,
+                            text: down.then(|| text.to_owned()),
+                            key: key.clone(),
+                            code: code.clone(),
+                            modifiers,
+                            repeat: false,
+                        },
+                        cx,
+                    );
+                }
+            }
+            _ => self.input(
+                PageInput::Text {
+                    text: text.to_owned(),
+                },
+                cx,
+            ),
+        }
+    }
+
+    /// Copy (or cut) what is selected in the page to this device's
+    /// clipboard: the page's own clipboard is the daemon machine's.
+    fn copy_selection(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(info) = &self.info else {
+            return;
+        };
+        let body = Request::PageSelection {
+            id: info.id.clone(),
+        };
+        request_in(&self.store, body, cx, move |this, result, cx| {
+            if let Ok(Response::Text { text }) = result
+                && !text.is_empty()
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                if cut {
+                    for down in [true, false] {
+                        this.input(
+                            PageInput::Key {
+                                down,
+                                text: None,
+                                key: "Backspace".into(),
+                                code: "Backspace".into(),
+                                modifiers: 0,
+                                repeat: false,
+                            },
+                            cx,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.input(PageInput::Text { text }, cx);
+        }
+    }
+}
+
+/// Text a key types (not a control character).
+fn is_text(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(char::is_control)
+}
+
+fn button(button: MouseButton) -> PageButton {
+    match button {
+        MouseButton::Left => PageButton::Left,
+        MouseButton::Right => PageButton::Right,
+        MouseButton::Middle => PageButton::Middle,
+        MouseButton::Navigate(_) => PageButton::None,
+    }
+}
+
+fn modifiers(m: &Modifiers) -> u8 {
+    let mut bits = 0;
+    if m.alt {
+        bits |= page_modifiers::ALT;
+    }
+    if m.control {
+        bits |= page_modifiers::CONTROL;
+    }
+    if m.platform {
+        bits |= page_modifiers::META;
+    }
+    if m.shift {
+        bits |= page_modifiers::SHIFT;
+    }
+    bits
+}
+
+/// A GPUI keystroke as a DOM `KeyboardEvent`'s `key` and `code`.
+fn dom_key(keystroke: &Keystroke) -> (String, String) {
+    let key = keystroke.key.as_str();
+    let named = |name: &str| (name.to_owned(), name.to_owned());
+    match key {
+        "enter" => named("Enter"),
+        "tab" => named("Tab"),
+        "escape" => named("Escape"),
+        "backspace" => named("Backspace"),
+        "delete" => named("Delete"),
+        "insert" => named("Insert"),
+        "up" => named("ArrowUp"),
+        "down" => named("ArrowDown"),
+        "left" => named("ArrowLeft"),
+        "right" => named("ArrowRight"),
+        "home" => named("Home"),
+        "end" => named("End"),
+        "pageup" => named("PageUp"),
+        "pagedown" => named("PageDown"),
+        "space" => (" ".into(), "Space".into()),
+        _ => {
+            if let Some(n) = key.strip_prefix('f')
+                && n.parse::<u8>().is_ok_and(|n| (1..=24).contains(&n))
+            {
+                return named(&format!("F{n}"));
+            }
+            let typed = keystroke
+                .key_char
+                .clone()
+                .filter(|c| is_text(c))
+                .unwrap_or_else(|| {
+                    if keystroke.modifiers.shift {
+                        key.to_uppercase()
+                    } else {
+                        key.to_owned()
+                    }
+                });
+            let mut chars = key.chars();
+            let code = match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphabetic() => {
+                    format!("Key{}", c.to_ascii_uppercase())
+                }
+                (Some(c), None) if c.is_ascii_digit() => format!("Digit{c}"),
+                (Some(c), None) => match c {
+                    '-' => "Minus",
+                    '=' => "Equal",
+                    '[' => "BracketLeft",
+                    ']' => "BracketRight",
+                    '\\' => "Backslash",
+                    ';' => "Semicolon",
+                    '\'' => "Quote",
+                    ',' => "Comma",
+                    '.' => "Period",
+                    '/' => "Slash",
+                    '`' => "Backquote",
+                    _ => "",
+                }
+                .to_owned(),
+                _ => String::new(),
+            };
+            (typed, code)
+        }
+    }
+}
+
+impl EntityInputHandler for PageView {
+    fn text_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.marked.clone()
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self
+            .marked
+            .as_ref()
+            .map_or(0, |text| text.encode_utf16().count());
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked
+            .as_ref()
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked = None;
+    }
+
+    /// A paste the platform delivers itself (the browser's paste event).
+    fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = item.text()
+            && !text.is_empty()
+        {
+            self.input(PageInput::Text { text }, cx);
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = None;
+        self.commit_text(text, cx);
+    }
+
+    /// What an input method is composing. It isn't shown in the page; the
+    /// text arrives there when it is committed.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.text_key = None;
+        self.marked = (!new_text.is_empty()).then(|| new_text.to_owned());
+    }
+
+    /// Input-method windows open by where the page was last clicked.
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            self.last_point,
+            gpui_kit::size(px(1.), px(18.)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Render for PageView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        // A browser session the daemon doesn't give its browser to.
+        if !self.store.read(cx).pages_allowed() {
+            return crate::host_ui::unavailable(
+                IconName::Globe,
+                "The browser is off for web access",
+                "Turn it on in the desktop app: Settings ▸ Web access.",
+                &p,
+            );
+        }
+        self.follow_size(window, cx);
+        if !self.editing_address
+            && let Some(url) = self.pending_address.take()
+        {
+            self.address
+                .update(cx, |state, cx| state.set_value(url, window, cx));
+        }
+        let info = self.info.clone();
+        let loading = self.is_loading();
+        let ready = info.is_some();
+        let prefix = if loading {
+            Spinner::new()
+                .xsmall()
+                .color(p.muted_foreground)
+                .into_any_element()
+        } else {
+            Icon::new(IconName::Globe)
+                .xsmall()
+                .text_color(p.muted_foreground)
+                .into_any_element()
+        };
+        let toolbar = h_flex()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_shrink_0()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                Button::new("page-back")
+                    .cursor_pointer()
+                    .ghost()
+                    .small()
+                    .icon(IconName::ArrowLeft)
+                    .disabled(!info.as_ref().is_some_and(|i| i.can_go_back))
+                    .on_click(cx.listener(|this, _, _, cx| this.navigate(PageNav::Back, cx))),
+            )
+            .child(
+                Button::new("page-forward")
+                    .cursor_pointer()
+                    .ghost()
+                    .small()
+                    .icon(IconName::ArrowRight)
+                    .disabled(!info.as_ref().is_some_and(|i| i.can_go_forward))
+                    .on_click(cx.listener(|this, _, _, cx| this.navigate(PageNav::Forward, cx))),
+            )
+            .child(
+                Button::new("page-reload")
+                    .cursor_pointer()
+                    .ghost()
+                    .small()
+                    .icon(if loading {
+                        IconName::Close
+                    } else {
+                        IconName::RotateCw
+                    })
+                    .disabled(!ready)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let nav = if this.info.as_ref().is_some_and(|i| i.loading) {
+                            PageNav::Stop
+                        } else {
+                            PageNav::Reload
+                        };
+                        this.navigate(nav, cx);
+                    })),
+            )
+            .child(
+                div().flex_1().min_w_0().pl_1().child(
+                    Input::new(&self.address)
+                        .small()
+                        .prefix(prefix)
+                        .disabled(!ready),
+                ),
+            );
+
+        let (bounds, focus, entity) = (self.bounds.clone(), self.focus.clone(), cx.entity());
+        let body = match (&self.note, &self.picture) {
+            (Some(note), _) => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(crate::host_ui::unavailable(
+                    IconName::Globe,
+                    "This tab isn't open",
+                    note,
+                    &p,
+                ))
+                .child(
+                    Button::new("page-reopen")
+                        .small()
+                        .label("Open again")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.note = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+            (None, Some(picture)) => img(picture.clone()).size_full().into_any_element(),
+            (None, None) => div().size_full().into_any_element(),
+        };
+        let page = div()
+            .id("page-viewport")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .bg(gpui_kit::white())
+            .track_focus(&self.focus)
+            .key_context(KEY_CONTEXT)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(false, cx)))
+            .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.copy_selection(true, cx)))
+            .on_action(cx.listener(Self::paste_clipboard))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll(cx.listener(Self::on_scroll))
+            .child(body)
+            .child(
+                // Where the page is, for mouse positions and its size; and
+                // the text input (typing, input methods, paste) while it
+                // has the focus.
+                canvas(
+                    move |area, _, _| bounds.set(Some(area)),
+                    move |area, (), window, cx| {
+                        window.handle_input(&focus, ElementInputHandler::new(area, entity), cx);
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
+        v_flex()
+            .size_full()
+            .bg(p.background)
+            .child(toolbar)
+            .child(page)
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
+        Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: key_char.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn keys_become_dom_keys() {
+        let plain = Modifiers::default();
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        let d = |k: Keystroke| dom_key(&k);
+        assert_eq!(
+            d(stroke("a", Some("a"), plain)),
+            ("a".into(), "KeyA".into())
+        );
+        assert_eq!(
+            d(stroke("a", Some("A"), shift)),
+            ("A".into(), "KeyA".into())
+        );
+        // A chord types nothing, but still names its key.
+        assert_eq!(d(stroke("a", None, shift)), ("A".into(), "KeyA".into()));
+        assert_eq!(
+            d(stroke("7", Some("7"), plain)),
+            ("7".into(), "Digit7".into())
+        );
+        assert_eq!(
+            d(stroke("/", Some("?"), shift)),
+            ("?".into(), "Slash".into())
+        );
+        assert_eq!(
+            d(stroke("enter", None, plain)),
+            ("Enter".into(), "Enter".into())
+        );
+        assert_eq!(
+            d(stroke("left", None, plain)),
+            ("ArrowLeft".into(), "ArrowLeft".into())
+        );
+        assert_eq!(
+            d(stroke("space", Some(" "), plain)),
+            (" ".into(), "Space".into())
+        );
+        assert_eq!(d(stroke("f5", None, plain)), ("F5".into(), "F5".into()));
+        // A key we have no code for still carries what it types.
+        assert_eq!(
+            d(stroke("é", Some("é"), plain)),
+            ("é".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn modifier_bits() {
+        let m = Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(modifiers(&m), page_modifiers::ALT | page_modifiers::SHIFT);
+        assert_eq!(modifiers(&Modifiers::default()), 0);
+        assert!(is_text("a") && is_text("日本") && !is_text("\r") && !is_text(""));
+    }
+}

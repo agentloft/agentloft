@@ -16,6 +16,7 @@ use loft_protocol::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -141,6 +142,8 @@ struct Registered {
     core: Arc<Core>,
     conn_id: u64,
     subs: HashMap<u64, tokio::task::AbortHandle>,
+    /// For subscriptions to a page: the last picture its viewer has shown.
+    page_acks: HashMap<u64, watch::Sender<u64>>,
     relay: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -193,6 +196,7 @@ pub(crate) async fn run<S>(
                 daemon_exe_mtime_ms: *crate::EXE_MTIME,
                 remote: remote.as_ref().map(|(_, policy)| RemoteAccess {
                     terminal: policy.allow_terminal,
+                    browser: policy.allow_browser,
                 }),
             }));
         }
@@ -238,6 +242,7 @@ pub(crate) async fn run<S>(
         core: core.clone(),
         conn_id,
         subs: HashMap::new(),
+        page_acks: HashMap::new(),
         relay,
     };
     let in_flight = Arc::new(Semaphore::new(MAX_REMOTE_IN_FLIGHT));
@@ -333,16 +338,40 @@ pub(crate) async fn run<S>(
                 if let Some(old) = registered.subs.remove(&sub_id) {
                     old.abort();
                 }
+                registered.page_acks.remove(&sub_id);
                 if let Topic::Thread(thread) = &topic {
                     core.clients().watch(conn_id, sub_id, thread.clone());
                 }
-                let task = tokio::spawn(forward(core.clone(), sub_id, topic, out_tx.clone()));
+                let task = match topic {
+                    Topic::Page(page) => {
+                        let (acked, acks) = watch::channel(0);
+                        registered.page_acks.insert(sub_id, acked);
+                        tokio::spawn(forward_page(
+                            core.clone(),
+                            sub_id,
+                            page,
+                            out_tx.clone(),
+                            acks,
+                        ))
+                    }
+                    topic => tokio::spawn(forward(core.clone(), sub_id, topic, out_tx.clone())),
+                };
                 registered.subs.insert(sub_id, task.abort_handle());
             }
             ClientMsg::Unsubscribe { sub_id } => {
                 core.clients().unwatch(conn_id, sub_id);
+                registered.page_acks.remove(&sub_id);
                 if let Some(task) = registered.subs.remove(&sub_id) {
                     task.abort();
+                }
+            }
+            ClientMsg::PageFrameAck { sub_id, seq } => {
+                if let Some(acked) = registered.page_acks.get(&sub_id) {
+                    acked.send_if_modified(|last| {
+                        let newer = seq > *last;
+                        *last = (*last).max(seq);
+                        newer
+                    });
                 }
             }
             ClientMsg::ClientCallResult { call_id, result } => {
@@ -434,7 +463,8 @@ async fn forward(
         let mut seq = match &snapshot {
             Snapshot::Workspace { seq, .. }
             | Snapshot::Thread { seq, .. }
-            | Snapshot::Terminal { seq, .. } => *seq,
+            | Snapshot::Terminal { seq, .. }
+            | Snapshot::Page { seq, .. } => *seq,
         };
         if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
             return;
@@ -491,6 +521,10 @@ async fn forward(
                         return;
                     }
                 }
+                // Pages have a forwarder of their own (`forward_page`).
+                Ok(
+                    BusMsg::PageFrame { .. } | BusMsg::PageState { .. } | BusMsg::PageClosed { .. },
+                ) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(n, sub_id, "subscriber lagged; resending snapshot");
                     break;
@@ -501,10 +535,136 @@ async fn forward(
     }
 }
 
+/// How long a viewer may sit on a picture before the next is sent anyway.
+const PAGE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Counts one viewer of a page for as long as it lives.
+struct Watching {
+    core: Arc<Core>,
+    page: loft_protocol::PageId,
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let (core, page) = (self.core.clone(), self.page.clone());
+        tokio::spawn(async move { core.page_watching(&page, false).await });
+    }
+}
+
+/// One viewer of a page of the daemon's browser: its state as it changes,
+/// and its pictures. One picture is in flight at a time; the next (always
+/// the newest) goes out when the viewer says it has shown the last, so a
+/// slow link gets fewer pictures instead of a queue of stale ones.
+async fn forward_page(
+    core: Arc<Core>,
+    sub_id: u64,
+    page: loft_protocol::PageId,
+    out: mpsc::UnboundedSender<ServerMsg>,
+    mut acks: watch::Receiver<u64>,
+) {
+    // Subscribe before snapshotting so nothing falls in between.
+    let mut bus = core.subscribe();
+    let snapshot = match core.snapshot(&Topic::Page(page.clone())) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = out.send(ServerMsg::PageClosed {
+                sub_id,
+                id: page,
+                reason: err.message,
+            });
+            return;
+        }
+    };
+    let mut sent = match &snapshot {
+        Snapshot::Page {
+            seq,
+            frame: Some(_),
+            ..
+        } => *seq,
+        _ => 0,
+    };
+    let mut in_flight = (sent > 0).then(|| (sent, tokio::time::Instant::now()));
+    if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
+        return;
+    }
+    core.page_watching(&page, true).await;
+    let _watching = Watching {
+        core: core.clone(),
+        page: page.clone(),
+    };
+    let mut newer = false;
+    loop {
+        let ready = in_flight
+            .is_none_or(|(seq, at)| *acks.borrow() >= seq || at.elapsed() >= PAGE_ACK_TIMEOUT);
+        if newer && ready {
+            newer = false;
+            if let Some(frame) = core.page_frame_after(&page, sent) {
+                sent = frame.seq;
+                in_flight = Some((sent, tokio::time::Instant::now()));
+                let frame = ServerMsg::PageFrame {
+                    sub_id,
+                    id: page.clone(),
+                    frame,
+                };
+                if out.send(frame).is_err() {
+                    return;
+                }
+            }
+        }
+        let waiting = newer
+            .then(|| in_flight.map(|(_, at)| at + PAGE_ACK_TIMEOUT))
+            .flatten();
+        tokio::select! {
+            msg = bus.recv() => match msg {
+                Ok(BusMsg::PageFrame { id, seq }) if id == page && seq > sent => newer = true,
+                Ok(BusMsg::PageState { id }) if id == page => {
+                    if let Some(info) = core.page_info(&page)
+                        && out.send(ServerMsg::PageState { sub_id, page: info }).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(BusMsg::PageClosed { id, reason }) if id == page => {
+                    let _ = out.send(ServerMsg::PageClosed { sub_id, id, reason });
+                    return;
+                }
+                Ok(_) => {}
+                // Missed some: the newest picture and the current state
+                // are all that matter.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    newer = true;
+                    match core.page_info(&page) {
+                        Some(info) => {
+                            if out.send(ServerMsg::PageState { sub_id, page: info }).is_err() {
+                                return;
+                            }
+                        }
+                        None => {
+                            let _ = out.send(ServerMsg::PageClosed {
+                                sub_id,
+                                id: page,
+                                reason: "The tab was closed.".into(),
+                            });
+                            return;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            changed = acks.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = async { tokio::time::sleep_until(waiting.unwrap_or_else(tokio::time::Instant::now)).await }, if waiting.is_some() => {}
+        }
+    }
+}
+
 fn matches_topic(topic: &Topic, event: &loft_protocol::Event) -> bool {
     match topic {
         Topic::Workspace => event.is_workspace_event(),
         Topic::Thread(id) => event.thread_id() == Some(id),
-        Topic::Terminal(_) => false,
+        Topic::Terminal(_) | Topic::Page(_) => false,
     }
 }

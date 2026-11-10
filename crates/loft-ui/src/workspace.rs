@@ -385,7 +385,11 @@ impl WorkspaceView {
                 self.panel_open = true;
                 self.panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
-                if let Some(browser) = self.panel.update(cx, |p, cx| p.browser(window, cx)) {
+                if crate::host::IS_WEB {
+                    if let Some(page) = self.panel.update(cx, |p, cx| p.page(window, cx)) {
+                        page.update(cx, |v, cx| v.go(url, cx));
+                    }
+                } else if let Some(browser) = self.panel.update(cx, |p, cx| p.browser(window, cx)) {
                     browser.update(cx, |b, cx| b.navigate(url, cx));
                 }
             }

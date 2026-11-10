@@ -48,7 +48,7 @@ Two constraints shape everything:
 
 | Piece | In the browser |
 |---|---|
-| Embedded browser (WKWebView) | Not offered; a tab that exists shows "Not available in the browser". |
+| Embedded browser (WKWebView) | Replaced by a page of the daemon's own browser, streamed ([ADR-0017](0017-streamed-browser.md)). |
 | Folder browser, file dialogs, Finder, "Open in editor" | Left out. |
 | Menus and Settings in their own window | Drawn inside the one window. |
 | Dock badge, notifications | None. |
@@ -78,6 +78,7 @@ allowed_hosts = ["desk.example.ts.net"]
 allow_insecure_remote = false
 session_days = 30
 allow_terminal = true       # default: true while only this machine can reach the listener
+allow_browser = true        # the same rule, for the daemon's browser (ADR-0017)
 ```
 
 - The listener follows the config: a change restarts it; a section that breaks the rules leaves it off, with the reason in its status.
@@ -154,7 +155,7 @@ Nothing here needs redesign to be reached from another machine or a phone:
 
 - One UI codebase. A view added to `loft-ui` appears in the browser too.
 - The protocol is unchanged, so features work in the browser without new endpoints.
-- The security-sensitive code is small, in one place (`loftd/src/web/`, `loft-core/src/remote.rs`) and covered by tests: 10 policy tests, 25 unit tests and 30 end-to-end tests against a real listener.
+- The security-sensitive code is small, in one place (`loftd/src/web/`, `loft-core/src/remote.rs`) and covered by tests: 11 policy tests, 25 unit tests and 32 end-to-end tests against a real listener.
 
 **Costs**
 

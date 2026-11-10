@@ -11,6 +11,8 @@ publish.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Image dimensions from file headers (reply images keep their proportions).
 imagesize = "0.14"
+# Pictures of the daemon's browser pages (JPEG), decoded for GPUI.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 loft-protocol.workspace = true
 loft-client.workspace = true
 loft-config.workspace = true

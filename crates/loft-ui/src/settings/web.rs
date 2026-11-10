@@ -393,6 +393,26 @@ impl SettingsView {
                     }))
                     .into_any_element(),
                 p,
+            ))
+            .child(row(
+                "Browser",
+                if auto_terminal {
+                    "Web pages loaded on this computer and shown in the browser. On while only this computer can reach Agentloft."
+                } else {
+                    "Web pages loaded on this computer and shown in the browser, with its network and its logins. Off unless you turn it on, because other devices can reach Agentloft."
+                },
+                Switch::new("web-browser")
+                    .checked(web.allow_browser.unwrap_or(auto_terminal))
+                    .on_click(cx.listener(move |this, on: &bool, _, cx| {
+                        let value = if *on == auto_terminal {
+                            SettingValue::Unset
+                        } else {
+                            SettingValue::Bool(*on)
+                        };
+                        this.set_web("allow_browser", value, cx);
+                    }))
+                    .into_any_element(),
+                p,
             ));
 
         // -- where it listens ---------------------------------------------------

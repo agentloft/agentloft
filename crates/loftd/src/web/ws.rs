@@ -137,6 +137,7 @@ where
         session: authed.id.clone(),
         policy: RemotePolicy {
             allow_terminal: ctx.plan.allow_terminal,
+            allow_browser: ctx.plan.allow_browser,
         },
     };
     let serving = tokio::spawn(conn::run(

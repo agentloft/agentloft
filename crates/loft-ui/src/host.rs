@@ -56,6 +56,25 @@ pub fn image_or_blank(path: &Path, thread: Option<&ThreadId>) -> gpui_kit::Image
     image(path, thread).unwrap_or_else(|| BLANK_IMAGE.with(|blank| blank.clone().into()))
 }
 
+/// Decode a JPEG into what GPUI paints (BGRA), off the main thread where
+/// there is another one. `None` if it isn't a JPEG.
+pub fn decode_jpeg(
+    bytes: Vec<u8>,
+    cx: &gpui_kit::App,
+) -> gpui_kit::Task<Option<std::sync::Arc<gpui_kit::RenderImage>>> {
+    cx.background_executor().spawn(async move {
+        let mut pixels = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+            .ok()?
+            .into_rgba8();
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        Some(std::sync::Arc::new(gpui_kit::RenderImage::new(vec![
+            image::Frame::new(pixels),
+        ])))
+    })
+}
+
 /// An image's format from its first bytes, else from its file name.
 pub fn image_format(path: &Path, bytes: &[u8]) -> Option<gpui_kit::ImageFormat> {
     use gpui_kit::ImageFormat as F;

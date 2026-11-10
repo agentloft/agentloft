@@ -165,6 +165,17 @@ pub struct Config {
     pub worktrees: WorktreeConfig,
     pub projects: ProjectsConfig,
     pub web: WebConfig,
+    pub browser: BrowserConfig,
+}
+
+/// `[browser]` in config.toml: the daemon's own browser, whose pages are
+/// streamed to the web client (ADR-0017).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BrowserConfig {
+    /// The Chromium-family browser to run (`~` allowed). Unset: the first
+    /// of Chrome, Chromium, Edge or Brave that is installed.
+    pub executable: Option<String>,
 }
 
 /// `[web]` in config.toml: Agentloft in a browser, served by the daemon
@@ -194,6 +205,10 @@ pub struct WebConfig {
     /// Unset: yes while only this machine can reach the listener (a
     /// loopback address and no extra host names), no once others can.
     pub allow_terminal: Option<bool>,
+    /// Let browser sessions use the daemon's browser: pages loaded on this
+    /// machine, with its network and the logins kept in that browser.
+    /// Unset: as for terminals.
+    pub allow_browser: Option<bool>,
 }
 
 impl Default for WebConfig {
@@ -208,6 +223,7 @@ impl Default for WebConfig {
             allowed_hosts: Vec::new(),
             session_days: 30,
             allow_terminal: None,
+            allow_browser: None,
         }
     }
 }
@@ -223,6 +239,7 @@ pub struct WebPlan {
     pub allowed_hosts: Vec<String>,
     pub session_ttl: Duration,
     pub allow_terminal: bool,
+    pub allow_browser: bool,
 }
 
 impl WebPlan {
@@ -285,11 +302,13 @@ impl WebConfig {
             allowed_hosts,
             session_ttl: Duration::from_secs(u64::from(self.session_days.clamp(1, 365)) * 86_400),
             allow_terminal: false,
+            allow_browser: false,
         };
-        // A shell is as much as this machine's own user can already do, so
-        // it comes with a local-only listener. Reachable from elsewhere, it
-        // has to be asked for.
+        // A shell, or a browser on this machine, is as much as this
+        // machine's own user can already do, so both come with a local-only
+        // listener. Reachable from elsewhere, they have to be asked for.
         plan.allow_terminal = self.allow_terminal.unwrap_or(plan.local_only());
+        plan.allow_browser = self.allow_browser.unwrap_or(plan.local_only());
         Ok(plan)
     }
 }
@@ -833,6 +852,16 @@ mod tests {
         assert!(!refused.plan().unwrap().allow_terminal);
         let cfg: Config = toml::from_str("[web]\nallow_terminal = false\n").unwrap();
         assert_eq!(cfg.web.allow_terminal, Some(false));
+
+        // The daemon's browser follows the same rule, on its own switch.
+        assert!(local.plan().unwrap().allow_browser);
+        assert!(!tunnel.plan().unwrap().allow_browser);
+        let no_browser = WebConfig {
+            allow_browser: Some(false),
+            ..WebConfig::default()
+        };
+        let plan = no_browser.plan().unwrap();
+        assert!(plan.allow_terminal && !plan.allow_browser);
     }
 
     #[test]

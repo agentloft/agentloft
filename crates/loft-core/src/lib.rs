@@ -5,6 +5,7 @@
 mod clients;
 mod forks;
 mod handoff;
+mod pages;
 mod remote;
 mod settings;
 mod terminals;
@@ -49,6 +50,20 @@ pub enum BusMsg {
     TerminalExited {
         id: loft_protocol::TerminalId,
         code: Option<i32>,
+    },
+    /// A page of the daemon's browser has a new picture, numbered `seq`.
+    /// Carries no data: a viewer takes the newest when it is ready.
+    PageFrame {
+        id: loft_protocol::PageId,
+        seq: u64,
+    },
+    /// A page's address, title, loading state or size changed.
+    PageState {
+        id: loft_protocol::PageId,
+    },
+    PageClosed {
+        id: loft_protocol::PageId,
+        reason: String,
     },
 }
 
@@ -106,6 +121,8 @@ pub struct Core {
     /// In-progress items being streamed, overlaid on snapshots.
     live: Mutex<HashMap<ItemId, Item>>,
     terminals: terminals::Terminals,
+    /// The daemon's own browser and its pages (ADR-0017).
+    pages: pages::Pages,
     clients: ClientRegistry,
     /// Serializes worktree creation (two first messages racing).
     worktree_lock: tokio::sync::Mutex<()>,
@@ -144,6 +161,7 @@ impl Core {
             threads: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             terminals: terminals::Terminals::default(),
+            pages: pages::Pages::default(),
             clients: ClientRegistry::default(),
             worktree_lock: tokio::sync::Mutex::new(()),
             config: std::sync::RwLock::new(opts.config.clone()),
@@ -491,6 +509,10 @@ impl Core {
                 replay: replay.into(),
             });
         }
+        if let Topic::Page(id) = topic {
+            let (page, frame, seq) = self.pages.snapshot(id)?;
+            return Ok(Snapshot::Page { seq, page, frame });
+        }
         // Read under the store lock so `seq` is consistent with the data.
         let snap = self.with_store(|s| {
             let seq = s.max_seq()?;
@@ -500,7 +522,7 @@ impl Core {
                     projects: s.projects()?,
                     threads: s.threads()?,
                 }),
-                Topic::Terminal(_) => None,
+                Topic::Terminal(_) | Topic::Page(_) => None,
                 Topic::Thread(id) => match s.thread(id)? {
                     None => None,
                     Some(thread) => Some(Snapshot::Thread {
@@ -540,8 +562,30 @@ impl Core {
                     .resize(id, *cols, *rows)
                     .map(|_| Response::Ok),
             ),
+            // Keys and clicks for a page, likewise.
+            Request::PageInput { id, input } => {
+                Some(self.pages.input(id, input.clone()).map(|_| Response::Ok))
+            }
             _ => None,
         }
+    }
+
+    /// The latest picture of a page, if newer than `seq`.
+    pub fn page_frame_after(
+        &self,
+        id: &loft_protocol::PageId,
+        seq: u64,
+    ) -> Option<loft_protocol::PageFrame> {
+        self.pages.frame_after(id, seq)
+    }
+
+    pub fn page_info(&self, id: &loft_protocol::PageId) -> Option<loft_protocol::PageInfo> {
+        self.pages.info(id)
+    }
+
+    /// A viewer started or stopped watching a page.
+    pub async fn page_watching(&self, id: &loft_protocol::PageId, joined: bool) {
+        self.pages.watching(id, joined).await;
     }
 
     pub async fn handle(self: &Arc<Self>, req: Request) -> CoreResult<Response> {
@@ -820,6 +864,65 @@ impl Core {
             }),
             Request::TerminalClose { id } => {
                 self.terminals.close(&id)?;
+                Ok(Response::Ok)
+            }
+            Request::PageOpen {
+                thread_id,
+                url,
+                width,
+                height,
+                scale,
+            } => {
+                // The thread has to be one of ours.
+                self.with_store(|s| s.thread(&thread_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "no such thread"))?;
+                let profile = self
+                    .opts()
+                    .config_file
+                    .as_ref()
+                    .and_then(|f| f.parent())
+                    .map(|home| home.join("browser").join("profile"))
+                    .ok_or_else(|| {
+                        ErrorBody::new(ErrorCode::Unsupported, "The browser isn't available here.")
+                    })?;
+                let executable = self.config().browser.executable;
+                let page = self
+                    .pages
+                    .open(
+                        thread_id,
+                        url,
+                        width,
+                        height,
+                        scale,
+                        executable.as_deref(),
+                        &profile,
+                        self.bus.clone(),
+                    )
+                    .await?;
+                Ok(Response::Page { page })
+            }
+            Request::PageNavigate { id, nav } => {
+                self.pages.navigate(&id, nav).await?;
+                Ok(Response::Ok)
+            }
+            Request::PageInput { id, input } => {
+                self.pages.input(&id, input)?;
+                Ok(Response::Ok)
+            }
+            Request::PageResize {
+                id,
+                width,
+                height,
+                scale,
+            } => {
+                self.pages.resize(&id, width, height, scale).await?;
+                Ok(Response::Ok)
+            }
+            Request::PageSelection { id } => Ok(Response::Text {
+                text: self.pages.selection(&id).await?,
+            }),
+            Request::PageClose { id } => {
+                self.pages.close(&id).await?;
                 Ok(Response::Ok)
             }
             Request::BrowserCall { thread_id, command } => {
@@ -1230,6 +1333,7 @@ impl Core {
     /// Stop all harness sessions and terminals (daemon shutdown).
     pub async fn shutdown(&self) {
         self.terminals.shutdown();
+        self.pages.shutdown().await;
         let handles: Vec<ThreadHandle> = lock(&self.threads).drain().map(|(_, h)| h).collect();
         let mut waits = Vec::new();
         for h in handles {
