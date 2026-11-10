@@ -93,7 +93,9 @@ conversation as a thread in its sidebar. When the user asks you to spawn, start 
 threads (or Agentloft agents), use the `agentloft` MCP tools: `spawn_thread` for each, then \
 `wait_for_threads` for their replies. Do not use your built-in subagents for that; use them \
 only when the user asks for subagents. Spawned threads use this thread's agent, model, \
-reasoning effort and permissions unless the user names others.";
+reasoning effort and permissions unless the user names others. To start a thread in another \
+project, pass its name as `project` to `spawn_thread` (never edit Agentloft itself to do it); \
+for a chat with no project, pass `chat`.";
 
 #[derive(Debug, Default)]
 pub struct Translator {

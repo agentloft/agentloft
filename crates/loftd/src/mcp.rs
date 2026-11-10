@@ -10,7 +10,8 @@ use anyhow::{Context as _, Result};
 use loft_client::Client;
 use loft_config::Paths;
 use loft_protocol::{
-    ClientKind, DiffScope, HarnessId, PermissionMode, ReadDetail, Request, Response, ThreadId,
+    ClientKind, DiffScope, HarnessId, PermissionMode, ProjectId, ReadDetail, Request, Response,
+    ThreadId,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -175,7 +176,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "list_agents",
-            "List the coding agents available to spawn (Claude Code, Codex, …): whether each is installed, its models with their reasoning efforts, the permission modes, and this thread's own settings (the defaults for spawn_thread).",
+            "List the coding agents available to spawn (Claude Code, Codex, …): whether each is installed, its models with their reasoning efforts, the permission modes, the projects threads can be started in, and this thread's own settings (the defaults for spawn_thread).",
             json!({}),
             &[],
         ),
@@ -190,7 +191,9 @@ pub fn tools() -> Vec<Value> {
                 "effort": { "type": "string", "description": "Reasoning effort, e.g. low | medium | high | xhigh | max" },
                 "permission_mode": { "type": "string", "enum": ["read-only", "ask-all", "accept-edits", "auto", "full-access"] },
                 "worktree": { "type": "boolean", "description": "Work in a new git worktree branched from this thread's current state instead of sharing this checkout (use when agents edit files in parallel)", "default": false },
-                "top_level": { "type": "boolean", "description": "Show it as a separate top-level thread in the sidebar instead of nested under this one (when the user asks for separate, standalone or top-level threads). You can still wait for, message and stop it.", "default": false }
+                "top_level": { "type": "boolean", "description": "Show it as a separate top-level thread in the sidebar instead of nested under this one (when the user asks for separate, standalone or top-level threads). You can still wait for, message and stop it.", "default": false },
+                "project": { "type": "string", "description": "Start it in another Agentloft project (its name, root path or id; see list_agents) when the user names one. Default: this thread's project." },
+                "chat": { "type": "boolean", "description": "Start it as a chat with no project (an empty folder of its own) when the user asks for a chat.", "default": false }
             }),
             &["prompt"],
         ),
@@ -222,9 +225,24 @@ pub fn tools() -> Vec<Value> {
             &["thread_id"],
         ),
         tool(
+            "list_projects",
+            "List the Agentloft projects: id, name, root path, how many threads, whether it's the built-in Chats project, and which one this thread is in (`current`).",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "add_project",
+            "Add a folder as an Agentloft project (when the user asks), returning its id. An existing project with that folder is returned as is.",
+            json!({
+                "path": { "type": "string", "description": "The folder (absolute, or ~/…)" },
+                "name": { "type": "string", "description": "Display name (default: the folder's name)" }
+            }),
+            &["path"],
+        ),
+        tool(
             "list_threads",
-            "List Agentloft threads (other agent conversations), optionally filtered by a title query.",
-            json!({ "query": { "type": "string" } }),
+            "List Agentloft threads (other agent conversations), optionally filtered by a title query and/or a project (its name, path or id).",
+            json!({ "query": { "type": "string" }, "project": { "type": "string" } }),
             &[],
         ),
         tool(
@@ -288,10 +306,23 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
         return result;
     }
     let request = match name {
-        "list_threads" => Request::ListThreads {
-            query: args.get("query").and_then(Value::as_str).map(str::to_owned),
-            project_id: None,
-        },
+        "list_threads" => {
+            let project_id = match args
+                .get("project")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                None => None,
+                Some(want) => match find_project(client, want).await {
+                    Ok(p) => p["id"].as_str().map(|id| ProjectId(id.to_owned())),
+                    Err(e) => return text_result(e, true),
+                },
+            };
+            Request::ListThreads {
+                query: args.get("query").and_then(Value::as_str).map(str::to_owned),
+                project_id,
+            }
+        }
         "read_thread" => match args.get("thread_id").and_then(Value::as_str) {
             Some(id) => Request::ReadThread {
                 thread_id: ThreadId(id.to_owned()),
@@ -392,6 +423,35 @@ async fn own_child(
     Ok((id, state))
 }
 
+async fn projects(client: &Client) -> Result<Vec<Value>, String> {
+    match client.request(Request::ListProjects).await {
+        Ok(Response::Json {
+            value: Value::Array(list),
+        }) => Ok(list),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(err) => Err(err.message),
+    }
+}
+
+/// A project by id, name (any case) or root path.
+async fn find_project(client: &Client, want: &str) -> Result<Value, String> {
+    let list = projects(client).await?;
+    let want = want.trim();
+    list.iter()
+        .find(|p| {
+            p["id"].as_str() == Some(want)
+                || p["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(want))
+                || p["path"].as_str() == Some(want.trim_end_matches('/'))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            let names: Vec<&str> = list.iter().filter_map(|p| p["name"].as_str()).collect();
+            format!("no project `{want}`; projects: {}", names.join(", "))
+        })
+}
+
 /// Orchestration tools; `None` for any other tool.
 async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -> Option<Value> {
     let str_arg = |k: &str| {
@@ -402,6 +462,38 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             .map(str::to_owned)
     };
     Some(match name {
+        "list_projects" => {
+            let mut list = match projects(client).await {
+                Ok(l) => l,
+                Err(e) => return Some(text_result(e, true)),
+            };
+            let current = outcome(client, me)
+                .await
+                .ok()
+                .and_then(|o| o["project_id"].as_str().map(str::to_owned));
+            for p in &mut list {
+                p["current"] = json!(current.is_some() && p["id"].as_str() == current.as_deref());
+            }
+            json_result(&Value::Array(list))
+        }
+        "add_project" => {
+            let Some(path) = str_arg("path") else {
+                return Some(text_result("path is required", true));
+            };
+            match client
+                .request(Request::AddProject {
+                    path,
+                    name: str_arg("name"),
+                })
+                .await
+            {
+                Ok(Response::Project { project }) => json_result(&json!({
+                    "id": project.id, "name": project.name, "path": project.root_path,
+                })),
+                Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
+                Err(err) => text_result(err.message, true),
+            }
+        }
         "list_agents" => {
             let mut agents = Vec::new();
             for id in AGENTS {
@@ -437,7 +529,12 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 }));
             }
             let current = outcome(client, me).await.unwrap_or(Value::Null);
+            let projects = match client.request(Request::ListProjects).await {
+                Ok(Response::Json { value }) => value,
+                _ => Value::Null,
+            };
             json_result(&json!({
+                "projects": projects,
                 "this_thread": {
                     "agent": current["agent"], "model": current["model"],
                     "effort": current["effort"], "permission_mode": current["permission_mode"],
@@ -475,6 +572,8 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                     .get("top_level")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                project: str_arg("project"),
+                chat: args.get("chat").and_then(Value::as_bool).unwrap_or(false),
             };
             match client.request(request).await {
                 Ok(Response::Thread { thread }) => json_result(&json!({

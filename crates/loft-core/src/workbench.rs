@@ -384,6 +384,7 @@ impl Core {
         Ok(serde_json::json!({
             "thread_id": thread.id,
             "title": thread.title,
+            "project_id": thread.project_id,
             "status": status,
             "agent": thread.harness,
             "model": thread.model,

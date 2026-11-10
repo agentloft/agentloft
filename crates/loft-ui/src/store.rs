@@ -878,6 +878,52 @@ impl AppStore {
     /// Open a new thread in `project_id`. It isn't really started until the
     /// first message, so an untouched one (no messages, no draft) is reused
     /// rather than piling up empty threads.
+    /// The built-in "Chats" project (threads without a project): its root
+    /// is Agentloft's chats folder.
+    pub fn is_chats(&self, project: &loft_protocol::Project) -> bool {
+        let dir = self.paths.chats_dir();
+        let canonical = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+        std::path::Path::new(&project.root_path) == dir
+            || std::path::Path::new(&project.root_path) == canonical
+    }
+
+    /// A chat: a thread without a project (an unsent one is reused).
+    pub fn new_chat(&mut self, cx: &mut Context<Self>) {
+        let chats: Vec<ProjectId> = self
+            .workspace
+            .projects
+            .iter()
+            .filter(|p| self.is_chats(p))
+            .map(|p| p.id.clone())
+            .collect();
+        let blank = self
+            .workspace
+            .threads
+            .iter()
+            .find(|t| {
+                chats.contains(&t.project_id)
+                    && t.status != ThreadStatus::Archived
+                    && !t.is_started()
+                    && t.draft_text().is_none()
+            })
+            .map(|t| t.id.clone());
+        if let Some(id) = blank {
+            self.select_thread(id, cx);
+            return;
+        }
+        self.request(
+            Request::CreateChat {
+                harness: self.default_harness.clone(),
+            },
+            cx,
+            |store, resp, cx| {
+                if let Response::Thread { thread } = resp {
+                    store.select_thread(thread.id, cx);
+                }
+            },
+        );
+    }
+
     pub fn new_thread(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
         let blank = self
             .workspace

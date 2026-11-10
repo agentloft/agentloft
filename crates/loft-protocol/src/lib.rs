@@ -75,6 +75,12 @@ pub enum Request {
         #[serde(default)]
         name: Option<String>,
     },
+    /// A thread without a project (a chat): kept in the built-in "Chats"
+    /// project, working in an empty folder of its own. Answers
+    /// `Response::Thread`.
+    CreateChat {
+        harness: HarnessId,
+    },
     CreateThread {
         project_id: ProjectId,
         harness: HarnessId,
@@ -309,7 +315,17 @@ pub enum Request {
         /// A thread of its own in the sidebar instead of one under `from`.
         #[serde(default)]
         top_level: bool,
+        /// Start it in another project (its name, root path or id) instead
+        /// of `from`'s.
+        #[serde(default)]
+        project: Option<String>,
+        /// Start it as a chat (no project).
+        #[serde(default)]
+        chat: bool,
     },
+    /// The projects, for agents choosing where to start threads
+    /// (`Response::Json`: id, name, path).
+    ListProjects,
     /// Where a thread stands, for an orchestrating agent: status, settings,
     /// its latest reply and who spawned it (`Response::Json`).
     ThreadOutcome {

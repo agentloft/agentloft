@@ -3,8 +3,9 @@
 
 use crate::panel::Tab;
 use crate::workspace::{
-    AddProject, Interrupt, NewTab, NewThread, NewWindow, OpenSettings, ShowBrowser, ShowChanges,
-    ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTheme, WorkspaceView, harness_name,
+    AddProject, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings, ShowBrowser,
+    ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTheme, WorkspaceView,
+    harness_name,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
@@ -493,6 +494,12 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
             |v, _, cx| v.new_thread(None, cx),
         ),
         entry(
+            "New chat (no project)",
+            IconName::MessageSquarePlus,
+            Some(Box::new(NewChat)),
+            |v, _, cx| v.store.update(cx, |s, cx| s.new_chat(cx)),
+        ),
+        entry(
             "New pane",
             IconName::Columns2,
             Some(Box::new(NewTab)),
@@ -576,6 +583,7 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
         .workspace
         .projects
         .iter()
+        .filter(|p| !store.is_chats(p))
         .map(|p| {
             let id = p.id.clone();
             let mut e = entry(

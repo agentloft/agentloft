@@ -72,6 +72,12 @@ impl Paths {
         self.home.join("worktrees")
     }
 
+    /// Chats (threads without a project) live here, each in a folder of its
+    /// own; the folder itself is the built-in "Chats" project.
+    pub fn chats_dir(&self) -> PathBuf {
+        self.home.join("chats")
+    }
+
     /// Create the directory layout. `run/` is private (0700).
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {

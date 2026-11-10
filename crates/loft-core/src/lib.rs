@@ -68,6 +68,8 @@ pub struct CoreOptions {
     /// Attach the Agentloft MCP server to agent sessions.
     pub mcp_bridge: Option<McpBridge>,
     /// Where per-thread worktrees go (`~/.agentloft/worktrees`).
+    /// Where chats (threads without a project) work.
+    pub chats_dir: PathBuf,
     pub worktrees_dir: PathBuf,
     /// `config.toml`, re-read on `Request::ReloadConfig`.
     pub config_file: Option<PathBuf>,
@@ -83,6 +85,7 @@ impl Default for CoreOptions {
             flush_interval: Duration::from_millis(250),
             mcp_bridge: None,
             worktrees_dir: std::env::temp_dir().join("agentloft-worktrees"),
+            chats_dir: std::env::temp_dir().join("agentloft-chats"),
             config_file: None,
             attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
         }
@@ -530,6 +533,32 @@ impl Core {
         match req {
             Request::Ping => Ok(Response::Pong),
             Request::AddProject { path, name } => self.add_project(path, name),
+            Request::CreateChat { harness } => self.create_chat(harness),
+            Request::ListProjects => {
+                let (projects, threads) = self.with_store(|s| Ok((s.projects()?, s.threads()?)))?;
+                let chats = std::fs::canonicalize(&self.opts().chats_dir)
+                    .unwrap_or_else(|_| self.opts().chats_dir.clone());
+                Ok(Response::Json {
+                    value: serde_json::Value::Array(
+                        projects
+                            .into_iter()
+                            .map(|p| {
+                                let count = threads
+                                    .iter()
+                                    .filter(|t| {
+                                        t.project_id == p.id && t.status != ThreadStatus::Archived
+                                    })
+                                    .count();
+                                serde_json::json!({
+                                    "id": p.id, "name": p.name, "path": p.root_path,
+                                    "chats": std::path::Path::new(&p.root_path) == chats,
+                                    "threads": count,
+                                })
+                            })
+                            .collect(),
+                    ),
+                })
+            }
             Request::CreateThread {
                 project_id,
                 harness,
@@ -730,6 +759,8 @@ impl Core {
                 permission_mode,
                 worktree,
                 top_level,
+                project,
+                chat,
             } => {
                 self.spawn_thread(forks::SpawnSpec {
                     from,
@@ -741,6 +772,8 @@ impl Core {
                     permission_mode,
                     worktree,
                     top_level,
+                    project,
+                    chat,
                 })
                 .await
             }
@@ -789,6 +822,33 @@ impl Core {
             project: project.clone(),
         }])?;
         Ok(Response::Project { project })
+    }
+
+    /// A thread without a project: it lives in the built-in "Chats" project
+    /// and works in an empty folder of its own.
+    /// The built-in "Chats" project (created on first use).
+    pub(crate) fn chats_project(&self) -> CoreResult<Project> {
+        let dir = self.opts().chats_dir.clone();
+        std::fs::create_dir_all(&dir).map_err(internal)?;
+        match self.add_project(dir.to_string_lossy().into_owned(), Some("Chats".into()))? {
+            Response::Project { project } => Ok(project),
+            _ => Err(ErrorBody::new(ErrorCode::Internal, "no chats project")),
+        }
+    }
+
+    fn create_chat(&self, harness: HarnessId) -> CoreResult<Response> {
+        let project = self.chats_project()?;
+        let Response::Thread { mut thread } = self.create_thread(project.id, harness, None)? else {
+            return Err(ErrorBody::new(ErrorCode::Internal, "no thread"));
+        };
+        let own = std::path::Path::new(&project.root_path).join(thread.id.as_str());
+        std::fs::create_dir_all(&own).map_err(internal)?;
+        thread.cwd = own.to_string_lossy().into_owned();
+        thread.workspace = loft_protocol::ThreadWorkspace::Local;
+        self.commit(vec![Event::ThreadUpdated {
+            thread: thread.clone(),
+        }])?;
+        Ok(Response::Thread { thread })
     }
 
     fn set_thread_harness(&self, id: &ThreadId, harness: HarnessId) -> CoreResult<Response> {

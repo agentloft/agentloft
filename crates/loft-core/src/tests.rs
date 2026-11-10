@@ -1064,6 +1064,8 @@ async fn spawned_threads_inherit_settings_and_report_back() {
                 permission_mode: None,
                 worktree: false,
                 top_level: false,
+                project: None,
+                chat: false,
             })
             .await
         }
@@ -1111,4 +1113,101 @@ async fn spawned_threads_inherit_settings_and_report_back() {
     let err = spawn(from, "too deep").await.unwrap_err();
     assert!(err.message.contains("deeper"), "{}", err.message);
     assert!(spawn(parent.id.clone(), "  ").await.is_err());
+}
+
+#[tokio::test]
+async fn chats_get_a_folder_of_their_own_in_one_project() {
+    let f = fixture();
+    let chat = || {
+        let core = f.core.clone();
+        async move {
+            match core
+                .handle(Request::CreateChat {
+                    harness: HarnessId(HarnessId::FAKE.into()),
+                })
+                .await
+                .unwrap()
+            {
+                Response::Thread { thread } => thread,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    let (a, b) = (chat().await, chat().await);
+    assert_eq!(a.project_id, b.project_id);
+    let project = f
+        .core
+        .with_store(|s| s.project(&a.project_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.name, "Chats");
+    assert_ne!(a.cwd, b.cwd);
+    assert!(a.cwd.ends_with(a.id.as_str()), "{}", a.cwd);
+    assert!(std::path::Path::new(&a.cwd).is_dir());
+    // It's a thread like any other.
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: a.id.clone(),
+            text: "hi".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &a.id, turn_done).await;
+}
+
+#[tokio::test]
+async fn threads_can_be_spawned_in_another_project_or_as_a_chat() {
+    let f = fixture();
+    let caller = new_thread(&f.core, f._dir.path()).await;
+    let other = tempfile::tempdir().unwrap();
+    let Response::Project { project } = f
+        .core
+        .handle(Request::AddProject {
+            path: other.path().to_string_lossy().into_owned(),
+            name: Some("Dispatch".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let spawn = |project: Option<&str>, chat: bool| {
+        let (core, from) = (f.core.clone(), caller.id.clone());
+        let project = project.map(str::to_owned);
+        async move {
+            core.handle(Request::SpawnThread {
+                from,
+                prompt: "look around".into(),
+                title: None,
+                harness: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                worktree: false,
+                top_level: false,
+                project,
+                chat,
+            })
+            .await
+        }
+    };
+    // By name, case aside: in that project's folder, its own row there.
+    let Response::Thread { thread } = spawn(Some("dispatch"), false).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(thread.project_id, project.id);
+    assert_eq!(thread.cwd, project.root_path);
+    let link = thread.parent.unwrap();
+    assert!(link.detached);
+    assert_eq!(link.thread_id, caller.id);
+    // As a chat.
+    let Response::Thread { thread } = spawn(None, true).await.unwrap() else {
+        panic!()
+    };
+    assert_ne!(thread.project_id, caller.project_id);
+    assert!(thread.cwd.ends_with(thread.id.as_str()));
+    // An unknown project names the ones there are.
+    let err = spawn(Some("nowhere"), false).await.unwrap_err();
+    assert!(err.message.contains("Dispatch"), "{}", err.message);
 }

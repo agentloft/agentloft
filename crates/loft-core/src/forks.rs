@@ -45,6 +45,8 @@ pub(crate) struct SpawnSpec {
     pub permission_mode: Option<loft_protocol::PermissionMode>,
     pub worktree: bool,
     pub top_level: bool,
+    pub project: Option<String>,
+    pub chat: bool,
 }
 
 impl Core {
@@ -113,10 +115,64 @@ impl Core {
             }
         });
         let id = ThreadId::new();
-        let (cwd, workspace) = if spec.worktree {
-            self.fork_workspace(&parent, &id, None).await?
+        // Another project (or a chat): that project's folder, or a fresh
+        // worktree there, and a thread of its own in its section.
+        let elsewhere = if spec.chat {
+            let chats = self.chats_project()?;
+            let own = Path::new(&chats.root_path).join(id.as_str());
+            std::fs::create_dir_all(&own).map_err(crate::internal)?;
+            Some((
+                chats,
+                own.to_string_lossy().into_owned(),
+                ThreadWorkspace::Local,
+            ))
+        } else if let Some(want) = spec
+            .project
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+        {
+            let projects = self.with_store(|s| s.projects())?;
+            let wanted = crate::expand_tilde(want);
+            let found = projects.iter().find(|p| {
+                p.id.as_str() == want
+                    || p.name.eq_ignore_ascii_case(want)
+                    || Path::new(&p.root_path) == wanted
+                    || std::fs::canonicalize(&wanted).is_ok_and(|c| Path::new(&p.root_path) == c)
+            });
+            let Some(found) = found.cloned() else {
+                let names: Vec<&str> = projects.iter().map(|p| p.name.as_str()).collect();
+                return Err(bad(format!(
+                    "no project `{want}`; projects: {}",
+                    names.join(", ")
+                )));
+            };
+            (found.id != parent.project_id).then(|| {
+                let workspace = if spec.worktree
+                    && loft_git::repo_root(Path::new(&found.root_path)).is_some()
+                {
+                    ThreadWorkspace::NewWorktree { base: None }
+                } else {
+                    self.default_workspace(&found.root_path)
+                };
+                let root = found.root_path.clone();
+                (found, root, workspace)
+            })
         } else {
-            (parent.cwd.clone(), parent.workspace.clone())
+            None
+        };
+        let detached = spec.top_level || elsewhere.is_some();
+        let (project_id, cwd, workspace) = match elsewhere {
+            Some((project, cwd, workspace)) => (project.id, cwd, workspace),
+            None if spec.worktree => {
+                let (cwd, workspace) = self.fork_workspace(&parent, &id, None).await?;
+                (parent.project_id.clone(), cwd, workspace)
+            }
+            None => (
+                parent.project_id.clone(),
+                parent.cwd.clone(),
+                parent.workspace.clone(),
+            ),
         };
         let title = spec
             .title
@@ -133,7 +189,7 @@ impl Core {
         let now = now_ms();
         let thread = Thread {
             id: id.clone(),
-            project_id: parent.project_id.clone(),
+            project_id,
             title,
             harness,
             cwd,
@@ -149,7 +205,7 @@ impl Core {
                 thread_id: parent.id.clone(),
                 turn_id: None,
                 kind: ForkKind::Spawned,
-                detached: spec.top_level,
+                detached,
             }),
             slash_commands: Vec::new(),
             command_info: Vec::new(),

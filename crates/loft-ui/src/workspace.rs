@@ -26,6 +26,7 @@ actions!(
     agentloft,
     [
         NewThread,
+        NewChat,
         Interrupt,
         ToggleSidebar,
         ToggleTheme,
@@ -58,6 +59,7 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
     loft_browser::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),
+        KeyBinding::new("alt-cmd-n", NewChat, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-n", NewWindow, None),
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-.", Interrupt, Some(CONTEXT)),
@@ -96,6 +98,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
         ]),
         Menu::new("File").items([
             MenuItem::action("New Thread", NewThread),
+            MenuItem::action("New Chat", NewChat),
             MenuItem::action("New Pane", NewTab),
             MenuItem::action("New Window", NewWindow),
             MenuItem::separator(),
@@ -2418,9 +2421,21 @@ impl WorkspaceView {
         let all_projects: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
         let query = self.query.clone();
         let mut list = v_flex().gap_4().px_2().pb_4();
+        // Chats (threads without a project) come first.
+        let chats: Vec<ProjectId> = {
+            let store = self.store.read(cx);
+            projects
+                .iter()
+                .filter(|p| store.is_chats(p))
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        let mut projects = projects;
+        projects.sort_by_key(|p| !chats.contains(&p.id));
 
         for project in &projects {
             let project_id = project.id.clone();
+            let is_chats = chats.contains(&project.id);
             let threads: Vec<_> = all_threads
                 .iter()
                 .filter(|t| t.project_id == project.id && t.status != ThreadStatus::Archived)
@@ -2434,7 +2449,7 @@ impl WorkspaceView {
                 })
                 .filter(|t| self.search_matches(t, &project.name))
                 .collect();
-            if !query.is_empty() && threads.is_empty() {
+            if (is_chats || !query.is_empty()) && threads.is_empty() {
                 continue;
             }
             // Searching shows every match, folded or not.
@@ -2446,8 +2461,15 @@ impl WorkspaceView {
                 folded,
                 &unread,
                 &all_projects,
+                is_chats,
                 p,
-                cx.listener(move |this, _, _, cx| this.new_thread(Some(project_id.clone()), cx)),
+                cx.listener(move |this, _, _, cx| {
+                    if is_chats {
+                        this.store.update(cx, |s, cx| s.new_chat(cx));
+                    } else {
+                        this.new_thread(Some(project_id.clone()), cx)
+                    }
+                }),
             );
             let mut rows = v_flex().gap_px();
             if !folded {
@@ -2625,14 +2647,26 @@ impl WorkspaceView {
                     .text_xs()
                     .text_color(p.faint_foreground)
                     .child("PROJECTS")
-                    .child(icon_button(
-                        "add-project",
-                        IconName::FolderPlus,
-                        p,
-                        cx.listener(|this, _, window, cx| {
-                            this.add_project(window, cx);
-                        }),
-                    )),
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(icon_button(
+                                "new-chat",
+                                IconName::MessageSquarePlus,
+                                p,
+                                cx.listener(|this, _, _, cx| {
+                                    this.store.update(cx, |s, cx| s.new_chat(cx))
+                                }),
+                            ))
+                            .child(icon_button(
+                                "add-project",
+                                IconName::FolderPlus,
+                                p,
+                                cx.listener(|this, _, window, cx| {
+                                    this.add_project(window, cx);
+                                }),
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -3071,6 +3105,16 @@ impl WorkspaceView {
         let waiting = pinned.is_empty() && model.open_requests().next().is_some();
         let empty = model.items.is_empty();
         let harness_choices = self.store.read(cx).available_harnesses();
+        // A chat (no project): no worktrees, and it says so.
+        let is_chat = {
+            let store = self.store.read(cx);
+            store
+                .workspace
+                .projects
+                .iter()
+                .find(|p| p.id == model.thread.project_id)
+                .is_some_and(|p| store.is_chats(p))
+        };
         let known_models = self
             .store
             .read(cx)
@@ -3132,7 +3176,11 @@ impl WorkspaceView {
                         .text_xl()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.foreground)
-                        .child("What should we work on?"),
+                        .child(if is_chat {
+                            "What's on your mind?"
+                        } else {
+                            "What should we work on?"
+                        }),
                 )
                 .when_some(model.thread.parent.clone(), |d, parent| {
                     let title = self
@@ -3175,13 +3223,15 @@ impl WorkspaceView {
                         &self.store,
                         p,
                     ))
-                    .child(workspace_picker(
-                        &model.thread.id,
-                        &model.thread.workspace,
-                        &self.store,
-                        p,
-                    ))
-                    .children(base_row)
+                    .when(!is_chat, |d| {
+                        d.child(workspace_picker(
+                            &model.thread.id,
+                            &model.thread.workspace,
+                            &self.store,
+                            p,
+                        ))
+                        .children(base_row)
+                    })
                 })
                 .child(
                     div()
@@ -3190,6 +3240,10 @@ impl WorkspaceView {
                         .text_xs()
                         .text_color(p.faint_foreground)
                         .child(match &model.thread.workspace {
+                            _ if is_chat => {
+                                "A chat, not tied to a project: the agent works in an empty folder of its own"
+                                    .to_owned()
+                            }
                             ThreadWorkspace::NewWorktree { .. } => match &worktree_base {
                                 Some(b) => format!(
                                     "Your first message creates a worktree on a new branch from {}",
@@ -4023,6 +4077,11 @@ impl Render for WorkspaceView {
         v_flex()
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &NewThread, _, cx| this.new_thread(None, cx)))
+            .on_action(
+                cx.listener(|this, _: &NewChat, _, cx| {
+                    this.store.update(cx, |s, cx| s.new_chat(cx))
+                }),
+            )
             .on_action(cx.listener(|this, _: &Interrupt, _, cx| this.interrupt(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
@@ -4438,6 +4497,7 @@ fn project_header(
     folded: bool,
     unread: &std::collections::HashSet<ThreadId>,
     all_projects: &[ProjectId],
+    chats: bool,
     p: &Palette,
     on_new: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
@@ -4531,7 +4591,9 @@ fn project_header(
                         .justify_center()
                         .group_hover(group.clone(), |d| d.invisible())
                         .child(
-                            Icon::new(if folded {
+                            Icon::new(if chats {
+                                IconName::MessageSquare
+                            } else if folded {
                                 IconName::Folder
                             } else {
                                 IconName::FolderOpen
