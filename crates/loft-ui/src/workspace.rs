@@ -193,7 +193,8 @@ pub struct WorkspaceView {
     sidebar_amount: f32,
     panel_slide: Slide,
     details_slide: Slide,
-    /// The side panel's width as last laid out (it slides at this width).
+    /// The side panel's width as last laid out (it slides, and reopens, at
+    /// this width). Zero until it first opens, when it gets a share of the room.
     panel_width: std::rc::Rc<std::cell::Cell<f32>>,
     /// The conversation's width as last laid out (the turn map needs a margin).
     /// Each pane's conversation width (the turn map needs a margin).
@@ -308,7 +309,7 @@ impl WorkspaceView {
             sidebar_amount: 1.,
             panel_slide: Slide::default(),
             details_slide: Slide::default(),
-            panel_width: std::rc::Rc::new(std::cell::Cell::new(560.)),
+            panel_width: std::rc::Rc::new(std::cell::Cell::new(0.)),
             details_card: None,
             details_room: Default::default(),
             window_title: String::new(),
@@ -4299,6 +4300,10 @@ impl Render for WorkspaceView {
         let maximized = show_panel && self.panel.read(cx).maximized;
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
+        if show_panel && self.panel_width.get() <= 0. {
+            let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
+            self.panel_width.set(default_panel_width(room));
+        }
         let header = self.render_header(header_title, &p, cx);
         let sidebar = (side > 0.).then(|| {
             div()
@@ -4434,8 +4439,8 @@ impl Render for WorkspaceView {
                                         .child(resizable_panel().children(body_slot.take()))
                                         .child(
                                             resizable_panel()
-                                                .size(px(560.))
-                                                .size_range(px(340.)..px(1600.))
+                                                .size(px(self.panel_width.get()))
+                                                .size_range(px(PANEL_MIN)..px(1600.))
                                                 .visible(show_panel)
                                                 .child(
                                                     div()
@@ -5484,6 +5489,15 @@ impl Render for DraggedThread {
             .child(Icon::new(IconName::Columns2).xsmall().text_color(p.accent))
             .child(div().truncate().child(self.title.clone()))
     }
+}
+
+/// The side panel's narrowest width.
+const PANEL_MIN: f32 = 340.;
+
+/// The side panel's first width: a share of the room beside the sidebar, so
+/// the conversation keeps most of it. Dragging it wider is remembered.
+fn default_panel_width(room: f32) -> f32 {
+    (room * 0.4).clamp(PANEL_MIN, 640.)
 }
 
 /// The docked details card's width, and the conversation width (with it)
