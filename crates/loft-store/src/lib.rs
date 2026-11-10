@@ -342,6 +342,8 @@ impl Store {
 fn event_type(event: &Event) -> &'static str {
     match event {
         Event::ProjectAdded { .. } => "project_added",
+        Event::ProjectUpdated { .. } => "project_updated",
+        Event::ProjectRemoved { .. } => "project_removed",
         Event::ThreadCreated { .. } => "thread_created",
         Event::ThreadUpdated { .. } => "thread_updated",
         Event::TurnStarted { .. } => "turn_started",
@@ -369,6 +371,18 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
                     project.created_at_ms,
                     json(project)?
                 ],
+            )?;
+        }
+        Event::ProjectUpdated { project } => {
+            conn.execute(
+                "UPDATE projects SET data = ?2 WHERE id = ?1",
+                params![project.id.as_str(), json(project)?],
+            )?;
+        }
+        Event::ProjectRemoved { project_id } => {
+            conn.execute(
+                "DELETE FROM projects WHERE id = ?1",
+                params![project_id.as_str()],
             )?;
         }
         Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => {

@@ -1253,3 +1253,48 @@ async fn new_projects_are_fresh_git_repos() {
         );
     }
 }
+
+#[tokio::test]
+async fn removing_a_project_deletes_its_threads_not_its_files() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let marker = f._dir.path().join("keep.txt");
+    std::fs::write(&marker, "x").unwrap();
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "hi".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let Response::Project { project } = f
+        .core
+        .handle(Request::RenameProject {
+            project_id: thread.project_id.clone(),
+            name: "  Renamed ".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(project.name, "Renamed");
+    f.core
+        .handle(Request::RemoveProject {
+            project_id: thread.project_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (projects, threads) = f
+        .core
+        .with_store(|s| Ok((s.projects()?, s.threads()?)))
+        .unwrap();
+    assert!(projects.is_empty());
+    assert!(threads.is_empty());
+    assert!(marker.exists());
+    // It can come back.
+    let again = new_thread(&f.core, f._dir.path()).await;
+    assert_ne!(again.project_id, thread.project_id);
+}

@@ -75,6 +75,15 @@ pub enum Request {
         #[serde(default)]
         name: Option<String>,
     },
+    RenameProject {
+        project_id: ProjectId,
+        name: String,
+    },
+    /// Remove a project from Agentloft: its threads are deleted (worktrees
+    /// and checkpoints too); the folder on disk is left alone.
+    RemoveProject {
+        project_id: ProjectId,
+    },
     /// A new project: an empty git repository named `name` in `parent`
     /// (answers `Response::Project`).
     CreateProject {
@@ -592,6 +601,15 @@ pub enum Event {
     ProjectAdded {
         project: Project,
     },
+    /// Renamed (or otherwise changed).
+    ProjectUpdated {
+        project: Project,
+    },
+    /// The project's entry is gone (its threads were deleted first; files
+    /// on disk are untouched).
+    ProjectRemoved {
+        project_id: ProjectId,
+    },
     ThreadCreated {
         thread: Thread,
     },
@@ -623,7 +641,9 @@ impl Event {
     /// The thread this event belongs to, if any (workspace-level otherwise).
     pub fn thread_id(&self) -> Option<&ThreadId> {
         match self {
-            Event::ProjectAdded { .. } => None,
+            Event::ProjectAdded { .. }
+            | Event::ProjectUpdated { .. }
+            | Event::ProjectRemoved { .. } => None,
             Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => Some(&thread.id),
             Event::TurnStarted { turn } | Event::TurnUpdated { turn } => Some(&turn.thread_id),
             Event::ItemUpserted { item } => Some(&item.thread_id),
@@ -639,6 +659,8 @@ impl Event {
         matches!(
             self,
             Event::ProjectAdded { .. }
+                | Event::ProjectUpdated { .. }
+                | Event::ProjectRemoved { .. }
                 | Event::ThreadCreated { .. }
                 | Event::ThreadUpdated { .. }
                 | Event::ThreadDeleted { .. }

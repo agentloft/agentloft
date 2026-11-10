@@ -4542,11 +4542,59 @@ fn project_header(
     };
     let menu = {
         let (store, all) = (store.clone(), all_projects.to_vec());
+        let (this_id, this_name, threads) = (id.clone(), project.name.clone(), threads.len());
         move |menu: gpui_kit::component::menu::PopupMenu,
               _: &mut Window,
-              _: &mut Context<gpui_kit::component::menu::PopupMenu>| {
+              cx: &mut Context<gpui_kit::component::menu::PopupMenu>| {
             use gpui_kit::component::menu::PopupMenuItem;
             let (s1, a1, s2, a2) = (store.clone(), all.clone(), store.clone(), all.clone());
+            // This project: pin, its settings, removing it (not for Chats).
+            let menu = if chats {
+                menu
+            } else {
+                let pinned = store.read(cx).pinned_projects.contains(&this_id);
+                let (s3, i3) = (store.clone(), this_id.clone());
+                let s4 = store.clone();
+                let (s5, i5, n5) = (store.clone(), this_id.clone(), this_name.clone());
+                menu.item(
+                    PopupMenuItem::new(if pinned { "Unpin" } else { "Pin" })
+                        .icon(if pinned {
+                            IconName::PinOff
+                        } else {
+                            IconName::Pin
+                        })
+                        .on_click(move |_, _, cx| {
+                            let id = i3.clone();
+                            s3.update(cx, |s, cx| s.toggle_pinned(id, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Project Settings…")
+                        .icon(IconName::Settings)
+                        .on_click(move |_, _, cx| {
+                            crate::settings::open(
+                                s4.clone(),
+                                Some(crate::settings::Section::Projects),
+                                cx,
+                            )
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Remove Project…")
+                        .icon(IconName::Trash)
+                        .on_click(move |_, window, cx| {
+                            confirm_remove_project(
+                                s5.clone(),
+                                i5.clone(),
+                                n5.clone(),
+                                threads,
+                                window,
+                                cx,
+                            )
+                        }),
+                )
+                .separator()
+            };
             menu.item(
                 PopupMenuItem::new("Collapse All")
                     .icon(IconName::ChevronsDownUp)
@@ -5456,6 +5504,50 @@ fn fork_submenu(
 }
 
 /// Confirm, then delete a thread for good.
+/// "Remove “name”?": its threads are deleted, its files stay.
+fn confirm_remove_project(
+    store: Entity<AppStore>,
+    project_id: ProjectId,
+    name: String,
+    threads: usize,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
+        let (store, project_id) = (store.clone(), project_id.clone());
+        let what = match threads {
+            0 => "It has no threads.".to_owned(),
+            1 => "Its thread is deleted, with its worktree and checkpoints.".to_owned(),
+            n => format!("Its {n} threads are deleted, with their worktrees and checkpoints."),
+        };
+        dialog
+            .title(format!("Remove “{name}” from Agentloft?"))
+            .child(format!(
+                "{what} The folder and its files on disk are not touched."
+            ))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").cursor_pointer().danger().label("Remove")),
+                    ),
+            )
+            .on_ok(move |_, _, cx| {
+                let id = project_id.clone();
+                store.update(cx, |s, cx| s.remove_project(id, cx));
+                true
+            })
+    });
+}
+
 fn confirm_delete(
     store: Entity<AppStore>,
     thread_id: ThreadId,

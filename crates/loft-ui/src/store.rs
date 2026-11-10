@@ -898,26 +898,40 @@ impl AppStore {
         });
     }
 
-    /// Where new and cloned projects go: next to the current project, else
-    /// next to the newest one, else ~/Projects.
+    /// Where Add Project starts and new and cloned projects go: Settings ▸
+    /// Projects ▸ "New projects start in", else the home folder.
+    pub fn projects_base(&self) -> std::path::PathBuf {
+        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
+        loft_config::Config::load(&self.paths)
+            .ok()
+            .and_then(|c| c.projects.base_dir)
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty())
+            .map(|d| match d.strip_prefix('~') {
+                Some(rest) => home.join(rest.trim_start_matches('/')),
+                None => d.into(),
+            })
+            .unwrap_or(home)
+    }
+
     pub fn projects_parent(&self) -> String {
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.workspace.thread(id))
-            .map(|t| t.project_id.clone());
-        let real: Vec<&loft_protocol::Project> = self
-            .workspace
-            .projects
-            .iter()
-            .filter(|p| !self.is_chats(p))
-            .collect();
-        real.iter()
-            .find(|p| Some(&p.id) == current.as_ref())
-            .or_else(|| real.iter().max_by_key(|p| p.created_at_ms))
-            .and_then(|p| std::path::Path::new(&p.root_path).parent())
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "~/Projects".into())
+        self.projects_base().to_string_lossy().into_owned()
+    }
+
+    pub fn rename_project(&mut self, project_id: ProjectId, name: String, cx: &mut Context<Self>) {
+        self.request(
+            Request::RenameProject { project_id, name },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    /// Remove a project from Agentloft (its threads too; files stay).
+    pub fn remove_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        self.pinned_projects.retain(|p| *p != project_id);
+        self.collapsed.remove(&project_id);
+        self.save_sidebar();
+        self.request(Request::RemoveProject { project_id }, cx, |_, _, _| {});
     }
 
     pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {

@@ -135,6 +135,16 @@ pub struct Config {
     pub ui: UiConfig,
     pub harness: HarnessConfigs,
     pub worktrees: WorktreeConfig,
+    pub projects: ProjectsConfig,
+}
+
+/// `[projects]` in config.toml.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectsConfig {
+    /// Where Add Project starts browsing and where new and cloned projects
+    /// go (`~` allowed); unset = the home folder.
+    pub base_dir: Option<String>,
 }
 
 /// `[worktrees]` in config.toml (PLAN §5.2).

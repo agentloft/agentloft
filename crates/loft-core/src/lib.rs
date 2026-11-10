@@ -535,6 +535,21 @@ impl Core {
             Request::AddProject { path, name } => self.add_project(path, name),
             Request::CreateChat { harness } => self.create_chat(harness),
             Request::CreateProject { parent, name } => self.create_project(parent, name).await,
+            Request::RenameProject { project_id, name } => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return Err(ErrorBody::new(ErrorCode::BadRequest, "empty name"));
+                }
+                let mut project = self
+                    .with_store(|s| s.project(&project_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+                project.name = name;
+                self.commit(vec![Event::ProjectUpdated {
+                    project: project.clone(),
+                }])?;
+                Ok(Response::Project { project })
+            }
+            Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
             Request::CloneProject {
                 parent,
                 source,
@@ -832,6 +847,22 @@ impl Core {
 
     /// A thread without a project: it lives in the built-in "Chats" project
     /// and works in an empty folder of its own.
+    /// Delete every thread of the project (stopping them, removing their
+    /// worktrees and checkpoints), then its entry. Files stay on disk.
+    async fn remove_project(self: &Arc<Self>, id: &ProjectId) -> CoreResult<Response> {
+        let threads = self.with_store(|s| s.threads())?;
+        if self.with_store(|s| s.project(id))?.is_none() {
+            return Err(ErrorBody::new(ErrorCode::NotFound, "project not found"));
+        }
+        for t in threads.iter().filter(|t| &t.project_id == id) {
+            self.delete_thread(&t.id).await?;
+        }
+        self.commit(vec![Event::ProjectRemoved {
+            project_id: id.clone(),
+        }])?;
+        Ok(Response::Ok)
+    }
+
     async fn create_project(&self, parent: String, name: String) -> CoreResult<Response> {
         let name = name.trim().to_owned();
         if name.is_empty() || name.contains('/') || name.starts_with('.') {

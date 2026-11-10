@@ -19,6 +19,7 @@ use loft_protocol::Request;
 
 mod agents;
 mod appearance;
+mod projects;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
 impl Global for SettingsWindow {}
@@ -155,6 +156,16 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Agents,
     },
     Findable {
+        label: "New projects folder",
+        keywords: "projects add clone new folder directory location base where",
+        section: Section::Projects,
+    },
+    Findable {
+        label: "Rename, pin or remove a project",
+        keywords: "projects delete remove rename pin",
+        section: Section::Projects,
+    },
+    Findable {
         label: "New threads: worktree or local",
         keywords: "worktrees ask local",
         section: Section::Worktrees,
@@ -195,6 +206,7 @@ pub const FINDABLE: &[Findable] = &[
 pub enum Section {
     Appearance,
     Agents,
+    Projects,
     Worktrees,
     About,
 }
@@ -206,9 +218,10 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s))
     }
 
-    const ALL: [Section; 4] = [
+    const ALL: [Section; 5] = [
         Section::Appearance,
         Section::Agents,
+        Section::Projects,
         Section::Worktrees,
         Section::About,
     ];
@@ -217,6 +230,7 @@ impl Section {
         match self {
             Section::Appearance => "Appearance",
             Section::Agents => "Agents",
+            Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
             Section::About => "About",
         }
@@ -226,6 +240,7 @@ impl Section {
         match self {
             Section::Appearance => IconName::Sun,
             Section::Agents => IconName::Bot,
+            Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
             Section::About => IconName::Sparkles,
         }
@@ -234,10 +249,11 @@ impl Section {
 
 /// Text fields, saved on Enter or blur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Field {
+pub(super) enum Field {
     UiFont,
     MonoFont,
     BranchPrefix,
+    ProjectsDir,
 }
 
 impl Field {
@@ -246,6 +262,7 @@ impl Field {
             Field::UiFont => &["ui", "font_family"],
             Field::MonoFont => &["ui", "mono_font_family"],
             Field::BranchPrefix => &["worktrees", "branch_prefix"],
+            Field::ProjectsDir => &["projects", "base_dir"],
         }
     }
 
@@ -254,6 +271,7 @@ impl Field {
             Field::UiFont => c.ui.font_family.clone().unwrap_or_default(),
             Field::MonoFont => c.ui.mono_font_family.clone().unwrap_or_default(),
             Field::BranchPrefix => c.worktrees.branch_prefix.clone(),
+            Field::ProjectsDir => c.projects.base_dir.clone().unwrap_or_default(),
         }
     }
 
@@ -262,6 +280,7 @@ impl Field {
             Field::UiFont => "System font",
             Field::MonoFont => "Theme monospace font",
             Field::BranchPrefix => "agentloft",
+            Field::ProjectsDir => "~/",
         }
     }
 
@@ -269,7 +288,7 @@ impl Field {
     fn value(self, text: &str) -> SettingValue {
         let text = text.trim();
         match (self, text.is_empty()) {
-            (Field::UiFont | Field::MonoFont, true) => SettingValue::Unset,
+            (Field::UiFont | Field::MonoFont | Field::ProjectsDir, true) => SettingValue::Unset,
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
             _ => SettingValue::Str(text.to_owned()),
         }
@@ -277,7 +296,7 @@ impl Field {
 
     /// Settings the daemon reads (it reloads on change).
     fn is_daemon(self) -> bool {
-        !matches!(self, Field::UiFont | Field::MonoFont)
+        !matches!(self, Field::UiFont | Field::MonoFont | Field::ProjectsDir)
     }
 }
 
@@ -289,6 +308,7 @@ pub struct SettingsView {
     error: Option<String>,
     studio: appearance::Studio,
     agents: agents::AgentsPage,
+    projects: projects::ProjectsPage,
     _subs: Vec<Subscription>,
 }
 
@@ -312,7 +332,12 @@ impl SettingsView {
         };
         let mut inputs = Vec::new();
         let mut subs = Vec::new();
-        for field in [Field::UiFont, Field::MonoFont, Field::BranchPrefix] {
+        for field in [
+            Field::UiFont,
+            Field::MonoFont,
+            Field::BranchPrefix,
+            Field::ProjectsDir,
+        ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
                 let mut s = InputState::new(window, cx).placeholder(field.placeholder());
@@ -341,11 +366,12 @@ impl SettingsView {
             error,
             studio,
             agents: agents::AgentsPage::new(),
+            projects: projects::ProjectsPage::default(),
             _subs: subs,
         }
     }
 
-    fn input(&self, field: Field) -> Entity<InputState> {
+    pub(super) fn input(&self, field: Field) -> Entity<InputState> {
         self.inputs
             .iter()
             .find(|(f, _)| *f == field)
@@ -576,6 +602,7 @@ impl Render for SettingsView {
         let body = match self.section {
             Section::Appearance => self.appearance(&p, window, cx),
             Section::Agents => self.agents_page(&p, window, cx),
+            Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
             Section::About => self.about(&p, cx),
         };
@@ -639,7 +666,7 @@ impl Render for SettingsView {
 
 // -- building blocks --------------------------------------------------------
 
-fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoElement {
+pub(super) fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoElement {
     h_flex()
         .gap_6()
         .items_center()
@@ -667,14 +694,14 @@ fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoEl
         .child(div().flex_shrink_0().child(control))
 }
 
-fn text_input(state: &Entity<InputState>) -> AnyElement {
+pub(super) fn text_input(state: &Entity<InputState>) -> AnyElement {
     div()
         .w(px(260.))
         .child(Input::new(state).small())
         .into_any_element()
 }
 
-fn path_link(
+pub(super) fn path_link(
     id: &'static str,
     path: std::path::PathBuf,
     p: &Palette,
