@@ -54,6 +54,8 @@ pub(crate) struct AskForm {
     expanded: bool,
     /// Answered; waiting for the request to close.
     sent: bool,
+    /// Keys for the form itself: 1–9 pick, ↩ next/submit, ←/→ questions.
+    focus: gpui_kit::FocusHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -115,7 +117,13 @@ impl AskForm {
                 _ => {}
             }),
         );
+        // A question takes the keys (1–9, ↩) as it opens.
+        let focus = cx.focus_handle();
+        if request.kind == RequestKind::Question {
+            window.focus(&focus, cx);
+        }
         Self {
+            focus,
             picked: vec![Vec::new(); questions.len()],
             questions,
             request,
@@ -247,50 +255,82 @@ impl AskForm {
         cx.notify();
     }
 
+    /// Keys while the form itself has focus (not one of its fields).
+    fn on_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.request.kind != RequestKind::Question || self.questions.is_empty() {
+            return false;
+        }
+        let ix = self.current.min(self.questions.len() - 1);
+        match key {
+            "enter" => self.next_or_submit(window, cx),
+            "left" if ix > 0 => self.current = ix - 1,
+            "right" if ix + 1 < self.questions.len() => self.current = ix + 1,
+            "escape" => self.decide(DecisionKind::Deny, cx),
+            k => {
+                let Some(n) = k.parse::<usize>().ok().filter(|n| *n >= 1) else {
+                    return false;
+                };
+                let q = &self.questions[ix];
+                if n <= q.options.len() {
+                    self.pick(ix, n - 1, window, cx);
+                } else if n == q.options.len() + 1 && q.allow_other {
+                    self.other[ix].update(cx, |s, cx| s.focus(window, cx));
+                } else {
+                    return false;
+                }
+            }
+        }
+        cx.notify();
+        true
+    }
+
     fn render_question(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let count = self.questions.len();
-        let ix = self.current.min(count.saturating_sub(1));
-        let headline = if count > 1 {
-            format!("{} has {count} questions", self.agent)
-        } else {
-            format!("{} has a question", self.agent)
-        };
-        let mut card = shell(p, IconName::MessageCircleQuestionMark, headline, p.accent);
         if count == 0 {
-            return card.into_any_element();
+            return div().into_any_element();
         }
+        let ix = self.current.min(count - 1);
+        let id = self.request.id.clone();
+        let q = self.questions[ix].clone();
 
-        // Tabs, when there is more than one question.
-        if count > 1 {
-            let mut tabs = h_flex().gap_1().flex_wrap();
-            for (k, q) in self.questions.iter().enumerate() {
+        // Top line: who asks (or the questions, as tabs) and where we are.
+        let mut top = h_flex().gap_1().items_center().min_w_0().child(
+            div()
+                .mr_1()
+                .text_color(p.accent)
+                .child(Icon::new(IconName::MessageCircleQuestionMark).xsmall()),
+        );
+        if count == 1 {
+            top = top.child(
+                div()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .child(format!("{} has a question", self.agent)),
+            );
+        } else {
+            for (k, question) in self.questions.iter().enumerate() {
                 let active = k == ix;
                 let done = self.answered(k, cx);
-                let label = if q.header.is_empty() {
+                let label = if question.header.is_empty() {
                     format!("Question {}", k + 1)
                 } else {
-                    q.header.clone()
+                    question.header.clone()
                 };
-                tabs = tabs.child(
+                top = top.child(
                     h_flex()
-                        .id(SharedString::from(format!(
-                            "ask-tab-{}-{k}",
-                            self.request.id
-                        )))
+                        .id(SharedString::from(format!("ask-tab-{id}-{k}")))
                         .gap_1()
                         .px_2()
-                        .py(px(3.))
-                        .rounded(px(999.))
+                        .py(px(2.))
+                        .rounded(px(6.))
                         .text_xs()
                         .cursor_pointer()
-                        .border_1()
-                        .border_color(if active { p.accent } else { p.border })
-                        .when(active, |d| d.bg(p.accent_soft).text_color(p.foreground))
+                        .when(active, |d| d.bg(p.muted).text_color(p.foreground))
                         .when(!active, |d| {
                             d.text_color(p.muted_foreground)
-                                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                .hover(|d| d.text_color(p.foreground))
                         })
-                        .when(done, |d| {
+                        .when(done && !active, |d| {
                             d.child(
                                 div()
                                     .text_color(p.success)
@@ -304,68 +344,106 @@ impl AskForm {
                         })),
                 );
             }
-            card = card.child(tabs);
         }
+        let top = h_flex()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .child(top)
+            .when(count > 1, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child(format!("{} of {count}", ix + 1)),
+                )
+            });
 
-        let q = self.questions[ix].clone();
-        card = card.child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.foreground)
-                .child(q.question.clone()),
-        );
-        if q.multi_select {
-            card = card.child(
+        let question = h_flex()
+            .px_1()
+            .gap_2()
+            .items_baseline()
+            .flex_wrap()
+            .child(
                 div()
-                    .text_xs()
-                    .text_color(p.faint_foreground)
-                    .child("Pick any that apply"),
-            );
-        }
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.foreground)
+                    .child(q.question.clone()),
+            )
+            .when(q.multi_select, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child("Pick any"),
+                )
+            });
 
-        let mut options = v_flex().gap_1p5();
+        let badge = |text: AnyElement, on: bool| {
+            div()
+                .flex_none()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .text_xs()
+                .when(on, |d| d.bg(p.accent).text_color(p.accent_foreground))
+                .when(!on, |d| {
+                    d.border_1()
+                        .border_color(p.border)
+                        .text_color(p.muted_foreground)
+                })
+                .child(text)
+        };
+        let mut options = v_flex().gap_0p5();
         for (o, option) in q.options.iter().enumerate() {
             let on = self.picked[ix].contains(&o);
-            let mark = match (q.multi_select, on) {
-                (true, true) => IconName::SquareCheck,
-                (true, false) => IconName::Square,
-                (false, true) => IconName::CircleDot,
-                (false, false) => IconName::Circle,
+            // "(Recommended)" reads better as a tag.
+            let (label, recommended) = match option.label.strip_suffix("(Recommended)") {
+                Some(rest) => (rest.trim_end().to_owned(), true),
+                None => (option.label.clone(), false),
+            };
+            let mark = if on && q.multi_select {
+                Icon::new(IconName::Check).xsmall().into_any_element()
+            } else {
+                format!("{}", o + 1).into_any_element()
             };
             options = options.child(
                 h_flex()
-                    .id(SharedString::from(format!(
-                        "ask-opt-{}-{ix}-{o}",
-                        self.request.id
-                    )))
+                    .id(SharedString::from(format!("ask-opt-{id}-{ix}-{o}")))
                     .gap_2p5()
                     .items_start()
-                    .px_3()
-                    .py_2()
-                    .rounded(px(10.))
-                    .border_1()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(px(8.))
                     .cursor_pointer()
-                    .border_color(if on { p.accent } else { p.border })
-                    .bg(if on { p.accent_soft } else { p.background })
+                    .when(on, |d| d.bg(p.accent_soft))
                     .when(!on, |d| d.hover(|d| d.bg(p.hover)))
-                    .child(
-                        div()
-                            .pt(px(2.))
-                            .text_color(if on { p.accent } else { p.faint_foreground })
-                            .child(Icon::new(mark).small()),
-                    )
+                    .child(badge(mark, on))
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .gap_0p5()
+                            .pt(px(1.))
                             .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(p.foreground)
-                                    .child(option.label.clone()),
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_sm().text_color(p.foreground).child(label))
+                                    .when(recommended, |d| {
+                                        d.child(
+                                            div()
+                                                .px_1p5()
+                                                .rounded(px(4.))
+                                                .bg(p.accent_soft)
+                                                .text_color(p.accent)
+                                                .text_xs()
+                                                .child("Recommended"),
+                                        )
+                                    }),
                             )
                             .when(!option.description.is_empty(), |d| {
                                 d.child(
@@ -376,64 +454,39 @@ impl AskForm {
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.faint_foreground)
-                            .child(format!("{}", o + 1)),
-                    )
                     .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, o, window, cx))),
             );
         }
         if q.allow_other {
             let typed = self.typed(ix, cx).is_some();
+            let n = q.options.len() + 1;
             options = options.child(
-                div()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(if typed { p.accent } else { p.border })
-                    .bg(p.background)
-                    .px_1()
-                    .child(Input::new(&self.other[ix]).appearance(false).small()),
-            );
-        }
-        card = card.child(options);
-
-        // Skip / stop on the left; back, next or submit on the right.
-        let id = self.request.id.clone();
-        let ready = self.all_answered(cx);
-        let last = !(0..count).any(|k| k != ix && !self.answered(k, cx));
-        let submit_hint = crate::keymap::display("secondary-enter");
-        let mut left = h_flex().gap_1();
-        if self.request.options.contains(&DecisionKind::DenyAndStop) {
-            left = left.child(
-                Button::new(SharedString::from(format!("{id}-stop")))
-                    .label("Stop")
-                    .ghost()
-                    .danger()
-                    .small()
-                    .cursor_pointer()
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.decide(DecisionKind::DenyAndStop, cx)),
+                h_flex()
+                    .gap_2p5()
+                    .items_center()
+                    .pl_2()
+                    .pr_1()
+                    .rounded(px(8.))
+                    .when(typed, |d| d.bg(p.accent_soft))
+                    .child(badge(format!("{n}").into_any_element(), typed))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.other[ix]).appearance(false).small()),
                     ),
             );
         }
-        if self.request.options.contains(&DecisionKind::Deny) {
-            left = left.child(
-                Button::new(SharedString::from(format!("{id}-skip")))
-                    .label("Skip")
-                    .ghost()
-                    .small()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.decide(DecisionKind::Deny, cx))),
-            );
-        }
-        let mut right = h_flex().gap_1();
+
+        // Skip on the left; back and next/submit on the right.
+        let ready = self.all_answered(cx);
+        let last = !(0..count).any(|k| k != ix && !self.answered(k, cx));
+        let mut right = h_flex().gap_1().items_center();
         if count > 1 && ix > 0 {
             right = right.child(
                 Button::new(SharedString::from(format!("{id}-back")))
                     .label("Back")
-                    .outline()
+                    .ghost()
                     .small()
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -442,9 +495,12 @@ impl AskForm {
                     })),
             );
         }
-        let primary = if ready || last || count == 1 {
+        let primary = if ready || last {
             Button::new(SharedString::from(format!("{id}-submit")))
-                .label(format!("Submit  {submit_hint}"))
+                .label(format!(
+                    "Submit  {}",
+                    crate::keymap::display("secondary-enter")
+                ))
                 .primary()
                 .small()
                 .disabled(!ready || self.sent)
@@ -460,95 +516,112 @@ impl AskForm {
                 .on_click(cx.listener(|this, _, window, cx| this.next_or_submit(window, cx)))
         };
         right = right.child(primary);
-        card.child(
-            h_flex()
-                .pt_1()
-                .justify_between()
-                .items_center()
-                .child(left)
-                .child(right),
-        )
-        .into_any_element()
+        let footer = h_flex()
+            .pt_1()
+            .justify_between()
+            .items_center()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when(self.request.options.contains(&DecisionKind::Deny), |d| {
+                        d.child(
+                            Button::new(SharedString::from(format!("{id}-skip")))
+                                .label("Skip")
+                                .ghost()
+                                .small()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.decide(DecisionKind::Deny, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.faint_foreground)
+                            .child("1–9 to pick · ↩ to continue"),
+                    ),
+            )
+            .child(right);
+
+        shell(p, "ask", &id, cx)
+            .gap_2()
+            .child(top)
+            .child(question)
+            .child(options)
+            .child(footer)
+            .into_any_element()
     }
 
     fn render_plan(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let id = self.request.id.clone();
         let plan = self.request.plan().unwrap_or_default().to_owned();
         let expanded = self.expanded;
-        let card = shell(
-            p,
-            IconName::ListChecks,
-            format!("{} has a plan", self.agent),
-            p.accent,
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(p.muted_foreground)
-                .child("Approve it to start, or say what to change and it keeps planning."),
-        )
-        .child(
-            div()
-                .relative()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(p.border)
-                .bg(p.background)
-                .child(
-                    div()
-                        .id(SharedString::from(format!("plan-{id}")))
-                        .px_4()
-                        .py_3()
-                        .when(!expanded, |d| d.max_h(px(320.)))
-                        .overflow_y_scroll()
-                        .child(
-                            TextView::markdown(SharedString::from(format!("plan-md-{id}")), plan)
-                                .selectable(true),
-                        ),
-                )
-                .child(
-                    div().absolute().top(px(6.)).right(px(6.)).child(
-                        Button::new(SharedString::from(format!("{id}-expand")))
-                            .icon(if expanded {
-                                IconName::ChevronsDownUp
-                            } else {
-                                IconName::ChevronsUpDown
-                            })
-                            .ghost()
-                            .xsmall()
-                            .cursor_pointer()
-                            .tooltip(if expanded { "Collapse" } else { "Expand" })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.expanded = !this.expanded;
-                                cx.notify();
-                            })),
+        let top = h_flex()
+            .justify_between()
+            .items_center()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_color(p.accent)
+                            .child(Icon::new(IconName::ListChecks).xsmall()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(p.muted_foreground)
+                            .child(format!("{} has a plan", self.agent)),
                     ),
-                ),
-        );
+            )
+            .child(
+                Button::new(SharedString::from(format!("{id}-expand")))
+                    .icon(if expanded {
+                        IconName::ChevronsDownUp
+                    } else {
+                        IconName::ChevronsUpDown
+                    })
+                    .ghost()
+                    .xsmall()
+                    .cursor_pointer()
+                    .tooltip(if expanded { "Collapse" } else { "Expand" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.expanded = !this.expanded;
+                        cx.notify();
+                    })),
+            );
+        let body = div()
+            .id(SharedString::from(format!("plan-{id}")))
+            .px_1()
+            .when(!expanded, |d| d.max_h(px(300.)))
+            .overflow_y_scroll()
+            .child(
+                TextView::markdown(SharedString::from(format!("plan-md-{id}")), plan)
+                    .selectable(true),
+            );
+
         let feedback = !self.feedback.read(cx).value().trim().is_empty();
-        let hint = |keys: &str| crate::keymap::display(keys);
-        let mut buttons = h_flex().gap_1p5().flex_wrap().items_center();
-        // Approve first (the primary), then the rest.
         let mut options = self.request.options.clone();
+        // Keep planning, then the approvals, the primary last (rightmost).
         options.sort_by_key(|d| match d {
-            DecisionKind::AllowOnce => 0,
-            DecisionKind::AllowSession => 1,
-            DecisionKind::Deny => 2,
-            DecisionKind::DenyAndStop => 3,
+            DecisionKind::DenyAndStop => 0,
+            DecisionKind::Deny => 1,
+            DecisionKind::AllowSession => 2,
+            DecisionKind::AllowOnce => 3,
         });
+        let mut buttons = h_flex().gap_1().items_center();
         for decision in options {
-            let (label, keys) = match decision {
-                DecisionKind::AllowOnce => ("Approve", "secondary-enter"),
-                DecisionKind::AllowSession => ("Approve & accept edits", "secondary-shift-enter"),
-                DecisionKind::Deny if feedback => ("Send feedback", "secondary-shift-backspace"),
-                DecisionKind::Deny => ("Keep planning", "secondary-shift-backspace"),
-                DecisionKind::DenyAndStop => ("Stop", ""),
-            };
-            let keys = hint(keys);
-            let label = if keys.is_empty() {
-                label.to_owned()
-            } else {
-                format!("{label}  {keys}")
+            let label = match decision {
+                DecisionKind::AllowOnce => {
+                    format!("Approve  {}", crate::keymap::display("secondary-enter"))
+                }
+                DecisionKind::AllowSession => "Approve & accept edits".to_owned(),
+                DecisionKind::Deny if feedback => "Send feedback".to_owned(),
+                DecisionKind::Deny => "Keep planning".to_owned(),
+                DecisionKind::DenyAndStop => "Stop".to_owned(),
             };
             let button = Button::new(SharedString::from(format!("{id}-{decision:?}")))
                 .label(label)
@@ -557,61 +630,76 @@ impl AskForm {
                 .cursor_pointer();
             let button = match decision {
                 DecisionKind::AllowOnce => button.primary(),
-                DecisionKind::AllowSession => button.outline(),
                 DecisionKind::Deny if feedback => button.outline(),
-                DecisionKind::Deny => button.ghost(),
-                DecisionKind::DenyAndStop => button.ghost().danger(),
+                _ => button.ghost(),
             };
             buttons = buttons.child(
                 button.on_click(cx.listener(move |this, _, _, cx| this.decide(decision, cx))),
             );
         }
-        card.child(
-            div()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(if feedback { p.accent } else { p.border })
-                .bg(p.background)
-                .px_1()
-                .child(Input::new(&self.feedback).appearance(false).small()),
-        )
-        .child(buttons)
-        .into_any_element()
+        let footer = h_flex()
+            .gap_2()
+            .items_center()
+            .pt_2()
+            .border_t_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.feedback).appearance(false).small()),
+            )
+            .child(buttons);
+
+        shell(p, "plan", &id, cx)
+            .gap_2()
+            .child(top)
+            .child(body)
+            .child(footer)
+            .into_any_element()
     }
 }
 
 impl Render for AskForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
-        match self.request.kind {
+        let body = match self.request.kind {
             RequestKind::Plan => self.render_plan(&p, cx),
             _ => self.render_question(&p, cx),
-        }
+        };
+        div()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, window, cx| {
+                // Only when the form itself is focused, not a field in it.
+                let m = &e.keystroke.modifiers;
+                if this.focus.is_focused(window)
+                    && !(m.platform || m.control || m.alt)
+                    && this.on_key(&e.keystroke.key, window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(body)
     }
 }
 
-/// The card around a form: an accent edge, an icon and a headline.
-fn shell(p: &Palette, icon: IconName, headline: String, tint: gpui_kit::Hsla) -> gpui_kit::Div {
+/// The card around a form, in the composer's style.
+fn shell(
+    p: &Palette,
+    kind: &str,
+    id: &loft_protocol::RequestId,
+    cx: &mut Context<AskForm>,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
     v_flex()
-        .p_3()
-        .gap_2p5()
-        .rounded(px(14.))
+        .id(SharedString::from(format!("{kind}-card-{id}")))
+        .p_2p5()
+        .rounded(px(16.))
         .border_1()
-        .border_color(tint.opacity(0.4))
+        .border_color(p.border)
         .bg(p.elevated)
         .shadow_md()
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(div().text_color(tint).child(Icon::new(icon).small()))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(p.foreground)
-                        .child(headline),
-                ),
-        )
+        // A click on the card (not a field) gives it the keys.
+        .on_click(cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
 }
 
 /// The timeline's record of a question or plan tool call: what was asked
