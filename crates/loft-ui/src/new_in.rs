@@ -61,15 +61,17 @@ pub fn open(
             .max_h(px(460.))
             .footer(|_, _, cx| crate::palette::key_hints(cx))
             .group(
-                CommandGroup::new().label("Projects").items(rows.iter().map(|r| {
-                    let row = r.clone();
-                    let mut keywords = vec![r.name.clone()];
-                    keywords.extend(r.detail.clone());
-                    CommandItem::new()
-                        .label(r.name.clone())
-                        .keywords(keywords)
-                        .child(move |_, cx| render_row(&row, cx))
-                })),
+                CommandGroup::new()
+                    .label("Projects")
+                    .items(rows.iter().map(|r| {
+                        let row = r.clone();
+                        let mut keywords = vec![r.name.clone()];
+                        keywords.extend(r.detail.clone());
+                        CommandItem::new()
+                            .label(r.name.clone())
+                            .keywords(keywords)
+                            .child(move |_, cx| render_row(&row, cx))
+                    })),
             );
         let (keys_pick, keys_rows) = (pick.clone(), rows.clone());
         let esc_state = state.clone();
@@ -99,15 +101,19 @@ pub fn open(
                             return;
                         }
                         let found = if m.alt && ks.key == "n" {
-                            keys_rows.iter().position(|r| matches!(r.target, Target::Chat))
+                            keys_rows
+                                .iter()
+                                .position(|r| matches!(r.target, Target::Chat))
                         } else {
-                            ks.key.parse::<usize>().ok().filter(|n| (1..=9).contains(n)).and_then(
-                                |n| {
-                                    keys_rows
-                                        .iter()
-                                        .position(|r| r.shortcut.as_deref() == Some(&format!("⌘{n}")))
-                                },
-                            )
+                            ks.key
+                                .parse::<usize>()
+                                .ok()
+                                .filter(|n| (1..=9).contains(n))
+                                .and_then(|n| {
+                                    keys_rows.iter().position(|r| {
+                                        r.shortcut.as_deref() == Some(&format!("⌘{n}"))
+                                    })
+                                })
                         };
                         if let Some(ix) = found {
                             cx.stop_propagation();
