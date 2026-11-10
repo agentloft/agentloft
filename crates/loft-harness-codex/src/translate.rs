@@ -4,8 +4,8 @@
 
 use loft_harness::{HarnessEvent, ToolResult};
 use loft_protocol::{
-    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, RequestKind,
-    ToolKind, TurnStatus, Usage,
+    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, Question,
+    QuestionOption, RequestKind, RequestReply, ToolKind, TurnStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -80,6 +80,8 @@ enum ApprovalKind {
     Decision,
     /// MCP tool call via `mcpServer/elicitation/request` → `{action}`.
     McpTool,
+    /// Questions via `item/tool/requestUserInput` → `{answers}`.
+    UserInput,
 }
 
 #[derive(Debug, Clone)]
@@ -919,7 +921,12 @@ impl Translator {
         vec![]
     }
 
-    pub fn respond(&mut self, request_id: &str, decision: DecisionKind) -> Vec<Out> {
+    pub fn respond(
+        &mut self,
+        request_id: &str,
+        decision: DecisionKind,
+        reply: Option<RequestReply>,
+    ) -> Vec<Out> {
         let Some(open) = self.approvals.remove(request_id) else {
             return vec![];
         };
@@ -931,13 +938,34 @@ impl Translator {
                 "decision": decision_value(decision, &open.available, open.command.as_deref())
             }),
             ApprovalKind::McpTool => mcp_action(decision),
+            ApprovalKind::UserInput => {
+                // Skipped (or stopped): no answers.
+                let answers: serde_json::Map<String, Value> = reply
+                    .filter(|_| {
+                        matches!(
+                            decision,
+                            DecisionKind::AllowOnce | DecisionKind::AllowSession
+                        )
+                    })
+                    .map(|r| r.answers)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| (a.id, json!({ "answers": a.answers })))
+                    .collect();
+                json!({ "answers": answers })
+            }
         };
-        vec![
+        let mut out = vec![
             Out::Send(json!({ "id": open.rpc_id, "result": result })),
             Out::Event(HarnessEvent::RequestResolved {
                 native_id: request_id.to_owned(),
             }),
-        ]
+        ];
+        // A question has no "cancel" answer: stop the turn ourselves.
+        if open.kind == ApprovalKind::UserInput && decision == DecisionKind::DenyAndStop {
+            out.extend(self.interrupt());
+        }
+        out
     }
 
     // -- incoming -----------------------------------------------------------
@@ -1365,6 +1393,34 @@ impl Translator {
                     related_item: None,
                 })];
             }
+            "item/tool/requestUserInput" => {
+                let questions = user_input_questions(p);
+                let first = questions
+                    .first()
+                    .map(|q| q.question.clone())
+                    .unwrap_or_default();
+                self.approvals.insert(
+                    native_id.clone(),
+                    OpenApproval {
+                        kind: ApprovalKind::UserInput,
+                        rpc_id: id,
+                        available: vec![],
+                        command: None,
+                    },
+                );
+                return vec![Out::Event(HarnessEvent::RequestOpened {
+                    native_id,
+                    kind: RequestKind::Question,
+                    title: format!("Question: {first}"),
+                    detail: json!({ "questions": questions }),
+                    options: vec![
+                        DecisionKind::AllowOnce,
+                        DecisionKind::Deny,
+                        DecisionKind::DenyAndStop,
+                    ],
+                    related_item: item_id,
+                })];
+            }
             "mcpServer/elicitation/request" => {
                 // Real MCP form elicitations aren't supported yet: decline.
                 return vec![Out::Send(
@@ -1563,6 +1619,44 @@ fn tool_body(item: &Value, cwd: &str) -> Option<ItemBody> {
         }
         _ => return None,
     })
+}
+
+/// `item/tool/requestUserInput`'s questions in canonical form.
+fn user_input_questions(p: &Value) -> Vec<Question> {
+    let text = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    p.get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|q| {
+            let options: Vec<QuestionOption> = q
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|o| QuestionOption {
+                    label: text(o, "label"),
+                    description: text(o, "description"),
+                })
+                .collect();
+            let flag = |k: &str| q.get(k).and_then(Value::as_bool).unwrap_or(false);
+            Question {
+                id: text(q, "id"),
+                header: text(q, "header"),
+                question: text(q, "question"),
+                multi_select: false,
+                // No options: the answer can only be typed.
+                allow_other: flag("isOther") || options.is_empty(),
+                secret: flag("isSecret"),
+                options,
+            }
+        })
+        .collect()
 }
 
 fn item_started(item: &Value, cwd: &str) -> Option<HarnessEvent> {
@@ -2132,7 +2226,7 @@ mod tests {
                             DecisionKind::DenyAndStop
                         ]
                     );
-                    let reply = t.respond(native_id, DecisionKind::AllowOnce);
+                    let reply = t.respond(native_id, DecisionKind::AllowOnce, None);
                     let Out::Send(v) = &reply[0] else { panic!() };
                     assert_eq!(v["result"]["decision"], "accept");
                     out.extend(reply);
@@ -2253,10 +2347,42 @@ mod tests {
             panic!("{out:?}")
         };
         assert_eq!(title, "MCP: github · list_threads");
-        let reply = t.respond(native_id, DecisionKind::Deny);
+        let reply = t.respond(native_id, DecisionKind::Deny, None);
         let Out::Send(v) = &reply[0] else { panic!() };
         assert_eq!(v["id"], 4);
         assert_eq!(v["result"]["action"], "decline");
+    }
+
+    #[test]
+    fn request_user_input_is_a_question() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        let out = t.on_line(
+            r#"{"id":7,"method":"item/tool/requestUserInput","params":{"threadId":"t","turnId":"u","itemId":"i1","isBlocking":true,"questions":[{"id":"db","header":"Database","question":"Which DB?","isOther":true,"options":[{"label":"SQLite","description":"a file"}]},{"id":"key","header":"Key","question":"API key?","isSecret":true,"options":null}]}}"#,
+        );
+        let Out::Event(HarnessEvent::RequestOpened {
+            native_id,
+            kind,
+            detail,
+            ..
+        }) = &out[0]
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(*kind, RequestKind::Question);
+        let qs: Vec<Question> = serde_json::from_value(detail["questions"].clone()).unwrap();
+        assert_eq!((qs[0].id.as_str(), qs[0].allow_other), ("db", true));
+        assert!(qs[1].secret && qs[1].allow_other && qs[1].options.is_empty());
+        let reply = RequestReply {
+            answers: vec![loft_protocol::QuestionAnswer {
+                id: "db".into(),
+                answers: vec!["SQLite".into()],
+            }],
+            message: None,
+        };
+        let out = t.respond(native_id, DecisionKind::AllowOnce, Some(reply));
+        let Out::Send(v) = &out[0] else { panic!() };
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["answers"]["db"]["answers"][0], "SQLite");
     }
 
     #[test]
@@ -2451,7 +2577,7 @@ mod tests {
     #[test]
     fn unsupported_server_requests_are_answered() {
         let mut t = Translator::new("/w".into(), None, None, None);
-        let out = t.on_line(r#"{"id":7,"method":"item/tool/requestUserInput","params":{}}"#);
+        let out = t.on_line(r#"{"id":7,"method":"account/chatgptAuthTokens/refresh","params":{}}"#);
         let Out::Send(v) = &out[0] else { panic!() };
         assert_eq!(v["id"], 7);
         assert!(v.get("error").is_some());

@@ -449,6 +449,73 @@ pub struct RuntimeRequest {
     pub status: RequestStatus,
     pub decision: Option<DecisionKind>,
     pub opened_at_ms: i64,
+    /// What the user answered (questions) or said (a plan sent back).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<RequestReply>,
+}
+
+impl RuntimeRequest {
+    /// A question request's questions (`detail.questions`).
+    pub fn questions(&self) -> Vec<Question> {
+        self.detail
+            .get("questions")
+            .and_then(|q| serde_json::from_value(q.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// A plan request's plan, as Markdown (`detail.plan`).
+    pub fn plan(&self) -> Option<&str> {
+        self.detail.get("plan").and_then(|p| p.as_str())
+    }
+}
+
+/// One question an agent asks (`RequestKind::Question`; the request's
+/// `detail` is `{"questions": [Question…]}`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Question {
+    /// What the answer is keyed by when it goes back to the agent.
+    pub id: String,
+    /// A short label for it (a tab, a chip).
+    #[serde(default)]
+    pub header: String,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    /// More than one option may be picked.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// The user may type an answer of their own.
+    #[serde(default)]
+    pub allow_other: bool,
+    /// The typed answer is a secret (hide it as it is typed).
+    #[serde(default)]
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// What goes back with a decision beyond allow/deny.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RequestReply {
+    /// Answers to a question request, one per question answered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<QuestionAnswer>,
+    /// Words for the agent (a plan sent back: what to change).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QuestionAnswer {
+    /// The question's `id`.
+    pub id: String,
+    /// Labels picked and/or text typed.
+    pub answers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -456,7 +523,12 @@ pub struct RuntimeRequest {
 pub enum RequestKind {
     ToolApproval,
     FileChangeApproval,
+    /// The agent asks the user something (`detail.questions`).
     Question,
+    /// The agent has a plan and asks to go ahead with it (`detail.plan`).
+    /// Allow = approve, AllowSession = approve and accept edits, Deny =
+    /// keep planning (with `RequestReply::message` as feedback).
+    Plan,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

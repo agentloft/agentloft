@@ -769,10 +769,12 @@ impl Core {
                 thread_id,
                 request_id,
                 decision,
+                reply: answer,
             } => {
                 self.thread_call(&thread_id, |reply| ThreadCmd::Respond {
                     request_id,
                     decision,
+                    answer,
                     reply,
                 })
                 .await

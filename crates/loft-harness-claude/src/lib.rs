@@ -182,8 +182,8 @@ async fn run(
                         waiting.insert(id, reply);
                         vec![translate::Out::Send(v)]
                     }
-                    Some(SessionCommand::Respond { native_request_id, decision }) => {
-                        t.respond(&native_request_id, decision)
+                    Some(SessionCommand::Respond { native_request_id, decision, reply }) => {
+                        t.respond(&native_request_id, decision, reply)
                     }
                     Some(SessionCommand::SetModel(model)) => t.set_model(model.as_deref()),
                     // The core restarts the session with `--effort` instead.

@@ -189,8 +189,8 @@ async fn run(
                         waiting.insert(query, reply);
                         outs
                     }
-                    Some(SessionCommand::Respond { native_request_id, decision }) => {
-                        t.respond(&native_request_id, decision)
+                    Some(SessionCommand::Respond { native_request_id, decision, reply }) => {
+                        t.respond(&native_request_id, decision, reply)
                     }
                     Some(SessionCommand::SetModel(model)) => t.set_model(model),
                     Some(SessionCommand::SetEffort(effort)) => {

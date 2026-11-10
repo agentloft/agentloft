@@ -164,6 +164,9 @@ pub struct WorkspaceView {
     picker_open: bool,
     /// Pending debounced draft saves, per thread.
     draft_saves: HashMap<ThreadId, gpui_kit::Task<()>>,
+    /// The forms for open questions and plans (kept while open, so what
+    /// was picked or typed survives switching threads).
+    ask_forms: HashMap<loft_protocol::RequestId, Entity<crate::ask::AskForm>>,
     /// Threads whose saved draft has been put back in their composer.
     drafts_restored: std::collections::HashSet<ThreadId>,
     /// The new-worktree branch chooser and whether it's open.
@@ -298,6 +301,7 @@ impl WorkspaceView {
             branch_picker: None,
             branch_picker_open: false,
             draft_saves: HashMap::new(),
+            ask_forms: HashMap::new(),
             drafts_restored: Default::default(),
             sidebar_open: true,
             panel,
@@ -1718,11 +1722,64 @@ impl WorkspaceView {
             .cloned()
     }
 
+    /// The forms for `thread`'s open questions and plans, made as they
+    /// open; forms whose request closed are dropped.
+    fn ask_forms_for(
+        &mut self,
+        thread: &Entity<ThreadState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Entity<crate::ask::AskForm>> {
+        let (open, agent) = {
+            let state = thread.read(cx);
+            let Some(model) = state.model.as_ref() else {
+                return Vec::new();
+            };
+            let open: Vec<loft_protocol::RuntimeRequest> = model
+                .open_requests()
+                .filter(|r| crate::ask::is_form(r))
+                .cloned()
+                .collect();
+            (open, harness_name(&model.thread.harness))
+        };
+        // Drop forms whose request is no longer open anywhere.
+        let store = self.store.read(cx);
+        self.ask_forms.retain(|id, form| {
+            let thread_id = &form.read(cx).request.thread_id;
+            store
+                .threads
+                .get(thread_id)
+                .and_then(|t| t.read(cx).model.as_ref())
+                .is_some_and(|m| m.open_requests().any(|r| &r.id == id))
+        });
+        let mut forms = Vec::new();
+        for req in open {
+            let form = match self.ask_forms.get(&req.id) {
+                Some(f) => f.clone(),
+                None => {
+                    let store = self.store.clone();
+                    let id = req.id.clone();
+                    let f = cx.new(|cx| crate::ask::AskForm::new(req, store, agent, window, cx));
+                    self.ask_forms.insert(id, f.clone());
+                    f
+                }
+            };
+            forms.push(form);
+        }
+        forms
+    }
+
     fn answer(&mut self, decision: loft_protocol::DecisionKind, cx: &mut Context<Self>) {
         let Some(req) = self.open_request(cx) else {
             return;
         };
         if !req.options.contains(&decision) {
+            return;
+        }
+        // Questions and plans answer through their form (the answers, the
+        // feedback typed).
+        if let Some(form) = self.ask_forms.get(&req.id).cloned() {
+            form.update(cx, |f, cx| f.decide(decision, cx));
             return;
         }
         self.store
@@ -3311,6 +3368,7 @@ impl WorkspaceView {
             .and_then(|m| m.thread.parent.clone());
         let fork_bar = fork_parent.map(|parent| self.fork_bar(parent, p, cx));
         let turn_map = self.turn_map(&thread, p, cx);
+        let ask_forms = self.ask_forms_for(&thread, window, cx);
         let state = thread.read(cx);
         let Some(model) = state.model.as_ref() else {
             return v_flex()
@@ -3336,6 +3394,7 @@ impl WorkspaceView {
             .collect();
         let pinned: Vec<AnyElement> = model
             .open_requests()
+            .filter(|req| !crate::ask::is_form(req))
             .filter(|req| {
                 let ix = req
                     .item_id
@@ -3378,6 +3437,11 @@ impl WorkspaceView {
                     ))
                     .into_any_element()
             })
+            .collect();
+        let pinned: Vec<AnyElement> = ask_forms
+            .into_iter()
+            .map(|f| f.into_any_element())
+            .chain(pinned)
             .collect();
         let waiting = pinned.is_empty() && model.open_requests().next().is_some();
         // Nothing said yet, and nothing waiting to be.
@@ -5115,6 +5179,26 @@ fn subtitle_line(sub: &Subtitle, branch: Option<&str>, p: &Palette) -> AnyElemen
 
 /// When the running turn started: the open thread's turn if we have it,
 /// else when the thread last changed status (its turn start, mostly).
+/// The sidebar badge of a thread waiting on the user: what it waits on,
+/// when the thread is loaded here.
+fn waiting_label(
+    store: &Entity<AppStore>,
+    thread: &loft_protocol::Thread,
+    cx: &gpui_kit::App,
+) -> &'static str {
+    let kind = store
+        .read(cx)
+        .threads
+        .get(&thread.id)
+        .and_then(|t| t.read(cx).model.as_ref())
+        .and_then(|m| m.open_requests().map(|r| r.kind).next());
+    match kind {
+        Some(loft_protocol::RequestKind::Question) => "Answer",
+        Some(loft_protocol::RequestKind::Plan) => "Review plan",
+        _ => "Approve",
+    }
+}
+
 fn running_since(
     store: &Entity<AppStore>,
     thread: &loft_protocol::Thread,
@@ -5190,7 +5274,7 @@ fn thread_row(
             .bg(p.warning_soft)
             .text_xs()
             .text_color(p.warning)
-            .child("Approve")
+            .child(waiting_label(store, thread, cx))
             .into_any_element(),
         ThreadStatus::Error => Icon::new(IconName::CircleAlert)
             .xsmall()

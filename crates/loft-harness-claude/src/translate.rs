@@ -5,8 +5,8 @@
 
 use loft_harness::{HarnessEvent, ToolResult};
 use loft_protocol::{
-    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, RequestKind,
-    ToolKind, TurnStatus, Usage,
+    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, Question,
+    QuestionOption, RequestKind, RequestReply, ToolKind, TurnStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +25,9 @@ pub enum Out {
 
 #[derive(Debug, Clone)]
 struct PendingApproval {
+    /// The tool asking (`AskUserQuestion` and `ExitPlanMode` answer
+    /// differently).
+    tool: String,
     input: Value,
     suggestions: Vec<Value>,
     tool_use_id: Option<String>,
@@ -192,13 +195,58 @@ impl Translator {
         }))]
     }
 
-    pub fn respond(&mut self, request_id: &str, decision: DecisionKind) -> Vec<Out> {
+    pub fn respond(
+        &mut self,
+        request_id: &str,
+        decision: DecisionKind,
+        reply: Option<RequestReply>,
+    ) -> Vec<Out> {
         let Some(pending) = self.pending.remove(request_id) else {
             return vec![];
         };
-        let response = match decision {
-            DecisionKind::AllowOnce => json!({"behavior": "allow", "updatedInput": pending.input}),
-            DecisionKind::AllowSession => {
+        let reply = reply.unwrap_or_default();
+        let response = match (pending.tool.as_str(), decision) {
+            (_, DecisionKind::DenyAndStop) => {
+                self.interrupt_requested = true;
+                json!({"behavior": "deny", "message": "The user denied this action and stopped the turn.", "interrupt": true})
+            }
+            // Answers go back in the tool's input, keyed by question text.
+            (QUESTION_TOOL, DecisionKind::AllowOnce | DecisionKind::AllowSession) => {
+                let answers: serde_json::Map<String, Value> = reply
+                    .answers
+                    .iter()
+                    .map(|a| (a.id.clone(), json!(a.answers.join(", "))))
+                    .collect();
+                let mut input = pending.input.clone();
+                input["answers"] = Value::Object(answers);
+                json!({"behavior": "allow", "updatedInput": input})
+            }
+            (QUESTION_TOOL, _) => json!({"behavior": "deny", "message": reply
+                .message
+                .unwrap_or_else(|| "The user chose not to answer. Carry on with your best judgement, or ask in plain text.".into())}),
+            // Approving a plan leaves plan mode.
+            (PLAN_TOOL, DecisionKind::AllowOnce | DecisionKind::AllowSession) => {
+                let mode = if decision == DecisionKind::AllowSession {
+                    "acceptEdits"
+                } else {
+                    "default"
+                };
+                json!({"behavior": "allow", "updatedInput": pending.input,
+                       "updatedPermissions": [{"type": "setMode", "mode": mode, "destination": "session"}]})
+            }
+            (PLAN_TOOL, _) => {
+                let message = match reply.message.as_deref().map(str::trim) {
+                    Some(m) if !m.is_empty() => format!(
+                        "The user wants changes to the plan before you start. Stay in plan mode, revise the plan, and present it again. Their feedback:\n\n{m}"
+                    ),
+                    _ => "The user didn't approve the plan. Stay in plan mode and ask what they'd like to change.".to_owned(),
+                };
+                json!({"behavior": "deny", "message": message})
+            }
+            (_, DecisionKind::AllowOnce) => {
+                json!({"behavior": "allow", "updatedInput": pending.input})
+            }
+            (_, DecisionKind::AllowSession) => {
                 let rules: Vec<Value> = pending
                     .suggestions
                     .iter()
@@ -211,12 +259,8 @@ impl Translator {
                     .collect();
                 json!({"behavior": "allow", "updatedInput": pending.input, "updatedPermissions": rules})
             }
-            DecisionKind::Deny => {
+            (_, DecisionKind::Deny) => {
                 json!({"behavior": "deny", "message": "The user denied this action."})
-            }
-            DecisionKind::DenyAndStop => {
-                self.interrupt_requested = true;
-                json!({"behavior": "deny", "message": "The user denied this action and stopped the turn.", "interrupt": true})
             }
         };
         if matches!(decision, DecisionKind::Deny | DecisionKind::DenyAndStop)
@@ -540,6 +584,7 @@ impl Translator {
                 self.pending.insert(
                     request_id.clone(),
                     PendingApproval {
+                        tool: tool.clone(),
                         input: input.clone(),
                         suggestions: request
                             .get("permission_suggestions")
@@ -549,6 +594,40 @@ impl Translator {
                         tool_use_id: tool_use_id.clone(),
                     },
                 );
+                if tool == QUESTION_TOOL {
+                    let questions = questions(&input);
+                    let first = questions
+                        .first()
+                        .map(|q| q.question.clone())
+                        .unwrap_or_default();
+                    return vec![Out::Event(HarnessEvent::RequestOpened {
+                        native_id: request_id,
+                        kind: RequestKind::Question,
+                        title: format!("{display}: {first}"),
+                        detail: json!({ "questions": questions }),
+                        options: vec![
+                            DecisionKind::AllowOnce,
+                            DecisionKind::Deny,
+                            DecisionKind::DenyAndStop,
+                        ],
+                        related_item: tool_use_id,
+                    })];
+                }
+                if tool == PLAN_TOOL {
+                    let plan = str_at(&input, "plan").unwrap_or_default();
+                    return vec![Out::Event(HarnessEvent::RequestOpened {
+                        native_id: request_id,
+                        kind: RequestKind::Plan,
+                        title: format!("{display}: Plan"),
+                        detail: json!({ "plan": plan }),
+                        options: vec![
+                            DecisionKind::AllowSession,
+                            DecisionKind::AllowOnce,
+                            DecisionKind::Deny,
+                        ],
+                        related_item: tool_use_id,
+                    })];
+                }
                 let kind = match tool_kind(&tool) {
                     ToolKind::FileChange => RequestKind::FileChangeApproval,
                     _ => RequestKind::ToolApproval,
@@ -704,6 +783,48 @@ impl Translator {
         }));
         out
     }
+}
+
+/// Claude's tool for asking the user multiple-choice questions.
+pub const QUESTION_TOOL: &str = "AskUserQuestion";
+/// Claude's tool for presenting a plan and leaving plan mode.
+pub const PLAN_TOOL: &str = "ExitPlanMode";
+
+/// `AskUserQuestion`'s questions in canonical form: keyed by their text
+/// (Claude's answers are), with a typed answer always allowed.
+pub fn questions(input: &Value) -> Vec<Question> {
+    input
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|q| {
+            let question = str_at(q, "question")?.to_owned();
+            Some(Question {
+                id: question.clone(),
+                header: str_at(q, "header").unwrap_or_default().to_owned(),
+                question,
+                options: q
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|o| {
+                        Some(QuestionOption {
+                            label: str_at(o, "label")?.to_owned(),
+                            description: str_at(o, "description").unwrap_or_default().to_owned(),
+                        })
+                    })
+                    .collect(),
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                allow_other: true,
+                secret: false,
+            })
+        })
+        .collect()
 }
 
 pub fn permission_mode_arg(mode: PermissionMode) -> &'static str {
@@ -941,7 +1062,7 @@ mod tests {
             out.extend(produced);
             // Answer the approval right where the CLI asked.
             if let Some(id) = request_id.take() {
-                let reply = t.respond(&id, DecisionKind::AllowSession);
+                let reply = t.respond(&id, DecisionKind::AllowSession, None);
                 match &reply[0] {
                     Out::Send(v) => {
                         assert_eq!(v["response"]["response"]["behavior"], "allow");
@@ -1143,6 +1264,84 @@ mod tests {
         );
         assert!(matches!(events(&out).as_slice(),
             [HarnessEvent::BackgroundTasks(v)] if v.is_empty()));
+    }
+
+    fn sent(out: &[Out]) -> Value {
+        out.iter()
+            .find_map(|o| match o {
+                Out::Send(v) => Some(v.clone()),
+                _ => None,
+            })
+            .expect("a line to Claude")
+    }
+
+    #[test]
+    fn ask_user_question_opens_a_question_and_sends_answers_back() {
+        let mut t = Translator::new();
+        let out = t.on_line(
+            r#"{"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"tu1","input":{"questions":[{"question":"Which DB?","header":"DB","multiSelect":false,"options":[{"label":"SQLite","description":"a file"},{"label":"Postgres","description":"a server"}]},{"question":"Extras?","header":"Extras","multiSelect":true,"options":[{"label":"Tests","description":""},{"label":"Docs","description":""}]}]}}}"#,
+        );
+        let [HarnessEvent::RequestOpened { kind, detail, .. }] = events(&out).as_slice() else {
+            panic!("expected a request: {out:?}");
+        };
+        assert_eq!(*kind, RequestKind::Question);
+        let qs: Vec<Question> = serde_json::from_value(detail["questions"].clone()).unwrap();
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].id, "Which DB?");
+        assert_eq!(qs[0].options[1].label, "Postgres");
+        assert!(qs[1].multi_select && qs[1].allow_other);
+
+        let reply = RequestReply {
+            answers: vec![
+                loft_protocol::QuestionAnswer {
+                    id: "Which DB?".into(),
+                    answers: vec!["SQLite".into()],
+                },
+                loft_protocol::QuestionAnswer {
+                    id: "Extras?".into(),
+                    answers: vec!["Tests".into(), "lint".into()],
+                },
+            ],
+            message: None,
+        };
+        let v = sent(&t.respond("q1", DecisionKind::AllowOnce, Some(reply)));
+        let r = &v["response"]["response"];
+        assert_eq!(r["behavior"], "allow");
+        assert_eq!(r["updatedInput"]["answers"]["Which DB?"], "SQLite");
+        assert_eq!(r["updatedInput"]["answers"]["Extras?"], "Tests, lint");
+        assert_eq!(r["updatedInput"]["questions"][0]["header"], "DB");
+    }
+
+    #[test]
+    fn exit_plan_mode_opens_a_plan() {
+        let open = |t: &mut Translator| {
+            t.on_line(
+                r#"{"type":"control_request","request_id":"p1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","tool_use_id":"tu2","input":{"plan":"1. Do it"}}}"#,
+            )
+        };
+        let mut t = Translator::new();
+        let out = open(&mut t);
+        let [HarnessEvent::RequestOpened { kind, detail, .. }] = events(&out).as_slice() else {
+            panic!("expected a request: {out:?}");
+        };
+        assert_eq!(*kind, RequestKind::Plan);
+        assert_eq!(detail["plan"], "1. Do it");
+        // Approve and accept edits: leaves plan mode for acceptEdits.
+        let v = sent(&t.respond("p1", DecisionKind::AllowSession, None));
+        let r = &v["response"]["response"];
+        assert_eq!(r["behavior"], "allow");
+        assert_eq!(r["updatedPermissions"][0]["mode"], "acceptEdits");
+        // Keep planning: the feedback goes back with the denial.
+        open(&mut t);
+        let reply = RequestReply {
+            answers: vec![],
+            message: Some("Use Postgres".into()),
+        };
+        let v = sent(&t.respond("p1", DecisionKind::Deny, Some(reply)));
+        let r = &v["response"]["response"];
+        assert_eq!(r["behavior"], "deny");
+        assert!(r["message"].as_str().unwrap().contains("Use Postgres"));
+        assert!(r.get("interrupt").is_none());
     }
 
     #[test]

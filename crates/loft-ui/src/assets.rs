@@ -121,6 +121,11 @@ gpui_kit::assets::icon_assets!(
         QrCode,
         KeyRound,
         MonitorSmartphone,
+        MessageCircleQuestionMark,
+        ListChecks,
+        Circle,
+        CircleDot,
+        SquareCheck,
     ]
 );
 

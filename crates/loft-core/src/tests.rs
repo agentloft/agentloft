@@ -1,6 +1,8 @@
 use super::*;
 use loft_harness::fake::FakeHarness;
-use loft_protocol::{DecisionKind, ItemBody, RequestStatus, Snapshot, ThreadWorkspace};
+use loft_protocol::{
+    DecisionKind, ItemBody, PermissionMode, RequestStatus, Snapshot, ThreadWorkspace,
+};
 use std::time::Duration;
 
 struct Fixture {
@@ -318,6 +320,7 @@ async fn approval_allow_flow() {
             thread_id: thread.id.clone(),
             request_id: request.id.clone(),
             decision: DecisionKind::AllowOnce,
+            reply: None,
         })
         .await
         .unwrap();
@@ -332,6 +335,92 @@ async fn approval_allow_flow() {
         .find(|i| matches!(i.body, ItemBody::ToolCall { .. }))
         .unwrap();
     assert_eq!(tool.status, ItemStatus::Completed);
+}
+
+#[tokio::test]
+async fn question_answers_reach_the_agent_and_stay_on_record() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "a question for you".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, |t, _| {
+        t.status == ThreadStatus::WaitingApproval
+    })
+    .await;
+    let (_, _, _, requests) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(requests[0].kind, loft_protocol::RequestKind::Question);
+    let questions = requests[0].questions();
+    assert_eq!(questions.len(), 2);
+    let reply = loft_protocol::RequestReply {
+        answers: vec![loft_protocol::QuestionAnswer {
+            id: questions[0].id.clone(),
+            answers: vec!["SQLite".into()],
+        }],
+        message: None,
+    };
+    f.core
+        .handle(Request::RespondRequest {
+            thread_id: thread.id.clone(),
+            request_id: requests[0].id.clone(),
+            decision: DecisionKind::AllowOnce,
+            reply: Some(reply.clone()),
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (_, _, items, requests) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(requests[0].reply.as_ref(), Some(&reply));
+    assert!(items.iter().any(|i| matches!(&i.body,
+        ItemBody::AssistantMessage { text } if text.contains("SQLite"))));
+}
+
+#[tokio::test]
+async fn approving_a_plan_leaves_read_only_mode() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SetPermissionMode {
+            thread_id: thread.id.clone(),
+            mode: Some(PermissionMode::ReadOnly),
+        })
+        .await
+        .unwrap();
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "make a plan".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, |t, _| {
+        t.status == ThreadStatus::WaitingApproval
+    })
+    .await;
+    let (_, _, _, requests) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(requests[0].kind, loft_protocol::RequestKind::Plan);
+    assert!(requests[0].plan().is_some_and(|p| p.contains("greet")));
+    f.core
+        .handle(Request::RespondRequest {
+            thread_id: thread.id.clone(),
+            request_id: requests[0].id.clone(),
+            decision: DecisionKind::AllowSession,
+            reply: None,
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (thread_now, _, _, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(
+        thread_now.permission_mode,
+        Some(PermissionMode::AcceptEdits)
+    );
 }
 
 #[tokio::test]
@@ -356,6 +445,7 @@ async fn deny_and_stop_interrupts() {
             thread_id: thread.id.clone(),
             request_id: requests[0].id.clone(),
             decision: DecisionKind::DenyAndStop,
+            reply: None,
         })
         .await
         .unwrap();

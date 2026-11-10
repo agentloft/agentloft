@@ -3,6 +3,7 @@
 
 mod agent_choice;
 mod app_icons;
+mod ask;
 pub mod assets;
 mod attachments;
 mod attention;

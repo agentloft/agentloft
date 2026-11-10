@@ -877,8 +877,18 @@ impl AppStore {
             let agent = thread
                 .map(|t| crate::workspace::harness_name(&t.harness))
                 .unwrap_or("The agent");
+            // What it waits on, when the thread is loaded here.
+            let asks = self
+                .threads
+                .get(id)
+                .and_then(|t| t.read(cx).model.as_ref())
+                .and_then(|m| m.open_requests().map(|r| r.kind).next());
             let headline = if needs_you {
-                format!("{agent} needs your approval")
+                match asks {
+                    Some(loft_protocol::RequestKind::Question) => format!("{agent} has a question"),
+                    Some(loft_protocol::RequestKind::Plan) => format!("{agent} has a plan for you"),
+                    _ => format!("{agent} needs your approval"),
+                }
             } else if after == Error {
                 format!("{agent} stopped with an error")
             } else {
@@ -2005,11 +2015,25 @@ impl AppStore {
         decision: DecisionKind,
         cx: &mut Context<Self>,
     ) {
+        self.respond_with(thread_id, request_id, decision, None, cx);
+    }
+
+    /// Answer a request, with answers to its questions or feedback on its
+    /// plan.
+    pub fn respond_with(
+        &mut self,
+        thread_id: ThreadId,
+        request_id: RequestId,
+        decision: DecisionKind,
+        reply: Option<loft_protocol::RequestReply>,
+        cx: &mut Context<Self>,
+    ) {
         self.request(
             Request::RespondRequest {
                 thread_id,
                 request_id,
                 decision,
+                reply,
             },
             cx,
             |_, _, _| {},
@@ -2721,7 +2745,12 @@ pub(crate) fn agent_running(
 /// one group row; consecutive agents share an agents card.
 fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
     let is_subagent = |i: usize| is_agent(&items[i]);
-    let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. }) && !is_subagent(i);
+    // Questions and plans stand on their own, not in a tool group.
+    let is_tool = |i: usize| {
+        matches!(items[i].body, ItemBody::ToolCall { .. })
+            && !is_subagent(i)
+            && !crate::ask::is_record(&items[i])
+    };
     let mut k = 0;
     while k < ixs.len() {
         if is_tool(ixs[k]) {

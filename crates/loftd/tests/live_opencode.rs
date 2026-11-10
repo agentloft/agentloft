@@ -90,6 +90,7 @@ async fn turn(
                             thread_id: model.thread.id.clone(),
                             request_id: req.id.clone(),
                             decision: DecisionKind::AllowOnce,
+                            reply: None,
                         })
                         .await;
                 }

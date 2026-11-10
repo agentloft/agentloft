@@ -165,6 +165,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
                 thread_id: s.model.thread.id.clone(),
                 request_id: req.id,
                 decision: DecisionKind::AllowOnce,
+                reply: None,
             })
             .await
             .unwrap();

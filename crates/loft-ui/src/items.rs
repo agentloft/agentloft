@@ -416,6 +416,9 @@ pub(crate) fn render_item(
     item: &Item,
     p: &Palette,
 ) -> AnyElement {
+    if crate::ask::is_record(item) {
+        return crate::ask::render_record(thread, state, item, p);
+    }
     match &item.body {
         ItemBody::UserMessage { text, attachments } => {
             use gpui_kit::StyledImage as _;
@@ -991,10 +994,11 @@ fn render_tool_group(
     cx: &App,
 ) -> AnyElement {
     let cwd = model.thread.cwd.as_str();
+    // Questions and plans are answered in their form above the composer.
     let open_requests: Vec<&RuntimeRequest> = items
         .iter()
         .filter_map(|i| model.request_for_item(&i.id))
-        .filter(|r| r.status == RequestStatus::Open)
+        .filter(|r| r.status == RequestStatus::Open && !crate::ask::is_form(r))
         .collect();
     let running = items.iter().any(|i| i.status == ItemStatus::InProgress);
     // The group's own open state: not the first tool's (they used to share
@@ -1782,7 +1786,7 @@ fn spawned_card(
 }
 
 /// The first line of `text` with its Markdown marks dropped, if any.
-fn first_line(text: &str) -> Option<String> {
+pub(crate) fn first_line(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     let plain: String = line
         .chars()
@@ -1806,6 +1810,7 @@ pub(crate) fn approval_card(
             pick("file_path").map(|f| relative_to(f, cwd)),
         ),
         RequestKind::Question => ("Claude has a question", None),
+        RequestKind::Plan => ("Claude has a plan", None),
         RequestKind::ToolApproval => match pick("command") {
             Some(cmd) => ("Allow Claude to run this command?", Some(cmd.to_owned())),
             None => ("Allow Claude to use this tool?", None),

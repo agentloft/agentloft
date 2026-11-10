@@ -86,6 +86,8 @@ pub enum SessionCommand {
     Respond {
         native_request_id: String,
         decision: DecisionKind,
+        /// Answers to a question, or feedback on a plan.
+        reply: Option<loft_protocol::RequestReply>,
     },
     SetModel(Option<String>),
     SetEffort(Option<String>),

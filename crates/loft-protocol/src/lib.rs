@@ -192,6 +192,9 @@ pub enum Request {
         thread_id: ThreadId,
         request_id: RequestId,
         decision: DecisionKind,
+        /// Answers to a question, or feedback on a plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<RequestReply>,
     },
     SetPermissionMode {
         thread_id: ThreadId,

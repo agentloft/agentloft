@@ -6,7 +6,7 @@ use crate::{Core, CoreResult, internal};
 use loft_harness::{HarnessEvent, SessionCommand, SessionConfig, SessionHandle, TurnInput};
 use loft_protocol::{
     AttachmentRef, DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, ForkKind, Item,
-    ItemBody, ItemId, ItemStatus, PermissionMode, RequestId, RequestStatus, Response,
+    ItemBody, ItemId, ItemStatus, PermissionMode, RequestId, RequestKind, RequestStatus, Response,
     RuntimeRequest, Thread, ThreadStatus, Turn, TurnId, TurnStatus,
 };
 use loft_store::now_ms;
@@ -41,6 +41,8 @@ pub(crate) enum ThreadCmd {
     Respond {
         request_id: RequestId,
         decision: DecisionKind,
+        /// Answers to a question, or feedback on a plan.
+        answer: Option<loft_protocol::RequestReply>,
         reply: Reply,
     },
     SetPermissionMode {
@@ -295,9 +297,10 @@ impl ThreadActor {
             ThreadCmd::Respond {
                 request_id,
                 decision,
+                answer,
                 reply,
             } => {
-                let _ = reply.send(self.respond(request_id, decision));
+                let _ = reply.send(self.respond(request_id, decision, answer));
             }
             ThreadCmd::SetPermissionMode { mode, reply } => {
                 self.thread.permission_mode = mode;
@@ -692,7 +695,12 @@ impl ThreadActor {
         }
     }
 
-    fn respond(&mut self, request_id: RequestId, decision: DecisionKind) -> CoreResult<Response> {
+    fn respond(
+        &mut self,
+        request_id: RequestId,
+        decision: DecisionKind,
+        answer: Option<loft_protocol::RequestReply>,
+    ) -> CoreResult<Response> {
         let native = self
             .requests
             .get(&request_id)
@@ -702,14 +710,42 @@ impl ThreadActor {
             .session
             .as_ref()
             .ok_or_else(|| ErrorBody::new(ErrorCode::Conflict, "session is not running"))?;
+        let plan = self
+            .find_open_request(&native)?
+            .is_some_and(|r| r.kind == RequestKind::Plan);
         session
             .commands
             .send(SessionCommand::Respond {
                 native_request_id: native.clone(),
                 decision,
+                reply: answer.clone(),
             })
             .map_err(|_| internal("harness session closed"))?;
-        self.resolve_request(&native, Some(decision))?;
+        self.resolve_request_with(&native, Some(decision), answer)?;
+        // An approved plan ends planning: the thread leaves read-only mode
+        // (edits asked about, or accepted with "approve & accept edits").
+        if plan {
+            let mode = match decision {
+                DecisionKind::AllowSession => Some(PermissionMode::AcceptEdits),
+                DecisionKind::AllowOnce => Some(PermissionMode::AskAll),
+                _ => None,
+            };
+            let current = self.thread.permission_mode;
+            let keep = matches!(
+                current,
+                Some(PermissionMode::Auto | PermissionMode::FullAccess)
+            ) || (current == Some(PermissionMode::AcceptEdits)
+                && mode == Some(PermissionMode::AskAll));
+            if let Some(mode) = mode.filter(|_| !keep) {
+                self.thread.permission_mode = Some(mode);
+                if let Some(s) = &self.session {
+                    let _ = s
+                        .commands
+                        .send(SessionCommand::SetPermissionMode(Some(mode)));
+                }
+                self.save_thread()?;
+            }
+        }
         Ok(Response::Ok)
     }
 
@@ -999,6 +1035,7 @@ impl ThreadActor {
                     status: RequestStatus::Open,
                     decision: None,
                     opened_at_ms: now_ms(),
+                    reply: None,
                 };
                 self.requests.insert(request.id.clone(), native_id);
                 self.thread.status = ThreadStatus::WaitingApproval;
@@ -1225,6 +1262,15 @@ impl ThreadActor {
     }
 
     fn resolve_request(&mut self, native: &str, decision: Option<DecisionKind>) -> CoreResult<()> {
+        self.resolve_request_with(native, decision, None)
+    }
+
+    fn resolve_request_with(
+        &mut self,
+        native: &str,
+        decision: Option<DecisionKind>,
+        reply: Option<loft_protocol::RequestReply>,
+    ) -> CoreResult<()> {
         let Some(mut request) = self.find_open_request(native)? else {
             return Ok(());
         };
@@ -1232,6 +1278,9 @@ impl ThreadActor {
         request.status = RequestStatus::Resolved;
         if decision.is_some() {
             request.decision = decision;
+        }
+        if reply.is_some() {
+            request.reply = reply;
         }
         let mut events = vec![Event::RequestUpdated { request }];
         if self.requests.is_empty() && self.thread.status == ThreadStatus::WaitingApproval {
