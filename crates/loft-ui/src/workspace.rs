@@ -145,6 +145,8 @@ pub struct WorkspaceView {
     show_archived: bool,
     /// The sidebar thread whose ··· menu is open.
     row_menu: Option<ThreadId>,
+    /// The sidebar thread being renamed in place, and its field.
+    renaming: Option<(ThreadId, Entity<InputState>, Subscription)>,
     /// Threads whose messages match the sidebar search, and the search
     /// those answer.
     search_hits: HashMap<ThreadId, loft_protocol::SearchHit>,
@@ -265,6 +267,7 @@ impl WorkspaceView {
             query: String::new(),
             show_archived: false,
             row_menu: None,
+            renaming: None,
             search_hits: HashMap::new(),
             search_seq: 0,
             completion: None,
@@ -635,15 +638,7 @@ impl WorkspaceView {
                 }
                 "palette" => crate::palette::open(cx.entity(), &self.store, window, cx),
                 "archived" => self.show_archived = true,
-                "rename" => {
-                    let title = thread
-                        .read(cx)
-                        .model
-                        .as_ref()
-                        .map(|m| m.thread.title.clone())
-                        .unwrap_or_default();
-                    rename_dialog(self.store.clone(), thread_id.clone(), title, window, cx);
-                }
+                "rename" => self.start_rename(thread_id.clone(), window, cx),
                 "undo" => {
                     let last = thread
                         .read(cx)
@@ -2237,6 +2232,80 @@ impl WorkspaceView {
 
     // -- sidebar ------------------------------------------------------------
 
+    /// Rename a thread in place: its sidebar title becomes a field (Enter
+    /// or clicking away saves, Esc cancels).
+    pub(crate) fn start_rename(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.renaming.as_ref().is_some_and(|(r, _, _)| *r == id) {
+            return;
+        }
+        let title = self
+            .store
+            .read(cx)
+            .workspace
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        // A folded project opens so the row shows.
+        if let Some(project) = self
+            .store
+            .read(cx)
+            .workspace
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.project_id.clone())
+        {
+            self.store
+                .update(cx, |s, cx| s.set_collapsed(&[project], false, cx));
+        }
+        self.sidebar_open = true;
+        let input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx);
+            s.set_value(title.clone(), window, cx);
+            s
+        });
+        let end = title.len();
+        input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            s.set_selected_range(0..end, cx);
+        });
+        let sub = cx.subscribe_in(&input, window, |this, _, event, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.finish_rename(true, cx);
+            }
+        });
+        self.renaming = Some((id, input, sub));
+        cx.notify();
+    }
+
+    /// End an in-place rename, saving the new title or not.
+    fn finish_rename(&mut self, save: bool, cx: &mut Context<Self>) {
+        let Some((id, input, _sub)) = self.renaming.take() else {
+            return;
+        };
+        let title = input.read(cx).value().trim().to_owned();
+        let old = self
+            .store
+            .read(cx)
+            .workspace
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.title.clone());
+        if save && !title.is_empty() && old.as_deref() != Some(title.as_str()) {
+            self.store
+                .update(cx, |s, cx| s.rename_thread(id, title, cx));
+        }
+        cx.notify();
+    }
+
     /// Look for the sidebar query in every thread's messages (after a
     /// short pause in typing).
     fn search_messages(&mut self, cx: &mut Context<Self>) {
@@ -2351,6 +2420,10 @@ impl WorkspaceView {
                         selected.as_ref() == Some(&id),
                         unread.contains(&id),
                         self.row_menu.as_ref() == Some(&id),
+                        self.renaming
+                            .as_ref()
+                            .filter(|(r, _, _)| *r == id)
+                            .map(|(_, input, _)| input.clone()),
                         // A message matched (not just the title): show where.
                         self.search_hits
                             .get(&id)
@@ -4386,11 +4459,13 @@ fn thread_row(
     active: bool,
     unread: bool,
     menu_open: bool,
+    renaming: Option<Entity<InputState>>,
     hit: Option<&loft_protocol::SearchHit>,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
     let id = thread.id.clone();
+    let editing = renaming.is_some();
     let trailing: AnyElement = match thread.status {
         ThreadStatus::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
         ThreadStatus::WaitingApproval => div()
@@ -4462,15 +4537,39 @@ fn thread_row(
         .child(div().flex_none().when(!active, |d| d.opacity(0.85)).child(
             crate::brand::agent_logo(thread.harness.as_str(), px(14.), p),
         ))
-        .child(match hit {
-            None => div()
+        .child(match (renaming, hit) {
+            // Renaming: the title is a field; Esc puts it back.
+            (Some(input), _) => div()
+                .id("rename-field")
+                .flex_1()
+                .min_w_0()
+                .capture_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, _, cx| {
+                    if e.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.finish_rename(false, cx);
+                    }
+                }))
+                // Clicks in the field stay in the field.
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .px(px(1.))
+                .ml(px(-6.))
+                .rounded(px(5.))
+                .border_1()
+                .border_color(p.accent.opacity(0.8))
+                .bg(p.background)
+                .child(Input::new(&input).appearance(false).small().text_sm())
+                .into_any_element(),
+            (None, None) => div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .child(title)
                 .into_any_element(),
             // Searching: the matching message under the title.
-            Some(hit) => v_flex()
+            (None, Some(hit)) => v_flex()
                 .flex_1()
                 .min_w_0()
                 .gap(px(1.))
@@ -4527,7 +4626,7 @@ fn thread_row(
                                 .xsmall()
                                 .dropdown_menu_with_anchor(
                                     gpui_kit::Anchor::TopRight,
-                                    thread_menu_items(thread, store),
+                                    thread_menu_items(thread, store, cx.entity().downgrade()),
                                 )
                                 .on_open_change(move |open, _, cx| {
                                     let row = row.clone();
@@ -4546,8 +4645,13 @@ fn thread_row(
         )
         .on_click({
             let reveal = hit.map(|h| h.item_id.clone());
-            cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
+            cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                 let id = id.clone();
+                // Double-click: rename in place.
+                if event.click_count() == 2 {
+                    this.start_rename(id, window, cx);
+                    return;
+                }
                 // ⌘-click: beside the current one, in a pane of its own.
                 if event.modifiers().platform {
                     this.store.update(cx, |s, cx| s.open_pane(id.clone(), cx));
@@ -4562,14 +4666,16 @@ fn thread_row(
                 }
             })
         })
-        .on_drag(
-            DraggedThread {
-                id: thread.id.clone(),
-                title: thread.title.clone(),
-            },
-            |d, _, _, cx| cx.new(|_| d.clone()),
-        )
-        .context_menu(thread_menu_items(thread, store))
+        .when(!editing, |d| {
+            d.on_drag(
+                DraggedThread {
+                    id: thread.id.clone(),
+                    title: thread.title.clone(),
+                },
+                |d, _, _, cx| cx.new(|_| d.clone()),
+            )
+        })
+        .context_menu(thread_menu_items(thread, store, cx.entity().downgrade()))
         .into_any_element()
 }
 
@@ -4626,53 +4732,6 @@ fn search_snippet(hit: &loft_protocol::SearchHit, p: &Palette) -> AnyElement {
             )
         })
         .into_any_element()
-}
-
-fn rename_dialog(
-    store: Entity<AppStore>,
-    thread_id: ThreadId,
-    title: String,
-    window: &mut Window,
-    cx: &mut gpui_kit::App,
-) {
-    use gpui_kit::component::WindowExt as _;
-    use gpui_kit::component::button::{Button, ButtonVariants as _};
-    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
-    let input = cx.new(|cx| {
-        let mut s = InputState::new(window, cx);
-        s.set_value(title, window, cx);
-        s
-    });
-    let focus = input.clone();
-    window.open_dialog(cx, move |dialog, _, _| {
-        let dialog = dialog.centered();
-        let (store, thread_id, input) = (store.clone(), thread_id.clone(), input.clone());
-        dialog
-            .title("Rename thread")
-            .w(px(420.))
-            .child(Input::new(&input))
-            .footer(
-                DialogFooter::new()
-                    .child(
-                        DialogClose::new()
-                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
-                    )
-                    .child(
-                        DialogAction::new()
-                            .child(Button::new("ok").cursor_pointer().primary().label("Rename")),
-                    ),
-            )
-            .on_ok(move |_, _, cx| {
-                let title = input.read(cx).value().trim().to_owned();
-                if title.is_empty() {
-                    return false;
-                }
-                let id = thread_id.clone();
-                store.update(cx, |s, cx| s.rename_thread(id, title, cx));
-                true
-            })
-    });
-    focus.update(cx, |s, cx| s.focus(window, cx));
 }
 
 /// `claude-opus-5-5` → `Opus 5.5`.
@@ -4963,6 +5022,7 @@ fn tilde(path: &str) -> String {
 fn thread_menu_items(
     thread: &loft_protocol::Thread,
     store: &Entity<AppStore>,
+    view: gpui_kit::WeakEntity<WorkspaceView>,
 ) -> impl Fn(
     gpui_kit::component::menu::PopupMenu,
     &mut Window,
@@ -4985,12 +5045,17 @@ fn thread_menu_items(
         ThreadStatus::Running | ThreadStatus::WaitingApproval
     );
     move |mut menu, window, cx| {
-        let (s1, i1, t1) = (store.clone(), id.clone(), title.clone());
+        let (v1, i1) = (view.clone(), id.clone());
         menu = menu.item(
-            PopupMenuItem::new("Rename…")
+            PopupMenuItem::new("Rename")
                 .icon(IconName::SquarePen)
                 .on_click(move |_, window, cx| {
-                    rename_dialog(s1.clone(), i1.clone(), t1.clone(), window, cx)
+                    let id = i1.clone();
+                    // After the menu closes, so the field keeps focus.
+                    let v = v1.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = v.update(cx, |v, cx| v.start_rename(id, window, cx));
+                    });
                 }),
         );
         let (s, t) = (store.clone(), id.clone());
