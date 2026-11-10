@@ -18,5 +18,6 @@ Each ADR records one significant decision: its context, the decision, the conseq
 | [0012](0012-multi-window-and-window-groups.md) | Multiple windows and user-defined window groups | Accepted |
 | [0013](0013-agentloft-mcp-cross-thread-context.md) | Agents read other threads through a built-in Agentloft MCP server | Accepted |
 | [0014](0014-remote-access-tailscale.md) | Remote access over the user's own Tailscale tailnet, or SSH | Accepted |
+| [0015](0015-thread-orchestration.md) | Agents orchestrate threads through the Agentloft MCP server | Accepted |
 
 To add an ADR, copy the structure of an existing one, use the next number, and add a row to this table.

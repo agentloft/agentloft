@@ -1038,3 +1038,76 @@ async fn search_finds_threads_by_their_messages() {
     assert_eq!(search("bug\nplease").await.len(), 1);
     assert_eq!(search("nowhere").await.len(), 0);
 }
+
+#[tokio::test]
+async fn spawned_threads_inherit_settings_and_report_back() {
+    let f = fixture();
+    let parent = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SetPermissionMode {
+            thread_id: parent.id.clone(),
+            mode: Some(loft_protocol::PermissionMode::AcceptEdits),
+        })
+        .await
+        .unwrap();
+    let spawn = |from: ThreadId, prompt: &str| {
+        let core = f.core.clone();
+        let prompt = prompt.to_owned();
+        async move {
+            core.handle(Request::SpawnThread {
+                from,
+                prompt,
+                title: None,
+                harness: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                worktree: false,
+            })
+            .await
+        }
+    };
+    let Response::Thread { thread: child } =
+        spawn(parent.id.clone(), "count the files").await.unwrap()
+    else {
+        panic!()
+    };
+    let link = child.parent.clone().unwrap();
+    assert_eq!(link.thread_id, parent.id);
+    assert_eq!(link.kind, loft_protocol::ForkKind::Spawned);
+    assert_eq!(child.harness, parent.harness);
+    assert_eq!(
+        child.permission_mode,
+        Some(loft_protocol::PermissionMode::AcceptEdits)
+    );
+    assert_eq!(child.cwd, parent.cwd);
+    assert_eq!(child.title, "count the files");
+
+    // It ran its prompt; the outcome carries the reply and who spawned it.
+    wait_for(&f.core, &child.id, turn_done).await;
+    let Response::Json { value } = f
+        .core
+        .handle(Request::ThreadOutcome {
+            thread_id: child.id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(value["status"], "idle");
+    assert_eq!(value["latest_reply"], "echo: count the files");
+    assert_eq!(value["spawned_by"], parent.id.0.as_str());
+
+    // Spawning nests only so deep.
+    let mut from = child.id.clone();
+    for _ in 0..2 {
+        let Response::Thread { thread } = spawn(from.clone(), "deeper").await.unwrap() else {
+            panic!()
+        };
+        from = thread.id;
+    }
+    let err = spawn(from, "too deep").await.unwrap_err();
+    assert!(err.message.contains("deeper"), "{}", err.message);
+    assert!(spawn(parent.id.clone(), "  ").await.is_err());
+}

@@ -2810,9 +2810,11 @@ impl WorkspaceView {
             .find(|t| t.id == parent.thread_id)
             .map(|t| t.title.clone())
             .unwrap_or_else(|| "another thread".into());
+        let spawned = parent.kind == loft_protocol::ForkKind::Spawned;
         let how = match parent.kind {
             loft_protocol::ForkKind::Native => "full context",
             loft_protocol::ForkKind::Handoff => "handoff",
+            loft_protocol::ForkKind::Spawned => "by its agent",
         };
         let id = parent.thread_id.clone();
         h_flex()
@@ -2832,13 +2834,19 @@ impl WorkspaceView {
                     .text_color(p.muted_foreground)
                     .cursor_pointer()
                     .hover(|d| d.text_color(p.foreground).bg(p.hover))
-                    .child(Icon::new(IconName::GitFork).xsmall())
                     .child(
-                        div()
-                            .max_w(px(420.))
-                            .truncate()
-                            .child(format!("Forked from “{title}”")),
+                        Icon::new(if spawned {
+                            IconName::Bot
+                        } else {
+                            IconName::GitFork
+                        })
+                        .xsmall(),
                     )
+                    .child(div().max_w(px(420.)).truncate().child(if spawned {
+                        format!("Started from “{title}”")
+                    } else {
+                        format!("Forked from “{title}”")
+                    }))
                     .child(
                         div()
                             .text_color(p.faint_foreground)
@@ -3112,6 +3120,9 @@ impl WorkspaceView {
                         ),
                         loft_protocol::ForkKind::Handoff => {
                             "It starts from a handoff summary. Review it below, then send.".into()
+                        }
+                        loft_protocol::ForkKind::Spawned => {
+                            "Started by that thread's agent.".into()
                         }
                     };
                     d.child(
@@ -4546,11 +4557,16 @@ fn thread_row(
         })
         .when(active, |d| d.bg(p.selected))
         .when(!active, |d| d.hover(|d| d.bg(p.hover)))
-        .when(thread.parent.is_some(), |d| {
+        // A fork, or a thread another agent started.
+        .when_some(thread.parent.as_ref(), |d, parent| {
             d.child(
-                Icon::new(IconName::GitFork)
-                    .xsmall()
-                    .text_color(p.faint_foreground),
+                Icon::new(if parent.kind == loft_protocol::ForkKind::Spawned {
+                    IconName::CornerDownRight
+                } else {
+                    IconName::GitFork
+                })
+                .xsmall()
+                .text_color(p.faint_foreground),
             )
         })
         // Which agent runs it.
@@ -5090,6 +5106,23 @@ fn thread_menu_items(
                         s.update(cx, |s, cx| s.open_pane(id, cx));
                     }),
             )
+            .item({
+                // For pointing an agent at this thread.
+                let raw = id.0.clone();
+                PopupMenuItem::new("Copy Thread ID")
+                    .icon(IconName::Hash)
+                    .on_click(move |_, window, cx| {
+                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(raw.clone()));
+                        use gpui_kit::component::WindowExt as _;
+                        use gpui_kit::component::notification::{Notification, NotificationType};
+                        window.push_notification(
+                            Notification::new()
+                                .message("Thread ID copied")
+                                .with_type(NotificationType::Success),
+                            cx,
+                        );
+                    })
+            })
             .separator();
         menu = fork_submenu(menu, &store, &id, &harness, window, cx);
         if let Some((path, branch, base)) = &worktree {
@@ -5390,7 +5423,7 @@ fn harness_picker(
     row.into_any_element()
 }
 
-fn pretty_model(id: &str) -> String {
+pub(crate) fn pretty_model(id: &str) -> String {
     // Provider-qualified ids (ACP agents): `opencode/iceman-free` → `iceman-free`.
     if let Some((_, name)) = id.rsplit_once('/') {
         return name.to_owned();

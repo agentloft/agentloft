@@ -128,7 +128,7 @@ impl Render for AgentView {
             count += 1;
             activity = activity.child(match &item.body {
                 ItemBody::ToolCall { .. } => {
-                    tool_line(&thread, &self.store, state, model, item, &p)
+                    tool_line(&thread, &self.store, state, model, item, &p, cx)
                 }
                 _ => render_item(&thread, state, item, &p),
             });

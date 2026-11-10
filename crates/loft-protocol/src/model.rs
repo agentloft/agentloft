@@ -154,6 +154,9 @@ pub enum ForkKind {
     Native,
     /// A different provider: the new thread starts from a handoff digest.
     Handoff,
+    /// Started by another thread's agent (orchestration): a fresh
+    /// conversation with its own prompt.
+    Spawned,
 }
 
 /// An attachment stored by the daemon (`~/.agentloft/attachments`).

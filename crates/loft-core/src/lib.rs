@@ -714,6 +714,31 @@ impl Core {
             Request::ArchiveThread { thread_id, force } => {
                 self.archive_thread(&thread_id, force).await
             }
+            Request::SpawnThread {
+                from,
+                prompt,
+                title,
+                harness,
+                model,
+                effort,
+                permission_mode,
+                worktree,
+            } => {
+                self.spawn_thread(forks::SpawnSpec {
+                    from,
+                    prompt,
+                    title,
+                    harness,
+                    model,
+                    effort,
+                    permission_mode,
+                    worktree,
+                })
+                .await
+            }
+            Request::ThreadOutcome { thread_id } => Ok(Response::Json {
+                value: self.thread_outcome(&thread_id)?,
+            }),
             Request::SearchThreads { query, limit } => Ok(Response::SearchHits {
                 hits: self.search_threads(&query, limit.min(500) as usize)?,
             }),

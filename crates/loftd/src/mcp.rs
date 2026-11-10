@@ -9,7 +9,9 @@
 use anyhow::{Context as _, Result};
 use loft_client::Client;
 use loft_config::Paths;
-use loft_protocol::{ClientKind, DiffScope, ReadDetail, Request, Response, ThreadId};
+use loft_protocol::{
+    ClientKind, DiffScope, HarnessId, PermissionMode, ReadDetail, Request, Response, ThreadId,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -79,7 +81,13 @@ pub async fn run(paths: Paths, thread_id: ThreadId) -> Result<()> {
 const INSTRUCTIONS: &str = "Agentloft tools. `browser_*` control the browser panel the \
 user sees next to this chat: navigate, then `browser_snapshot` to read the page \
 (interactive elements carry [ref=N] ids for `browser_click`/`browser_type`). \
-`list_threads`/`read_thread` read other Agentloft threads (other agents' work) in this project.";
+`list_threads`/`read_thread` read other Agentloft threads (other agents' work) in this project. \
+Orchestration: `spawn_thread` starts another agent in its own Agentloft thread (the user sees \
+it in the sidebar); it runs in parallel, so spawn several before waiting. `wait_for_threads` \
+waits for them and returns each one's latest reply; `send_to_thread` follows up and \
+`stop_thread` stops one. Spawned threads use this thread's agent, model, reasoning effort and \
+permissions unless the user explicitly asked for something else; `list_agents` lists what's \
+available.";
 
 async fn write(out: &mut tokio::io::Stdout, v: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(v)?;
@@ -166,6 +174,53 @@ pub fn tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            "list_agents",
+            "List the coding agents available to spawn (Claude Code, Codex, …): whether each is installed, its models with their reasoning efforts, the permission modes, and this thread's own settings (the defaults for spawn_thread).",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "spawn_thread",
+            "Start another agent in a new Agentloft thread with `prompt` as its first message, and return its thread_id at once (it runs in parallel; use wait_for_threads for the result). By default it gets THIS thread's agent, model, reasoning effort and permissions and works in the same checkout: only set agent/model/effort/permission_mode when the user explicitly asked for them. The prompt must stand alone: the new agent doesn't see this conversation.",
+            json!({
+                "prompt": { "type": "string", "description": "Complete, self-contained task for the new agent" },
+                "title": { "type": "string", "description": "Short sidebar title (default: the prompt's first line)" },
+                "agent": { "type": "string", "description": "claude | codex | opencode | gemini (default: this thread's)" },
+                "model": { "type": "string", "description": "Model id from list_agents (default: this thread's, or the agent's default)" },
+                "effort": { "type": "string", "description": "Reasoning effort, e.g. low | medium | high | xhigh | max" },
+                "permission_mode": { "type": "string", "enum": ["read-only", "ask-all", "accept-edits", "auto", "full-access"] },
+                "worktree": { "type": "boolean", "description": "Work in a new git worktree branched from this thread's current state instead of sharing this checkout (use when agents edit files in parallel)", "default": false }
+            }),
+            &["prompt"],
+        ),
+        tool(
+            "thread_status",
+            "Where a thread stands: running / idle / waiting_for_approval / error, its settings and its latest reply.",
+            json!({ "thread_id": { "type": "string" } }),
+            &["thread_id"],
+        ),
+        tool(
+            "wait_for_threads",
+            "Wait until the given threads stop running (finished, failed or waiting for the user's approval), up to timeout_seconds, and return each one's status and latest reply. If some are still running when it returns, call it again.",
+            json!({
+                "thread_ids": { "type": "array", "items": { "type": "string" } },
+                "timeout_seconds": { "type": "integer", "default": 50, "minimum": 1, "maximum": 600 }
+            }),
+            &["thread_ids"],
+        ),
+        tool(
+            "send_to_thread",
+            "Send a follow-up message to a thread this thread spawned (it must not be running).",
+            json!({ "thread_id": { "type": "string" }, "message": { "type": "string" } }),
+            &["thread_id", "message"],
+        ),
+        tool(
+            "stop_thread",
+            "Stop the current turn of a thread this thread spawned.",
+            json!({ "thread_id": { "type": "string" } }),
+            &["thread_id"],
+        ),
+        tool(
             "list_threads",
             "List Agentloft threads (other agent conversations), optionally filtered by a title query.",
             json!({ "query": { "type": "string" } }),
@@ -228,6 +283,9 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
             Err(err) => text_result(err.message, true),
         };
     }
+    if let Some(result) = orchestrate(client, thread, name, args).await {
+        return result;
+    }
     let request = match name {
         "list_threads" => Request::ListThreads {
             query: args.get("query").and_then(Value::as_str).map(str::to_owned),
@@ -284,6 +342,229 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
         Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
         Err(err) => text_result(err.message, true),
     }
+}
+
+/// The agents a thread may spawn, in the order they're offered.
+const AGENTS: [&str; 4] = [
+    HarnessId::CLAUDE,
+    HarnessId::CODEX,
+    HarnessId::OPENCODE,
+    HarnessId::GEMINI,
+];
+
+async fn outcome(client: &Client, id: &ThreadId) -> Result<Value, String> {
+    match client
+        .request(Request::ThreadOutcome {
+            thread_id: id.clone(),
+        })
+        .await
+    {
+        Ok(Response::Json { value }) => Ok(value),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(err) => Err(err.message),
+    }
+}
+
+fn json_result(v: &Value) -> Value {
+    text_result(serde_json::to_string_pretty(v).unwrap_or_default(), false)
+}
+
+/// A thread this one spawned (only those may be messaged or stopped).
+async fn own_child(
+    client: &Client,
+    me: &ThreadId,
+    args: &Value,
+) -> Result<(ThreadId, Value), Value> {
+    let Some(id) = args.get("thread_id").and_then(Value::as_str) else {
+        return Err(text_result("thread_id is required", true));
+    };
+    let id = ThreadId(id.to_owned());
+    let state = outcome(client, &id)
+        .await
+        .map_err(|e| text_result(e, true))?;
+    if state["spawned_by"].as_str() != Some(me.as_str()) {
+        return Err(text_result(
+            "only threads this thread spawned can be messaged or stopped",
+            true,
+        ));
+    }
+    Ok((id, state))
+}
+
+/// Orchestration tools; `None` for any other tool.
+async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -> Option<Value> {
+    let str_arg = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    Some(match name {
+        "list_agents" => {
+            let mut agents = Vec::new();
+            for id in AGENTS {
+                let harness = HarnessId(id.into());
+                let status = match client
+                    .request(Request::ProbeHarness {
+                        harness: harness.clone(),
+                    })
+                    .await
+                {
+                    Ok(Response::HarnessStatus { status }) => status,
+                    _ => continue,
+                };
+                let models = if status.installed {
+                    match client.request(Request::ListModels { harness }).await {
+                        Ok(Response::Models { models }) => models
+                            .into_iter()
+                            .map(|m| {
+                                json!({
+                                    "id": m.id, "name": m.display_name, "default": m.is_default,
+                                    "efforts": m.efforts, "default_effort": m.default_effort,
+                                })
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                agents.push(json!({
+                    "agent": id, "installed": status.installed,
+                    "version": status.version, "models": models,
+                }));
+            }
+            let current = outcome(client, me).await.unwrap_or(Value::Null);
+            json_result(&json!({
+                "this_thread": {
+                    "agent": current["agent"], "model": current["model"],
+                    "effort": current["effort"], "permission_mode": current["permission_mode"],
+                },
+                "agents": agents,
+                "permission_modes": ["read-only", "ask-all", "accept-edits", "auto", "full-access"],
+            }))
+        }
+        "spawn_thread" => {
+            let Some(prompt) = str_arg("prompt") else {
+                return Some(text_result("prompt is required", true));
+            };
+            let permission_mode = match str_arg("permission_mode") {
+                None => None,
+                Some(m) => match serde_json::from_value::<PermissionMode>(json!(m)) {
+                    Ok(m) => Some(m),
+                    Err(_) => {
+                        return Some(text_result(format!("unknown permission_mode `{m}`"), true));
+                    }
+                },
+            };
+            let request = Request::SpawnThread {
+                from: me.clone(),
+                prompt,
+                title: str_arg("title"),
+                harness: str_arg("agent").map(HarnessId),
+                model: str_arg("model"),
+                effort: str_arg("effort"),
+                permission_mode,
+                worktree: args
+                    .get("worktree")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            match client.request(request).await {
+                Ok(Response::Thread { thread }) => json_result(&json!({
+                    "thread_id": thread.id, "title": thread.title, "agent": thread.harness,
+                    "model": thread.model, "effort": thread.effort,
+                    "permission_mode": thread.permission_mode, "cwd": thread.cwd,
+                    "next": "It is running. Call wait_for_threads with this thread_id for its reply.",
+                })),
+                Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
+                Err(err) => text_result(err.message, true),
+            }
+        }
+        "thread_status" => match str_arg("thread_id") {
+            None => text_result("thread_id is required", true),
+            Some(id) => match outcome(client, &ThreadId(id)).await {
+                Ok(v) => json_result(&v),
+                Err(e) => text_result(e, true),
+            },
+        },
+        "wait_for_threads" => {
+            let ids: Vec<ThreadId> = args
+                .get("thread_ids")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| ThreadId(s.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Some(text_result("thread_ids is required", true));
+            }
+            let timeout = args
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .clamp(1, 600);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            loop {
+                let mut states = Vec::new();
+                for id in &ids {
+                    states.push(match outcome(client, id).await {
+                        Ok(v) => v,
+                        Err(e) => json!({ "thread_id": id, "status": "unknown", "error": e }),
+                    });
+                }
+                let running = states.iter().filter(|s| s["status"] == "running").count();
+                if running == 0 || std::time::Instant::now() >= deadline {
+                    break json_result(&json!({
+                        "still_running": running,
+                        "threads": states,
+                    }));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+        }
+        "send_to_thread" => {
+            let (id, state) = match own_child(client, me, args).await {
+                Ok(c) => c,
+                Err(e) => return Some(e),
+            };
+            let Some(message) = str_arg("message") else {
+                return Some(text_result("message is required", true));
+            };
+            if state["status"] == "running" {
+                return Some(text_result(
+                    "that thread is still running: wait_for_threads first, or stop_thread",
+                    true,
+                ));
+            }
+            match client
+                .request(Request::SendMessage {
+                    thread_id: id,
+                    text: message,
+                    attachments: Vec::new(),
+                })
+                .await
+            {
+                Ok(_) => text_result("Sent. Call wait_for_threads for the reply.", false),
+                Err(err) => text_result(err.message, true),
+            }
+        }
+        "stop_thread" => {
+            let (id, _) = match own_child(client, me, args).await {
+                Ok(c) => c,
+                Err(e) => return Some(e),
+            };
+            match client.request(Request::Interrupt { thread_id: id }).await {
+                Ok(_) => text_result("Stopped.", false),
+                Err(err) => text_result(err.message, true),
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// Render a browser result; screenshots become MCP image content.

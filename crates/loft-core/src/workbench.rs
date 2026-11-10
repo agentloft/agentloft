@@ -343,6 +343,64 @@ impl Core {
         Ok(out.into_iter().take(limit).map(|(_, h)| h).collect())
     }
 
+    /// Where a thread stands, for the agent orchestrating it.
+    pub(crate) fn thread_outcome(&self, id: &ThreadId) -> CoreResult<serde_json::Value> {
+        let (thread, turns, items) =
+            self.with_store(|s| Ok((s.thread(id)?, s.turns(id)?, s.items(id)?)))?;
+        let thread =
+            thread.ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
+        // The latest answer: the last top-level agent message.
+        const MAX: usize = 20_000;
+        let reply = items
+            .iter()
+            .rev()
+            .filter(|i| i.parent_id.is_none())
+            .find_map(|i| match &i.body {
+                ItemBody::AssistantMessage { text } if !text.trim().is_empty() => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .map(|t| {
+                if t.len() > MAX {
+                    let mut end = MAX;
+                    while !t.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}\n[truncated]", &t[..end])
+                } else {
+                    t
+                }
+            });
+        let status = match thread.status {
+            loft_protocol::ThreadStatus::Running => "running",
+            loft_protocol::ThreadStatus::WaitingApproval => "waiting_for_approval",
+            loft_protocol::ThreadStatus::Error => "error",
+            loft_protocol::ThreadStatus::Archived => "archived",
+            _ => "idle",
+        };
+        let last = turns.last();
+        Ok(serde_json::json!({
+            "thread_id": thread.id,
+            "title": thread.title,
+            "status": status,
+            "agent": thread.harness,
+            "model": thread.model,
+            "effort": thread.effort,
+            "permission_mode": thread.permission_mode,
+            "cwd": thread.cwd,
+            "turns": turns.len(),
+            "last_turn": last.map(|t| serde_json::json!({
+                "status": t.status,
+                "error": t.error,
+            })),
+            "spawned_by": thread.parent.as_ref()
+                .filter(|p| p.kind == loft_protocol::ForkKind::Spawned)
+                .map(|p| p.thread_id.clone()),
+            "latest_reply": reply,
+        }))
+    }
+
     /// A readable transcript of a thread for another agent.
     pub(crate) fn read_thread_text(&self, id: &ThreadId, detail: ReadDetail) -> CoreResult<String> {
         let (thread, items) = self.with_store(|s| Ok((s.thread(id)?, s.items(id)?)))?;

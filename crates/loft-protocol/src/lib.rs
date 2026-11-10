@@ -287,6 +287,31 @@ pub enum Request {
         thread_id: ThreadId,
         command: serde_json::Value,
     },
+    /// An agent starts another thread (orchestration): a child of `from`,
+    /// with `from`'s agent, model, effort and permissions unless given, in
+    /// `from`'s workspace (or a new worktree from it), sent `prompt` at
+    /// once. Answers `Response::Thread`.
+    SpawnThread {
+        from: ThreadId,
+        prompt: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        harness: Option<HarnessId>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+        #[serde(default)]
+        worktree: bool,
+    },
+    /// Where a thread stands, for an orchestrating agent: status, settings,
+    /// its latest reply and who spawned it (`Response::Json`).
+    ThreadOutcome {
+        thread_id: ThreadId,
+    },
     /// Threads whose messages contain `query` (case-insensitive), most
     /// recent first, one hit per thread (answers `Response::SearchHits`).
     SearchThreads {

@@ -29,7 +29,144 @@ pub(crate) fn harness_display(h: &HarnessId) -> String {
     }
 }
 
+/// How deep agents may spawn agents (a spawned thread's spawned thread…).
+const MAX_SPAWN_DEPTH: usize = 3;
+/// How many spawned threads one thread may have running at once.
+const MAX_RUNNING_CHILDREN: usize = 8;
+
+/// What an agent asked for when spawning a thread.
+pub(crate) struct SpawnSpec {
+    pub from: ThreadId,
+    pub prompt: String,
+    pub title: Option<String>,
+    pub harness: Option<HarnessId>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub permission_mode: Option<loft_protocol::PermissionMode>,
+    pub worktree: bool,
+}
+
 impl Core {
+    /// Orchestration: `spec.from`'s agent starts another thread. Unless
+    /// asked otherwise it gets the same agent, model, effort and
+    /// permissions, and works in the same checkout.
+    pub(crate) async fn spawn_thread(self: &Arc<Self>, spec: SpawnSpec) -> CoreResult<Response> {
+        let bad = |m: String| ErrorBody::new(ErrorCode::BadRequest, m);
+        let prompt = spec.prompt.trim().to_owned();
+        if prompt.is_empty() {
+            return Err(bad("prompt is empty".into()));
+        }
+        let (parent, threads) = self.with_store(|s| Ok((s.thread(&spec.from)?, s.threads()?)))?;
+        let parent =
+            parent.ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
+        // Agents spawning agents spawning agents… stops somewhere.
+        let mut depth = 0;
+        let mut at = parent.parent.clone();
+        while let Some(p) = at.filter(|p| p.kind == ForkKind::Spawned) {
+            depth += 1;
+            at = threads
+                .iter()
+                .find(|t| t.id == p.thread_id)
+                .and_then(|t| t.parent.clone());
+        }
+        if depth + 1 > MAX_SPAWN_DEPTH {
+            return Err(bad(format!(
+                "spawned threads may not nest deeper than {MAX_SPAWN_DEPTH}"
+            )));
+        }
+        let running = threads
+            .iter()
+            .filter(|t| {
+                t.parent
+                    .as_ref()
+                    .is_some_and(|p| p.thread_id == parent.id && p.kind == ForkKind::Spawned)
+                    && matches!(
+                        t.status,
+                        ThreadStatus::Running | ThreadStatus::WaitingApproval
+                    )
+            })
+            .count();
+        if running >= MAX_RUNNING_CHILDREN {
+            return Err(bad(format!(
+                "{running} spawned threads are still running; wait for some first"
+            )));
+        }
+        let harness = spec.harness.unwrap_or_else(|| parent.harness.clone());
+        if self.harness(&harness).is_none() {
+            return Err(bad(format!("unknown agent `{harness}`")));
+        }
+        let same = harness == parent.harness;
+        let (default_model, _, default_effort) = crate::thread_defaults(&self.config(), &harness);
+        let model = spec.model.or_else(|| {
+            if same {
+                parent.model.clone()
+            } else {
+                default_model
+            }
+        });
+        let effort = spec.effort.or_else(|| {
+            if same {
+                parent.effort.clone()
+            } else {
+                default_effort
+            }
+        });
+        let id = ThreadId::new();
+        let (cwd, workspace) = if spec.worktree {
+            self.fork_workspace(&parent, &id, None).await?
+        } else {
+            (parent.cwd.clone(), parent.workspace.clone())
+        };
+        let title = spec
+            .title
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| {
+                let line = prompt.lines().next().unwrap_or(&prompt).trim();
+                let mut t: String = line.chars().take(60).collect();
+                if line.chars().count() > 60 {
+                    t.push('…');
+                }
+                t
+            });
+        let now = now_ms();
+        let thread = Thread {
+            id: id.clone(),
+            project_id: parent.project_id.clone(),
+            title,
+            harness,
+            cwd,
+            model,
+            permission_mode: spec.permission_mode.or(parent.permission_mode),
+            effort,
+            native_session_id: None,
+            status: ThreadStatus::Idle,
+            created_at_ms: now,
+            updated_at_ms: now,
+            workspace,
+            parent: Some(ThreadParent {
+                thread_id: parent.id.clone(),
+                turn_id: None,
+                kind: ForkKind::Spawned,
+            }),
+            slash_commands: Vec::new(),
+            command_info: Vec::new(),
+            started_at_ms: None,
+            draft: None,
+        };
+        self.commit(vec![Event::ThreadCreated {
+            thread: thread.clone(),
+        }])?;
+        Box::pin(self.handle(loft_protocol::Request::SendMessage {
+            thread_id: id.clone(),
+            text: prompt,
+            attachments: Vec::new(),
+        }))
+        .await?;
+        let thread = self.with_store(|s| s.thread(&id))?.unwrap_or(thread);
+        Ok(Response::Thread { thread })
+    }
+
     pub(crate) async fn fork_thread(
         self: &Arc<Self>,
         parent_id: &ThreadId,

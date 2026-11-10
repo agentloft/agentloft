@@ -98,7 +98,7 @@ fn tool_name(name: &str) -> String {
 }
 
 /// "claude-opus-5-5" → "Opus 5.5".
-fn model_name(id: &str) -> String {
+pub(crate) fn model_name(id: &str) -> String {
     let id = id.strip_prefix("claude-").unwrap_or(id);
     let mut parts = id.split('-');
     let family = parts.next().unwrap_or(id);

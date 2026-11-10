@@ -258,6 +258,19 @@ impl AppStore {
         cx.notify();
     }
 
+    /// A model's name as the agent lists it (`gpt-6.1-sol` → its display
+    /// name), else a tidied id.
+    pub fn model_display(&self, harness: &HarnessId, model: &str) -> String {
+        self.models
+            .get(harness)
+            .and_then(|list| {
+                list.iter()
+                    .find(|k| k.id == model || k.resolved_id.as_deref() == Some(model))
+            })
+            .map(|k| k.display_name.clone())
+            .unwrap_or_else(|| crate::workspace::pretty_model(model))
+    }
+
     /// Fetch `harness`'s models unless they're already here.
     pub fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         if !self.models.get(&harness).is_some_and(|m| !m.is_empty()) {
@@ -1758,10 +1771,12 @@ pub enum CardState {
 /// Rows for a list of top-level items: consecutive tool calls fold into
 /// one group row.
 fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
-    // Subagents get a row of their own (their card), never a group's.
+    // Subagents (and threads an agent started) get a row of their own
+    // (their card), never a group's.
     let is_subagent = |i: usize| {
-        matches!(&items[i].body, ItemBody::ToolCall { tool_kind, .. }
-            if *tool_kind == loft_protocol::ToolKind::Subagent)
+        matches!(&items[i].body, ItemBody::ToolCall { tool_kind, tool, .. }
+            if *tool_kind == loft_protocol::ToolKind::Subagent
+                || tool.ends_with("agentloft__spawn_thread"))
     };
     let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. }) && !is_subagent(i);
     let mut k = 0;

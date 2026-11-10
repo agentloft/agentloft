@@ -16,7 +16,7 @@ use gpui_kit::{
 use loft_client::model::ThreadModel;
 use loft_protocol::{
     DecisionKind, Item, ItemBody, ItemStatus, NoticeLevel, RequestKind, RequestStatus,
-    RuntimeRequest, ToolKind, TurnStatus,
+    RuntimeRequest, ThreadId, ThreadStatus, ToolKind, TurnStatus,
 };
 
 const OUTPUT_PREVIEW_LINES: usize = 14;
@@ -333,7 +333,7 @@ pub fn render_row(
         Row::Item(i) => render_item(thread, state, &model.items[*i], p),
         Row::ToolGroup { members } => {
             let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();
-            render_tool_group(thread, store, state, model, &items, p)
+            render_tool_group(thread, store, state, model, &items, p, cx)
         }
         Row::Work {
             turn_ix,
@@ -721,6 +721,7 @@ fn render_tool_group(
     model: &ThreadModel,
     items: &[&Item],
     p: &Palette,
+    cx: &App,
 ) -> AnyElement {
     let cwd = model.thread.cwd.as_str();
     let open_requests: Vec<&RuntimeRequest> = items
@@ -735,7 +736,7 @@ fn render_tool_group(
 
     let mut col = v_flex().gap_1();
     if items.len() == 1 {
-        col = col.child(tool_line(thread, store, state, model, items[0], p));
+        col = col.child(tool_line(thread, store, state, model, items[0], p, cx));
     } else {
         let open = state.is_expanded(&key, running);
         let thread_h = thread.clone();
@@ -765,7 +766,7 @@ fn render_tool_group(
                 .border_l_1()
                 .border_color(p.border);
             for item in items {
-                list = list.child(tool_line(thread, store, state, model, item, p));
+                list = list.child(tool_line(thread, store, state, model, item, p, cx));
             }
             col = col.child(list);
         }
@@ -784,6 +785,7 @@ pub(crate) fn tool_line(
     model: &ThreadModel,
     item: &Item,
     p: &Palette,
+    cx: &App,
 ) -> AnyElement {
     let ItemBody::ToolCall {
         tool,
@@ -798,6 +800,11 @@ pub(crate) fn tool_line(
     };
     if *tool_kind == ToolKind::Subagent {
         return agent_card(store, model, item, title, p);
+    }
+    // An agent this one started in its own thread (orchestration).
+    if tool.ends_with("agentloft__spawn_thread") && !*is_error && item.status != ItemStatus::Failed
+    {
+        return spawned_card(store, model, item, input, output.as_deref(), p, cx);
     }
     let cwd = model.thread.cwd.as_str();
     let running = item.status == ItemStatus::InProgress;
@@ -833,6 +840,54 @@ pub(crate) fn tool_line(
             _ => String::new(),
         };
     }
+    // Orchestration tools name the threads they touch, not their ids.
+    let mut label = tool_label(tool);
+    let mut plain = false;
+    if let Some(op) = tool.strip_prefix("mcp__agentloft__") {
+        let title_of = |id: &str| {
+            store
+                .read(cx)
+                .workspace
+                .threads
+                .iter()
+                .find(|t| t.id.0 == id)
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| id.chars().take(8).collect())
+        };
+        let one = input
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(title_of);
+        let named = match op {
+            "wait_for_threads" => Some((
+                "Waited for",
+                input
+                    .get("thread_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|id| format!("“{}”", title_of(id)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+            )),
+            "send_to_thread" => Some((
+                "Messaged",
+                one.map(|t| format!("“{t}”")).unwrap_or_default(),
+            )),
+            "stop_thread" => Some(("Stopped", one.map(|t| format!("“{t}”")).unwrap_or_default())),
+            "thread_status" => Some(("Checked", one.map(|t| format!("“{t}”")).unwrap_or_default())),
+            "list_agents" => Some(("Listed agents", String::new())),
+            _ => None,
+        };
+        if let Some((verb, what)) = named {
+            label = verb.to_owned();
+            detail = what;
+            plain = true;
+        }
+    }
     let clickable = file.is_some() || output.is_some();
 
     let row = h_flex()
@@ -848,15 +903,16 @@ pub(crate) fn tool_line(
                 .flex_shrink_0()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(p.foreground)
-                .child(tool_label(tool)),
+                .child(label),
         )
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .font_family(p.mono.clone())
-                .text_size(p.mono_size)
+                .when(!plain, |d| {
+                    d.font_family(p.mono.clone()).text_size(p.mono_size)
+                })
                 .text_color(if file.is_some() {
                     p.accent
                 } else {
@@ -1144,6 +1200,151 @@ fn agent_card(
         .on_click(move |_, _, cx| {
             let (thread_id, item_id) = (thread_id.clone(), item_id.clone());
             store.update(cx, |s, cx| s.open_agent(thread_id, item_id, cx));
+        })
+        .into_any_element()
+}
+
+/// The thread id in a `spawn_thread` result (its JSON, or the text around it).
+fn spawned_id(output: &str) -> Option<ThreadId> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output)
+        && let Some(id) = v.get("thread_id").and_then(|v| v.as_str())
+    {
+        return Some(ThreadId(id.to_owned()));
+    }
+    let at = output.find("\"thread_id\"")?;
+    let rest = &output[at + 11..];
+    let start = rest.find('"')? + 1;
+    let len = rest[start..].find('"')?;
+    Some(ThreadId(rest[start..start + len].to_owned()))
+}
+
+/// A thread another agent started (`spawn_thread`): its agent, title and
+/// live status; click to open it (⌘-click: beside this one).
+fn spawned_card(
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    item: &Item,
+    input: &serde_json::Value,
+    output: Option<&str>,
+    p: &Palette,
+    cx: &App,
+) -> AnyElement {
+    let child = output.and_then(spawned_id).and_then(|id| {
+        store
+            .read(cx)
+            .workspace
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+    });
+    let asked = |k: &str| {
+        input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let (harness, title, subtitle, dot, running) = match &child {
+        Some(t) => {
+            let (what, dot, running) = match t.status {
+                ThreadStatus::Running => ("Working", p.accent, true),
+                ThreadStatus::WaitingApproval => ("Needs your approval", p.warning, false),
+                ThreadStatus::Error => ("Failed", p.danger, false),
+                _ => ("Done", p.success, false),
+            };
+            let mut subtitle = crate::workspace::harness_name(&t.harness).to_owned();
+            if let Some(m) = &t.model {
+                subtitle.push_str(&format!(
+                    " · {}",
+                    store.read(cx).model_display(&t.harness, m)
+                ));
+            }
+            if let Some(e) = &t.effort {
+                subtitle.push_str(&format!(" · {e}"));
+            }
+            (
+                t.harness.as_str().to_owned(),
+                t.title.clone(),
+                format!("{what} · {subtitle}"),
+                dot,
+                running,
+            )
+        }
+        None => (
+            asked("agent")
+                .unwrap_or(model.thread.harness.as_str())
+                .to_owned(),
+            asked("title")
+                .map(str::to_owned)
+                .or_else(|| asked("prompt").and_then(first_line))
+                .unwrap_or_else(|| "New agent".into()),
+            "Starting agent…".into(),
+            p.accent,
+            item.status == ItemStatus::InProgress,
+        ),
+    };
+    let target = child.map(|t| t.id);
+    let store = store.clone();
+    h_flex()
+        .id(SharedString::from(format!("spawned-{}", item.id)))
+        .gap_3()
+        .items_center()
+        .px_2()
+        .py_1p5()
+        .ml(px(-8.))
+        .rounded(px(10.))
+        .when(target.is_some(), |d| {
+            d.cursor_pointer().hover(|d| d.bg(p.hover))
+        })
+        .child(agent_avatar(
+            &format!("spawned-dot-{}", item.id),
+            &harness,
+            30.,
+            dot,
+            running,
+            p,
+        ))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.foreground)
+                        .truncate()
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(p.muted_foreground)
+                        .truncate()
+                        .child(subtitle),
+                ),
+        )
+        .when(target.is_some(), |d| {
+            d.child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(p.faint_foreground)
+                    .child("Open thread")
+                    .child(Icon::new(IconName::ChevronRight).xsmall()),
+            )
+        })
+        .when_some(target, |d, id| {
+            d.on_click(move |e: &gpui_kit::ClickEvent, _, cx| {
+                let id = id.clone();
+                if e.modifiers().platform {
+                    store.update(cx, |s, cx| s.open_pane(id, cx));
+                } else {
+                    store.update(cx, |s, cx| s.select_thread(id, cx));
+                }
+            })
         })
         .into_any_element()
 }
