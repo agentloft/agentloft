@@ -338,3 +338,111 @@ mod tests {
         assert_eq!(normalize_rename("src/{ => sub}/x.rs"), "src/sub/x.rs");
     }
 }
+
+/// A new, empty repository at `dir` (created) on branch `main`.
+pub fn init_repo(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    run(git(dir).args(["init", "--quiet", "--initial-branch=main"]))?;
+    Ok(())
+}
+
+/// Clone `url` into `dest` (which must not exist yet). `env` is the login
+/// environment (credentials, SSH agent); GitHub `owner/repo` goes through
+/// `gh` when it's installed (private repos), else plain https.
+pub fn clone_repo(
+    source: &CloneSource,
+    dest: &Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if dest.exists() {
+        bail!("{} already exists", dest.display());
+    }
+    let parent = dest.parent().context("no parent folder")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let mut cmd = match source {
+        CloneSource::GitHub(repo) if which("gh", env) => {
+            let mut c = Command::new("gh");
+            c.args(["repo", "clone", repo]).arg(dest);
+            c
+        }
+        CloneSource::GitHub(repo) => {
+            let mut c = Command::new("git");
+            c.args([
+                "clone",
+                "--quiet",
+                &format!("https://github.com/{repo}.git"),
+            ])
+            .arg(dest);
+            c
+        }
+        CloneSource::Url(url) => {
+            let mut c = Command::new("git");
+            c.args(["clone", "--quiet", url]).arg(dest);
+            c
+        }
+    };
+    cmd.current_dir(parent)
+        .envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    let out = cmd.output().context("run clone")?;
+    if !out.status.success() {
+        bail!(
+            "clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Where to clone from.
+pub enum CloneSource {
+    Url(String),
+    /// `owner/repo`.
+    GitHub(String),
+}
+
+impl CloneSource {
+    /// The folder name a clone gets: the repo's name.
+    pub fn name(&self) -> String {
+        let s = match self {
+            CloneSource::Url(u) | CloneSource::GitHub(u) => u.trim_end_matches('/'),
+        };
+        let last = s.rsplit(['/', ':']).next().unwrap_or(s);
+        last.strip_suffix(".git").unwrap_or(last).to_owned()
+    }
+}
+
+fn which(bin: &str, env: &std::collections::HashMap<String, String>) -> bool {
+    let path = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    std::env::split_paths(&path).any(|d| d.join(bin).is_file())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::CloneSource;
+
+    #[test]
+    fn clone_folders_are_named_after_the_repo() {
+        assert_eq!(
+            CloneSource::Url("https://github.com/a/b.git".into()).name(),
+            "b"
+        );
+        assert_eq!(
+            CloneSource::Url("git@github.com:a/tool.git".into()).name(),
+            "tool"
+        );
+        assert_eq!(
+            CloneSource::Url("https://x.org/repo/".into()).name(),
+            "repo"
+        );
+        assert_eq!(
+            CloneSource::GitHub("zed-industries/zed".into()).name(),
+            "zed"
+        );
+    }
+}

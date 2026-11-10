@@ -534,6 +534,12 @@ impl Core {
             Request::Ping => Ok(Response::Pong),
             Request::AddProject { path, name } => self.add_project(path, name),
             Request::CreateChat { harness } => self.create_chat(harness),
+            Request::CreateProject { parent, name } => self.create_project(parent, name).await,
+            Request::CloneProject {
+                parent,
+                source,
+                github,
+            } => self.clone_project(parent, source, github).await,
             Request::ListProjects => {
                 let (projects, threads) = self.with_store(|s| Ok((s.projects()?, s.threads()?)))?;
                 let chats = std::fs::canonicalize(&self.opts().chats_dir)
@@ -826,6 +832,52 @@ impl Core {
 
     /// A thread without a project: it lives in the built-in "Chats" project
     /// and works in an empty folder of its own.
+    async fn create_project(&self, parent: String, name: String) -> CoreResult<Response> {
+        let name = name.trim().to_owned();
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            return Err(ErrorBody::new(ErrorCode::BadRequest, "not a folder name"));
+        }
+        let dir = expand_tilde(&parent).join(&name);
+        if dir.exists() {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!("{} already exists", dir.display()),
+            ));
+        }
+        let at = dir.clone();
+        worktrees::blocking(move || loft_git::init_repo(&at)).await?;
+        self.add_project(dir.to_string_lossy().into_owned(), Some(name))
+    }
+
+    async fn clone_project(
+        &self,
+        parent: String,
+        source: String,
+        github: bool,
+    ) -> CoreResult<Response> {
+        let source = source.trim().to_owned();
+        if source.is_empty() {
+            return Err(ErrorBody::new(ErrorCode::BadRequest, "nothing to clone"));
+        }
+        let source = if github {
+            let repo = source
+                .trim_start_matches("https://github.com/")
+                .trim_end_matches(".git")
+                .trim_matches('/')
+                .to_owned();
+            if repo.split('/').count() != 2 {
+                return Err(ErrorBody::new(ErrorCode::BadRequest, "use owner/repo"));
+            }
+            loft_git::CloneSource::GitHub(repo)
+        } else {
+            loft_git::CloneSource::Url(source)
+        };
+        let dest = expand_tilde(&parent).join(source.name());
+        let (at, env) = (dest.clone(), self.opts().env.clone());
+        worktrees::blocking(move || loft_git::clone_repo(&source, &at, &env)).await?;
+        self.add_project(dest.to_string_lossy().into_owned(), None)
+    }
+
     /// The built-in "Chats" project (created on first use).
     pub(crate) fn chats_project(&self) -> CoreResult<Project> {
         let dir = self.opts().chats_dir.clone();

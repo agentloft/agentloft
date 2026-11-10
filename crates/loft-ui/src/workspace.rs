@@ -2431,7 +2431,14 @@ impl WorkspaceView {
                 .collect()
         };
         let mut projects = projects;
-        projects.sort_by_key(|p| !chats.contains(&p.id));
+        // Then pinned projects, in pin order; then the rest as they were.
+        let pinned = self.store.read(cx).pinned_projects.clone();
+        projects.sort_by_key(|p| {
+            (
+                !chats.contains(&p.id),
+                pinned.iter().position(|x| *x == p.id).unwrap_or(usize::MAX),
+            )
+        });
 
         for project in &projects {
             let project_id = project.id.clone();

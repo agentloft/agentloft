@@ -138,7 +138,13 @@ pub fn open(
 
 /// "↑ ↓ Navigate · Enter Select · Esc Close" under the list.
 pub(crate) fn key_hints(cx: &App) -> gpui_kit::AnyElement {
+    key_hints_with_back(cx, false)
+}
+
+/// The key hints, with "Backspace Back" when there's a step to go back to.
+pub(crate) fn key_hints_with_back(cx: &App, back: bool) -> gpui_kit::AnyElement {
     use gpui_kit::component::Sizable as _;
+    use gpui_kit::prelude::FluentBuilder as _;
     use gpui_kit::{IntoElement as _, div};
     let p = crate::theme::Palette::of(cx);
     let key = |child: gpui_kit::AnyElement| {
@@ -184,6 +190,7 @@ pub(crate) fn key_hints(cx: &App) -> gpui_kit::AnyElement {
             "Navigate",
         ))
         .child(hint(vec![word("Enter")], "Select"))
+        .when(back, |d| d.child(hint(vec![word("Backspace")], "Back")))
         .child(hint(vec![word("Esc")], "Close"))
         .into_any_element()
 }

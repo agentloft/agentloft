@@ -108,6 +108,8 @@ pub struct AppStore {
     pub collapsed: std::collections::HashSet<ProjectId>,
     /// Threads whose forks / spawned threads are folded in the sidebar.
     pub folded_threads: std::collections::HashSet<ThreadId>,
+    /// Projects pinned to the top (sidebar and pickers), in pin order.
+    pub pinned_projects: Vec<ProjectId>,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
     /// Commands an agent offers in a folder, asked without a session
@@ -146,6 +148,7 @@ impl AppStore {
     pub fn new(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut Context<Self>) -> Self {
         let collapsed = load_collapsed(&paths);
         let folded_threads = load_folded_threads(&paths);
+        let pinned_projects = load_list::<ProjectId>(&paths, "pinned_projects");
         let mut this = Self {
             runtime,
             paths,
@@ -161,6 +164,7 @@ impl AppStore {
             max_rows: 2,
             collapsed,
             folded_threads,
+            pinned_projects,
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
@@ -709,12 +713,25 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Pin a project to the top, or unpin it.
+    pub fn toggle_pinned(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        match self.pinned_projects.iter().position(|p| *p == project) {
+            Some(at) => {
+                self.pinned_projects.remove(at);
+            }
+            None => self.pinned_projects.push(project),
+        }
+        self.save_sidebar();
+        cx.notify();
+    }
+
     fn save_sidebar(&self) {
         let projects: Vec<&str> = self.collapsed.iter().map(|p| p.as_str()).collect();
         let threads: Vec<&str> = self.folded_threads.iter().map(|t| t.as_str()).collect();
-        if let Ok(json) = serde_json::to_vec_pretty(
-            &serde_json::json!({ "collapsed": projects, "folded_threads": threads }),
-        ) {
+        let pinned: Vec<&str> = self.pinned_projects.iter().map(|p| p.as_str()).collect();
+        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({
+            "collapsed": projects, "folded_threads": threads, "pinned_projects": pinned,
+        })) {
             let _ = std::fs::write(sidebar_file(&self.paths), json);
         }
     }
@@ -871,13 +888,42 @@ impl AppStore {
         .detach();
     }
 
+    /// Create or clone a project (`CreateProject` / `CloneProject`), then
+    /// open a new thread in it.
+    pub fn make_project(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.request(request, cx, |store, resp, cx| {
+            if let Response::Project { project } = resp {
+                store.new_thread(project.id, cx);
+            }
+        });
+    }
+
+    /// Where new and cloned projects go: next to the current project, else
+    /// next to the newest one, else ~/Projects.
+    pub fn projects_parent(&self) -> String {
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.workspace.thread(id))
+            .map(|t| t.project_id.clone());
+        let real: Vec<&loft_protocol::Project> = self
+            .workspace
+            .projects
+            .iter()
+            .filter(|p| !self.is_chats(p))
+            .collect();
+        real.iter()
+            .find(|p| Some(&p.id) == current.as_ref())
+            .or_else(|| real.iter().max_by_key(|p| p.created_at_ms))
+            .and_then(|p| std::path::Path::new(&p.root_path).parent())
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "~/Projects".into())
+    }
+
     pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
         self.request(Request::AddProject { path, name: None }, cx, |_, _, _| {});
     }
 
-    /// Open a new thread in `project_id`. It isn't really started until the
-    /// first message, so an untouched one (no messages, no draft) is reused
-    /// rather than piling up empty threads.
     /// The built-in "Chats" project (threads without a project): its root
     /// is Agentloft's chats folder.
     pub fn is_chats(&self, project: &loft_protocol::Project) -> bool {
@@ -924,6 +970,9 @@ impl AppStore {
         );
     }
 
+    /// Open a new thread in `project_id`. It isn't really started until the
+    /// first message, so an untouched one (no messages, no draft) is reused
+    /// rather than piling up empty threads.
     pub fn new_thread(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
         let blank = self
             .workspace
@@ -1380,6 +1429,15 @@ fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
         .unwrap_or_default()
         .into_iter()
         .collect()
+}
+
+fn load_list<T: serde::de::DeserializeOwned>(paths: &Paths, key: &str) -> Vec<T> {
+    std::fs::read(sidebar_file(paths))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get(key).cloned())
+        .and_then(|v| serde_json::from_value::<Vec<T>>(v).ok())
+        .unwrap_or_default()
 }
 
 fn load_folded_threads(paths: &Paths) -> std::collections::HashSet<ThreadId> {

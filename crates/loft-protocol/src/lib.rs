@@ -75,6 +75,20 @@ pub enum Request {
         #[serde(default)]
         name: Option<String>,
     },
+    /// A new project: an empty git repository named `name` in `parent`
+    /// (answers `Response::Project`).
+    CreateProject {
+        parent: String,
+        name: String,
+    },
+    /// A project cloned from `source` (a git URL, or GitHub `owner/repo`
+    /// with `github`) into `parent` (answers `Response::Project`).
+    CloneProject {
+        parent: String,
+        source: String,
+        #[serde(default)]
+        github: bool,
+    },
     /// A thread without a project (a chat): kept in the built-in "Chats"
     /// project, working in an empty folder of its own. Answers
     /// `Response::Thread`.

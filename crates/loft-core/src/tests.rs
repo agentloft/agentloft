@@ -1218,3 +1218,38 @@ async fn threads_can_be_spawned_in_another_project_or_as_a_chat() {
     let err = spawn(Some("nowhere"), false).await.unwrap_err();
     assert!(err.message.contains("Dispatch"), "{}", err.message);
 }
+
+#[tokio::test]
+async fn new_projects_are_fresh_git_repos() {
+    let f = fixture();
+    let parent = tempfile::tempdir().unwrap();
+    let Response::Project { project } = f
+        .core
+        .handle(Request::CreateProject {
+            parent: parent.path().to_string_lossy().into_owned(),
+            name: "fresh".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(project.name, "fresh");
+    assert!(
+        std::path::Path::new(&project.root_path)
+            .join(".git")
+            .exists()
+    );
+    // Not twice, and not a path.
+    for name in ["fresh", "a/b", ""] {
+        assert!(
+            f.core
+                .handle(Request::CreateProject {
+                    parent: parent.path().to_string_lossy().into_owned(),
+                    name: name.into(),
+                })
+                .await
+                .is_err()
+        );
+    }
+}
