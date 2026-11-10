@@ -265,6 +265,9 @@ pub struct AppStore {
     pub conn: ConnState,
     pub workspace: WorkspaceModel,
     ws_sub: Option<u64>,
+    /// The daemon's thread list has arrived on this connection. Threads are
+    /// only watched from then on: one remembered from last time may be gone.
+    ws_ready: bool,
     /// Open thread views (subscribed).
     pub threads: HashMap<ThreadId, Entity<ThreadState>>,
     subs: HashMap<u64, ThreadId>,
@@ -298,8 +301,6 @@ pub struct AppStore {
     /// Threads with a queued message on its way (sent, not yet answered):
     /// the next one waits for it, so two never race for the same turn.
     flushing: HashSet<ThreadId>,
-    /// Last request error, shown in the UI.
-    pub last_error: Option<String>,
     /// Text to prefill a thread's composer with (a fork's handoff digest).
     pub drafts: HashMap<ThreadId, String>,
     /// Threads that finished a turn while not selected (sidebar dot).
@@ -341,6 +342,7 @@ impl AppStore {
             conn: ConnState::Connecting,
             workspace: WorkspaceModel::default(),
             ws_sub: None,
+            ws_ready: false,
             threads: HashMap::new(),
             subs: HashMap::new(),
             selected: None,
@@ -356,7 +358,6 @@ impl AppStore {
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
             flushing: HashSet::new(),
-            last_error: None,
             drafts: HashMap::new(),
             unread: Default::default(),
             models: HashMap::new(),
@@ -452,12 +453,11 @@ impl AppStore {
     fn on_connected(&mut self, client: Client, cx: &mut Context<Self>) {
         tracing::info!(daemon = %client.welcome().daemon_build, pid = client.welcome().daemon_pid, "connected");
         self.conn = ConnState::Connected;
+        // Open threads are watched once the thread list is in (see
+        // `on_workspace_snapshot`).
         self.subs.clear();
+        self.ws_ready = false;
         self.ws_sub = Some(client.subscribe(Topic::Workspace));
-        for id in self.threads.keys() {
-            let sub = client.subscribe(Topic::Thread(id.clone()));
-            self.subs.insert(sub, id.clone());
-        }
         let pid = client.welcome().daemon_pid;
         let restarted = self.daemon_pid.is_some_and(|old| old != pid);
         self.daemon_pid = Some(pid);
@@ -693,6 +693,7 @@ impl AppStore {
 
     fn on_disconnected(&mut self, cx: &mut Context<Self>) {
         self.client = None;
+        self.ws_ready = false;
         crate::host::set_client(None);
         self.conn = ConnState::Disconnected("connection to agentloftd lost".into());
         cx.notify();
@@ -728,6 +729,7 @@ impl AppStore {
                     }
                 } else if Some(sub_id) == self.ws_sub {
                     self.workspace.apply_snapshot(snapshot);
+                    self.on_workspace_snapshot(cx);
                     self.refresh_badge();
                     // Reopen the most recently active thread on launch.
                     if self.selected.is_none()
@@ -782,6 +784,10 @@ impl AppStore {
                             {
                                 self.fetch_models(thread.harness.clone(), cx);
                             }
+                        }
+                        // Deleted (here or from another window or agent).
+                        if let Event::ThreadDeleted { thread_id } = &event.event {
+                            self.forget_thread(thread_id, cx);
                         }
                         cx.notify();
                     }
@@ -843,10 +849,7 @@ impl AppStore {
                     });
                 }
             },
-            ClientEvent::Fatal(err) => {
-                self.last_error = Some(err.message);
-                cx.notify();
-            }
+            ClientEvent::Fatal(err) => self.fail(err.message, cx),
             ClientEvent::Disconnected => self.on_disconnected(cx),
         }
     }
@@ -942,11 +945,40 @@ impl AppStore {
         let live = self.live_spawned(id);
         entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
         self.threads.insert(id.clone(), entity.clone());
-        if let Some(client) = &self.client {
+        if self.ws_ready
+            && let Some(client) = &self.client
+        {
             let sub = client.subscribe(Topic::Thread(id.clone()));
             self.subs.insert(sub, id.clone());
         }
         entity
+    }
+
+    /// The daemon's thread list is in: let go of threads it no longer has
+    /// (one deleted since this window last showed it, say), then watch the
+    /// open ones.
+    fn on_workspace_snapshot(&mut self, cx: &mut Context<Self>) {
+        let gone: Vec<ThreadId> = self
+            .threads
+            .keys()
+            .chain(self.layout.iter().flatten())
+            .chain(self.selected.iter())
+            .filter(|id| !self.workspace.threads.iter().any(|t| &t.id == *id))
+            .cloned()
+            .collect();
+        for id in gone {
+            self.forget_thread(&id, cx);
+        }
+        self.ws_ready = true;
+        let Some(client) = &self.client else {
+            return;
+        };
+        for id in self.threads.keys() {
+            if !self.subs.values().any(|watched| watched == id) {
+                let sub = client.subscribe(Topic::Thread(id.clone()));
+                self.subs.insert(sub, id.clone());
+            }
+        }
     }
 
     pub fn select_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
@@ -1194,28 +1226,31 @@ impl AppStore {
             .and_then(|id| self.threads.get(id).cloned())
     }
 
-    /// Fire a request; errors are surfaced in `last_error`.
+    /// Tell the user something went wrong (an error toast).
+    fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        cx.emit(StoreEvent::Notify {
+            message: message.into(),
+            error: true,
+        });
+    }
+
+    /// Fire a request; errors are shown to the user as a toast.
     pub fn request(
         &mut self,
         body: Request,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, Response, &mut Context<Self>) + 'static,
     ) {
+        // Not connected: the "reconnecting" banner already says so.
         let Some(client) = self.client.clone() else {
-            self.last_error = Some("not connected to agentloftd".into());
-            cx.notify();
             return;
         };
-        self.last_error = None;
         let fut = client.request(body);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result: Result<Response, ErrorBody> = fut.await;
             let _ = this.update(cx, |store, cx| match result {
                 Ok(resp) => then(store, resp, cx),
-                Err(err) => {
-                    store.last_error = Some(err.message);
-                    cx.notify();
-                }
+                Err(err) => store.fail(err.message, cx),
             });
         })
         .detach();
@@ -1316,8 +1351,7 @@ impl AppStore {
                 match std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&src, &dest)) {
                     Ok(_) => Some(dest.to_string_lossy().into_owned()),
                     Err(e) => {
-                        self.last_error = Some(format!("Couldn't use that image: {e}"));
-                        cx.notify();
+                        self.fail(format!("Couldn't use that image: {e}"), cx);
                         return;
                     }
                 }
@@ -1668,19 +1702,45 @@ impl AppStore {
         };
         self.request_result(body, cx, move |store, result, cx| match result {
             Ok(_) => {
-                store.on_archived(&thread_id, cx);
-                store.threads.remove(&thread_id);
-                store.unread.remove(&thread_id);
-                store.drafts.remove(&thread_id);
+                store.forget_thread(&thread_id, cx);
                 store.notify_result(Ok("Thread deleted".into()), cx);
             }
             Err(err) => store.notify_result(Err(err), cx),
         });
     }
 
-    /// Move the selection off an archived (or deleted) thread.
+    /// A thread is gone for good: close its pane and drop what we held for
+    /// it, so nothing asks the daemon about it again.
+    fn forget_thread(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
+        self.on_archived(thread_id, cx);
+        self.threads.remove(thread_id);
+        self.unread.remove(thread_id);
+        self.drafts.remove(thread_id);
+        self.queued.remove(thread_id);
+        self.flushing.remove(thread_id);
+        let subs: Vec<u64> = self
+            .subs
+            .iter()
+            .filter(|(_, id)| *id == thread_id)
+            .map(|(sub, _)| *sub)
+            .collect();
+        for sub in subs {
+            self.subs.remove(&sub);
+            if let Some(client) = &self.client {
+                client.unsubscribe(sub);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Move the selection off an archived (or deleted) thread, and close
+    /// its pane.
     fn on_archived(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
         if self.selected.as_ref() != Some(thread_id) {
+            // Shown beside the focused thread: just that pane goes.
+            if self.take_pane(thread_id).is_some() {
+                cx.notify();
+            }
             return;
         }
         let next = self
@@ -1752,7 +1812,6 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client.clone() else {
-            self.last_error = Some("not connected to agentloftd".into());
             self.requeue(thread_id, message, back_at, cx);
             return;
         };
@@ -1766,7 +1825,7 @@ impl AppStore {
             let result = fut.await;
             let _ = this.update(cx, |store, cx| {
                 if let Err(err) = result {
-                    store.last_error = Some(err.message);
+                    store.fail(err.message, cx);
                     store.requeue(thread_id, message, back_at, cx);
                 }
             });
@@ -1845,7 +1904,7 @@ impl AppStore {
                     // Still first in line: it goes when the agent is free.
                     store.queued.entry(id.clone()).or_default().push_front(next);
                     if err.code != loft_protocol::ErrorCode::Conflict {
-                        store.last_error = Some(err.message);
+                        store.fail(err.message, cx);
                     }
                 }
                 cx.notify();

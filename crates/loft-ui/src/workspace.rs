@@ -379,7 +379,11 @@ impl WorkspaceView {
                 use gpui_kit::component::notification::Notification;
                 let note = Notification::new().message(message.clone());
                 let note = if *error {
-                    note.with_type(gpui_kit::component::notification::NotificationType::Error)
+                    // The same error again replaces its toast rather than
+                    // stacking another.
+                    struct ErrorToast;
+                    note.id1::<ErrorToast>(gpui_kit::SharedString::from(message.clone()))
+                        .with_type(gpui_kit::component::notification::NotificationType::Error)
                 } else {
                     note.with_type(gpui_kit::component::notification::NotificationType::Success)
                 };
@@ -2754,14 +2758,13 @@ impl WorkspaceView {
     }
 
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let (projects, all_threads, selected, conn, error, unread, collapsed) = {
+        let (projects, all_threads, selected, conn, unread, collapsed) = {
             let store = self.store.read(cx);
             (
                 store.workspace.projects.clone(),
                 store.workspace.threads.clone(),
                 store.selected.clone(),
                 store.conn.clone(),
-                store.last_error.clone(),
                 store.unread.clone(),
                 store.collapsed.clone(),
             )
@@ -3134,20 +3137,6 @@ impl WorkspaceView {
                     .overflow_y_scroll()
                     .child(list),
             )
-            .when_some(error, |d, e| {
-                d.child(
-                    div()
-                        .mx_3()
-                        .mb_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded(px(8.))
-                        .bg(p.danger_soft)
-                        .text_xs()
-                        .text_color(p.danger)
-                        .child(e),
-                )
-            })
             .child(
                 h_flex()
                     .px_3()
@@ -3344,8 +3333,14 @@ impl WorkspaceView {
             .threads
             .iter()
             .find(|t| t.id == parent.thread_id)
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "another thread".into());
+            .map(|t| t.title.clone());
+        // The thread it came from may have been deleted since: say so, and
+        // don't offer to open it.
+        let exists = title.is_some();
+        let from = match title {
+            Some(title) => format!("“{title}”"),
+            None => "a deleted thread".into(),
+        };
         let spawned = parent.kind == loft_protocol::ForkKind::Spawned;
         let how = match parent.kind {
             loft_protocol::ForkKind::Native => "full context",
@@ -3368,8 +3363,6 @@ impl WorkspaceView {
                     .border_color(p.border)
                     .text_xs()
                     .text_color(p.muted_foreground)
-                    .cursor_pointer()
-                    .hover(|d| d.text_color(p.foreground).bg(p.hover))
                     .child(
                         Icon::new(if spawned {
                             IconName::Bot
@@ -3379,19 +3372,23 @@ impl WorkspaceView {
                         .xsmall(),
                     )
                     .child(div().max_w(px(420.)).truncate().child(if spawned {
-                        format!("Started from “{title}”")
+                        format!("Started from {from}")
                     } else {
-                        format!("Forked from “{title}”")
+                        format!("Forked from {from}")
                     }))
                     .child(
                         div()
                             .text_color(p.faint_foreground)
                             .child(format!("· {how}")),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let id = id.clone();
-                        this.store.update(cx, |s, cx| s.select_thread(id, cx));
-                    })),
+                    .when(exists, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.text_color(p.foreground).bg(p.hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let id = id.clone();
+                                this.store.update(cx, |s, cx| s.select_thread(id, cx));
+                            }))
+                    }),
             )
             .into_any_element()
     }
@@ -3669,8 +3666,8 @@ impl WorkspaceView {
                         .threads
                         .iter()
                         .find(|t| t.id == parent.thread_id)
-                        .map(|t| t.title.clone())
-                        .unwrap_or_else(|| "another thread".into());
+                        .map(|t| format!("“{}”", t.title))
+                        .unwrap_or_else(|| "a deleted thread".into());
                     let how = match parent.kind {
                         loft_protocol::ForkKind::Native => format!(
                             "{} continues with the full conversation.",
@@ -3690,7 +3687,7 @@ impl WorkspaceView {
                             .items_center()
                             .text_sm()
                             .child(Icon::new(IconName::GitFork).small())
-                            .child(format!("Forked from “{title}”")),
+                            .child(format!("Forked from {title}")),
                     )
                     .child(div().text_xs().child(how))
                 })

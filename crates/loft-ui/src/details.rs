@@ -109,15 +109,15 @@ struct Info {
 
 fn thread_info(store: &AppStore, id: &ThreadId) -> Option<Info> {
     let thread = store.workspace.threads.iter().find(|t| t.id == *id)?;
-    let parent = thread.parent.clone().map(|p| {
+    // A parent deleted since has nothing to open: no row for it.
+    let parent = thread.parent.clone().and_then(|p| {
         let title = store
             .workspace
             .threads
             .iter()
             .find(|t| t.id == p.thread_id)
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "another thread".into());
-        (p, title)
+            .map(|t| t.title.clone())?;
+        Some((p, title))
     });
     Some(Info {
         cwd: thread.cwd.clone(),
