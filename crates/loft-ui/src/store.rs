@@ -58,6 +58,112 @@ fn move_in_line(q: &mut std::collections::VecDeque<Queued>, id: u64, to: u64) ->
     true
 }
 
+/// Something the user said (as opposed to the agent's work).
+fn is_said(item: &loft_protocol::Item) -> bool {
+    matches!(item.body, ItemBody::UserMessage { .. })
+}
+
+/// What of a turn's `work` stays in view while it is folded under "Worked
+/// for …": what the user said along the way (a steer is part of the
+/// conversation, not of the agent's work) and agents still at work.
+fn shown_when_folded(
+    items: &[loft_protocol::Item],
+    work: &[usize],
+    still_running: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    work.iter()
+        .copied()
+        .filter(|&i| is_said(&items[i]) || still_running(i))
+        .collect()
+}
+
+/// Whether item `ix` is something the user said into a turn already under
+/// way (a steer), not the message that started it.
+pub fn is_steer(items: &[loft_protocol::Item], ix: usize) -> bool {
+    let Some(item) = items.get(ix).filter(|item| is_said(item)) else {
+        return false;
+    };
+    let Some(turn) = &item.turn_id else {
+        return false;
+    };
+    items[..ix]
+        .iter()
+        .rev()
+        .take_while(|earlier| earlier.turn_id.as_ref() == Some(turn))
+        .any(|earlier| earlier.parent_id.is_none() && !is_said(earlier))
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+    use loft_protocol::{Item, ItemStatus, TurnId};
+
+    fn item(turn: &TurnId, body: ItemBody) -> Item {
+        Item {
+            id: ItemId::new(),
+            thread_id: ThreadId::new(),
+            turn_id: Some(turn.clone()),
+            ordinal: 0,
+            status: ItemStatus::Completed,
+            body,
+            updated_at_ms: 0,
+            parent_id: None,
+            started_at_ms: None,
+        }
+    }
+
+    fn said(turn: &TurnId, text: &str) -> Item {
+        item(
+            turn,
+            ItemBody::UserMessage {
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+        )
+    }
+
+    fn note(turn: &TurnId, text: &str) -> Item {
+        item(turn, ItemBody::AssistantMessage { text: text.into() })
+    }
+
+    #[test]
+    fn a_steer_stays_in_view_when_the_work_is_folded() {
+        let (first, second) = (TurnId::new(), TurnId::new());
+        let items = vec![
+            said(&first, "do some work"),
+            note(&first, "looking"),
+            said(&first, "stop"),
+            note(&first, "one more thing"),
+            note(&first, "Stopped."),
+            said(&second, "thanks"),
+        ];
+        // The prompt opens its turn; what is said into it later steers it.
+        assert!(!is_steer(&items, 0));
+        assert!(is_steer(&items, 2));
+        assert!(!is_steer(&items, 1), "not something the user said");
+        assert!(!is_steer(&items, 5), "the next turn's own prompt");
+        assert!(!is_steer(&items, 99));
+
+        // Folded, the steer shows and the agent's steps don't.
+        let work = [1, 2, 3];
+        assert_eq!(shown_when_folded(&items, &work, |_| false), [2]);
+        // An agent still running stays too, in order.
+        assert_eq!(shown_when_folded(&items, &work, |i| i == 3), [2, 3]);
+        assert!(shown_when_folded(&items, &[1, 3], |_| false).is_empty());
+    }
+
+    #[test]
+    fn two_messages_sent_together_are_both_the_prompt() {
+        let turn = TurnId::new();
+        let items = vec![
+            said(&turn, "first"),
+            said(&turn, "and this"),
+            note(&turn, "ok"),
+        ];
+        assert!(!is_steer(&items, 0) && !is_steer(&items, 1));
+    }
+}
+
 #[cfg(test)]
 mod queue_tests {
     use super::*;
@@ -2122,21 +2228,16 @@ impl ThreadState {
                 rows.push(Row::Work {
                     turn_ix,
                     open,
-                    steps: work.len(),
+                    // What you said along the way isn't one of its steps.
+                    steps: work.iter().filter(|&&i| !is_said(&items[i])).count(),
                 });
                 if open {
                     push_runs(&mut rows, items, &work);
                 } else {
-                    // Folded, but agents still at work stay in view.
-                    let live: Vec<usize> = work
-                        .iter()
-                        .copied()
-                        .filter(|&i| {
-                            is_agent(&items[i])
-                                && agent_running(model, &items[i], &self.live_spawned)
-                        })
-                        .collect();
-                    push_runs(&mut rows, items, &live);
+                    let shown = shown_when_folded(items, &work, |i| {
+                        is_agent(&items[i]) && agent_running(model, &items[i], &self.live_spawned)
+                    });
+                    push_runs(&mut rows, items, &shown);
                 }
             }
             if !done {

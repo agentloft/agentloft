@@ -117,6 +117,9 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 pub struct WorkspaceView {
     pub(crate) store: Entity<AppStore>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
+    /// Threads whose composer has something typed in it right now (a
+    /// draft is saved a moment later).
+    typed: std::collections::HashSet<ThreadId>,
     /// Images waiting in each thread's composer.
     attachments: HashMap<ThreadId, Vec<crate::attachments::PendingImage>>,
     /// Large pastes held as chips until sent, per thread.
@@ -269,6 +272,7 @@ impl WorkspaceView {
         Self {
             store,
             composers: HashMap::new(),
+            typed: Default::default(),
             attachments: HashMap::new(),
             pasted: HashMap::new(),
             page_notes: HashMap::new(),
@@ -1180,6 +1184,17 @@ impl WorkspaceView {
                     InputEvent::Change => {
                         this.refresh_completion(&thread_id, state, cx);
                         this.queue_draft_save(&thread_id, state, cx);
+                        // The sidebar lists a new thread once something is
+                        // typed for it (and stops when that is deleted).
+                        let typed = !state.read(cx).value().trim().is_empty();
+                        let was = if typed {
+                            !this.typed.insert(thread_id.clone())
+                        } else {
+                            this.typed.remove(&thread_id)
+                        };
+                        if was != typed {
+                            cx.notify();
+                        }
                     }
                     InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
                     _ => {}
@@ -2794,12 +2809,7 @@ impl WorkspaceView {
                 .iter()
                 .filter(|t| t.status != ThreadStatus::Archived)
                 .filter(|t| filter.as_ref().is_none_or(|f| &t.project_id == f))
-                .filter(|t| {
-                    t.is_started()
-                        || t.parent.is_some()
-                        || t.draft_text().is_some()
-                        || selected.as_ref() == Some(&t.id)
-                })
+                .filter(|t| self.lists_thread(t))
                 .filter(|t| {
                     let name = projects
                         .iter()
@@ -2854,14 +2864,7 @@ impl WorkspaceView {
             let threads: Vec<_> = all_threads
                 .iter()
                 .filter(|t| t.project_id == project.id && t.status != ThreadStatus::Archived)
-                // A new thread shows once it has a message or a draft (or
-                // while it's open).
-                .filter(|t| {
-                    t.is_started()
-                        || t.parent.is_some()
-                        || t.draft_text().is_some()
-                        || selected.as_ref() == Some(&t.id)
-                })
+                .filter(|t| self.lists_thread(t))
                 .filter(|t| self.search_matches(t, &project.name))
                 .collect();
             if (is_chats || !query.is_empty()) && threads.is_empty() {
@@ -4060,6 +4063,20 @@ impl WorkspaceView {
             // Last, so it floats over the conversation.
             .children(preview)
             .into_any_element()
+    }
+
+    /// Whether the sidebar lists `thread`. A new thread isn't one yet: it
+    /// shows once it has a message, or something typed for one (a saved
+    /// draft, text in its composer, or pictures waiting to go with it).
+    fn lists_thread(&self, thread: &loft_protocol::Thread) -> bool {
+        thread.is_started()
+            || thread.parent.is_some()
+            || thread.draft_text().is_some()
+            || self.typed.contains(&thread.id)
+            || self
+                .attachments
+                .get(&thread.id)
+                .is_some_and(|waiting| !waiting.is_empty())
     }
 
     /// "From ⎇ main ▾ · Local | origin" under the workspace picker.

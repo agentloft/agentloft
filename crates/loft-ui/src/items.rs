@@ -338,6 +338,22 @@ pub fn render_row(
             div()
                 .relative()
                 .child(render_item(thread, state, &model.items[*i], p))
+                // Said while the agent was working: marked as a steer, in
+                // the space a message keeps above itself.
+                .when(crate::store::is_steer(&model.items, *i), |d| {
+                    d.child(
+                        h_flex()
+                            .absolute()
+                            .top_0()
+                            .right(px(4.))
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .text_color(p.faint_foreground)
+                            .child(Icon::new(IconName::CornerDownRight).xsmall())
+                            .child("Steer"),
+                    )
+                })
                 .child(
                     gpui_kit::canvas(
                         move |bounds, _, _| {
