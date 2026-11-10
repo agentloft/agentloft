@@ -974,11 +974,7 @@ pub(super) fn path_link(
     p: &Palette,
     cx: &mut Context<SettingsView>,
 ) -> AnyElement {
-    let shown =
-        match std::env::home_dir().and_then(|h| path.strip_prefix(h).ok().map(|r| r.to_owned())) {
-            Some(rest) => format!("~/{}", rest.display()),
-            None => path.display().to_string(),
-        };
+    let shown = crate::workspace::tilde_path(&path);
     h_flex()
         .id(id)
         .gap_1p5()

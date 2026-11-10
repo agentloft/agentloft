@@ -160,6 +160,10 @@ pub struct WorkbenchPanel {
     shown: Option<(ThreadId, usize)>,
     /// Filling the window (the conversation is hidden).
     pub maximized: bool,
+    /// The window has no room for the conversation beside the panel, so the
+    /// panel has its place (set by the workspace while laying out). There
+    /// is no "back beside the conversation" to offer then.
+    pub(crate) cramped: bool,
 }
 
 impl gpui_kit::EventEmitter<PanelEvent> for WorkbenchPanel {}
@@ -174,6 +178,7 @@ impl WorkbenchPanel {
             tab_scroll: gpui_kit::ScrollHandle::new(),
             shown: None,
             maximized: false,
+            cramped: false,
         }
     }
 
@@ -1025,38 +1030,42 @@ impl Render for WorkbenchPanel {
             .child(tabs)
             .child(add)
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("panel-maximize")
-                    .flex_none()
-                    .p(px(5.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_color(p.muted_foreground)
-                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                    .child(
-                        Icon::new(if self.maximized {
-                            IconName::Minimize2
-                        } else {
-                            IconName::Maximize2
+            // With no room beside the conversation there is nothing to
+            // fill or go back to: the panel is all there is.
+            .when(!self.cramped, |strip| {
+                strip.child(
+                    div()
+                        .id("panel-maximize")
+                        .flex_none()
+                        .p(px(5.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_color(p.muted_foreground)
+                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                        .child(
+                            Icon::new(if self.maximized {
+                                IconName::Minimize2
+                            } else {
+                                IconName::Maximize2
+                            })
+                            .small(),
+                        )
+                        .tooltip({
+                            let label = if self.maximized {
+                                "Back beside the conversation"
+                            } else {
+                                "Fill the window"
+                            };
+                            move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                            }
                         })
-                        .small(),
-                    )
-                    .tooltip({
-                        let label = if self.maximized {
-                            "Back beside the conversation"
-                        } else {
-                            "Fill the window"
-                        };
-                        move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
-                        }
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let on = !this.maximized;
-                        this.set_maximized(on, cx);
-                    })),
-            );
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let on = !this.maximized;
+                            this.set_maximized(on, cx);
+                        })),
+                )
+            });
 
         let panel = self.threads.get(&thread_id).expect("ensured");
         let body: AnyElement = match panel.active_tab() {

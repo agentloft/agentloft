@@ -3636,13 +3636,20 @@ impl WorkspaceView {
         let timeline = if empty {
             v_flex()
                 .flex_1()
+                // As wide as the column and no wider: what doesn't fit on
+                // a line wraps onto the next.
+                .w_full()
+                .min_w_0()
+                .px_6()
                 .items_center()
                 .justify_center()
                 .gap_2()
                 .text_color(p.muted_foreground)
                 .child(
                     div()
+                        .max_w_full()
                         .text_xl()
+                        .text_center()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.foreground)
                         .child(if is_chat {
@@ -3703,9 +3710,11 @@ impl WorkspaceView {
                     })
                 })
                 .child(
+                    // Said in full: on a second line if one isn't enough.
                     div()
+                        .w_full()
                         .max_w(px(520.))
-                        .truncate()
+                        .text_center()
                         .text_xs()
                         .text_color(p.faint_foreground)
                         .child(match &model.thread.workspace {
@@ -3833,6 +3842,7 @@ impl WorkspaceView {
                 div().px_6().pb_5().pt_1().flex().justify_center().child(
                     v_flex()
                         .w_full()
+                        .min_w_0()
                         .max_w(p.content_width)
                         .gap_1()
                         .children(queued_list)
@@ -3994,9 +4004,16 @@ impl WorkspaceView {
                                     h_flex()
                                         .items_center()
                                         .justify_between()
+                                        .gap_2()
                                         .child(
                                             h_flex()
                                                 .gap_1()
+                                                // In a narrow column the
+                                                // model's name gives way,
+                                                // never the send button.
+                                                .flex_1()
+                                                .min_w_0()
+                                                .overflow_hidden()
                                                 // Picking files uses this
                                                 // computer's file dialog.
                                                 .when(!crate::host::IS_WEB, |d| {
@@ -4023,6 +4040,7 @@ impl WorkspaceView {
                                         )
                                         .child(
                                             h_flex()
+                                                .flex_none()
                                                 .gap_2()
                                                 .items_center()
                                                 .when(running && !stop_hint.is_empty(), |d| {
@@ -4541,7 +4559,6 @@ impl Render for WorkspaceView {
         };
         let body = self.with_details_dock(body, window, cx);
         let show_panel = self.panel_open && header_title.is_some();
-        let maximized = show_panel && self.panel.read(cx).maximized;
         let show_dock = self.dock_open && header_title.is_some();
         if show_dock && self.panel.read(cx).dock_len(cx) == 0 {
             // A thread picked with the dock open gets a shell of its own.
@@ -4552,9 +4569,28 @@ impl Render for WorkspaceView {
         let mut body_slot = Some(body);
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
+        // What the conversation and the side panel have to share.
+        let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
+        // Not enough for both at a usable width: the panel takes the
+        // conversation's place, as when it is asked to fill the window,
+        // rather than squeeze the conversation to a sliver.
+        let cramped = room < CONVERSATION_MIN + PANEL_FLOOR;
+        if self.panel.read(cx).cramped != cramped {
+            self.panel.update(cx, |panel, _| panel.cramped = cramped);
+        }
+        let maximized = show_panel && (cramped || self.panel.read(cx).maximized);
+        // The conversation keeps its width: the panel is as wide as what
+        // is left allows, whether it is being dragged or was left wide in
+        // a window that has since shrunk. In a tight window that is less
+        // than the panel would otherwise go down to.
+        let panel_max = (room - CONVERSATION_MIN).max(PANEL_FLOOR);
+        let panel_min = panel_max.min(PANEL_MIN);
         if show_panel && self.panel_width.get() <= 0. {
-            let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
             self.panel_width.set(default_panel_width(room));
+        }
+        if show_panel && !maximized {
+            self.panel_width
+                .set(self.panel_width.get().clamp(panel_min, panel_max));
         }
         let header = self.render_header(header_title, &p, cx);
         let sidebar = (side > 0.).then(|| {
@@ -4689,11 +4725,21 @@ impl Render for WorkspaceView {
                             d.child(
                                 div().flex_1().min_h_0().w_full().child(
                                     h_resizable("workbench")
-                                        .child(resizable_panel().children(body_slot.take()))
+                                        .child(
+                                            resizable_panel()
+                                                // Beside the panel, the
+                                                // conversation keeps a width
+                                                // it can be read and written
+                                                // at; alone, it has the lot.
+                                                .when(show_panel, |d| {
+                                                    d.size_range(px(CONVERSATION_MIN)..px(100_000.))
+                                                })
+                                                .children(body_slot.take()),
+                                        )
                                         .child(
                                             resizable_panel()
                                                 .size(px(self.panel_width.get()))
-                                                .size_range(px(PANEL_MIN)..px(1600.))
+                                                .size_range(px(panel_min)..px(panel_max))
                                                 .visible(show_panel)
                                                 .child(
                                                     div()
@@ -5779,8 +5825,18 @@ impl Render for DraggedQueued {
 const DOCK_HEIGHT: f32 = 280.;
 const DOCK_MIN_HEIGHT: f32 = 120.;
 
-/// The side panel's narrowest width.
+/// The side panel's narrowest width while there is room to spare.
 const PANEL_MIN: f32 = 340.;
+
+/// The narrowest the side panel gets when the window is tight: it gives
+/// way before the conversation does.
+const PANEL_FLOOR: f32 = 240.;
+
+/// The conversation's narrowest width beside the side panel: room for the
+/// new-thread choices on one line and the composer's row of controls. A
+/// window with less than this and [`PANEL_FLOOR`] to share shows the panel
+/// alone.
+const CONVERSATION_MIN: f32 = 360.;
 
 /// The side panel's first width: a share of the room beside the sidebar, so
 /// the conversation keeps most of it. Dragging it wider is remembered.
@@ -5934,14 +5990,18 @@ pub(crate) fn tilde_path(path: &std::path::Path) -> String {
     tilde(&path.to_string_lossy())
 }
 
-/// `/Users/me/x` → `~/x`.
+/// `/Users/me/x` → `~/x`. The home is that of the machine the path is on
+/// (the daemon's, in a browser).
 fn tilde(path: &str) -> String {
-    match std::env::home_dir() {
-        Some(home) => match std::path::Path::new(path).strip_prefix(&home) {
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => path.to_owned(),
-        },
-        None => path.to_owned(),
+    let home = crate::host::user_home();
+    // No real home known: nothing to shorten.
+    if home.parent().is_none() {
+        return path.to_owned();
+    }
+    match std::path::Path::new(path).strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_owned(),
     }
 }
 
@@ -6374,7 +6434,12 @@ fn workspace_picker(
     p: &Palette,
 ) -> AnyElement {
     let wants = current.is_new_worktree();
-    let mut row = h_flex().gap_1().text_xs();
+    let mut row = h_flex()
+        .gap_1()
+        .text_xs()
+        .max_w_full()
+        .flex_wrap()
+        .justify_center();
     for (worktree, label, icon) in [
         (false, "Local", IconName::Laptop),
         (true, "New worktree", IconName::GitBranch),
@@ -6428,7 +6493,11 @@ fn harness_picker(
         .p(px(3.))
         .gap(px(3.))
         .rounded(px(10.))
-        .bg(p.muted);
+        .bg(p.muted)
+        // More agents than fit on a line go onto a second one.
+        .max_w_full()
+        .flex_wrap()
+        .justify_center();
     for (id, label) in choices {
         let active = current.as_str() == id;
         let store = store.clone();
