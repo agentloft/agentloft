@@ -174,6 +174,14 @@ async fn run(
                             .collect();
                         t.start_turn_with(&input.text, &images)
                     }
+                    Some(SessionCommand::Steer(input)) => {
+                        let images: Vec<String> = input
+                            .images
+                            .iter()
+                            .map(|i| i.path.to_string_lossy().into_owned())
+                            .collect();
+                        t.steer_with(&input.text, &images)
+                    }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::StopSubagent(_)) => vec![],
                     Some(SessionCommand::Query { reply, .. }) => {

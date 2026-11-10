@@ -97,6 +97,20 @@ pub fn init(paths: Paths, cx: &mut App) {
     apply(cx);
 }
 
+/// Whether the sidebar groups threads by project (`ui.sidebar =
+/// "projects"`) rather than listing them by recency.
+pub fn sidebar_by_project(cx: &App) -> bool {
+    cx.try_global::<AppearanceState>()
+        .is_some_and(|s| s.config.sidebar == "projects")
+}
+
+/// Shortcuts the user changed (`[ui.keys]`).
+pub fn key_overrides(cx: &App) -> std::collections::BTreeMap<String, String> {
+    cx.try_global::<AppearanceState>()
+        .map(|s| s.config.keys.clone())
+        .unwrap_or_default()
+}
+
 /// The selected theme's id (`ui.palette`).
 pub fn palette_id(cx: &App) -> Option<String> {
     cx.try_global::<AppearanceState>()
@@ -113,12 +127,16 @@ pub fn reload_if_changed(cx: &mut App) -> bool {
         return false;
     }
     let changed = config != state.config;
+    let keys_changed = config.keys != state.config.keys;
     let state = cx.global_mut::<AppearanceState>();
     state.mtime = mtime;
     state.config = config;
     if changed {
         tracing::info!("appearance settings reloaded");
         apply(cx);
+    }
+    if keys_changed {
+        crate::keymap::apply(cx);
     }
     changed
 }

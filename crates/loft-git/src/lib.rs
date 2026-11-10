@@ -338,3 +338,183 @@ mod tests {
         assert_eq!(normalize_rename("src/{ => sub}/x.rs"), "src/sub/x.rs");
     }
 }
+
+/// A new, empty repository at `dir` (created) on branch `main`.
+pub fn init_repo(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    run(git(dir).args(["init", "--quiet", "--initial-branch=main"]))?;
+    Ok(())
+}
+
+/// A README naming the project and, when git knows who's committing, a
+/// first commit. Returns whether it committed.
+pub fn first_commit(
+    dir: &Path,
+    name: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<bool> {
+    std::fs::write(dir.join("README.md"), format!("# {name}\n"))
+        .with_context(|| format!("write README in {}", dir.display()))?;
+    let who = |key: &str| {
+        let mut c = git(dir);
+        c.envs(env).args(["config", key]);
+        run(&mut c).map(|v| !v.trim().is_empty()).unwrap_or(false)
+    };
+    if !who("user.name") || !who("user.email") {
+        return Ok(false);
+    }
+    let mut add = git(dir);
+    add.envs(env).args(["add", "-A"]);
+    run(&mut add)?;
+    let mut commit = git(dir);
+    commit
+        .envs(env)
+        .args(["commit", "--quiet", "-m", "Initial commit"]);
+    run(&mut commit)?;
+    Ok(true)
+}
+
+/// A private GitHub repository named `name` for the repo at `dir`, added
+/// as `origin` (and pushed when it has commits), through `gh`.
+pub fn publish_github(
+    dir: &Path,
+    name: &str,
+    push: bool,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if !which("gh", env) {
+        bail!("the GitHub CLI (gh) isn't installed");
+    }
+    let mut cmd = Command::new("gh");
+    cmd.args(["repo", "create", name, "--private", "--source", "."])
+        .args(["--remote", "origin"]);
+    if push {
+        cmd.arg("--push");
+    }
+    cmd.current_dir(dir)
+        .envs(env)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null());
+    let out = cmd.output().context("run gh")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// The GitHub account `gh` is signed in to, if any.
+pub fn github_login(env: &std::collections::HashMap<String, String>) -> Option<String> {
+    if !which("gh", env) {
+        return None;
+    }
+    let out = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .envs(env)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let login = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !login.is_empty()).then_some(login)
+}
+
+/// Clone `url` into `dest` (which must not exist yet). `env` is the login
+/// environment (credentials, SSH agent); GitHub `owner/repo` goes through
+/// `gh` when it's installed (private repos), else plain https.
+pub fn clone_repo(
+    source: &CloneSource,
+    dest: &Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if dest.exists() {
+        bail!("{} already exists", dest.display());
+    }
+    let parent = dest.parent().context("no parent folder")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let mut cmd = match source {
+        CloneSource::GitHub(repo) if which("gh", env) => {
+            let mut c = Command::new("gh");
+            c.args(["repo", "clone", repo]).arg(dest);
+            c
+        }
+        CloneSource::GitHub(repo) => {
+            let mut c = Command::new("git");
+            c.args([
+                "clone",
+                "--quiet",
+                &format!("https://github.com/{repo}.git"),
+            ])
+            .arg(dest);
+            c
+        }
+        CloneSource::Url(url) => {
+            let mut c = Command::new("git");
+            c.args(["clone", "--quiet", url]).arg(dest);
+            c
+        }
+    };
+    cmd.current_dir(parent)
+        .envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    let out = cmd.output().context("run clone")?;
+    if !out.status.success() {
+        bail!(
+            "clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Where to clone from.
+pub enum CloneSource {
+    Url(String),
+    /// `owner/repo`.
+    GitHub(String),
+}
+
+impl CloneSource {
+    /// The folder name a clone gets: the repo's name.
+    pub fn name(&self) -> String {
+        let s = match self {
+            CloneSource::Url(u) | CloneSource::GitHub(u) => u.trim_end_matches('/'),
+        };
+        let last = s.rsplit(['/', ':']).next().unwrap_or(s);
+        last.strip_suffix(".git").unwrap_or(last).to_owned()
+    }
+}
+
+fn which(bin: &str, env: &std::collections::HashMap<String, String>) -> bool {
+    let path = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    std::env::split_paths(&path).any(|d| d.join(bin).is_file())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::CloneSource;
+
+    #[test]
+    fn clone_folders_are_named_after_the_repo() {
+        assert_eq!(
+            CloneSource::Url("https://github.com/a/b.git".into()).name(),
+            "b"
+        );
+        assert_eq!(
+            CloneSource::Url("git@github.com:a/tool.git".into()).name(),
+            "tool"
+        );
+        assert_eq!(
+            CloneSource::Url("https://x.org/repo/".into()).name(),
+            "repo"
+        );
+        assert_eq!(
+            CloneSource::GitHub("zed-industries/zed".into()).name(),
+            "zed"
+        );
+    }
+}

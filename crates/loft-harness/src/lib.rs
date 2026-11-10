@@ -71,6 +71,9 @@ pub struct ImageInput {
 #[derive(Debug)]
 pub enum SessionCommand {
     StartTurn(TurnInput),
+    /// Add to the running turn without stopping it (agents with
+    /// `Capabilities::steer`).
+    Steer(TurnInput),
     Interrupt,
     /// Stop the subagent started by the tool call `native_id` (agents that
     /// can't stop one subagent ignore it).

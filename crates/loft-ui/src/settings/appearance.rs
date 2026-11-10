@@ -29,7 +29,7 @@ const TOKENS: [(&str, &str); 7] = [
 ];
 
 pub(super) struct Studio {
-    themes: Vec<Theme>,
+    pub(super) themes: Vec<Theme>,
     editing: Option<Editing>,
     describe: Option<Entity<InputState>>,
     /// Which agent and model designs it.
@@ -584,6 +584,15 @@ impl SettingsView {
                 this.set_str(&["ui", "density"], value, false, cx)
             }),
         );
+        let sidebar = segmented(
+            "sidebar-layout",
+            &[("threads", "Threads"), ("projects", "Projects")],
+            &ui.sidebar,
+            p,
+            cx.listener(|this, value: &&str, _, cx| {
+                this.set_str(&["ui", "sidebar"], value, false, cx)
+            }),
+        );
         let _ = window;
 
         v_flex()
@@ -619,6 +628,12 @@ impl SettingsView {
                 "Contrast",
                 "How strongly borders and secondary text stand out.",
                 contrast_ctl,
+                p,
+            ))
+            .child(row(
+                "Sidebar",
+                "Threads: one list, most recent first, each with its project. Projects: threads grouped under their project.",
+                sidebar,
                 p,
             ))
             .child(row("Density", "Spacing in the conversation.", density, p))

@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod changes;
+pub mod dock;
 pub mod docs;
 pub mod files;
 pub mod terminal;
@@ -80,6 +81,9 @@ struct ThreadPanel {
     changes: Entity<ChangesView>,
     tabs: Vec<Open>,
     active: usize,
+    /// Shells docked under the conversation (Ctrl+`), by reattach key.
+    dock: Vec<(String, Entity<TerminalPane>)>,
+    dock_active: usize,
     /// Shells left running in the daemon (after a restart) were reattached.
     terminals_restored: bool,
     /// Last finished turn we refreshed for.
@@ -103,6 +107,16 @@ impl ThreadPanel {
         self.tabs.iter().rposition(|t| t.kind() == *kind)
     }
 
+    /// Reattach keys of every shell open, in the side panel or the dock.
+    fn terminal_keys(&self) -> Vec<String> {
+        let tabs = self.tabs.iter().filter_map(|t| match t {
+            Open::Terminal { key, .. } => Some(key.clone()),
+            _ => None,
+        });
+        tabs.chain(self.dock.iter().map(|(key, _)| key.clone()))
+            .collect()
+    }
+
     fn browser(&self) -> Option<Entity<BrowserView>> {
         let ix = self.find(&Tab::Browser)?;
         match &self.tabs[ix] {
@@ -120,6 +134,12 @@ pub enum PanelEvent {
     Screenshot(ThreadId, Vec<u8>),
     /// The panel was expanded to fill the window, or brought back.
     Maximized(bool),
+    /// A terminal moved into the side panel: show it.
+    ShowPanel,
+    /// A terminal moved under the conversation: show the dock.
+    ShowDock,
+    /// Hide the dock (its last shell closed or moved away, or asked to).
+    HideDock,
     /// `thread`'s browser left annotation mode.
     AnnotatingStopped(ThreadId),
 }
@@ -195,6 +215,8 @@ impl WorkbenchPanel {
                     changes,
                     tabs: Vec::new(),
                     active: 0,
+                    dock: Vec::new(),
+                    dock_active: 0,
                     terminals_restored: false,
                     seen_turn,
                     cwd,
@@ -241,6 +263,9 @@ impl WorkbenchPanel {
                 if let Open::Terminal { pane, .. } = tab {
                     pane.update(cx, |p, cx| p.restart(cx));
                 }
+            }
+            for (_, pane) in &panel.dock {
+                pane.update(cx, |p, cx| p.restart(cx));
             }
         }
         if moved || (finished.is_some() && finished != panel.seen_turn) {
@@ -324,35 +349,59 @@ impl WorkbenchPanel {
 
     // -- terminals -------------------------------------------------------------
 
-    fn new_terminal(&mut self, thread_id: &ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+    /// A new shell for `thread_id`, in the side panel or the dock. The
+    /// first one takes the thread's main key (reattaching its shell).
+    fn new_terminal(
+        &mut self,
+        thread_id: &ThreadId,
+        docked: bool,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let base = format!("thread:{}", thread_id.as_str());
         let Some(panel) = self.threads.get(thread_id) else {
             return;
         };
-        let used: Vec<&str> = panel
-            .tabs
-            .iter()
-            .filter_map(|t| match t {
-                Open::Terminal { key, .. } => Some(key.as_str()),
-                _ => None,
-            })
-            .collect();
-        let key = if !used.contains(&base.as_str()) {
-            base.clone()
-        } else {
-            let next = used
-                .iter()
-                .filter_map(|k| k.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()))
-                .max()
-                .unwrap_or(1)
-                + 1;
-            format!("{base}#{next}")
-        };
+        let key = next_terminal_key(&base, &panel.terminal_keys());
         let restore = !panel.terminals_restored;
-        self.push_terminal(thread_id, key, window, cx);
+        let pane = self.make_terminal(thread_id, key.clone(), window, cx);
+        if let Some(panel) = self.threads.get_mut(thread_id) {
+            if docked {
+                panel.dock.push((key, pane.clone()));
+                panel.dock_active = panel.dock.len() - 1;
+            } else {
+                panel.tabs.push(Open::Terminal {
+                    key,
+                    pane: pane.clone(),
+                });
+                panel.active = panel.tabs.len() - 1;
+            }
+        }
+        if focus {
+            focus_terminal(&pane, window, cx);
+        }
+        cx.notify();
         if restore {
             self.restore_terminals(thread_id, base, window, cx);
         }
+    }
+
+    fn make_terminal(
+        &mut self,
+        thread_id: &ThreadId,
+        key: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalPane> {
+        let store = self.store.clone();
+        let root = FsRoot::Thread(thread_id.clone());
+        let pane = cx.new(|cx| TerminalPane::new(store, root, key, window, cx));
+        let sub = cx.observe(&pane, |_, _, cx| cx.notify());
+        if let Some(panel) = self.threads.get_mut(thread_id) {
+            panel._subs.push(sub);
+        }
+        pane
     }
 
     fn push_terminal(
@@ -362,20 +411,15 @@ impl WorkbenchPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = self.store.clone();
-        let root = FsRoot::Thread(thread_id.clone());
-        let pane = cx.new(|cx| TerminalPane::new(store, root, key.clone(), window, cx));
-        let sub = cx.observe(&pane, |_, _, cx| cx.notify());
+        let pane = self.make_terminal(thread_id, key.clone(), window, cx);
         if let Some(panel) = self.threads.get_mut(thread_id) {
-            panel._subs.push(sub);
             panel.tabs.push(Open::Terminal {
                 key,
                 pane: pane.clone(),
             });
             panel.active = panel.tabs.len() - 1;
         }
-        let view = pane.read(cx).view.clone();
-        window.focus(&gpui_kit::Focusable::focus_handle(&view, cx), cx);
+        focus_terminal(&pane, window, cx);
         cx.notify();
     }
 
@@ -405,14 +449,7 @@ impl WorkbenchPanel {
                         return;
                     };
                     let active = panel.active;
-                    let open: Vec<String> = panel
-                        .tabs
-                        .iter()
-                        .filter_map(|t| match t {
-                            Open::Terminal { key, .. } => Some(key.clone()),
-                            _ => None,
-                        })
-                        .collect();
+                    let open = panel.terminal_keys();
                     for key in terminals.into_iter().filter_map(|t| t.key) {
                         if !open.contains(&key) {
                             this.push_terminal(&id, key, window, cx);
@@ -466,7 +503,7 @@ impl WorkbenchPanel {
                 });
                 panel.active = panel.tabs.len() - 1;
             }
-            Tab::Terminal => self.new_terminal(thread_id, window, cx),
+            Tab::Terminal => self.new_terminal(thread_id, false, true, window, cx),
             Tab::Browser => {
                 let view = self.new_browser(thread_id, window, cx);
                 view.update(cx, |b, cx| b.focus_address_bar(window, cx));
@@ -498,8 +535,7 @@ impl WorkbenchPanel {
         }
         panel.active = ix;
         if let Open::Terminal { pane, .. } = &panel.tabs[ix] {
-            let view = pane.read(cx).view.clone();
-            window.focus(&gpui_kit::Focusable::focus_handle(&view, cx), cx);
+            focus_terminal(pane, window, cx);
         }
         cx.notify();
     }
@@ -634,6 +670,26 @@ impl WorkbenchPanel {
             Entry::Separator,
             item("Close All", IconName::Trash, |_, _| true),
         ];
+        // A shell can move under the conversation.
+        if let Some(Open::Terminal { .. }) =
+            self.threads.get(thread_id).and_then(|p| p.tabs.get(ix))
+        {
+            let (panel, id, handle) = (panel.clone(), thread_id.clone(), window.window_handle());
+            entries.insert(
+                0,
+                Entry::item(
+                    "Move to Bottom Panel".to_owned(),
+                    IconName::PanelBottom,
+                    move |cx| {
+                        let (panel, id) = (panel.clone(), id.clone());
+                        let _ = handle.update(cx, move |_, window, cx| {
+                            _ = panel.update(cx, |p, cx| p.move_to_dock(&id, ix, window, cx));
+                        });
+                    },
+                ),
+            );
+            entries.insert(1, Entry::Separator);
+        }
         // A page tab also offers a reload.
         if let Some(Open::Browser { view }) =
             self.threads.get(thread_id).and_then(|p| p.tabs.get(ix))
@@ -675,6 +731,25 @@ impl WorkbenchPanel {
         ];
         menu::open(window, at, entries, cx);
     }
+}
+
+/// The first unused reattach key: the thread's main one, then `#2`, `#3`…
+fn next_terminal_key(base: &str, used: &[String]) -> String {
+    if !used.iter().any(|k| k == base) {
+        return base.to_owned();
+    }
+    let next = used
+        .iter()
+        .filter_map(|k| k.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(1)
+        + 1;
+    format!("{base}#{next}")
+}
+
+fn focus_terminal(pane: &Entity<TerminalPane>, window: &mut Window, cx: &mut gpui_kit::App) {
+    let view = pane.read(cx).view.clone();
+    window.focus(&gpui_kit::Focusable::focus_handle(&view, cx), cx);
 }
 
 /// "github.com" for a URL, for untitled pages.
@@ -975,7 +1050,17 @@ fn empty_state(thread_id: &ThreadId, p: &Palette, cx: &mut Context<WorkbenchPane
 
 #[cfg(test)]
 mod tests {
-    use super::{host, terminal_title};
+    use super::{host, next_terminal_key, terminal_title};
+
+    #[test]
+    fn terminal_keys_fill_in_order() {
+        let keys = |v: &[&str]| v.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        assert_eq!(next_terminal_key("t", &[]), "t");
+        assert_eq!(next_terminal_key("t", &keys(&["t"])), "t#2");
+        assert_eq!(next_terminal_key("t", &keys(&["t", "t#2", "t#5"])), "t#6");
+        // The main shell moved away (or closed): it is free again.
+        assert_eq!(next_terminal_key("t", &keys(&["t#2"])), "t");
+    }
 
     #[test]
     fn terminal_tabs_show_the_folder() {

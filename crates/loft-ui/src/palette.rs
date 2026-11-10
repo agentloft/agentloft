@@ -4,8 +4,8 @@
 use crate::panel::Tab;
 use crate::workspace::{
     AddProject, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings, ShowBrowser,
-    ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTheme, WorkspaceView,
-    harness_name,
+    ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTerminal, ToggleTheme,
+    WorkspaceView, harness_name,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
@@ -138,7 +138,13 @@ pub fn open(
 
 /// "↑ ↓ Navigate · Enter Select · Esc Close" under the list.
 pub(crate) fn key_hints(cx: &App) -> gpui_kit::AnyElement {
+    key_hints_with_back(cx, false)
+}
+
+/// The key hints, with "Backspace Back" when there's a step to go back to.
+pub(crate) fn key_hints_with_back(cx: &App, back: bool) -> gpui_kit::AnyElement {
     use gpui_kit::component::Sizable as _;
+    use gpui_kit::prelude::FluentBuilder as _;
     use gpui_kit::{IntoElement as _, div};
     let p = crate::theme::Palette::of(cx);
     let key = |child: gpui_kit::AnyElement| {
@@ -184,6 +190,7 @@ pub(crate) fn key_hints(cx: &App) -> gpui_kit::AnyElement {
             "Navigate",
         ))
         .child(hint(vec![word("Enter")], "Select"))
+        .when(back, |d| d.child(hint(vec![word("Backspace")], "Back")))
         .child(hint(vec![word("Esc")], "Close"))
         .into_any_element()
 }
@@ -534,7 +541,13 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
             |v, w, cx| v.show_tab(Tab::Changes, w, cx),
         ),
         entry(
-            "Show terminal",
+            "Toggle terminal",
+            IconName::PanelBottom,
+            Some(Box::new(ToggleTerminal)),
+            |v, w, cx| v.toggle_terminal(w, cx),
+        ),
+        entry(
+            "Show terminal in side panel",
             IconName::SquareTerminal,
             Some(Box::new(ShowTerminal)),
             |v, w, cx| v.show_tab(Tab::Terminal, w, cx),

@@ -43,6 +43,16 @@ impl WorkspaceModel {
                     self.projects.push(project.clone());
                 }
             }
+            Event::ProjectUpdated { project } => {
+                match self.projects.iter_mut().find(|p| p.id == project.id) {
+                    Some(p) => *p = project.clone(),
+                    None => self.projects.push(project.clone()),
+                }
+            }
+            Event::ProjectRemoved { project_id } => {
+                self.projects.retain(|p| &p.id != project_id);
+                self.threads.retain(|t| &t.project_id != project_id);
+            }
             Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => {
                 match self.threads.iter_mut().find(|t| t.id == thread.id) {
                     Some(t) => *t = thread.clone(),
@@ -135,7 +145,10 @@ impl ThreadModel {
                     None => self.requests.push(request.clone()),
                 }
             }
-            Event::ProjectAdded { .. } | Event::ThreadDeleted { .. } => return false,
+            Event::ProjectAdded { .. }
+            | Event::ProjectUpdated { .. }
+            | Event::ProjectRemoved { .. }
+            | Event::ThreadDeleted { .. } => return false,
         }
         true
     }

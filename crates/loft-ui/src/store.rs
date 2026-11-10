@@ -14,7 +14,7 @@ use loft_protocol::{
     ItemStatus, ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId,
     ThreadStatus, Topic,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -23,8 +23,76 @@ pub const BUILD: &str = env!("CARGO_PKG_VERSION");
 /// A message typed while a turn was running.
 #[derive(Clone)]
 pub struct Queued {
+    /// Stays the same while others are sent or moved around it.
+    pub id: u64,
     pub text: String,
     pub images: Vec<crate::attachments::PendingImage>,
+}
+
+impl Queued {
+    pub fn new(text: String, images: Vec<crate::attachments::PendingImage>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            text,
+            images,
+        }
+    }
+}
+
+/// Move message `id` to where `to` is: after it when moving down, before
+/// it when moving up. Whether anything moved.
+fn move_in_line(q: &mut std::collections::VecDeque<Queued>, id: u64, to: u64) -> bool {
+    let (Some(from), Some(at)) = (
+        q.iter().position(|m| m.id == id),
+        q.iter().position(|m| m.id == to),
+    ) else {
+        return false;
+    };
+    if from == at {
+        return false;
+    }
+    let Some(message) = q.remove(from) else {
+        return false;
+    };
+    q.insert(at, message);
+    true
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn texts(q: &std::collections::VecDeque<Queued>) -> Vec<&str> {
+        q.iter().map(|m| m.text.as_str()).collect()
+    }
+
+    #[test]
+    fn queued_messages_move_by_id() {
+        let mut q: std::collections::VecDeque<Queued> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|t| Queued::new(t.into(), vec![]))
+            .collect();
+        let id = |q: &std::collections::VecDeque<Queued>, t: &str| {
+            q.iter().find(|m| m.text == t).unwrap().id
+        };
+        // Down onto "c": lands after it.
+        let (a, c) = (id(&q, "a"), id(&q, "c"));
+        assert!(move_in_line(&mut q, a, c));
+        assert_eq!(texts(&q), ["b", "c", "a", "d"]);
+        // Up onto "b": lands before it, first in line.
+        let (d, b) = (id(&q, "d"), id(&q, "b"));
+        assert!(move_in_line(&mut q, d, b));
+        assert_eq!(texts(&q), ["d", "b", "c", "a"]);
+        // One sent meanwhile: the ids still find the right ones.
+        q.pop_front();
+        let (a, b) = (id(&q, "a"), id(&q, "b"));
+        assert!(move_in_line(&mut q, a, b));
+        assert_eq!(texts(&q), ["a", "b", "c"]);
+        // Gone, or onto itself: nothing moves.
+        assert!(!move_in_line(&mut q, d, a));
+        assert!(!move_in_line(&mut q, a, a));
+    }
 }
 
 /// App-wide UI events (e.g. a timeline row asking the panel to open a file).
@@ -108,6 +176,11 @@ pub struct AppStore {
     pub collapsed: std::collections::HashSet<ProjectId>,
     /// Threads whose forks / spawned threads are folded in the sidebar.
     pub folded_threads: std::collections::HashSet<ThreadId>,
+    /// Projects pinned to the top (sidebar and pickers), in pin order.
+    pub pinned_projects: Vec<ProjectId>,
+    /// The GitHub account `gh` is signed in to: `None` = not asked yet,
+    /// `Some(None)` = asked, none (yet).
+    pub github_login: Option<Option<String>>,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
     /// Commands an agent offers in a folder, asked without a session
@@ -117,6 +190,9 @@ pub struct AppStore {
     pub default_harness: HarnessId,
     /// Messages typed while a turn was running, sent when it ends.
     pub queued: HashMap<ThreadId, std::collections::VecDeque<Queued>>,
+    /// Threads with a queued message on its way (sent, not yet answered):
+    /// the next one waits for it, so two never race for the same turn.
+    flushing: HashSet<ThreadId>,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
     /// Text to prefill a thread's composer with (a fork's handoff digest).
@@ -146,6 +222,7 @@ impl AppStore {
     pub fn new(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut Context<Self>) -> Self {
         let collapsed = load_collapsed(&paths);
         let folded_threads = load_folded_threads(&paths);
+        let pinned_projects = load_list::<ProjectId>(&paths, "pinned_projects");
         let mut this = Self {
             runtime,
             paths,
@@ -161,10 +238,13 @@ impl AppStore {
             max_rows: 2,
             collapsed,
             folded_threads,
+            pinned_projects,
+            github_login: None,
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
+            flushing: HashSet::new(),
             last_error: None,
             drafts: HashMap::new(),
             unread: Default::default(),
@@ -180,7 +260,52 @@ impl AppStore {
         };
         this.reload_agent_prefs(cx);
         this.connect(cx);
+        this.watch_settings(cx);
         this
+    }
+
+    /// Settings can change outside the app (an agent, an editor): watch
+    /// `config.toml` and the themes folder and apply changes as they come.
+    fn watch_settings(&mut self, cx: &mut Context<Self>) {
+        fn stamp(paths: &Paths) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+            let modified =
+                |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let themes = std::fs::read_dir(paths.home.join("themes"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| modified(&e.path()))
+                .max();
+            (modified(&paths.config_file()), themes)
+        }
+        let paths = self.paths.clone();
+        let mut last = stamp(&paths);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let now = stamp(&paths);
+                if now == last {
+                    continue;
+                }
+                let themes_changed = now.1 != last.1;
+                last = now;
+                let alive = this.update(cx, |store, cx| {
+                    crate::theme::reload_if_changed(cx);
+                    if themes_changed {
+                        crate::theme::apply(cx);
+                    }
+                    store.reload_agent_prefs(cx);
+                    crate::settings::refresh(cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
@@ -709,12 +834,25 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Pin a project to the top, or unpin it.
+    pub fn toggle_pinned(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        match self.pinned_projects.iter().position(|p| *p == project) {
+            Some(at) => {
+                self.pinned_projects.remove(at);
+            }
+            None => self.pinned_projects.push(project),
+        }
+        self.save_sidebar();
+        cx.notify();
+    }
+
     fn save_sidebar(&self) {
         let projects: Vec<&str> = self.collapsed.iter().map(|p| p.as_str()).collect();
         let threads: Vec<&str> = self.folded_threads.iter().map(|t| t.as_str()).collect();
-        if let Ok(json) = serde_json::to_vec_pretty(
-            &serde_json::json!({ "collapsed": projects, "folded_threads": threads }),
-        ) {
+        let pinned: Vec<&str> = self.pinned_projects.iter().map(|p| p.as_str()).collect();
+        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({
+            "collapsed": projects, "folded_threads": threads, "pinned_projects": pinned,
+        })) {
             let _ = std::fs::write(sidebar_file(&self.paths), json);
         }
     }
@@ -871,13 +1009,147 @@ impl AppStore {
         .detach();
     }
 
+    /// Create or clone a project (`CreateProject` / `CloneProject`), then
+    /// open a new thread in it.
+    pub fn make_project(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.request(request, cx, |store, resp, cx| {
+            if let Response::Project { project } = resp {
+                store.new_thread(project.id, cx);
+            }
+        });
+    }
+
+    /// A `[projects]` folder setting, `~` expanded, if set.
+    fn projects_setting(
+        &self,
+        pick: impl Fn(&loft_config::ProjectsConfig) -> Option<String>,
+    ) -> Option<std::path::PathBuf> {
+        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
+        loft_config::Config::load(&self.paths)
+            .ok()
+            .and_then(|c| pick(&c.projects))
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty())
+            .map(|d| match d.strip_prefix('~') {
+                Some(rest) => home.join(rest.trim_start_matches('/')),
+                None => d.into(),
+            })
+    }
+
+    /// Where Add Project's folder browser opens and clones go: Settings ▸
+    /// Projects ▸ "Add project starts in", else the home folder.
+    pub fn projects_base(&self) -> std::path::PathBuf {
+        self.projects_setting(|p| p.base_dir.clone())
+            .unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| "/".into()))
+    }
+
+    /// Where new projects (made from a name) go: Settings ▸ Projects ▸ "New
+    /// projects go in", else ~/.agentloft/projects.
+    pub fn new_projects_dir(&self) -> std::path::PathBuf {
+        self.projects_setting(|p| p.new_dir.clone())
+            .unwrap_or_else(|| self.paths.projects_dir())
+    }
+
+    pub fn projects_parent(&self) -> String {
+        self.projects_base().to_string_lossy().into_owned()
+    }
+
+    /// Ask (once) which GitHub account `gh` is signed in to.
+    pub fn ensure_github_login(&mut self, cx: &mut Context<Self>) {
+        if self.github_login.is_some() {
+            return;
+        }
+        self.github_login = Some(None);
+        self.request(Request::GitHubLogin, cx, |store, resp, cx| {
+            if let Response::Text { text } = resp
+                && !text.is_empty()
+            {
+                store.github_login = Some(Some(text));
+                cx.notify();
+            }
+        });
+    }
+
+    /// Use the image at `path` as the project's icon (`None`: automatic).
+    /// A chosen file is copied into ~/.agentloft/icons, so it stays put.
+    pub fn set_project_icon(
+        &mut self,
+        project_id: ProjectId,
+        path: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let icon = match path {
+            None => None,
+            Some(src) => {
+                let dir = self.paths.home.join("icons");
+                let ext = src
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png")
+                    .to_ascii_lowercase();
+                // A new name each time: images are cached by path.
+                let dest = dir.join(format!(
+                    "{}-{}.{ext}",
+                    project_id.as_str(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis())
+                ));
+                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&src, &dest)) {
+                    Ok(_) => Some(dest.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        self.last_error = Some(format!("Couldn't use that image: {e}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        };
+        crate::project_icon::forget();
+        self.request(
+            Request::SetProjectIcon { project_id, icon },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    /// What new threads in a project start with.
+    pub fn set_project_defaults(
+        &mut self,
+        project_id: ProjectId,
+        defaults: loft_protocol::ProjectDefaults,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            Request::SetProjectDefaults {
+                project_id,
+                defaults,
+            },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    pub fn rename_project(&mut self, project_id: ProjectId, name: String, cx: &mut Context<Self>) {
+        self.request(
+            Request::RenameProject { project_id, name },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    /// Remove a project from Agentloft (its threads too; files stay).
+    pub fn remove_project(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
+        self.pinned_projects.retain(|p| *p != project_id);
+        self.collapsed.remove(&project_id);
+        self.save_sidebar();
+        self.request(Request::RemoveProject { project_id }, cx, |_, _, _| {});
+    }
+
     pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
         self.request(Request::AddProject { path, name: None }, cx, |_, _, _| {});
     }
 
-    /// Open a new thread in `project_id`. It isn't really started until the
-    /// first message, so an untouched one (no messages, no draft) is reused
-    /// rather than piling up empty threads.
     /// The built-in "Chats" project (threads without a project): its root
     /// is Agentloft's chats folder.
     pub fn is_chats(&self, project: &loft_protocol::Project) -> bool {
@@ -924,6 +1196,9 @@ impl AppStore {
         );
     }
 
+    /// Open a new thread in `project_id`. It isn't really started until the
+    /// first message, so an untouched one (no messages, no draft) is reused
+    /// rather than piling up empty threads.
     pub fn new_thread(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
         let blank = self
             .workspace
@@ -1217,31 +1492,105 @@ impl AppStore {
         cx.notify();
     }
 
-    pub fn dequeue(&mut self, thread_id: &ThreadId, index: usize, cx: &mut Context<Self>) {
-        if let Some(q) = self.queued.get_mut(thread_id) {
+    /// Where queued message `id` is in line now.
+    fn queued_index(&self, thread_id: &ThreadId, id: u64) -> Option<usize> {
+        self.queued.get(thread_id)?.iter().position(|m| m.id == id)
+    }
+
+    pub fn dequeue(&mut self, thread_id: &ThreadId, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.queued_index(thread_id, id)
+            && let Some(q) = self.queued.get_mut(thread_id)
+        {
             q.remove(index);
         }
         cx.notify();
     }
 
-    /// Send a queued message now: it moves to the front and the running
-    /// turn stops, so it goes out as soon as the agent is idle.
-    pub fn send_queued_now(&mut self, thread_id: ThreadId, index: usize, cx: &mut Context<Self>) {
-        if let Some(q) = self.queued.get_mut(&thread_id)
-            && let Some(message) = q.remove(index)
-        {
-            q.push_front(message);
+    /// Send a queued message now, into the running turn (the agent reads
+    /// it at its next step; nothing stops). The rest stay queued.
+    pub fn send_queued_now(&mut self, thread_id: ThreadId, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.queued_index(&thread_id, id) else {
+            return;
+        };
+        let Some(message) = self
+            .queued
+            .get_mut(&thread_id)
+            .and_then(|q| q.remove(index))
+        else {
+            return;
+        };
+        self.steer(thread_id, message, Some(index), cx);
+        cx.notify();
+    }
+
+    /// A message into the running turn. If it can't go in (the agent can't
+    /// take one mid-turn, say), it waits in the queue instead — at `back_at`
+    /// if it came from there — and nothing is lost.
+    pub fn steer(
+        &mut self,
+        thread_id: ThreadId,
+        message: Queued,
+        back_at: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            self.last_error = Some("not connected to agentloftd".into());
+            self.requeue(thread_id, message, back_at, cx);
+            return;
+        };
+        let attachments = message.images.iter().map(|i| i.to_attachment()).collect();
+        let fut = client.request(Request::Steer {
+            thread_id: thread_id.clone(),
+            text: message.text.clone(),
+            attachments,
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = fut.await;
+            let _ = this.update(cx, |store, cx| {
+                if let Err(err) = result {
+                    store.last_error = Some(err.message);
+                    store.requeue(thread_id, message, back_at, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn requeue(
+        &mut self,
+        thread_id: ThreadId,
+        message: Queued,
+        at: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let q = self.queued.entry(thread_id.clone()).or_default();
+        let at = at.unwrap_or(q.len()).min(q.len());
+        q.insert(at, message);
+        cx.notify();
+        if let Some(thread) = self.threads.get(&thread_id).cloned() {
+            self.flush_queue(&thread_id, &thread, cx);
         }
-        self.interrupt(thread_id, cx);
+    }
+
+    /// Move queued message `id` to where message `to` is (moving down, it
+    /// lands after it; up, before). The first in line goes next. By id, so
+    /// a message sent meanwhile doesn't shift the wrong one.
+    pub fn move_queued(&mut self, thread_id: &ThreadId, id: u64, to: u64, cx: &mut Context<Self>) {
+        if let Some(q) = self.queued.get_mut(thread_id)
+            && move_in_line(q, id, to)
+        {
+            cx.notify();
+        }
     }
 
     /// Take a queued message back out (to edit it).
     pub fn take_queued(
         &mut self,
         thread_id: &ThreadId,
-        index: usize,
+        id: u64,
         cx: &mut Context<Self>,
     ) -> Option<Queued> {
+        let index = self.queued_index(thread_id, id)?;
         let message = self.queued.get_mut(thread_id)?.remove(index);
         cx.notify();
         message
@@ -1252,14 +1601,39 @@ impl AppStore {
         let idle = thread.read(cx).model.as_ref().is_some_and(|m| {
             m.running_turn().is_none() && m.thread.status != loft_protocol::ThreadStatus::Running
         });
-        if !idle {
+        if !idle || self.flushing.contains(id) {
             return;
         }
         let Some(next) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
             return;
         };
+        let Some(client) = self.client.clone() else {
+            self.queued.entry(id.clone()).or_default().push_front(next);
+            return;
+        };
+        self.flushing.insert(id.clone());
         let attachments = next.images.iter().map(|i| i.to_attachment()).collect();
-        self.send_message(id.clone(), next.text, attachments, cx);
+        let fut = client.request(Request::SendMessage {
+            thread_id: id.clone(),
+            text: next.text.clone(),
+            attachments,
+        });
+        let id = id.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = fut.await;
+            let _ = this.update(cx, |store, cx| {
+                store.flushing.remove(&id);
+                if let Err(err) = result {
+                    // Still first in line: it goes when the agent is free.
+                    store.queued.entry(id.clone()).or_default().push_front(next);
+                    if err.code != loft_protocol::ErrorCode::Conflict {
+                        store.last_error = Some(err.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1380,6 +1754,15 @@ fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
         .unwrap_or_default()
         .into_iter()
         .collect()
+}
+
+fn load_list<T: serde::de::DeserializeOwned>(paths: &Paths, key: &str) -> Vec<T> {
+    std::fs::read(sidebar_file(paths))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get(key).cloned())
+        .and_then(|v| serde_json::from_value::<Vec<T>>(v).ok())
+        .unwrap_or_default()
 }
 
 fn load_folded_threads(paths: &Paths) -> std::collections::HashSet<ThreadId> {

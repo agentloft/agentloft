@@ -75,6 +75,65 @@ pub enum Request {
         #[serde(default)]
         name: Option<String>,
     },
+    RenameProject {
+        project_id: ProjectId,
+        name: String,
+    },
+    /// Settings for agents: current values, settable keys, themes
+    /// (`Response::Json`).
+    GetSettings,
+    /// Set one known setting (`ui.theme`, `harness.codex.default_model`…);
+    /// `null` resets it (`Response::Text`).
+    ChangeSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Save a colour theme (its TOML) and optionally switch to it.
+    SaveTheme {
+        toml: String,
+        #[serde(default)]
+        select: bool,
+    },
+    /// A project's icon: an image file, or `None` for automatic (answers
+    /// `Response::Project`).
+    SetProjectIcon {
+        project_id: ProjectId,
+        #[serde(default)]
+        icon: Option<String>,
+    },
+    /// What new threads in a project start with (answers
+    /// `Response::Project`).
+    SetProjectDefaults {
+        project_id: ProjectId,
+        defaults: ProjectDefaults,
+    },
+    /// Remove a project from Agentloft: its threads are deleted (worktrees
+    /// and checkpoints too); the folder on disk is left alone.
+    RemoveProject {
+        project_id: ProjectId,
+    },
+    /// A new project named `name`: a git repository (README, first commit)
+    /// in a folder named after it, under `parent` (default: Agentloft's
+    /// projects folder), optionally published as a private GitHub
+    /// repository. Answers `Response::Project`.
+    CreateProject {
+        #[serde(default)]
+        parent: Option<String>,
+        name: String,
+        #[serde(default)]
+        github: bool,
+    },
+    /// The GitHub account `gh` is signed in to (`Response::Text`, empty if
+    /// none).
+    GitHubLogin,
+    /// A project cloned from `source` (a git URL, or GitHub `owner/repo`
+    /// with `github`) into `parent` (answers `Response::Project`).
+    CloneProject {
+        parent: String,
+        source: String,
+        #[serde(default)]
+        github: bool,
+    },
     /// A thread without a project (a chat): kept in the built-in "Chats"
     /// project, working in an empty folder of its own. Answers
     /// `Response::Thread`.
@@ -88,6 +147,14 @@ pub enum Request {
         title: Option<String>,
     },
     SendMessage {
+        thread_id: ThreadId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
+    /// A message for the running turn: the agent takes it in at its next
+    /// step, without stopping. With no turn running, it starts one.
+    Steer {
         thread_id: ThreadId,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -578,6 +645,15 @@ pub enum Event {
     ProjectAdded {
         project: Project,
     },
+    /// Renamed (or otherwise changed).
+    ProjectUpdated {
+        project: Project,
+    },
+    /// The project's entry is gone (its threads were deleted first; files
+    /// on disk are untouched).
+    ProjectRemoved {
+        project_id: ProjectId,
+    },
     ThreadCreated {
         thread: Thread,
     },
@@ -609,7 +685,9 @@ impl Event {
     /// The thread this event belongs to, if any (workspace-level otherwise).
     pub fn thread_id(&self) -> Option<&ThreadId> {
         match self {
-            Event::ProjectAdded { .. } => None,
+            Event::ProjectAdded { .. }
+            | Event::ProjectUpdated { .. }
+            | Event::ProjectRemoved { .. } => None,
             Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => Some(&thread.id),
             Event::TurnStarted { turn } | Event::TurnUpdated { turn } => Some(&turn.thread_id),
             Event::ItemUpserted { item } => Some(&item.thread_id),
@@ -625,6 +703,8 @@ impl Event {
         matches!(
             self,
             Event::ProjectAdded { .. }
+                | Event::ProjectUpdated { .. }
+                | Event::ProjectRemoved { .. }
                 | Event::ThreadCreated { .. }
                 | Event::ThreadUpdated { .. }
                 | Event::ThreadDeleted { .. }

@@ -15,7 +15,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, KeyBinding, ParentElement as _, PathPromptOptions, Render, SharedString,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div,
     prelude::FluentBuilder as _, px,
 };
@@ -42,10 +42,12 @@ actions!(
         ShowFiles,
         ShowChanges,
         ShowTerminal,
+        ToggleTerminal,
         ShowBrowser,
         NewWindow,
         NewTab,
-        OpenPalette
+        OpenPalette,
+        SteerMessage
     ]
 );
 
@@ -56,29 +58,8 @@ const HEADER_HEIGHT: f32 = 52.;
 const TRAFFIC_LIGHTS_INSET: f32 = 78.;
 
 pub fn bind_keys(cx: &mut gpui_kit::App) {
-    loft_browser::bind_keys(cx);
-    cx.bind_keys([
-        KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),
-        KeyBinding::new("alt-cmd-n", NewChat, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-n", NewWindow, None),
-        KeyBinding::new("cmd-t", NewTab, None),
-        KeyBinding::new("cmd-.", Interrupt, Some(CONTEXT)),
-        KeyBinding::new("cmd-b", ToggleSidebar, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-l", ToggleTheme, Some(CONTEXT)),
-        KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
-        KeyBinding::new("cmd-o", AddProject, Some(CONTEXT)),
-        KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-f", FocusSearch, Some(CONTEXT)),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-j", TogglePanel, Some(CONTEXT)),
-        KeyBinding::new("cmd-enter", ApproveOnce, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-enter", ApproveSession, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-backspace", DenyRequest, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-e", ShowFiles, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-g", ShowChanges, Some(CONTEXT)),
-        KeyBinding::new("ctrl-`", ShowTerminal, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-b", ShowBrowser, Some(CONTEXT)),
-    ]);
+    // Every shortcut, with the user's own keys (Settings → Shortcuts).
+    crate::keymap::apply(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
@@ -119,7 +100,8 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
             MenuItem::separator(),
             MenuItem::action("Files", ShowFiles),
             MenuItem::action("Changes", ShowChanges),
-            MenuItem::action("Terminal", ShowTerminal),
+            MenuItem::action("Terminal", ToggleTerminal),
+            MenuItem::action("Terminal in Side Panel", ShowTerminal),
             MenuItem::action("Browser", ShowBrowser),
             MenuItem::separator(),
             MenuItem::action("Command Palette…", OpenPalette),
@@ -148,6 +130,14 @@ pub struct WorkspaceView {
     show_archived: bool,
     /// The sidebar thread whose ··· menu is open.
     row_menu: Option<ThreadId>,
+    /// Threads sidebar: only this project's threads (`None` = all).
+    project_filter: Option<ProjectId>,
+    /// Sidebar threads picked together (shift-click), in sidebar order.
+    multi: Vec<ThreadId>,
+    /// Where a shift-click range starts: the last thread clicked.
+    anchor: Option<ThreadId>,
+    /// The sidebar's thread rows as last drawn, top to bottom.
+    visible_rows: Vec<ThreadId>,
     /// The sidebar thread being renamed in place, and its field.
     renaming: Option<(ThreadId, Entity<InputState>, Subscription)>,
     /// Threads whose messages match the sidebar search, and the search
@@ -178,6 +168,12 @@ pub struct WorkspaceView {
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
+    /// Terminals docked under the conversation (Ctrl+`).
+    dock: Entity<crate::panel::dock::TerminalDock>,
+    pub(crate) dock_open: bool,
+    dock_slide: Slide,
+    /// The dock's height as last laid out (it slides, and reopens, at it).
+    dock_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// Where the details button is (its card opens under it).
     details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     sidebar_slide: Slide,
@@ -185,7 +181,8 @@ pub struct WorkspaceView {
     sidebar_amount: f32,
     panel_slide: Slide,
     details_slide: Slide,
-    /// The side panel's width as last laid out (it slides at this width).
+    /// The side panel's width as last laid out (it slides, and reopens, at
+    /// this width). Zero until it first opens, when it gets a share of the room.
     panel_width: std::rc::Rc<std::cell::Cell<f32>>,
     /// The conversation's width as last laid out (the turn map needs a margin).
     /// Each pane's conversation width (the turn map needs a margin).
@@ -214,6 +211,7 @@ impl WorkspaceView {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads"));
         let panel = cx.new(|cx| WorkbenchPanel::new(store.clone(), window, cx));
+        let dock = cx.new(|cx| crate::panel::dock::TerminalDock::new(panel.clone(), cx));
         let subs = vec![
             cx.subscribe_in(&store, window, |this, _, event, window, cx| {
                 this.on_store_event(event, window, cx)
@@ -224,6 +222,15 @@ impl WorkspaceView {
                     this.add_annotation(thread_id, note, window, cx)
                 }
                 crate::panel::PanelEvent::Maximized(_) => cx.notify(),
+                crate::panel::PanelEvent::ShowPanel => {
+                    this.panel_open = true;
+                    cx.notify();
+                }
+                crate::panel::PanelEvent::ShowDock => {
+                    this.dock_open = true;
+                    cx.notify();
+                }
+                crate::panel::PanelEvent::HideDock => this.hide_dock(window, cx),
                 // Done annotating with no notes waiting: clear the page.
                 crate::panel::PanelEvent::AnnotatingStopped(thread_id) => {
                     if this.page_notes.get(thread_id).is_none_or(|n| n.is_empty())
@@ -270,6 +277,10 @@ impl WorkspaceView {
             query: String::new(),
             show_archived: false,
             row_menu: None,
+            project_filter: None,
+            multi: Vec::new(),
+            anchor: None,
+            visible_rows: Vec::new(),
             renaming: None,
             search_hits: HashMap::new(),
             search_seq: 0,
@@ -286,6 +297,10 @@ impl WorkspaceView {
             sidebar_open: true,
             panel,
             panel_open: false,
+            dock,
+            dock_open: false,
+            dock_slide: Slide::default(),
+            dock_height: std::rc::Rc::new(std::cell::Cell::new(DOCK_HEIGHT)),
             details_anchor: Default::default(),
             details_open: false,
             peek: None,
@@ -296,7 +311,7 @@ impl WorkspaceView {
             sidebar_amount: 1.,
             panel_slide: Slide::default(),
             details_slide: Slide::default(),
-            panel_width: std::rc::Rc::new(std::cell::Cell::new(560.)),
+            panel_width: std::rc::Rc::new(std::cell::Cell::new(0.)),
             details_card: None,
             details_room: Default::default(),
             window_title: String::new(),
@@ -554,14 +569,14 @@ impl WorkspaceView {
                 self.store
                     .update(cx, |s, cx| s.send_message(id, text, Vec::new(), cx));
             }
+            // `queue:first|second|…` queues each.
             Some(("queue", text)) => {
                 self.panel_open = false;
-                let queued = crate::store::Queued {
-                    text: text.to_owned(),
-                    images: Vec::new(),
-                };
-                let id = thread_id.clone();
-                self.store.update(cx, |s, cx| s.enqueue(id, queued, cx));
+                for part in text.split('|') {
+                    let queued = crate::store::Queued::new(part.to_owned(), Vec::new());
+                    let id = thread_id.clone();
+                    self.store.update(cx, |s, cx| s.enqueue(id, queued, cx));
+                }
             }
             Some(("file", path)) => {
                 let path = path.to_owned();
@@ -626,6 +641,7 @@ impl WorkspaceView {
                 "terminal" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Terminal, window, cx)),
+                "dock" => self.toggle_terminal(window, cx),
                 "browser" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx)),
@@ -993,6 +1009,71 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    /// The conversation with the terminal dock under it (sliding in and
+    /// out, then resizable by its top edge).
+    fn with_terminal_dock(
+        &mut self,
+        body: AnyElement,
+        show: bool,
+        p: &Palette,
+        window: &mut Window,
+    ) -> AnyElement {
+        let amount = self.dock_slide.update(show, window);
+        if amount <= 0. {
+            return body;
+        }
+        let height = self.dock_height.get();
+        if amount < 1. {
+            // Mid-slide: the dock at its full height, partly shown (so the
+            // shell isn't resized every frame).
+            return v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().w_full().child(body))
+                .child(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .h(px(height * amount))
+                        .overflow_hidden()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .child(div().w_full().h(px(height)).child(self.dock.clone())),
+                )
+                .into_any_element();
+        }
+        let measured = self.dock_height.clone();
+        div()
+            .size_full()
+            .child(
+                v_resizable("terminal-dock")
+                    .child(resizable_panel().child(body))
+                    .child(
+                        resizable_panel()
+                            .size(px(height))
+                            .size_range(px(DOCK_MIN_HEIGHT)..px(2000.))
+                            .child(
+                                div()
+                                    .size_full()
+                                    .relative()
+                                    .border_t_1()
+                                    .border_color(p.border)
+                                    .child(self.dock.clone())
+                                    .child(
+                                        gpui_kit::canvas(
+                                            move |bounds, _, _| {
+                                                measured.set(f32::from(bounds.size.height))
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_full(),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Show a panel tab (never closes the panel, unlike [`Self::show_tab`]).
     pub(crate) fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         self.panel_open = true;
@@ -1009,6 +1090,35 @@ impl WorkspaceView {
             self.panel_open = true;
             self.panel
                 .update(cx, |panel, cx| panel.show(tab, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+`: open the terminal dock (with a shell) and focus it; when
+    /// open, focus it, or hide it if it has focus already.
+    pub(crate) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.read(cx).selected.is_none() {
+            return;
+        }
+        if self.dock_open && self.panel.read(cx).docked_focused(window, cx) {
+            self.hide_dock(window, cx);
+            return;
+        }
+        self.dock_open = true;
+        self.panel
+            .update(cx, |p, cx| p.ensure_docked(true, window, cx));
+        cx.notify();
+    }
+
+    /// Hide the terminal dock, handing focus back to the composer.
+    fn hide_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_focus = self.panel.read(cx).docked_focused(window, cx);
+        self.dock_open = false;
+        if had_focus
+            && let Some(id) = self.store.read(cx).selected.clone()
+            && let Some(composer) = self.composers.get(&id)
+        {
+            composer.update(cx, |c, cx| c.focus(window, cx));
         }
         cx.notify();
     }
@@ -1054,31 +1164,22 @@ impl WorkspaceView {
                 .placeholder(placeholder_for(&thread_harness))
         });
         let thread_id = id.clone();
-        let sub = cx.subscribe_in(&composer, window, move |this, state, event, window, cx| {
-            match event {
-                // ⌘⏎ / ⌘⇧⏎ answer an open approval even while typing.
-                InputEvent::PressEnter {
-                    secondary: true,
-                    shift,
-                } if this.open_request(cx).is_some() => {
-                    let decision = if *shift {
-                        loft_protocol::DecisionKind::AllowSession
-                    } else {
-                        loft_protocol::DecisionKind::AllowOnce
-                    };
-                    this.answer(decision, cx);
-                }
-                InputEvent::PressEnter { shift: false, .. } => {
-                    this.submit(&thread_id, state, window, cx);
-                }
-                InputEvent::Change => {
-                    this.refresh_completion(&thread_id, state, cx);
-                    this.queue_draft_save(&thread_id, state, cx);
-                }
-                InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
-                _ => {}
-            }
-        });
+        let sub =
+            cx.subscribe_in(
+                &composer,
+                window,
+                move |this, state, event, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.submit(&thread_id, state, window, cx, false);
+                    }
+                    InputEvent::Change => {
+                        this.refresh_completion(&thread_id, state, cx);
+                        this.queue_draft_save(&thread_id, state, cx);
+                    }
+                    InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
+                    _ => {}
+                },
+            );
         self._subs.push(sub);
         // A fork's handoff digest, for the user to review and send.
         if let Some(draft) = self.store.update(cx, |s, _| s.drafts.remove(&id)) {
@@ -1130,12 +1231,35 @@ impl WorkspaceView {
         self.draft_saves.insert(thread_id.clone(), task);
     }
 
+    /// ⌘↩ in the composer: with nothing typed and an approval open, approve
+    /// it; otherwise send what's typed into the running turn right away.
+    fn steer_or_approve(
+        &mut self,
+        thread_id: &ThreadId,
+        composer: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let empty = composer.read(cx).value().trim().is_empty()
+            && self.attachments.get(thread_id).is_none_or(|a| a.is_empty())
+            && self.pasted.get(thread_id).is_none_or(|p| p.is_empty())
+            && self.page_notes.get(thread_id).is_none_or(|n| n.is_empty());
+        if empty && self.open_request(cx).is_some() {
+            self.answer(loft_protocol::DecisionKind::AllowOnce, cx);
+            return;
+        }
+        self.submit(thread_id, composer, window, cx, true);
+    }
+
+    /// Send what's typed. While the agent works it waits in the queue, or
+    /// with `steer` goes into the running turn now.
     fn submit(
         &mut self,
         thread_id: &ThreadId,
         composer: &Entity<TextareaState>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        steer: bool,
     ) {
         let typed = composer.read(cx).value().trim().to_owned();
         let has_images = self
@@ -1227,10 +1351,15 @@ impl WorkspaceView {
             images.iter().map(|a| a.to_attachment()).collect();
         let id = thread_id.clone();
         if self.is_running(thread_id, cx) {
-            // Sent automatically when the current turn ends.
-            let queued = crate::store::Queued { text, images };
-            self.store
-                .update(cx, |store, cx| store.enqueue(id, queued, cx));
+            let message = crate::store::Queued::new(text, images);
+            self.store.update(cx, |store, cx| {
+                if steer {
+                    store.steer(id, message, None, cx);
+                } else {
+                    // Sent automatically when the current turn ends.
+                    store.enqueue(id, message, cx);
+                }
+            });
         } else {
             self.store.update(cx, |store, cx| {
                 store.send_message(id, text, attachments, cx)
@@ -1422,8 +1551,9 @@ impl WorkspaceView {
         )
     }
 
-    /// Messages waiting for the current turn to end: dashed bubbles you can
-    /// send now (stopping the turn), take back to edit, or drop.
+    /// Messages waiting for the current turn to end, the top one next:
+    /// dashed bubbles you can send now (into the running turn), reorder
+    /// (drag, or the arrows), take back to edit, or drop.
     fn queued_list(
         &self,
         thread_id: &ThreadId,
@@ -1436,6 +1566,7 @@ impl WorkspaceView {
             return None;
         }
         let mut list = v_flex().gap_3().pb_2();
+        let count = queued.len();
         for (ix, q) in queued.iter().enumerate() {
             let mut thumbs = h_flex().gap_1p5().flex_wrap().justify_end();
             for (n, image) in q.images.iter().enumerate() {
@@ -1471,12 +1602,32 @@ impl WorkspaceView {
                     .children(label)
             };
             let (t1, t2, t3) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
+            let (t_up, t_down, t_drop) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
+            let my_id = q.id;
+            let prev_id = ix.checked_sub(1).map(|i| queued[i].id);
+            let next_id = queued.get(ix + 1).map(|m| m.id);
+            let drag = DraggedQueued {
+                thread_id: thread_id.clone(),
+                id: my_id,
+                text: q
+                    .text
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("Image")
+                    .to_owned(),
+            };
+            let drop_accent = p.accent;
+            let steer_tip = match crate::keymap::hint("steer", cx) {
+                k if k.is_empty() => "Send into the running turn now".to_owned(),
+                k => format!("Send into the running turn now ({k} while typing)"),
+            };
             list = list.child(
                 v_flex()
                     .items_end()
                     .gap_1()
                     .child(
                         v_flex()
+                            .id(SharedString::from(format!("queued-bubble-{ix}")))
                             .max_w(gpui_kit::relative(0.85))
                             .gap_2()
                             .px_4()
@@ -1487,6 +1638,22 @@ impl WorkspaceView {
                             .border_color(p.border)
                             .text_sm()
                             .text_color(p.muted_foreground)
+                            // Drag one onto another to put it there.
+                            .when(count > 1, |d| {
+                                d.cursor_grab()
+                                    .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+                                    .drag_over::<DraggedQueued>(move |d, _, _, _| {
+                                        d.border_color(drop_accent).border_2()
+                                    })
+                                    .on_drop(cx.listener(move |this, d: &DraggedQueued, _, cx| {
+                                        if d.thread_id == t_drop {
+                                            let id = t_drop.clone();
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_queued(&id, d.id, my_id, cx)
+                                            });
+                                        }
+                                    }))
+                            })
                             .when(!q.images.is_empty(), |d| d.child(thumbs))
                             .when(!preview.is_empty(), |d| {
                                 d.child(div().line_clamp(4).child(preview))
@@ -1496,25 +1663,70 @@ impl WorkspaceView {
                         h_flex()
                             .gap_0p5()
                             .items_center()
+                            .when(count > 1 && ix == 0, |d| {
+                                d.child(
+                                    div()
+                                        .px_1p5()
+                                        .text_xs()
+                                        .text_color(p.faint_foreground)
+                                        .child("Next"),
+                                )
+                            })
+                            .when_some(prev_id, |d, prev_id| {
+                                d.child(
+                                    action("queued-up", Some(IconName::ChevronUp), None)
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new("Move up")
+                                                .build(window, cx)
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let id = t_up.clone();
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_queued(&id, my_id, prev_id, cx)
+                                            });
+                                        })),
+                                )
+                            })
+                            .when_some(next_id, |d, next_id| {
+                                d.child(
+                                    action("queued-down", Some(IconName::ChevronDown), None)
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new("Move down")
+                                                .build(window, cx)
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let id = t_down.clone();
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_queued(&id, my_id, next_id, cx)
+                                            });
+                                        })),
+                                )
+                            })
                             .child(
                                 action("queued-send", Some(IconName::ArrowUp), Some("Send now"))
+                                    .tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            steer_tip.clone(),
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let id = t1.clone();
                                         this.store
-                                            .update(cx, |s, cx| s.send_queued_now(id, ix, cx));
+                                            .update(cx, |s, cx| s.send_queued_now(id, my_id, cx));
                                     })),
                             )
                             .child(
                                 action("queued-edit", Some(IconName::SquarePen), None).on_click(
                                     cx.listener(move |this, _, window, cx| {
-                                        this.edit_queued(&t2, ix, window, cx)
+                                        this.edit_queued(&t2, my_id, window, cx)
                                     }),
                                 ),
                             )
                             .child(action("queued-drop", Some(IconName::X), None).on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     let id = t3.clone();
-                                    this.store.update(cx, |s, cx| s.dequeue(&id, ix, cx));
+                                    this.store.update(cx, |s, cx| s.dequeue(&id, my_id, cx));
                                 }),
                             )),
                     ),
@@ -1527,13 +1739,13 @@ impl WorkspaceView {
     fn edit_queued(
         &mut self,
         thread_id: &ThreadId,
-        ix: usize,
+        id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(q) = self
             .store
-            .update(cx, |s, cx| s.take_queued(thread_id, ix, cx))
+            .update(cx, |s, cx| s.take_queued(thread_id, id, cx))
         else {
             return;
         };
@@ -2349,6 +2561,24 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Shift-click: pick the threads from the last one clicked (or the open
+    /// one) to `id`, as the sidebar lists them.
+    fn select_range(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        let from = self
+            .anchor
+            .clone()
+            .or_else(|| self.store.read(cx).selected.clone());
+        let at = |t: &ThreadId| self.visible_rows.iter().position(|r| r == t);
+        self.multi = match (from.as_ref().and_then(at), at(&id)) {
+            (Some(a), Some(b)) => self.visible_rows[a.min(b)..=a.max(b)].to_vec(),
+            _ => vec![id.clone()],
+        };
+        if self.anchor.is_none() {
+            self.anchor = from;
+        }
+        cx.notify();
+    }
+
     /// Look for the sidebar query in every thread's messages (after a
     /// short pause in typing).
     fn search_messages(&mut self, cx: &mut Context<Self>) {
@@ -2405,6 +2635,103 @@ impl WorkspaceView {
             || self.search_hits.contains_key(&t.id)
     }
 
+    /// Threads sidebar: show every project's threads, or one's.
+    fn project_filter_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let (projects, chats): (Vec<loft_protocol::Project>, Option<ProjectId>) = {
+            let store = self.store.read(cx);
+            let mut list: Vec<_> = store
+                .workspace
+                .projects
+                .iter()
+                .filter(|p| !store.is_chats(p))
+                .cloned()
+                .collect();
+            list.sort_by_key(|p| p.name.to_lowercase());
+            let chats = store
+                .workspace
+                .projects
+                .iter()
+                .find(|p| store.is_chats(p))
+                .map(|p| p.id.clone());
+            (list, chats)
+        };
+        let current = self.project_filter.clone();
+        let view = cx.entity().downgrade();
+        let _ = p;
+        Button::new("project-filter")
+            .cursor_pointer()
+            .ghost()
+            .xsmall()
+            .icon(IconName::ListFilter)
+            .when(current.is_some(), |b| {
+                gpui_kit::component::Selectable::selected(b, true)
+            })
+            .tooltip("Filter by project")
+            .dropdown_menu(move |mut menu, _, _| {
+                let set = |id: Option<ProjectId>| {
+                    let v = view.clone();
+                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
+                        let id = id.clone();
+                        let _ = v.update(cx, |this, cx| {
+                            this.project_filter = id;
+                            cx.notify();
+                        });
+                    }
+                };
+                // Built like the project rows below, so all line up.
+                let plain = |icon: IconName, label: &'static str| {
+                    PopupMenuItem::element(move |_, cx| {
+                        let p = Palette::of(cx);
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(Icon::new(icon).xsmall().text_color(p.muted_foreground)),
+                            )
+                            .child(label)
+                    })
+                };
+                menu = menu.item(
+                    plain(IconName::FolderOpen, "All projects")
+                        .checked(current.is_none())
+                        .on_click(set(None)),
+                );
+                if let Some(chats) = &chats {
+                    menu = menu.item(
+                        plain(IconName::MessageSquareDashed, "No project")
+                            .checked(current.as_ref() == Some(chats))
+                            .on_click(set(Some(chats.clone()))),
+                    );
+                }
+                menu = menu.separator();
+                // Each with its icon (favicon, chosen image or initials).
+                for project in &projects {
+                    let row = project.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let p = Palette::of(cx);
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(crate::project_icon::badge(&row, 16., &p))
+                                .child(row.name.clone())
+                        })
+                        .checked(current.as_ref() == Some(&project.id))
+                        .on_click(set(Some(project.id.clone()))),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (projects, all_threads, selected, conn, error, unread, collapsed) = {
             let store = self.store.read(cx);
@@ -2420,6 +2747,11 @@ impl WorkspaceView {
         };
         let all_projects: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
         let query = self.query.clone();
+        // Rows picked together (gone threads drop out).
+        self.multi
+            .retain(|id| all_threads.iter().any(|t| &t.id == id));
+        let multi = self.multi.clone();
+        let mut drawn: Vec<ThreadId> = Vec::new();
         let mut list = v_flex().gap_4().px_2().pb_4();
         // Chats (threads without a project) come first.
         let chats: Vec<ProjectId> = {
@@ -2431,9 +2763,86 @@ impl WorkspaceView {
                 .collect()
         };
         let mut projects = projects;
-        projects.sort_by_key(|p| !chats.contains(&p.id));
+        // Then pinned projects, in pin order; then the rest as they were.
+        let pinned = self.store.read(cx).pinned_projects.clone();
+        projects.sort_by_key(|p| {
+            (
+                !chats.contains(&p.id),
+                pinned.iter().position(|x| *x == p.id).unwrap_or(usize::MAX),
+            )
+        });
 
-        for project in &projects {
+        // One list, most recent first, each row with its project.
+        let flat = !theme::sidebar_by_project(cx);
+        if flat {
+            let folded_threads = if query.is_empty() {
+                self.store.read(cx).folded_threads.clone()
+            } else {
+                Default::default()
+            };
+            let filter = self
+                .project_filter
+                .clone()
+                .filter(|f| projects.iter().any(|p| &p.id == f));
+            let threads: Vec<_> = all_threads
+                .iter()
+                .filter(|t| t.status != ThreadStatus::Archived)
+                .filter(|t| filter.as_ref().is_none_or(|f| &t.project_id == f))
+                .filter(|t| {
+                    t.is_started()
+                        || t.parent.is_some()
+                        || t.draft_text().is_some()
+                        || selected.as_ref() == Some(&t.id)
+                })
+                .filter(|t| {
+                    let name = projects
+                        .iter()
+                        .find(|p| p.id == t.project_id)
+                        .map_or("", |p| p.name.as_str());
+                    self.search_matches(t, name)
+                })
+                .collect();
+            let mut rows = v_flex().gap_px();
+            for Nested {
+                thread,
+                depth,
+                under,
+            } in nest_forks(threads, &folded_threads)
+            {
+                let id = thread.id.clone();
+                let project = projects.iter().find(|p| p.id == thread.project_id);
+                // Under the title (top-level rows): its project.
+                let subtitle = (depth == 0).then(|| match project {
+                    Some(pr) if chats.contains(&pr.id) => Subtitle::NoProject,
+                    Some(pr) => Subtitle::Project(pr.clone()),
+                    None => Subtitle::NoProject,
+                });
+                drawn.push(id.clone());
+                rows = rows.child(thread_row(
+                    &self.store,
+                    thread,
+                    depth,
+                    under,
+                    selected.as_ref() == Some(&id) || multi.contains(&id),
+                    unread.contains(&id),
+                    self.row_menu.as_ref() == Some(&id),
+                    self.renaming
+                        .as_ref()
+                        .filter(|(r, _, _)| *r == id)
+                        .map(|(_, input, _)| input.clone()),
+                    self.search_hits
+                        .get(&id)
+                        .filter(|_| !thread.title.to_lowercase().contains(&query)),
+                    subtitle,
+                    (multi.len() > 1 && multi.contains(&id)).then(|| multi.clone()),
+                    p,
+                    cx,
+                ));
+            }
+            list = list.child(rows);
+        }
+
+        for project in projects.iter().filter(|_| !flat) {
             let project_id = project.id.clone();
             let is_chats = chats.contains(&project.id);
             let threads: Vec<_> = all_threads
@@ -2485,12 +2894,13 @@ impl WorkspaceView {
                 } in nest_forks(threads, &folded_threads)
                 {
                     let id = thread.id.clone();
+                    drawn.push(id.clone());
                     rows = rows.child(thread_row(
                         &self.store,
                         thread,
                         depth,
                         under,
-                        selected.as_ref() == Some(&id),
+                        selected.as_ref() == Some(&id) || multi.contains(&id),
                         unread.contains(&id),
                         self.row_menu.as_ref() == Some(&id),
                         self.renaming
@@ -2501,6 +2911,8 @@ impl WorkspaceView {
                         self.search_hits
                             .get(&id)
                             .filter(|_| !thread.title.to_lowercase().contains(&query)),
+                        None,
+                        (multi.len() > 1 && multi.contains(&id)).then(|| multi.clone()),
                         p,
                         cx,
                     ));
@@ -2508,6 +2920,8 @@ impl WorkspaceView {
             }
             list = list.child(v_flex().gap_1().child(header).child(rows));
         }
+
+        self.visible_rows = drawn;
 
         // Archived threads: hidden unless asked for; each can be restored.
         let archived: Vec<_> = all_threads
@@ -2649,15 +3063,48 @@ impl WorkspaceView {
                     .justify_between()
                     .text_xs()
                     .text_color(p.faint_foreground)
-                    .child("PROJECTS")
-                    .child(icon_button(
-                        "add-project",
-                        IconName::FolderPlus,
-                        p,
-                        cx.listener(|this, _, window, cx| {
-                            this.add_project(window, cx);
-                        }),
-                    )),
+                    .child(if flat {
+                        // Filtered to a project: say which.
+                        match &self.project_filter {
+                            Some(f) => self
+                                .store
+                                .read(cx)
+                                .workspace
+                                .projects
+                                .iter()
+                                .find(|p| &p.id == f)
+                                .map(|p| {
+                                    if self.store.read(cx).is_chats(p) {
+                                        "NO PROJECT".to_owned()
+                                    } else {
+                                        p.name.to_uppercase()
+                                    }
+                                })
+                                .unwrap_or_else(|| "THREADS".into()),
+                            None => "THREADS".into(),
+                        }
+                    } else {
+                        "PROJECTS".to_owned()
+                    })
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .when(flat, |d| d.child(self.project_filter_button(p, cx)))
+                            .child(icon_button(
+                                "add-project",
+                                IconName::FolderPlus,
+                                p,
+                                // New, local folder, git URL or GitHub.
+                                cx.listener(|this, _, window, cx| {
+                                    crate::new_in::open_sources(
+                                        cx.entity(),
+                                        &this.store,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -2836,6 +3283,19 @@ impl WorkspaceView {
                             .size_full(),
                         ),
                 )
+                .child(toggle_button(
+                    "hdr-terminal",
+                    IconName::PanelBottom,
+                    self.dock_open,
+                    p,
+                    cx.listener(|this, _, window, cx| {
+                        if this.dock_open {
+                            this.hide_dock(window, cx);
+                        } else {
+                            this.toggle_terminal(window, cx);
+                        }
+                    }),
+                ))
                 .child(toggle_button(
                     "hdr-panel",
                     IconName::PanelRight,
@@ -3037,6 +3497,7 @@ impl WorkspaceView {
         };
         let thread_id = model.thread.id.clone();
         let running = model.running_turn().is_some();
+        let stop_hint = crate::keymap::hint("stop", cx);
         // Open approvals whose card isn't on screen (a background subagent's
         // step, or a step inside folded work) are pinned above the composer.
         let shown_items: std::collections::HashSet<usize> = state
@@ -3298,7 +3759,7 @@ impl WorkspaceView {
                 p.accent,
                 p.accent_foreground,
                 cx.listener(move |this, _, window, cx| {
-                    this.submit(&id, &composer_h, window, cx);
+                    this.submit(&id, &composer_h, window, cx, false);
                 }),
             )
         };
@@ -3495,8 +3956,21 @@ impl WorkspaceView {
                                 .children(self.paste_chips(&thread_id, p, cx))
                                 .child(
                                     div()
+                                        .key_context("Composer")
                                         .px_2()
                                         .pt_1()
+                                        // ⌘↩ (Ctrl+Enter): into the running turn now.
+                                        .on_action({
+                                            let id = thread_id.clone();
+                                            let composer = composer.clone();
+                                            cx.listener(
+                                                move |this, _: &SteerMessage, window, cx| {
+                                                    this.steer_or_approve(
+                                                        &id, &composer, window, cx,
+                                                    );
+                                                },
+                                            )
+                                        })
                                         .child(Textarea::new(&composer).appearance(false)),
                                 )
                                 .child(
@@ -3532,12 +4006,12 @@ impl WorkspaceView {
                                             h_flex()
                                                 .gap_2()
                                                 .items_center()
-                                                .when(running, |d| {
+                                                .when(running && !stop_hint.is_empty(), |d| {
                                                     d.child(
                                                         div()
                                                             .text_xs()
                                                             .text_color(p.faint_foreground)
-                                                            .child("⌘. to stop"),
+                                                            .child(format!("{stop_hint} to stop")),
                                                     )
                                                 })
                                                 .child(action),
@@ -3990,10 +4464,10 @@ impl WorkspaceView {
                         "welcome-add",
                         IconName::FolderPlus,
                         "Add project",
-                        "⌘O",
+                        crate::keymap::hint("add_project", cx),
                         p,
                         cx.listener(|this, _, window, cx| {
-                            this.add_project(window, cx);
+                            crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
                         }),
                     ))
                     .when(has_projects, |d| {
@@ -4001,7 +4475,7 @@ impl WorkspaceView {
                             "welcome-new",
                             IconName::SquarePen,
                             "New thread",
-                            "⌘N",
+                            crate::keymap::hint("new_thread", cx),
                             p,
                             cx.listener(|this, _, _, cx| this.new_thread(None, cx)),
                         ))
@@ -4047,11 +4521,22 @@ impl Render for WorkspaceView {
             None => self.render_welcome(&p, cx),
         };
         let body = self.with_details_dock(body, window, cx);
-        let mut body_slot = Some(body);
         let show_panel = self.panel_open && header_title.is_some();
         let maximized = show_panel && self.panel.read(cx).maximized;
+        let show_dock = self.dock_open && header_title.is_some();
+        if show_dock && self.panel.read(cx).dock_len(cx) == 0 {
+            // A thread picked with the dock open gets a shell of its own.
+            self.panel
+                .update(cx, |p, cx| p.ensure_docked(false, window, cx));
+        }
+        let body = self.with_terminal_dock(body, show_dock, &p, window);
+        let mut body_slot = Some(body);
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
+        if show_panel && self.panel_width.get() <= 0. {
+            let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
+            self.panel_width.set(default_panel_width(room));
+        }
         let header = self.render_header(header_title, &p, cx);
         let sidebar = (side > 0.).then(|| {
             div()
@@ -4067,6 +4552,13 @@ impl Render for WorkspaceView {
 
         v_flex()
             .key_context(CONTEXT)
+            // Esc lets go of threads picked together in the sidebar.
+            .on_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, _, cx| {
+                if e.keystroke.key == "escape" && !this.multi.is_empty() {
+                    this.multi.clear();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &NewThread, _, cx| this.new_thread(None, cx)))
             .on_action(
                 cx.listener(|this, _: &NewChat, _, cx| {
@@ -4081,7 +4573,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| theme::toggle_mode(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &AddProject, window, cx| {
-                this.add_project(window, cx);
+                crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
             }))
             .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
@@ -4115,6 +4607,7 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &ShowTerminal, w, cx| this.show_tab(Tab::Terminal, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleTerminal, w, cx| this.toggle_terminal(w, cx)))
             .on_action(
                 cx.listener(|this, _: &ShowBrowser, w, cx| this.show_tab(Tab::Browser, w, cx)),
             )
@@ -4180,8 +4673,8 @@ impl Render for WorkspaceView {
                                         .child(resizable_panel().children(body_slot.take()))
                                         .child(
                                             resizable_panel()
-                                                .size(px(560.))
-                                                .size_range(px(340.)..px(1600.))
+                                                .size(px(self.panel_width.get()))
+                                                .size_range(px(PANEL_MIN)..px(1600.))
                                                 .visible(show_panel)
                                                 .child(
                                                     div()
@@ -4338,7 +4831,7 @@ fn pill_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,
-    shortcut: &'static str,
+    shortcut: String,
     p: &Palette,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {
@@ -4534,11 +5027,55 @@ fn project_header(
     };
     let menu = {
         let (store, all) = (store.clone(), all_projects.to_vec());
+        let (this_id, this_name, threads) = (id.clone(), project.name.clone(), threads.len());
         move |menu: gpui_kit::component::menu::PopupMenu,
               _: &mut Window,
-              _: &mut Context<gpui_kit::component::menu::PopupMenu>| {
+              cx: &mut Context<gpui_kit::component::menu::PopupMenu>| {
             use gpui_kit::component::menu::PopupMenuItem;
             let (s1, a1, s2, a2) = (store.clone(), all.clone(), store.clone(), all.clone());
+            // This project: pin, its settings, removing it (not for Chats).
+            let menu = if chats {
+                menu
+            } else {
+                let pinned = store.read(cx).pinned_projects.contains(&this_id);
+                let (s3, i3) = (store.clone(), this_id.clone());
+                let (s4, i4) = (store.clone(), this_id.clone());
+                let (s5, i5, n5) = (store.clone(), this_id.clone(), this_name.clone());
+                menu.item(
+                    PopupMenuItem::new(if pinned { "Unpin" } else { "Pin" })
+                        .icon(if pinned {
+                            IconName::PinOff
+                        } else {
+                            IconName::Pin
+                        })
+                        .on_click(move |_, _, cx| {
+                            let id = i3.clone();
+                            s3.update(cx, |s, cx| s.toggle_pinned(id, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Project Settings…")
+                        .icon(IconName::Settings)
+                        .on_click(move |_, _, cx| {
+                            crate::settings::open_project(s4.clone(), i4.clone(), cx)
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Remove Project…")
+                        .icon(IconName::Trash)
+                        .on_click(move |_, window, cx| {
+                            confirm_remove_project(
+                                s5.clone(),
+                                i5.clone(),
+                                n5.clone(),
+                                threads,
+                                window,
+                                cx,
+                            )
+                        }),
+                )
+                .separator()
+            };
             menu.item(
                 PopupMenuItem::new("Collapse All")
                     .icon(IconName::ChevronsDownUp)
@@ -4581,16 +5118,15 @@ fn project_header(
                         .items_center()
                         .justify_center()
                         .group_hover(group.clone(), |d| d.invisible())
-                        .child(
-                            Icon::new(if chats {
-                                IconName::MessageSquare
-                            } else if folded {
-                                IconName::Folder
-                            } else {
-                                IconName::FolderOpen
-                            })
-                            .xsmall(),
-                        ),
+                        // The project's icon (favicon, chosen image or
+                        // initials); chats get a bubble.
+                        .child(if chats {
+                            Icon::new(IconName::MessageSquare)
+                                .xsmall()
+                                .into_any_element()
+                        } else {
+                            crate::project_icon::badge(project, 14., p)
+                        }),
                 )
                 .child(
                     div()
@@ -4640,6 +5176,48 @@ fn project_header(
         .into_any_element()
 }
 
+/// The line under a thread's title in the Threads sidebar: its project.
+enum Subtitle {
+    Project(loft_protocol::Project),
+    NoProject,
+}
+
+fn subtitle_line(sub: &Subtitle, branch: Option<&str>, p: &Palette) -> AnyElement {
+    let (badge, name): (AnyElement, String) = match sub {
+        Subtitle::Project(project) => (
+            crate::project_icon::badge(project, 15., p),
+            project.name.clone(),
+        ),
+        Subtitle::NoProject => (
+            Icon::new(IconName::MessageSquareDashed)
+                .xsmall()
+                .text_color(p.faint_foreground)
+                .into_any_element(),
+            "No project".into(),
+        ),
+    };
+    h_flex()
+        .gap_1p5()
+        .items_center()
+        .min_w_0()
+        .text_xs()
+        .text_color(p.muted_foreground)
+        .child(badge)
+        .child(div().flex_none().max_w(px(140.)).truncate().child(name))
+        .when_some(branch, |d, b| {
+            d.child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .items_center()
+                    .text_color(p.faint_foreground)
+                    .child(Icon::new(IconName::GitBranch).xsmall())
+                    .child(div().truncate().child(b.to_owned())),
+            )
+        })
+        .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn thread_row(
     store: &Entity<AppStore>,
@@ -4651,11 +5229,14 @@ fn thread_row(
     menu_open: bool,
     renaming: Option<Entity<InputState>>,
     hit: Option<&loft_protocol::SearchHit>,
+    subtitle: Option<Subtitle>,
+    bulk: Option<Vec<ThreadId>>,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
     let id = thread.id.clone();
     let editing = renaming.is_some();
+    let branch = thread.workspace.branch().map(str::to_owned);
     let trailing: AnyElement = match thread.status {
         ThreadStatus::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
         ThreadStatus::WaitingApproval => div()
@@ -4823,28 +5404,35 @@ fn thread_row(
                 .bg(p.background)
                 .child(Input::new(&input).appearance(false).small().text_sm())
                 .into_any_element(),
-            (None, None) => div()
+            (None, None) if subtitle.is_none() => div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .child(title)
                 .into_any_element(),
-            // Searching: the matching message under the title.
-            (None, Some(hit)) => v_flex()
+            // Title, then its project (Threads sidebar) and/or the message
+            // that matched a search.
+            (None, hit) => v_flex()
                 .flex_1()
                 .min_w_0()
-                .gap(px(1.))
+                .gap(px(2.))
                 .child(div().truncate().child(title))
-                .child(search_snippet(hit, p))
+                .when_some(subtitle.as_ref(), |d, sub| {
+                    d.child(subtitle_line(sub, branch.as_deref(), p))
+                })
+                .when_some(hit, |d, hit| d.child(search_snippet(hit, p)))
                 .into_any_element(),
         })
-        .when(thread.workspace.branch().is_some(), |d| {
-            d.child(
-                Icon::new(IconName::GitBranch)
-                    .xsmall()
-                    .text_color(p.faint_foreground),
-            )
-        })
+        .when(
+            thread.workspace.branch().is_some() && subtitle.is_none(),
+            |d| {
+                d.child(
+                    Icon::new(IconName::GitBranch)
+                        .xsmall()
+                        .text_color(p.faint_foreground),
+                )
+            },
+        )
         .children(tucked)
         // Under the pointer, the time (or status) makes way for a ··· menu.
         .child(
@@ -4909,6 +5497,13 @@ fn thread_row(
             let reveal = hit.map(|h| h.item_id.clone());
             cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                 let id = id.clone();
+                // Shift-click: every thread from the last one clicked to here.
+                if event.modifiers().shift {
+                    this.select_range(id, cx);
+                    return;
+                }
+                this.multi.clear();
+                this.anchor = Some(id.clone());
                 // Double-click: rename in place.
                 if event.click_count() == 2 {
                     this.start_rename(id, window, cx);
@@ -4937,7 +5532,15 @@ fn thread_row(
                 |d, _, _, cx| cx.new(|_| d.clone()),
             )
         })
-        .context_menu(thread_menu_items(thread, store, cx.entity().downgrade()))
+        .map(|d| match bulk {
+            // Part of a multi-selection: one menu for all of them.
+            Some(ids) => d
+                .context_menu(bulk_menu_items(ids, store, cx.entity().downgrade()))
+                .into_any_element(),
+            None => d
+                .context_menu(thread_menu_items(thread, store, cx.entity().downgrade()))
+                .into_any_element(),
+        })
         .into_any_element()
 }
 
@@ -5120,6 +5723,46 @@ impl Render for DraggedThread {
             .child(Icon::new(IconName::Columns2).xsmall().text_color(p.accent))
             .child(div().truncate().child(self.title.clone()))
     }
+}
+
+/// A queued message being dragged to a new place in line.
+#[derive(Clone)]
+pub(crate) struct DraggedQueued {
+    thread_id: ThreadId,
+    id: u64,
+    text: String,
+}
+
+impl Render for DraggedQueued {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        div()
+            .max_w(px(320.))
+            .px_3()
+            .py_1p5()
+            .rounded(px(12.))
+            .bg(p.elevated)
+            .border_1()
+            .border_dashed()
+            .border_color(p.accent.opacity(0.6))
+            .shadow_lg()
+            .text_sm()
+            .text_color(p.muted_foreground)
+            .child(div().truncate().child(self.text.clone()))
+    }
+}
+
+/// The terminal dock's first height, and its shortest.
+const DOCK_HEIGHT: f32 = 280.;
+const DOCK_MIN_HEIGHT: f32 = 120.;
+
+/// The side panel's narrowest width.
+const PANEL_MIN: f32 = 340.;
+
+/// The side panel's first width: a share of the room beside the sidebar, so
+/// the conversation keeps most of it. Dragging it wider is remembered.
+fn default_panel_width(room: f32) -> f32 {
+    (room * 0.4).clamp(PANEL_MIN, 640.)
 }
 
 /// The docked details card's width, and the conversation width (with it)
@@ -5448,6 +6091,159 @@ fn fork_submenu(
 }
 
 /// Confirm, then delete a thread for good.
+/// The menu for several sidebar threads picked together.
+fn bulk_menu_items(
+    ids: Vec<ThreadId>,
+    store: &Entity<AppStore>,
+    view: gpui_kit::WeakEntity<WorkspaceView>,
+) -> impl Fn(
+    gpui_kit::component::menu::PopupMenu,
+    &mut Window,
+    &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu
++ 'static {
+    use gpui_kit::component::menu::PopupMenuItem;
+    let store = store.clone();
+    move |menu, _, _| {
+        let n = ids.len();
+        let clear = {
+            let view = view.clone();
+            move |cx: &mut gpui_kit::App| {
+                let _ = view.update(cx, |v, cx| {
+                    v.multi.clear();
+                    cx.notify();
+                });
+            }
+        };
+        let (s1, i1) = (store.clone(), ids.clone());
+        let (s2, i2, c2) = (store.clone(), ids.clone(), clear.clone());
+        let c3 = clear.clone();
+        let (s4, i4) = (store.clone(), ids.clone());
+        menu.item(
+            PopupMenuItem::new(format!("Open in Panes ({n})"))
+                .icon(IconName::Columns2)
+                .on_click(move |_, _, cx| {
+                    for id in &i1 {
+                        let id = id.clone();
+                        s1.update(cx, |s, cx| s.open_pane(id, cx));
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(format!("Archive ({n})"))
+                .icon(IconName::Archive)
+                .on_click(move |_, _, cx| {
+                    for id in &i2 {
+                        let id = id.clone();
+                        s2.update(cx, |s, cx| s.archive_thread(id, false, cx));
+                    }
+                    c2(cx);
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Clear Selection")
+                .icon(IconName::X)
+                .on_click(move |_, _, cx| c3(cx)),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(format!("Delete ({n})…"))
+                .icon(IconName::Trash)
+                .on_click(move |_, window, cx| {
+                    confirm_delete_many(s4.clone(), i4.clone(), clear.clone(), window, cx)
+                }),
+        )
+    }
+}
+
+/// "Delete 4 threads?" for a multi-selection.
+fn confirm_delete_many(
+    store: Entity<AppStore>,
+    ids: Vec<ThreadId>,
+    done: impl Fn(&mut gpui_kit::App) + 'static,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    let done = std::rc::Rc::new(done);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
+        let (store, ids, done) = (store.clone(), ids.clone(), done.clone());
+        dialog
+            .title(format!("Delete {} threads?", ids.len()))
+            .child(
+                "Their conversations, turn history and checkpoints are erased and their agents \
+                 and terminals stopped. Worktrees are removed; their branches are kept. This \
+                 can't be undone.",
+            )
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").cursor_pointer().danger().label("Delete")),
+                    ),
+            )
+            .on_ok(move |_, _, cx| {
+                for id in &ids {
+                    let id = id.clone();
+                    store.update(cx, |s, cx| s.delete_thread(id, cx));
+                }
+                done(cx);
+                true
+            })
+    });
+}
+
+/// "Remove “name”?": its threads are deleted, its files stay.
+fn confirm_remove_project(
+    store: Entity<AppStore>,
+    project_id: ProjectId,
+    name: String,
+    threads: usize,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
+        let (store, project_id) = (store.clone(), project_id.clone());
+        let what = match threads {
+            0 => "It has no threads.".to_owned(),
+            1 => "Its thread is deleted, with its worktree and checkpoints.".to_owned(),
+            n => format!("Its {n} threads are deleted, with their worktrees and checkpoints."),
+        };
+        dialog
+            .title(format!("Remove “{name}” from Agentloft?"))
+            .child(format!(
+                "{what} The folder and its files on disk are not touched."
+            ))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").cursor_pointer().danger().label("Remove")),
+                    ),
+            )
+            .on_ok(move |_, _, cx| {
+                let id = project_id.clone();
+                store.update(cx, |s, cx| s.remove_project(id, cx));
+                true
+            })
+    });
+}
+
 fn confirm_delete(
     store: Entity<AppStore>,
     thread_id: ThreadId,

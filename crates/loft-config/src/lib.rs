@@ -78,6 +78,11 @@ impl Paths {
         self.home.join("chats")
     }
 
+    /// New projects (made from a name) live here, a folder each.
+    pub fn projects_dir(&self) -> PathBuf {
+        self.home.join("projects")
+    }
+
     /// Create the directory layout. `run/` is private (0700).
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
@@ -135,6 +140,19 @@ pub struct Config {
     pub ui: UiConfig,
     pub harness: HarnessConfigs,
     pub worktrees: WorktreeConfig,
+    pub projects: ProjectsConfig,
+}
+
+/// `[projects]` in config.toml.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectsConfig {
+    /// Where Add Project starts browsing and where clones go (`~`
+    /// allowed); unset = the home folder.
+    pub base_dir: Option<String>,
+    /// Where new projects (made from a name) go; unset =
+    /// `~/.agentloft/projects`.
+    pub new_dir: Option<String>,
 }
 
 /// `[worktrees]` in config.toml (PLAN §5.2).
@@ -183,6 +201,12 @@ pub struct UiConfig {
     pub density: String,
     /// Max width of the conversation column in px.
     pub content_width: f32,
+    /// Sidebar: `threads` (one list, most recent first, each with its
+    /// project) | `projects` (threads grouped under their project).
+    pub sidebar: String,
+    /// Shortcuts changed from their defaults: shortcut id → keys
+    /// (`"cmd-shift-t"`; `""` turns it off).
+    pub keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -198,6 +222,8 @@ impl Default for UiConfig {
             mono_font_size: 12.5,
             density: "comfortable".into(),
             content_width: 780.0,
+            sidebar: "threads".into(),
+            keys: Default::default(),
         }
     }
 }

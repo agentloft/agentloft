@@ -244,6 +244,50 @@ async fn second_turn_rejected_while_running_then_interrupt() {
 }
 
 #[tokio::test]
+async fn steering_goes_into_the_running_turn() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    // Idle: a steer is just a message.
+    f.core
+        .handle(Request::Steer {
+            thread_id: thread.id.clone(),
+            text: "slow one two three four five six".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    f.core
+        .handle(Request::Steer {
+            thread_id: thread.id.clone(),
+            text: "also this".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (_, turns, items, _) = thread_snapshot(&f.core, &thread.id);
+    // One turn, not stopped: both messages in it, and the agent heard the second.
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, TurnStatus::Completed);
+    let users: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["slow one two three four five six", "also this"]);
+    assert!(items.iter().any(|i| matches!(&i.body,
+        ItemBody::AssistantMessage { text } if text == "heard: also this")));
+    assert!(
+        items
+            .iter()
+            .all(|i| i.turn_id.as_ref() == Some(&turns[0].id))
+    );
+}
+
+#[tokio::test]
 async fn approval_allow_flow() {
     let f = fixture();
     let thread = new_thread(&f.core, f._dir.path()).await;
@@ -1217,4 +1261,204 @@ async fn threads_can_be_spawned_in_another_project_or_as_a_chat() {
     // An unknown project names the ones there are.
     let err = spawn(Some("nowhere"), false).await.unwrap_err();
     assert!(err.message.contains("Dispatch"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn new_projects_are_fresh_git_repos() {
+    let f = fixture();
+    let parent = tempfile::tempdir().unwrap();
+    let create = |name: &str| {
+        let core = f.core.clone();
+        let (parent, name) = (
+            parent.path().to_string_lossy().into_owned(),
+            name.to_owned(),
+        );
+        async move {
+            core.handle(Request::CreateProject {
+                parent: Some(parent),
+                name,
+                github: false,
+            })
+            .await
+        }
+    };
+    let Response::Project { project } = create("Fresh Start").await.unwrap() else {
+        panic!()
+    };
+    // Named as typed, in a folder named after it, with a README.
+    assert_eq!(project.name, "Fresh Start");
+    let root = std::path::Path::new(&project.root_path);
+    assert_eq!(root.file_name().unwrap(), "fresh-start");
+    assert!(root.join(".git").exists());
+    assert!(root.join("README.md").exists());
+    // The same name again gets a folder of its own.
+    let Response::Project { project: again } = create("Fresh Start").await.unwrap() else {
+        panic!()
+    };
+    assert!(
+        again.root_path.ends_with("fresh-start-2"),
+        "{}",
+        again.root_path
+    );
+    assert!(create("  ").await.is_err());
+}
+
+#[tokio::test]
+async fn removing_a_project_deletes_its_threads_not_its_files() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let marker = f._dir.path().join("keep.txt");
+    std::fs::write(&marker, "x").unwrap();
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "hi".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let Response::Project { project } = f
+        .core
+        .handle(Request::RenameProject {
+            project_id: thread.project_id.clone(),
+            name: "  Renamed ".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(project.name, "Renamed");
+    f.core
+        .handle(Request::RemoveProject {
+            project_id: thread.project_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (projects, threads) = f
+        .core
+        .with_store(|s| Ok((s.projects()?, s.threads()?)))
+        .unwrap();
+    assert!(projects.is_empty());
+    assert!(threads.is_empty());
+    assert!(marker.exists());
+    // It can come back.
+    let again = new_thread(&f.core, f._dir.path()).await;
+    assert_ne!(again.project_id, thread.project_id);
+}
+
+#[tokio::test]
+async fn project_defaults_shape_new_threads() {
+    let f = fixture();
+    let first = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SetProjectDefaults {
+            project_id: first.project_id.clone(),
+            defaults: loft_protocol::ProjectDefaults {
+                agent: Some(HarnessId(HarnessId::FAKE.into())),
+                model: Some("fast".into()),
+                effort: Some("low".into()),
+                worktree: Some(false),
+            },
+        })
+        .await
+        .unwrap();
+    let Response::Thread { thread } = f
+        .core
+        .handle(Request::CreateThread {
+            project_id: first.project_id.clone(),
+            harness: HarnessId(HarnessId::FAKE.into()),
+            title: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.model.as_deref(), Some("fast"));
+    assert_eq!(thread.effort.as_deref(), Some("low"));
+    assert_eq!(thread.workspace, ThreadWorkspace::Local);
+}
+
+#[tokio::test]
+async fn agents_change_settings_and_add_themes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_file = dir.path().join("config.toml");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(config_file.clone()),
+            ..Default::default()
+        },
+    );
+    let call = |req: Request| {
+        let core = core.clone();
+        async move { core.handle(req).await }
+    };
+    call(Request::ChangeSetting {
+        key: "ui.theme".into(),
+        value: serde_json::json!("dark"),
+    })
+    .await
+    .unwrap();
+    call(Request::ChangeSetting {
+        key: "harness.codex.default_model".into(),
+        value: serde_json::json!("gpt-6"),
+    })
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(text.contains("theme = \"dark\""), "{text}");
+    assert!(text.contains("default_model = \"gpt-6\""), "{text}");
+    // Unknown keys and wrong values are refused.
+    for (key, value) in [
+        ("ui.nope", serde_json::json!(1)),
+        ("ui.theme", serde_json::json!("purple")),
+        ("ui.palette", serde_json::json!("custom:missing")),
+    ] {
+        assert!(
+            call(Request::ChangeSetting {
+                key: key.into(),
+                value
+            })
+            .await
+            .is_err()
+        );
+    }
+    // A theme, saved and switched to.
+    let theme = r##"name = "Ember"
+[dark]
+background = "#1a1110"
+foreground = "#f5e6e0"
+accent = "#ff7a45"
+[light]
+background = "#fffaf7"
+foreground = "#2a1a14"
+accent = "#d9480f"
+"##;
+    call(Request::SaveTheme {
+        toml: theme.into(),
+        select: true,
+    })
+    .await
+    .unwrap();
+    assert!(dir.path().join("themes/ember.toml").exists());
+    let text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(text.contains("palette = \"custom:ember\""), "{text}");
+    assert!(
+        call(Request::SaveTheme {
+            toml: theme.replace("#ff7a45", "orange"),
+            select: false,
+        })
+        .await
+        .is_err()
+    );
+    // Reading them back.
+    let Response::Json { value } = call(Request::GetSettings).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(value["current"]["ui"]["theme"], "dark");
+    assert_eq!(value["themes"]["custom"][0]["id"], "custom:ember");
 }

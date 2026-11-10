@@ -66,8 +66,9 @@ impl FolderPicker {
                 }
             }),
         ];
-        // Start where projects already live, else home.
-        let start = common_parent(&store, cx).unwrap_or_else(home);
+        // Start in Settings ▸ Projects ▸ "New projects start in" (home
+        // by default).
+        let start = store.read(cx).projects_base();
         let mut this = Self {
             store,
             dir: start.clone(),
@@ -661,26 +662,6 @@ fn system_picker(store: Entity<AppStore>, _from: PathBuf, cx: &mut Context<Folde
 
 pub fn home() -> PathBuf {
     std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"))
-}
-
-/// The deepest folder all projects share, when there are any (and it isn't
-/// just `/` or home itself).
-fn common_parent(store: &Entity<AppStore>, cx: &App) -> Option<PathBuf> {
-    let roots: Vec<PathBuf> = store
-        .read(cx)
-        .workspace
-        .projects
-        .iter()
-        .filter_map(|p| Path::new(&p.root_path).parent().map(Path::to_path_buf))
-        .collect();
-    let first = roots.first()?.clone();
-    let mut common = first;
-    for r in &roots[1..] {
-        while !r.starts_with(&common) {
-            common = common.parent()?.to_path_buf();
-        }
-    }
-    (common.is_dir() && common != Path::new("/")).then_some(common)
 }
 
 /// `~/Desktop/de` → (`/Users/me/Desktop/`, `de`): the folder typed so far

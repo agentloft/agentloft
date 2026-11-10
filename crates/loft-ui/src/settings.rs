@@ -19,6 +19,8 @@ use loft_protocol::Request;
 
 mod agents;
 mod appearance;
+mod projects;
+mod shortcuts;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
 impl Global for SettingsWindow {}
@@ -67,6 +69,31 @@ pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
     match opened {
         Ok((handle, view)) => cx.set_global(SettingsWindow(handle, view.downgrade())),
         Err(err) => tracing::error!("open settings: {err:#}"),
+    }
+}
+
+/// Re-read `config.toml` into an open settings window (changed elsewhere).
+pub fn refresh(cx: &mut App) {
+    if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
+        let _ = view.update(cx, |v, cx| {
+            let paths = v.store.read(cx).paths().clone();
+            if let Ok(c) = Config::load(&paths) {
+                v.config = c;
+                v.studio.themes = crate::themes::all(&paths.home);
+            }
+            cx.notify();
+        });
+    }
+}
+
+/// Open the settings window on one project's page.
+pub fn open_project(store: Entity<AppStore>, project: loft_protocol::ProjectId, cx: &mut App) {
+    open(store, Some(Section::Projects), cx);
+    if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
+        let _ = view.update(cx, |v, cx| {
+            v.open_project(project);
+            cx.notify();
+        });
     }
 }
 
@@ -155,6 +182,16 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Agents,
     },
     Findable {
+        label: "New projects folder",
+        keywords: "projects add clone new folder directory location base where",
+        section: Section::Projects,
+    },
+    Findable {
+        label: "Rename, pin or remove a project",
+        keywords: "projects delete remove rename pin",
+        section: Section::Projects,
+    },
+    Findable {
         label: "New threads: worktree or local",
         keywords: "worktrees ask local",
         section: Section::Worktrees,
@@ -173,6 +210,11 @@ pub const FINDABLE: &[Findable] = &[
         label: "Per-project setup",
         keywords: "worktrees setup script copy config.toml",
         section: Section::Worktrees,
+    },
+    Findable {
+        label: "Keyboard shortcuts",
+        keywords: "shortcuts hotkeys keys keybindings keymap rebind steer",
+        section: Section::Shortcuts,
     },
     Findable {
         label: "Settings file",
@@ -195,7 +237,9 @@ pub const FINDABLE: &[Findable] = &[
 pub enum Section {
     Appearance,
     Agents,
+    Projects,
     Worktrees,
+    Shortcuts,
     About,
 }
 
@@ -206,10 +250,12 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s))
     }
 
-    const ALL: [Section; 4] = [
+    const ALL: [Section; 6] = [
         Section::Appearance,
         Section::Agents,
+        Section::Projects,
         Section::Worktrees,
+        Section::Shortcuts,
         Section::About,
     ];
 
@@ -217,7 +263,9 @@ impl Section {
         match self {
             Section::Appearance => "Appearance",
             Section::Agents => "Agents",
+            Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
+            Section::Shortcuts => "Shortcuts",
             Section::About => "About",
         }
     }
@@ -226,7 +274,9 @@ impl Section {
         match self {
             Section::Appearance => IconName::Sun,
             Section::Agents => IconName::Bot,
+            Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
+            Section::Shortcuts => IconName::Keyboard,
             Section::About => IconName::Sparkles,
         }
     }
@@ -234,10 +284,12 @@ impl Section {
 
 /// Text fields, saved on Enter or blur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Field {
+pub(super) enum Field {
     UiFont,
     MonoFont,
     BranchPrefix,
+    ProjectsDir,
+    NewProjectsDir,
 }
 
 impl Field {
@@ -246,6 +298,8 @@ impl Field {
             Field::UiFont => &["ui", "font_family"],
             Field::MonoFont => &["ui", "mono_font_family"],
             Field::BranchPrefix => &["worktrees", "branch_prefix"],
+            Field::ProjectsDir => &["projects", "base_dir"],
+            Field::NewProjectsDir => &["projects", "new_dir"],
         }
     }
 
@@ -254,6 +308,8 @@ impl Field {
             Field::UiFont => c.ui.font_family.clone().unwrap_or_default(),
             Field::MonoFont => c.ui.mono_font_family.clone().unwrap_or_default(),
             Field::BranchPrefix => c.worktrees.branch_prefix.clone(),
+            Field::ProjectsDir => c.projects.base_dir.clone().unwrap_or_default(),
+            Field::NewProjectsDir => c.projects.new_dir.clone().unwrap_or_default(),
         }
     }
 
@@ -262,6 +318,8 @@ impl Field {
             Field::UiFont => "System font",
             Field::MonoFont => "Theme monospace font",
             Field::BranchPrefix => "agentloft",
+            Field::ProjectsDir => "~/",
+            Field::NewProjectsDir => "~/.agentloft/projects",
         }
     }
 
@@ -269,7 +327,10 @@ impl Field {
     fn value(self, text: &str) -> SettingValue {
         let text = text.trim();
         match (self, text.is_empty()) {
-            (Field::UiFont | Field::MonoFont, true) => SettingValue::Unset,
+            (
+                Field::UiFont | Field::MonoFont | Field::ProjectsDir | Field::NewProjectsDir,
+                true,
+            ) => SettingValue::Unset,
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
             _ => SettingValue::Str(text.to_owned()),
         }
@@ -277,7 +338,10 @@ impl Field {
 
     /// Settings the daemon reads (it reloads on change).
     fn is_daemon(self) -> bool {
-        !matches!(self, Field::UiFont | Field::MonoFont)
+        !matches!(
+            self,
+            Field::UiFont | Field::MonoFont | Field::ProjectsDir | Field::NewProjectsDir
+        )
     }
 }
 
@@ -289,6 +353,8 @@ pub struct SettingsView {
     error: Option<String>,
     studio: appearance::Studio,
     agents: agents::AgentsPage,
+    projects: projects::ProjectsPage,
+    shortcuts: shortcuts::ShortcutsPage,
     _subs: Vec<Subscription>,
 }
 
@@ -312,7 +378,13 @@ impl SettingsView {
         };
         let mut inputs = Vec::new();
         let mut subs = Vec::new();
-        for field in [Field::UiFont, Field::MonoFont, Field::BranchPrefix] {
+        for field in [
+            Field::UiFont,
+            Field::MonoFont,
+            Field::BranchPrefix,
+            Field::ProjectsDir,
+            Field::NewProjectsDir,
+        ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
                 let mut s = InputState::new(window, cx).placeholder(field.placeholder());
@@ -341,11 +413,13 @@ impl SettingsView {
             error,
             studio,
             agents: agents::AgentsPage::new(),
+            projects: projects::ProjectsPage::default(),
+            shortcuts: shortcuts::ShortcutsPage::default(),
             _subs: subs,
         }
     }
 
-    fn input(&self, field: Field) -> Entity<InputState> {
+    pub(super) fn input(&self, field: Field) -> Entity<InputState> {
         self.inputs
             .iter()
             .find(|(f, _)| *f == field)
@@ -576,7 +650,9 @@ impl Render for SettingsView {
         let body = match self.section {
             Section::Appearance => self.appearance(&p, window, cx),
             Section::Agents => self.agents_page(&p, window, cx),
+            Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
+            Section::Shortcuts => self.shortcuts_page(&p, cx),
             Section::About => self.about(&p, cx),
         };
         h_flex()
@@ -639,7 +715,7 @@ impl Render for SettingsView {
 
 // -- building blocks --------------------------------------------------------
 
-fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoElement {
+pub(super) fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoElement {
     h_flex()
         .gap_6()
         .items_center()
@@ -667,14 +743,14 @@ fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoEl
         .child(div().flex_shrink_0().child(control))
 }
 
-fn text_input(state: &Entity<InputState>) -> AnyElement {
+pub(super) fn text_input(state: &Entity<InputState>) -> AnyElement {
     div()
         .w(px(260.))
         .child(Input::new(state).small())
         .into_any_element()
 }
 
-fn path_link(
+pub(super) fn path_link(
     id: &'static str,
     path: std::path::PathBuf,
     p: &Palette,

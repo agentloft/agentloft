@@ -29,6 +29,7 @@ impl Harness for FakeHarness {
             client_session_id: true,
             live_model_switch: true,
             live_mode_switch: true,
+            steer: true,
             ..Default::default()
         }
     }
@@ -162,6 +163,8 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
         Duration::from_millis(5)
     };
     let words: Vec<&str> = reply.split_inclusive(' ').collect();
+    // Messages sent into the turn, answered before it ends.
+    let mut steered: Vec<String> = Vec::new();
     for word in words {
         tokio::select! {
             _ = tokio::time::sleep(chunk_delay) => {}
@@ -181,6 +184,7 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
                     return true;
                 }
                 Some(SessionCommand::Shutdown) | None => return false,
+                Some(SessionCommand::Steer(input)) => steered.push(input.text),
                 Some(_) => {}
             }
         }
@@ -196,6 +200,22 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
         tool_result: None,
         status: ItemStatus::Completed,
     });
+    for (i, heard) in steered.into_iter().enumerate() {
+        let id = format!("msg-{turn_no}-steer-{i}");
+        ends.emit(HarnessEvent::ItemStarted {
+            parent: None,
+            native_id: id.clone(),
+            body: ItemBody::AssistantMessage {
+                text: format!("heard: {heard}"),
+            },
+        });
+        ends.emit(HarnessEvent::ItemCompleted {
+            native_id: id,
+            body: None,
+            tool_result: None,
+            status: ItemStatus::Completed,
+        });
+    }
     let failed = text.contains("fail");
     ends.emit(HarnessEvent::TurnCompleted {
         status: if failed {

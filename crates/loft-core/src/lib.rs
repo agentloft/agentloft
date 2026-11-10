@@ -5,6 +5,7 @@
 mod clients;
 mod forks;
 mod handoff;
+mod settings;
 mod terminals;
 mod thread;
 mod workbench;
@@ -70,6 +71,8 @@ pub struct CoreOptions {
     /// Where per-thread worktrees go (`~/.agentloft/worktrees`).
     /// Where chats (threads without a project) work.
     pub chats_dir: PathBuf,
+    /// Where new projects (made from a name) go.
+    pub projects_dir: PathBuf,
     pub worktrees_dir: PathBuf,
     /// `config.toml`, re-read on `Request::ReloadConfig`.
     pub config_file: Option<PathBuf>,
@@ -86,6 +89,7 @@ impl Default for CoreOptions {
             mcp_bridge: None,
             worktrees_dir: std::env::temp_dir().join("agentloft-worktrees"),
             chats_dir: std::env::temp_dir().join("agentloft-chats"),
+            projects_dir: std::env::temp_dir().join("agentloft-projects"),
             config_file: None,
             attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
         }
@@ -534,6 +538,95 @@ impl Core {
             Request::Ping => Ok(Response::Pong),
             Request::AddProject { path, name } => self.add_project(path, name),
             Request::CreateChat { harness } => self.create_chat(harness),
+            Request::CreateProject {
+                parent,
+                name,
+                github,
+            } => self.create_project(parent, name, github).await,
+            Request::GitHubLogin => {
+                let env = self.opts().env.clone();
+                let login = worktrees::blocking(move || Ok(loft_git::github_login(&env)))
+                    .await?
+                    .unwrap_or_default();
+                Ok(Response::Text { text: login })
+            }
+            Request::RenameProject { project_id, name } => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return Err(ErrorBody::new(ErrorCode::BadRequest, "empty name"));
+                }
+                let mut project = self
+                    .with_store(|s| s.project(&project_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+                project.name = name;
+                self.commit(vec![Event::ProjectUpdated {
+                    project: project.clone(),
+                }])?;
+                Ok(Response::Project { project })
+            }
+            Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
+            Request::GetSettings => self.get_settings(),
+            Request::ChangeSetting { key, value } => self.change_setting(&key, &value),
+            Request::SaveTheme { toml, select } => self.save_theme(&toml, select),
+            Request::SetProjectIcon { project_id, icon } => {
+                let mut project = self
+                    .with_store(|s| s.project(&project_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+                let icon = icon.map(|i| i.trim().to_owned()).filter(|i| !i.is_empty());
+                // An image from elsewhere (an agent's pick) is copied in,
+                // so it stays put.
+                let icon = match (
+                    icon,
+                    self.opts().config_file.as_ref().and_then(|f| f.parent()),
+                ) {
+                    (Some(src), Some(home))
+                        if !std::path::Path::new(&src).starts_with(home.join("icons")) =>
+                    {
+                        let src = expand_tilde(&src);
+                        if !src.is_file() {
+                            return Err(ErrorBody::new(
+                                ErrorCode::BadRequest,
+                                format!("{} isn't a file", src.display()),
+                            ));
+                        }
+                        let ext = src
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("png")
+                            .to_ascii_lowercase();
+                        let dir = home.join("icons");
+                        let dest = dir.join(format!("{}-{}.{ext}", project_id.as_str(), now_ms()));
+                        std::fs::create_dir_all(&dir)
+                            .and_then(|_| std::fs::copy(&src, &dest))
+                            .map_err(internal)?;
+                        Some(dest.to_string_lossy().into_owned())
+                    }
+                    (icon, _) => icon,
+                };
+                project.icon = icon;
+                self.commit(vec![Event::ProjectUpdated {
+                    project: project.clone(),
+                }])?;
+                Ok(Response::Project { project })
+            }
+            Request::SetProjectDefaults {
+                project_id,
+                defaults,
+            } => {
+                let mut project = self
+                    .with_store(|s| s.project(&project_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+                project.defaults = defaults;
+                self.commit(vec![Event::ProjectUpdated {
+                    project: project.clone(),
+                }])?;
+                Ok(Response::Project { project })
+            }
+            Request::CloneProject {
+                parent,
+                source,
+                github,
+            } => self.clone_project(parent, source, github).await,
             Request::ListProjects => {
                 let (projects, threads) = self.with_store(|s| Ok((s.projects()?, s.threads()?)))?;
                 let chats = std::fs::canonicalize(&self.opts().chats_dir)
@@ -553,6 +646,8 @@ impl Core {
                                     "id": p.id, "name": p.name, "path": p.root_path,
                                     "chats": std::path::Path::new(&p.root_path) == chats,
                                     "threads": count,
+                                    "icon": p.icon,
+                                    "defaults": p.defaults,
                                 })
                             })
                             .collect(),
@@ -575,6 +670,23 @@ impl Core {
                 let attachments = self.store_attachments(&thread_id, attachments).await?;
                 self.ensure_workspace(&thread_id, &text).await?;
                 self.thread_call(&thread_id, |reply| ThreadCmd::SendMessage {
+                    text,
+                    attachments,
+                    reply,
+                })
+                .await
+            }
+            Request::Steer {
+                thread_id,
+                text,
+                attachments,
+            } => {
+                if text.trim().is_empty() && attachments.is_empty() {
+                    return Err(ErrorBody::new(ErrorCode::BadRequest, "empty message"));
+                }
+                let attachments = self.store_attachments(&thread_id, attachments).await?;
+                self.ensure_workspace(&thread_id, &text).await?;
+                self.thread_call(&thread_id, |reply| ThreadCmd::Steer {
                     text,
                     attachments,
                     reply,
@@ -817,6 +929,8 @@ impl Core {
             }),
             root_path,
             created_at_ms: now_ms(),
+            defaults: Default::default(),
+            icon: None,
         };
         self.commit(vec![Event::ProjectAdded {
             project: project.clone(),
@@ -826,6 +940,105 @@ impl Core {
 
     /// A thread without a project: it lives in the built-in "Chats" project
     /// and works in an empty folder of its own.
+    /// Delete every thread of the project (stopping them, removing their
+    /// worktrees and checkpoints), then its entry. Files stay on disk.
+    async fn remove_project(self: &Arc<Self>, id: &ProjectId) -> CoreResult<Response> {
+        let threads = self.with_store(|s| s.threads())?;
+        if self.with_store(|s| s.project(id))?.is_none() {
+            return Err(ErrorBody::new(ErrorCode::NotFound, "project not found"));
+        }
+        for t in threads.iter().filter(|t| &t.project_id == id) {
+            self.delete_thread(&t.id).await?;
+        }
+        self.commit(vec![Event::ProjectRemoved {
+            project_id: id.clone(),
+        }])?;
+        Ok(Response::Ok)
+    }
+
+    async fn create_project(
+        &self,
+        parent: Option<String>,
+        name: String,
+        github: bool,
+    ) -> CoreResult<Response> {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "the project needs a name",
+            ));
+        }
+        let parent = match parent {
+            Some(p) => expand_tilde(&p),
+            None => self.opts().projects_dir.clone(),
+        };
+        // "Pinball Stats" → pinball-stats (-2, -3… if taken).
+        let slug = worktrees::slug_or(&name, "project");
+        let mut dir = parent.join(&slug);
+        let mut n = 2;
+        while dir.exists() {
+            dir = parent.join(format!("{slug}-{n}"));
+            n += 1;
+        }
+        let (at, env, title) = (dir.clone(), self.opts().env.clone(), name.clone());
+        let committed = worktrees::blocking(move || {
+            loft_git::init_repo(&at)?;
+            loft_git::first_commit(&at, &title, &env)
+        })
+        .await?;
+        let added = self.add_project(dir.to_string_lossy().into_owned(), Some(name))?;
+        if github {
+            let repo = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(slug);
+            let (at, env) = (dir.clone(), self.opts().env.clone());
+            if let Err(e) =
+                worktrees::blocking(move || loft_git::publish_github(&at, &repo, committed, &env))
+                    .await
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "The project was created, but publishing it to GitHub failed: {}",
+                        e.message
+                    ),
+                ));
+            }
+        }
+        Ok(added)
+    }
+
+    async fn clone_project(
+        &self,
+        parent: String,
+        source: String,
+        github: bool,
+    ) -> CoreResult<Response> {
+        let source = source.trim().to_owned();
+        if source.is_empty() {
+            return Err(ErrorBody::new(ErrorCode::BadRequest, "nothing to clone"));
+        }
+        let source = if github {
+            let repo = source
+                .trim_start_matches("https://github.com/")
+                .trim_end_matches(".git")
+                .trim_matches('/')
+                .to_owned();
+            if repo.split('/').count() != 2 {
+                return Err(ErrorBody::new(ErrorCode::BadRequest, "use owner/repo"));
+            }
+            loft_git::CloneSource::GitHub(repo)
+        } else {
+            loft_git::CloneSource::Url(source)
+        };
+        let dest = expand_tilde(&parent).join(source.name());
+        let (at, env) = (dest.clone(), self.opts().env.clone());
+        worktrees::blocking(move || loft_git::clone_repo(&source, &at, &env)).await?;
+        self.add_project(dest.to_string_lossy().into_owned(), None)
+    }
+
     /// The built-in "Chats" project (created on first use).
     pub(crate) fn chats_project(&self) -> CoreResult<Project> {
         let dir = self.opts().chats_dir.clone();
@@ -888,18 +1101,37 @@ impl Core {
         harness: HarnessId,
         title: Option<String>,
     ) -> CoreResult<Response> {
+        let project = self
+            .with_store(|s| s.project(&project_id))?
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+        // The project's own defaults come first (Settings ▸ Projects).
+        let d = project.defaults.clone();
+        let harness = d
+            .agent
+            .clone()
+            .filter(|a| self.harness(a).is_some())
+            .unwrap_or(harness);
         if self.harness(&harness).is_none() {
             return Err(ErrorBody::new(
                 ErrorCode::BadRequest,
                 format!("unknown harness `{harness}`"),
             ));
         }
-        let project = self
-            .with_store(|s| s.project(&project_id))?
-            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let now = now_ms();
-        let workspace = self.default_workspace(&project.root_path);
+        let workspace = match d.worktree {
+            Some(true)
+                if loft_git::repo_root(std::path::Path::new(&project.root_path)).is_some() =>
+            {
+                loft_protocol::ThreadWorkspace::NewWorktree { base: None }
+            }
+            Some(_) => loft_protocol::ThreadWorkspace::Local,
+            None => self.default_workspace(&project.root_path),
+        };
         let (model, permission_mode, effort) = thread_defaults(&self.config(), &harness);
+        // A model and effort set for the project's agent.
+        let own = d.agent.as_ref() == Some(&harness);
+        let model = d.model.clone().filter(|_| own).or(model);
+        let effort = d.effort.clone().filter(|_| own).or(effort);
         let thread = Thread {
             id: ThreadId::new(),
             project_id,
