@@ -2412,16 +2412,16 @@ impl WorkspaceView {
     fn project_filter_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants as _};
         use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-        let (projects, chats): (Vec<(ProjectId, String)>, Option<ProjectId>) = {
+        let (projects, chats): (Vec<loft_protocol::Project>, Option<ProjectId>) = {
             let store = self.store.read(cx);
             let mut list: Vec<_> = store
                 .workspace
                 .projects
                 .iter()
                 .filter(|p| !store.is_chats(p))
-                .map(|p| (p.id.clone(), p.name.clone()))
+                .cloned()
                 .collect();
-            list.sort_by_key(|(_, n)| n.to_lowercase());
+            list.sort_by_key(|p| p.name.to_lowercase());
             let chats = store
                 .workspace
                 .projects
@@ -2453,26 +2453,51 @@ impl WorkspaceView {
                         });
                     }
                 };
+                // Built like the project rows below, so all line up.
+                let plain = |icon: IconName, label: &'static str| {
+                    PopupMenuItem::element(move |_, cx| {
+                        let p = Palette::of(cx);
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(Icon::new(icon).xsmall().text_color(p.muted_foreground)),
+                            )
+                            .child(label)
+                    })
+                };
                 menu = menu.item(
-                    PopupMenuItem::new("All projects")
-                        .icon(IconName::FolderOpen)
+                    plain(IconName::FolderOpen, "All projects")
                         .checked(current.is_none())
                         .on_click(set(None)),
                 );
                 if let Some(chats) = &chats {
                     menu = menu.item(
-                        PopupMenuItem::new("No project")
-                            .icon(IconName::MessageSquareDashed)
+                        plain(IconName::MessageSquareDashed, "No project")
                             .checked(current.as_ref() == Some(chats))
                             .on_click(set(Some(chats.clone()))),
                     );
                 }
                 menu = menu.separator();
-                for (id, name) in &projects {
+                // Each with its icon (favicon, chosen image or initials).
+                for project in &projects {
+                    let row = project.clone();
                     menu = menu.item(
-                        PopupMenuItem::new(name.clone())
-                            .checked(current.as_ref() == Some(id))
-                            .on_click(set(Some(id.clone()))),
+                        PopupMenuItem::element(move |_, cx| {
+                            let p = Palette::of(cx);
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(crate::project_icon::badge(&row, 16., &p))
+                                .child(row.name.clone())
+                        })
+                        .checked(current.as_ref() == Some(&project.id))
+                        .on_click(set(Some(project.id.clone()))),
                     );
                 }
                 menu
