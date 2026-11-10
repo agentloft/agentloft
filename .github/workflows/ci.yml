@@ -48,6 +48,19 @@ jobs:
           -p loft-harness-claude -p loft-harness-codex -p loft-core -p loft-client
           -p loft-docs -p loftd
 
+  web:
+    name: Web client (wasm32)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Builds crates/loft-web for wasm32-unknown-unknown and generates the
+      # JS glue into target/web.
+      - name: Build the web bundle
+        run: cargo xtask web
+
   deny:
     name: Dependency policy
     runs-on: ubuntu-24.04

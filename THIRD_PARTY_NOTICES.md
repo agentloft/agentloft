@@ -52,6 +52,21 @@ GitHub Primer (Studio), Catppuccin (Lavender), Nord (Glacier), Rosé Pine
 (Dusk), Gruvbox (Harvest), Everforest (Evergreen), Tokyo Night (Neon),
 Atom One (Slate) and Dracula (Nightshade). Thanks to their authors.
 
+## Fonts in the web client
+
+The browser has no access to system fonts, so the web client
+(`crates/loft-web/fonts/`) ships its own, each under the SIL Open Font
+License 1.1 (license texts are alongside the files):
+
+- Inter 4.1, https://github.com/rsms/inter (`Inter-LICENSE.txt`): the
+  interface font.
+- JetBrains Mono 2.304, https://github.com/JetBrains/JetBrainsMono
+  (`JetBrainsMono-OFL.txt`): code, diffs and tool output.
+- IBM Plex Sans, https://github.com/IBM/plex (`IBMPlexSans-LICENSE.txt`):
+  the family GPUI's web platform falls back to when a font is missing.
+
+The font files are unmodified.
+
 ## Simple Icons
 
 - Project: Simple Icons, https://simpleicons.org (`simple-icons` 15.0.0)
