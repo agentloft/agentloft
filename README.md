@@ -62,15 +62,22 @@ You need Rust (the version pinned in `rust-toolchain.toml`) and [Zig](https://zi
 cargo xtask dev            # run the app against an isolated ./.dev-home
 cargo xtask bundle --open  # build target/bundle/Agentloft.app
 cargo xtask ci             # fmt, clippy and tests, as CI runs them
+cargo xtask web --release  # the browser client, into target/web
 ```
+
+### In a browser
+
+The same interface runs in a web browser, served by the daemon ([ADR-0016](docs/adr/0016-web-client.md)). It is off until you turn it on in Settings ▸ Web access, and reachable only from this computer unless you say otherwise. Build the browser client first (`cargo xtask web --release`), then open the pairing link from Settings.
 
 ## Layout
 
 | Crate | What it is |
 |---|---|
 | `loft-app` | The app binary |
-| `loft-ui` | GPUI views |
-| `loftd` | The daemon, socket server and MCP server |
+| `loft-ui` | GPUI views (desktop and browser) |
+| `loft-web` | The browser build of the app (WebAssembly) |
+| `loft-client` | Connection to the daemon: Unix socket, or WebSocket in a browser |
+| `loftd` | The daemon, socket server, web listener and MCP server |
 | `loft-core` | Threads, turns, approvals, worktrees, forks, terminals |
 | `loft-store` | SQLite event log and projections |
 | `loft-protocol` | Wire types |
