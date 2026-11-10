@@ -1012,7 +1012,16 @@ impl WorkspaceView {
                     .w(px(DOCK_WIDTH * amount))
                     .h_full()
                     .overflow_hidden()
-                    .child(div().w(px(DOCK_WIDTH)).pt_3().pr_3().child(card))
+                    .child(
+                        // As tall as the conversation at most: a long card scrolls.
+                        v_flex()
+                            .w(px(DOCK_WIDTH))
+                            .h_full()
+                            .pt_3()
+                            .pr_3()
+                            .pb_3()
+                            .child(card),
+                    )
                     .into_any_element()
             }))
             .into_any_element()
@@ -3269,7 +3278,7 @@ impl WorkspaceView {
             .when(has_thread, |d| {
                 let anchor = self.details_anchor.clone();
                 let measure = anchor.clone();
-                let docked = self.details_open && self.can_dock();
+                let docked = self.details_open && self.can_dock() || crate::details::is_over(cx);
                 d.child(
                     div()
                         .relative()
@@ -4787,6 +4796,7 @@ impl Render for WorkspaceView {
             // Where there is one window only (a browser tab): settings and
             // menus that otherwise get a window of their own.
             .children(crate::settings::overlay(cx))
+            .children(crate::details::overlay(window, cx))
             .children(loft_browser::menu::overlay(window, cx))
     }
 }

@@ -1,7 +1,9 @@
 //! The thread's details card (title-bar button): where it runs, open in
-//! an editor, its branch and changes, where it was forked from. On a wide
-//! window it docks beside the conversation; on a narrow one it floats in a
-//! small window (so it shows over the browser panel too).
+//! an editor, its branch and changes, its subagents and the threads it
+//! started, where it came from. On a wide window it docks beside the
+//! conversation; on a narrow one it floats in a small window (so it shows
+//! over the browser panel too), or over the page where there is one window
+//! only (a browser tab).
 
 use crate::panel::Tab;
 use crate::store::AppStore;
@@ -16,7 +18,10 @@ use gpui_kit::{
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point,
     prelude::FluentBuilder as _, px, size,
 };
-use loft_protocol::{DiffScope, Request, Response, ThreadId, ThreadParent, ThreadWorkspace};
+use loft_protocol::{
+    DiffScope, ForkKind, ProjectId, Request, Response, ThreadId, ThreadParent, ThreadStatus,
+    ThreadWorkspace,
+};
 use std::cell::Cell;
 use std::path::PathBuf;
 
@@ -26,10 +31,10 @@ const PAD: f32 = 6.;
 const DIVIDER: f32 = 13.;
 /// A section heading ("Subagents").
 const SECTION: f32 = 24.;
-/// Subagents listed (the most recent).
-const MAX_AGENTS: usize = 8;
+/// The card is no taller than this: its lists scroll.
+const MAX_HEIGHT: f32 = 600.;
 
-/// The thread's subagents, most recent last.
+/// The thread's subagents, oldest first.
 fn subagents(store: &AppStore, thread_id: &ThreadId, cx: &App) -> Vec<loft_protocol::Item> {
     let Some(thread) = store.threads.get(thread_id) else {
         return Vec::new();
@@ -37,7 +42,7 @@ fn subagents(store: &AppStore, thread_id: &ThreadId, cx: &App) -> Vec<loft_proto
     let Some(model) = thread.read(cx).model.as_ref() else {
         return Vec::new();
     };
-    let all: Vec<_> = model
+    model
         .items
         .iter()
         .filter(|i| {
@@ -46,9 +51,96 @@ fn subagents(store: &AppStore, thread_id: &ThreadId, cx: &App) -> Vec<loft_proto
                     if *tool_kind == loft_protocol::ToolKind::Subagent)
         })
         .cloned()
+        .collect()
+}
+
+/// The threads this one's agent started, oldest first.
+fn started_threads(store: &AppStore, thread_id: &ThreadId) -> Vec<loft_protocol::Thread> {
+    let mut all: Vec<_> = store
+        .workspace
+        .threads
+        .iter()
+        .filter(|t| {
+            t.status != ThreadStatus::Archived
+                && t.parent
+                    .as_ref()
+                    .is_some_and(|p| p.thread_id == *thread_id && p.kind == ForkKind::Spawned)
+        })
+        .cloned()
         .collect();
-    let skip = all.len().saturating_sub(MAX_AGENTS);
-    all.into_iter().skip(skip).collect()
+    all.sort_by_key(|t| t.created_at_ms);
+    all
+}
+
+/// Where a card is shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Beside the conversation.
+    Docked,
+    /// In a small window of its own.
+    Window,
+    /// Over the main window's content.
+    Overlay,
+}
+
+/// The card open over the window's content.
+struct Overlay {
+    view: gpui_kit::Entity<DetailsCard>,
+    /// Its top-left corner.
+    at: gpui_kit::Point<Pixels>,
+    focused: bool,
+}
+
+impl gpui_kit::Global for Overlay {}
+
+thread_local! {
+    /// When the overlay last closed: the click that closed it may be on
+    /// the button that would open it again.
+    static CLOSED_AT: Cell<Option<web_time::Instant>> = const { Cell::new(None) };
+}
+
+fn close_overlay(cx: &mut App) {
+    if cx.try_global::<Overlay>().is_some() {
+        CLOSED_AT.set(Some(web_time::Instant::now()));
+        cx.remove_global::<Overlay>();
+        cx.refresh_windows();
+    }
+}
+
+/// Whether the card is open over the window's content.
+pub fn is_over(cx: &App) -> bool {
+    cx.try_global::<Overlay>().is_some()
+}
+
+/// The card open over the window's content, for the window's root view to
+/// draw above everything else. `None` when it isn't open (always, where it
+/// gets a window of its own).
+pub fn overlay(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    let overlay = cx.try_global::<Overlay>()?;
+    let (view, at, focused) = (overlay.view.clone(), overlay.at, overlay.focused);
+    // It is about the thread in view, and goes with it.
+    let card = view.read(cx);
+    if card.store.read(cx).selected.as_ref() != Some(&card.thread_id) {
+        cx.remove_global::<Overlay>();
+        return None;
+    }
+    if !focused {
+        window.focus(&view.focus_handle(cx), cx);
+        cx.global_mut::<Overlay>().focused = true;
+    }
+    Some(
+        gpui_kit::deferred(
+            gpui_kit::anchored().position(at).child(
+                div()
+                    .occlude()
+                    .w(px(WIDTH))
+                    .on_mouse_down_out(|_, _, cx| close_overlay(cx))
+                    .child(view),
+            ),
+        )
+        .with_priority(9)
+        .into_any_element(),
+    )
 }
 
 /// The computer row has two lines (name, folder).
@@ -102,6 +194,7 @@ fn open_in(editor: usize, folder: &str) {
 }
 
 struct Info {
+    project: ProjectId,
     cwd: String,
     workspace: ThreadWorkspace,
     parent: Option<(ThreadParent, String)>,
@@ -120,6 +213,7 @@ fn thread_info(store: &AppStore, id: &ThreadId) -> Option<Info> {
         (p, title)
     });
     Some(Info {
+        project: thread.project_id.clone(),
         cwd: thread.cwd.clone(),
         workspace: thread.workspace.clone(),
         parent,
@@ -128,7 +222,7 @@ fn thread_info(store: &AppStore, id: &ThreadId) -> Option<Info> {
 
 /// Open the card under `anchor` (bounds in `window`), right edges aligned.
 pub fn open(
-    window: &Window,
+    window: &mut Window,
     anchor: Bounds<Pixels>,
     workspace: WeakEntity<WorkspaceView>,
     store: gpui_kit::Entity<AppStore>,
@@ -138,13 +232,44 @@ pub fn open(
     let Some(info) = thread_info(store.read(cx), &thread_id) else {
         return;
     };
-    let agents = subagents(store.read(cx), &thread_id, cx)
-        .len()
-        .min(MAX_AGENTS) as f32;
-    let rows = 3. + if info.parent.is_some() { 1. } else { 0. } + agents;
-    let dividers = 1. + if info.parent.is_some() { 1. } else { 0. } + agents.min(1.);
-    let heading = if agents > 0. { SECTION } else { 0. };
-    let height = PAD * 2. + TALL_ROW + rows * ROW + dividers * DIVIDER + heading + 4.;
+    if crate::host::IS_WEB {
+        // One window only: over its content, and as tall as it turns out.
+        if is_over(cx) {
+            close_overlay(cx);
+            return;
+        }
+        if CLOSED_AT
+            .get()
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250))
+        {
+            return;
+        }
+        let room = f32::from(window.viewport_size().width);
+        let x = (f32::from(anchor.origin.x + anchor.size.width) - WIDTH)
+            .min(room - WIDTH - 4.)
+            .max(4.);
+        let y = f32::from(anchor.origin.y + anchor.size.height) + 4.;
+        let main = window.window_handle();
+        let view = cx.new(|cx| {
+            let place = Place::Overlay;
+            DetailsCard::new(store, workspace, main, thread_id, info, place, window, cx)
+        });
+        cx.set_global(Overlay {
+            view,
+            at: point(px(x), px(y)),
+            focused: false,
+        });
+        cx.refresh_windows();
+        return;
+    }
+    let agents = subagents(store.read(cx), &thread_id, cx).len() as f32;
+    let threads = started_threads(store.read(cx), &thread_id).len() as f32;
+    let parent = if info.parent.is_some() { 1. } else { 0. };
+    let rows = 3. + parent + agents + threads;
+    let lists = agents.min(1.) + threads.min(1.);
+    let dividers = 1. + parent + lists;
+    let height = PAD * 2. + TALL_ROW + rows * ROW + dividers * DIVIDER + lists * SECTION + 4.;
+    let height = height.min(MAX_HEIGHT);
     let win = window.bounds();
     let x = f32::from(win.origin.x + anchor.origin.x + anchor.size.width) - WIDTH;
     let y = f32::from(win.origin.y + anchor.origin.y + anchor.size.height) + 4.;
@@ -166,7 +291,10 @@ pub fn open(
         ..Default::default()
     };
     let _ = cx.open_window(options, move |window, cx| {
-        cx.new(|cx| DetailsCard::new(store, workspace, main, thread_id, info, true, window, cx))
+        cx.new(|cx| {
+            let place = Place::Window;
+            DetailsCard::new(store, workspace, main, thread_id, info, place, window, cx)
+        })
     });
 }
 
@@ -180,7 +308,10 @@ pub fn docked(
 ) -> Option<gpui_kit::Entity<DetailsCard>> {
     let info = thread_info(store.read(cx), &thread_id)?;
     let main = window.window_handle();
-    Some(cx.new(|cx| DetailsCard::new(store, workspace, main, thread_id, info, false, window, cx)))
+    Some(cx.new(|cx| {
+        let place = Place::Docked;
+        DetailsCard::new(store, workspace, main, thread_id, info, place, window, cx)
+    }))
 }
 
 pub struct DetailsCard {
@@ -189,8 +320,7 @@ pub struct DetailsCard {
     main: AnyWindowHandle,
     thread_id: ThreadId,
     info: Info,
-    /// In its own pop-up window (else docked in the main window).
-    floating: bool,
+    place: Place,
     /// The last finished turn whose changes are counted.
     counted_turn: Option<loft_protocol::TurnId>,
     focus: FocusHandle,
@@ -213,7 +343,7 @@ impl DetailsCard {
         main: AnyWindowHandle,
         thread_id: ThreadId,
         info: Info,
-        floating: bool,
+        place: Place,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -222,7 +352,15 @@ impl DetailsCard {
         if let Some(thread) = store.read(cx).threads.get(&thread_id).cloned() {
             cx.observe(&thread, |_, _, cx| cx.notify()).detach();
         }
-        if floating {
+        // So do the threads it starts, and what each is doing.
+        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        let local = matches!(info.workspace, ThreadWorkspace::Local);
+        if crate::host::IS_WEB && local {
+            // No git to ask in a browser: Agentloft knows the branch.
+            let project = info.project.clone();
+            store.update(cx, |store, cx| store.fetch_branches(project, cx));
+        }
+        if place == Place::Window {
             window.focus(&focus, cx);
             cx.observe_window_activation(window, |_, window, _| {
                 if !window.is_window_active() {
@@ -248,7 +386,6 @@ impl DetailsCard {
             .detach();
         }
         let cwd = info.cwd.clone();
-        let local = matches!(info.workspace, ThreadWorkspace::Local);
         cx.spawn(async move |this, cx| {
             let (computer, branch) = cx
                 .background_executor()
@@ -287,7 +424,7 @@ impl DetailsCard {
             main,
             thread_id,
             info,
-            floating,
+            place,
             counted_turn,
             focus,
             computer: None,
@@ -326,10 +463,12 @@ impl DetailsCard {
         &self.thread_id
     }
 
-    /// Close the card if it is the floating one.
-    fn dismiss(floating: bool, window: &mut Window) {
-        if floating {
-            window.remove_window();
+    /// Close the card if it floats.
+    fn dismiss(place: Place, window: &mut Window, cx: &mut App) {
+        match place {
+            Place::Docked => {}
+            Place::Window => window.remove_window(),
+            Place::Overlay => close_overlay(cx),
         }
     }
 
@@ -341,8 +480,9 @@ impl DetailsCard {
         f: impl FnOnce(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>) + 'static,
     ) {
         let workspace = self.workspace.clone();
-        if !self.floating {
-            // Docked: we are in the main window already.
+        if self.place != Place::Window {
+            // We are in the main window already.
+            Self::dismiss(self.place, window, cx);
             _ = workspace.update(cx, |w, cx| f(w, window, cx));
             return;
         }
@@ -369,6 +509,8 @@ impl Focusable for DetailsCard {
 fn row(id: &str, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
     h_flex()
         .id(SharedString::from(id.to_owned()))
+        // Rows keep their height: a card too tall for its place scrolls.
+        .flex_none()
         .h(px(ROW))
         .px_2()
         .gap_2p5()
@@ -380,10 +522,25 @@ fn row(id: &str, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
 
 fn divider(p: &Palette) -> AnyElement {
     div()
+        .flex_none()
         .h(px(DIVIDER))
         .flex()
         .items_center()
         .child(div().w_full().h_px().bg(p.border))
+        .into_any_element()
+}
+
+/// A list's heading ("Subagents").
+fn section(label: &'static str, p: &Palette) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(SECTION))
+        .px_2()
+        .flex()
+        .items_center()
+        .text_xs()
+        .text_color(p.faint_foreground)
+        .child(label)
         .into_any_element()
 }
 
@@ -395,16 +552,17 @@ fn icon(name: IconName, p: &Palette) -> AnyElement {
 }
 
 impl Render for DetailsCard {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         let cwd = self.info.cwd.clone();
-        let floating = self.floating;
-        let mut list = v_flex().p(px(PAD));
+        let place = self.place;
+        // What the thread is, then what it started: only the lists scroll.
+        let mut top = v_flex().flex_none();
 
         // Where it runs.
         let folder = cwd.clone();
-        list =
-            list.child(
+        top =
+            top.child(
                 row("details-computer", &p)
                     .h(px(TALL_ROW))
                     .child(icon(IconName::Laptop, &p))
@@ -444,15 +602,15 @@ impl Render for DetailsCard {
                                 .child(Icon::new(IconName::FolderOpen).small())
                                 .on_click(move |_, window, cx| {
                                     cx.open_with_system(std::path::Path::new(&folder));
-                                    Self::dismiss(floating, window);
+                                    Self::dismiss(place, window, cx);
                                 }),
                         )
                     }),
             );
 
-        // Open in an editor.
+        // Open in an editor: this computer's to do, so not from a browser.
         let editor = self.editor();
-        list = list.child(match editor {
+        let editor_row = match editor {
             Some(ed) => {
                 let folder = cwd.clone();
                 row("details-editor", &p)
@@ -469,9 +627,9 @@ impl Render for DetailsCard {
                         None => icon(IconName::Code, &p),
                     })
                     .child(div().flex_1().child(format!("Open in {}", EDITORS[ed].1)))
-                    .on_click(move |_, window, _| {
+                    .on_click(move |_, window, cx| {
                         open_in(ed, &folder);
-                        Self::dismiss(floating, window);
+                        Self::dismiss(place, window, cx);
                     })
                     .when(self.editors.len() > 1, |d| {
                         let (anchor, editors, folder) = (
@@ -533,8 +691,11 @@ impl Render for DetailsCard {
                         .text_color(p.muted_foreground)
                         .child("No editor found in Applications"),
                 ),
-        });
-        list = list.child(divider(&p));
+        };
+        if !crate::host::IS_WEB {
+            top = top.child(editor_row);
+        }
+        top = top.child(divider(&p));
 
         // Branch.
         let (branch, base) = match &self.info.workspace {
@@ -544,10 +705,16 @@ impl Render for DetailsCard {
             ThreadWorkspace::NewWorktree { .. } => {
                 (Some("New worktree (on first message)".into()), None)
             }
-            ThreadWorkspace::Local => (self.local_branch.clone(), None),
+            ThreadWorkspace::Local => (
+                self.local_branch.clone().or_else(|| {
+                    let branches = self.store.read(cx).branches.get(&self.info.project)?;
+                    branches.current.clone()
+                }),
+                None,
+            ),
         };
         let copy = branch.clone();
-        list = list.child(
+        top = top.child(
             row("details-branch", &p)
                 .cursor_pointer()
                 .hover(|d| d.bg(p.hover))
@@ -601,7 +768,7 @@ impl Render for DetailsCard {
                 .child(div().text_color(p.danger).child(format!("−{removed}")))
                 .into_any_element(),
         };
-        list = list.child(
+        top = top.child(
             row("details-changes", &p)
                 .cursor_pointer()
                 .hover(|d| d.bg(p.hover))
@@ -615,6 +782,33 @@ impl Render for DetailsCard {
                 })),
         );
 
+        // Where it came from.
+        if let Some((parent, title)) = self.info.parent.clone() {
+            let from = match parent.kind {
+                ForkKind::Spawned => format!("Started by {title}"),
+                _ => format!("Forked from {title}"),
+            };
+            top = top.child(divider(&p)).child(
+                row("details-parent", &p)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.hover))
+                    .child(icon(IconName::GitFork, &p))
+                    .child(div().flex_1().min_w_0().truncate().child(from))
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .xsmall()
+                            .text_color(p.faint_foreground),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let (store, id) = (this.store.clone(), parent.thread_id.clone());
+                        this.in_main(window, cx, move |_, _, cx| {
+                            store.update(cx, |s, cx| s.select_thread(id, cx));
+                        });
+                    })),
+            );
+        }
+
+        let mut lists = v_flex().id("details-list").min_h_0().overflow_y_scroll();
         // Subagents: open one, or stop it while it runs.
         let (agents, harness) = {
             let store = self.store.read(cx);
@@ -625,18 +819,12 @@ impl Render for DetailsCard {
                 .and_then(|t| t.read(cx).model.as_ref().map(|m| m.thread.harness.clone()));
             (agents, harness)
         };
-        if !agents.is_empty() {
+        let agents_listed = !agents.is_empty();
+        if agents_listed {
             let model_state = self.store.read(cx).threads.get(&self.thread_id).cloned();
-            list = list.child(divider(&p)).child(
-                div()
-                    .h(px(SECTION))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .text_xs()
-                    .text_color(p.faint_foreground)
-                    .child("Subagents"),
-            );
+            // The line under what stays put is not part of what scrolls.
+            top = top.child(divider(&p));
+            lists = lists.child(section("Subagents", &p));
             let can_stop = harness.as_ref().is_some_and(|h| h.as_str() == "claude");
             for agent in agents {
                 let Some(thread) = model_state.as_ref() else {
@@ -661,7 +849,7 @@ impl Render for DetailsCard {
                     p.success
                 };
                 let (open_id, stop_id) = (agent.id.clone(), agent.id.clone());
-                list = list.child(
+                lists = lists.child(
                     row(&format!("details-agent-{}", agent.id), &p)
                         .group("details-agent")
                         .cursor_pointer()
@@ -716,27 +904,48 @@ impl Render for DetailsCard {
             }
         }
 
-        // Lineage.
-        if let Some((parent, title)) = self.info.parent.clone() {
-            list = list.child(divider(&p)).child(
-                row("details-parent", &p)
+        // Threads its agent started: what each is doing, and a way to it.
+        let threads = started_threads(self.store.read(cx), &self.thread_id);
+        if !threads.is_empty() {
+            if agents_listed {
+                lists = lists.child(divider(&p));
+            } else {
+                top = top.child(divider(&p));
+            }
+            lists = lists.child(section("Threads", &p));
+        }
+        for thread in threads {
+            let running = thread.status == ThreadStatus::Running;
+            let (dot, note) = match thread.status {
+                ThreadStatus::Running => (p.accent, None),
+                ThreadStatus::WaitingApproval => (p.warning, Some("Approve")),
+                ThreadStatus::Error => (p.danger, Some("Failed")),
+                _ if thread.is_waiting() => (p.accent, Some("Waiting")),
+                _ => (p.success, None),
+            };
+            let open_id = thread.id.clone();
+            lists = lists.child(
+                row(&format!("details-thread-{}", thread.id.0), &p)
                     .cursor_pointer()
                     .hover(|d| d.bg(p.hover))
-                    .child(icon(IconName::GitFork, &p))
+                    .child(crate::items::agent_avatar(
+                        &format!("details-thread-dot-{}", thread.id.0),
+                        thread.harness.as_str(),
+                        22.,
+                        dot,
+                        running,
+                        &p,
+                    ))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(format!("Forked from {title}")),
+                            .child(thread.title.clone()),
                     )
-                    .child(
-                        Icon::new(IconName::ChevronRight)
-                            .xsmall()
-                            .text_color(p.faint_foreground),
-                    )
+                    .children(note.map(|note| div().text_xs().text_color(dot).child(note)))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        let (store, id) = (this.store.clone(), parent.thread_id.clone());
+                        let (store, id) = (this.store.clone(), open_id.clone());
                         this.in_main(window, cx, move |_, _, cx| {
                             store.update(cx, |s, cx| s.select_thread(id, cx));
                         });
@@ -744,24 +953,48 @@ impl Render for DetailsCard {
             );
         }
 
-        let card = list
+        let card = v_flex()
+            .p(px(PAD))
+            .child(top)
+            .child(lists)
             .bg(p.elevated)
             .border_1()
             .border_color(p.border)
             .rounded(px(12.))
             .font_weight(FontWeight::NORMAL);
-        if !floating {
-            return card.w_full().into_any_element();
+        match place {
+            // No taller than its column either.
+            Place::Docked => card
+                .w_full()
+                .min_h_0()
+                .max_h(px(MAX_HEIGHT))
+                .into_any_element(),
+            Place::Window => div()
+                .size_full()
+                .track_focus(&self.focus)
+                .on_key_down(|event, window, _| {
+                    if event.keystroke.key == "escape" {
+                        window.remove_window();
+                    }
+                })
+                .child(card.size_full().shadow_lg())
+                .into_any_element(),
+            Place::Overlay => {
+                // As tall as what it lists, within the window.
+                let at = cx.try_global::<Overlay>().map_or(0., |o| f32::from(o.at.y));
+                let room = f32::from(window.viewport_size().height) - at - 8.;
+                let room = room.min(MAX_HEIGHT);
+                div()
+                    .w_full()
+                    .track_focus(&self.focus)
+                    .on_key_down(|event, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            close_overlay(cx);
+                        }
+                    })
+                    .child(card.w_full().max_h(px(room.max(TALL_ROW))).shadow_lg())
+                    .into_any_element()
+            }
         }
-        div()
-            .size_full()
-            .track_focus(&self.focus)
-            .on_key_down(|event, window, _| {
-                if event.keystroke.key == "escape" {
-                    window.remove_window();
-                }
-            })
-            .child(card.size_full().shadow_lg())
-            .into_any_element()
     }
 }

@@ -956,12 +956,18 @@ impl Render for SettingsView {
                     }),
             )
             .child(
+                // A page is a column of a width that reads well, in the
+                // middle of whatever room there is (a browser window can be
+                // very wide).
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .items_center()
                     .child(
                         h_flex()
+                            .w_full()
+                            .max_w(px(PAGE_MAX))
                             .h(px(52.))
                             .flex_shrink_0()
                             .px_8()
@@ -972,31 +978,42 @@ impl Render for SettingsView {
                     )
                     .when_some(self.error.clone(), |d, err| {
                         d.child(
-                            div()
-                                .mx_8()
-                                .mb_2()
-                                .px_3()
-                                .py_2()
-                                .rounded(px(8.))
-                                .text_sm()
-                                .bg(p.danger_soft)
-                                .text_color(p.danger)
-                                .child(err),
+                            div().w_full().max_w(px(PAGE_MAX)).px_8().pb_2().child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded(px(8.))
+                                    .text_sm()
+                                    .bg(p.danger_soft)
+                                    .text_color(p.danger)
+                                    .child(err),
+                            ),
                         )
                     })
                     .child(
-                        div()
+                        v_flex()
                             .id("settings-scroll")
+                            .w_full()
                             .flex_1()
                             .min_h_0()
+                            .items_center()
                             .overflow_y_scroll()
-                            .px_8()
-                            .pb_8()
-                            .child(body),
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(PAGE_MAX))
+                                    .flex_none()
+                                    .px_8()
+                                    .pb_8()
+                                    .child(body),
+                            ),
                     ),
             )
     }
 }
+
+/// How wide a settings page gets, its side padding included.
+const PAGE_MAX: f32 = 800.;
 
 // -- building blocks --------------------------------------------------------
 
