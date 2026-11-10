@@ -3226,8 +3226,8 @@ impl WorkspaceView {
             round_button(
                 "stop",
                 IconName::Square,
-                p.foreground,
-                p.background,
+                p.danger,
+                gpui_kit::white(),
                 cx.listener(move |this, _, _, cx| {
                     let id = id.clone();
                     this.store.update(cx, |s, cx| s.interrupt(id, cx));

@@ -88,6 +88,13 @@ struct OpenApproval {
     command: Option<Vec<String>>,
 }
 
+const AGENTLOFT_INSTRUCTIONS: &str = "You are running inside Agentloft, which shows each \
+conversation as a thread in its sidebar. When the user asks you to spawn, start or create \
+threads (or Agentloft agents), use the `agentloft` MCP tools: `spawn_thread` for each, then \
+`wait_for_threads` for their replies. Do not use your built-in subagents for that; use them \
+only when the user asks for subagents. Spawned threads use this thread's agent, model, \
+reasoning effort and permissions unless the user names others.";
+
 #[derive(Debug, Default)]
 pub struct Translator {
     next_id: u64,
@@ -611,18 +618,34 @@ impl Translator {
         )
     }
 
+    /// Standing instructions for a session with the Agentloft MCP server:
+    /// "threads" are Agentloft threads (Codex otherwise reaches for its own
+    /// subagents).
+    fn developer_instructions(&self) -> Option<&'static str> {
+        self.auto_allow_mcp
+            .iter()
+            .any(|s| s == "agentloft")
+            .then_some(AGENTLOFT_INSTRUCTIONS)
+    }
+
     fn open_thread(&mut self) -> Value {
+        let instructions = self.developer_instructions();
         match (self.resume.clone(), self.fork_from.clone()) {
-            (Some(id), _) => self.request(
-                Pending::ThreadResume,
-                "thread/resume",
-                json!({ "threadId": id }),
-            ),
+            (Some(id), _) => {
+                let mut params = json!({ "threadId": id });
+                if let Some(text) = instructions {
+                    params["developerInstructions"] = json!(text);
+                }
+                self.request(Pending::ThreadResume, "thread/resume", params)
+            }
             (None, Some(parent)) => {
                 // Native fork (ADR-0011), into this thread's own cwd.
                 let mut params = json!({ "threadId": parent, "cwd": self.cwd });
                 if let Some(at) = &self.fork_at {
                     params["lastTurnId"] = json!(at);
+                }
+                if let Some(text) = instructions {
+                    params["developerInstructions"] = json!(text);
                 }
                 if let Some(model) = &self.model {
                     params["model"] = json!(model);
@@ -636,6 +659,9 @@ impl Translator {
             }
             (None, None) => {
                 let mut params = json!({ "cwd": self.cwd });
+                if let Some(text) = instructions {
+                    params["developerInstructions"] = json!(text);
+                }
                 if let Some(model) = &self.model {
                     params["model"] = json!(model);
                 }
@@ -1944,6 +1970,19 @@ mod tests {
     }
 
     #[test]
+    fn agentloft_sessions_learn_what_threads_are() {
+        let mut t = Translator::new("/tmp/probe".into(), None, None, None);
+        t.auto_allow_mcp = vec!["agentloft".into()];
+        t.initialize();
+        t.start_turn("hi");
+        let out = t.on_line(r#"{"id":1,"result":{}}"#);
+        let Out::Send(start) = &out[1] else { panic!() };
+        assert_eq!(start["method"], "thread/start");
+        let text = start["params"]["developerInstructions"].as_str().unwrap();
+        assert!(text.contains("spawn_thread"), "{text}");
+    }
+
+    #[test]
     fn handshake_then_thread_then_queued_turn() {
         let mut t = Translator::new("/tmp/probe".into(), None, None, None);
         let init = t.initialize();
@@ -1964,6 +2003,7 @@ mod tests {
             start["params"].get("approvalPolicy").is_none(),
             "harness default"
         );
+        assert!(start["params"].get("developerInstructions").is_none());
         let out = t.on_line(r#"{"id":2,"result":{"thread":{"id":"T1"}}}"#);
         assert!(
             matches!(events(&out)[0], HarnessEvent::SessionReady { native_session_id, .. } if native_session_id == "T1")
