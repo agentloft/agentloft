@@ -551,6 +551,28 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// WebKit's inspector, in its own window: it docks into ours a moment
+    /// after opening, so keep moving it out for a short while.
+    fn open_inspector(&mut self, cx: &mut Context<Self>) {
+        let Some(native) = self.native.clone() else {
+            return;
+        };
+        native.open_devtools();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..30 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if native.detach_devtools() {
+                    // Put the page back where it belongs.
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// The ⋮ menu: reloads, inspector, zoom, site data.
     fn more_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
@@ -573,6 +595,10 @@ impl BrowserView {
                             _ = v.update(cx, f);
                         })
                     };
+                let inspecting = view
+                    .upgrade()
+                    .and_then(|v| v.read(cx).native.as_ref().map(|n| n.devtools_open()))
+                    .unwrap_or(false);
                 let entries = vec![
                     act("Hard Reload".into(), IconName::RotateCw, |this, cx| {
                         if let Some(native) = &this.native {
@@ -580,11 +606,17 @@ impl BrowserView {
                             cx.notify();
                         }
                     }),
-                    act("Open Web Inspector".into(), IconName::Bug, |this, _| {
-                        if let Some(native) = &this.native {
-                            native.open_devtools();
-                        }
-                    }),
+                    if inspecting {
+                        act("Close Web Inspector".into(), IconName::Bug, |this, _| {
+                            if let Some(native) = &this.native {
+                                native.close_devtools();
+                            }
+                        })
+                    } else {
+                        act("Open Web Inspector".into(), IconName::Bug, |this, cx| {
+                            this.open_inspector(cx)
+                        })
+                    },
                     Entry::Separator,
                     act("Zoom In".into(), IconName::ZoomIn, |this, cx| {
                         this.zoom_step(1, cx)

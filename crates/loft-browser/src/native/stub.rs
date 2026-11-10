@@ -44,6 +44,18 @@ impl NativeWebView {
         match self.never {}
     }
 
+    pub fn detach_devtools(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn close_devtools(&self) {
+        match self.never {}
+    }
+
+    pub fn devtools_open(&self) -> bool {
+        match self.never {}
+    }
+
     pub fn clear_data(&self, _what: super::SiteData) {
         match self.never {}
     }

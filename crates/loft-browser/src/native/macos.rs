@@ -148,9 +148,50 @@ impl NativeWebView {
         unsafe { self.wk.reloadFromOrigin() };
     }
 
-    /// Show WebKit's Web Inspector for the page.
+    /// Show WebKit's Web Inspector for the page, in a window of its own.
+    /// (Docked, WebKit lays itself out inside our window and resizes the
+    /// page view to fill it, with no way back.)
     pub fn open_devtools(&self) {
         self.webview.open_devtools();
+        self.detach_devtools();
+    }
+
+    /// If the inspector is docked in our window, move it to its own window;
+    /// returns whether it was docked. (It docks a moment after `show`, so
+    /// the caller retries for a little while.)
+    pub fn detach_devtools(&self) -> bool {
+        // SAFETY: `_inspector` is WebKit's own SPI (what wry calls); each
+        // selector is checked before it's sent.
+        unsafe {
+            let inspector: Option<Retained<AnyObject>> = objc2::msg_send![&*self.wk, _inspector];
+            let Some(inspector) = inspector else {
+                return false;
+            };
+            let responds = |sel: objc2::runtime::Sel| -> bool {
+                objc2::msg_send![&*inspector, respondsToSelector: sel]
+            };
+            if !responds(objc2::sel!(inspectorWebView)) || !responds(objc2::sel!(detach)) {
+                return false;
+            }
+            // Docked = its view lives in the same window as the page.
+            let view: Option<Retained<NSView>> = objc2::msg_send![&*inspector, inspectorWebView];
+            let docked = match (view.and_then(|v| v.window()), self.wk.window()) {
+                (Some(a), Some(b)) => Retained::as_ptr(&a) == Retained::as_ptr(&b),
+                _ => false,
+            };
+            if docked {
+                let () = objc2::msg_send![&*inspector, detach];
+            }
+            docked
+        }
+    }
+
+    pub fn close_devtools(&self) {
+        self.webview.close_devtools();
+    }
+
+    pub fn devtools_open(&self) -> bool {
+        self.webview.is_devtools_open()
     }
 
     /// Forget the browser's cookies (and other site storage), or its cache.
@@ -238,18 +279,20 @@ impl NativeWebView {
             return;
         };
         let parent_bounds = parent.bounds();
-        let key = [x, y, w, h, parent_bounds.size.height];
-        if self.last_frame.get() == Some(key) {
-            return;
-        }
         // GPUI's content view is not flipped: AppKit's y axis points up.
         let origin_y = if parent.isFlipped() {
             y
         } else {
             parent_bounds.size.height - y - h
         };
-        self.wk
-            .setFrame(NSRect::new(NSPoint::new(x, origin_y), NSSize::new(w, h)));
+        let rect = NSRect::new(NSPoint::new(x, origin_y), NSSize::new(w, h));
+        // Skip only if the view is really there: WebKit moves it itself
+        // while its inspector is docked.
+        let key = [x, y, w, h, parent_bounds.size.height];
+        if self.last_frame.get() == Some(key) && self.wk.frame() == rect {
+            return;
+        }
+        self.wk.setFrame(rect);
         self.last_frame.set(Some(key));
     }
 
