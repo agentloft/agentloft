@@ -1,6 +1,6 @@
 # ADR-0007: Daemon-owned PTYs, `alacritty_terminal` rendering in GPUI
 
-- **Status:** Proposed
+- **Status:** Accepted, amended 2026-11-09: the UI parser is **libghostty-vt** (see below)
 - **Date:** 2026-11-08
 
 ## Context
@@ -33,6 +33,24 @@ For PTYs, `portable-pty` 0.9 (MIT, from wezterm) covers both openpty and ConPTY.
 
 **Swappability**
 - The parser sits behind a `TerminalBackend` trait, so `libghostty-vt` can replace `alacritty_terminal` later without touching the daemon side.
+
+## Amendment (2026-11-09): libghostty-vt, not `alacritty_terminal`
+
+The product owner asked for a Ghostty terminal, so `loft-terminal` uses libghostty-vt through the
+`ghostty-vt` 0.8.0 crate (Apache-2.0 bindings, Ghostty 1.4.0 at a pinned sha256, built with **Zig 0.17**).
+`libghostty-vt` 0.2.2 was not usable: it pins a Ghostty commit that needs Zig 0.15.
+
+What stays as decided above:
+- Daemon-owned PTYs with an 8 MiB ring buffer.
+- The `TerminalBackend` trait, so `alacritty_terminal` remains a drop-in fallback.
+- The custom GPUI element.
+
+What changed:
+- **Builds need Zig.** Contributors and CI need Zig 0.17; CI uses `mlugg/setup-zig`.
+- **The bus carries no bytes.** Output notifications are offsets only, and subscribers read new bytes from the ring.
+- **Terminals reattach after a UI restart.** Each is keyed (`thread:<id>`, `thread:<id>#n` for tabs) so the UI rebuilds its tabs.
+- **Rendering approximations.** Double, dotted and dashed underlines draw as plain lines, and box-drawing lines are 1 px.
+- **Credits.** Ghostex patterns and Ghostty's license are credited in `THIRD_PARTY_NOTICES.md`.
 
 ## Consequences
 **Benefits**

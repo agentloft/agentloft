@@ -5,6 +5,8 @@
 //! - `stop-dev`: ask the dev daemon to shut down.
 //! - `live-claude`: run the live Claude end-to-end test (uses real tokens).
 //! - `ci`: fmt check, clippy, tests, cargo-deny — what CI runs.
+//! - `bundle [--debug] [--open]`: build `target/bundle/Agentloft.app`
+//!   (macOS; both binaries, `AppIcon.icns`, Info.plist, ad-hoc signature).
 
 use anyhow::{Context as _, Result, bail};
 use std::path::PathBuf;
@@ -14,6 +16,7 @@ fn main() -> Result<()> {
     let task = std::env::args().nth(1).unwrap_or_default();
     match task.as_str() {
         "dev" => dev(),
+        "bundle" => bundle(),
         "stop-dev" => stop_dev(),
         "live-claude" => run(cargo().args([
             "test",
@@ -39,7 +42,7 @@ fn main() -> Result<()> {
             run(cargo().args(["deny", "check"]))
         }
         _ => {
-            eprintln!("usage: cargo xtask <dev|stop-dev|live-claude|ci>");
+            eprintln!("usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle>");
             Ok(())
         }
     }
@@ -78,6 +81,86 @@ fn dev() -> Result<()> {
     run(Command::new(bin.join("agentloft"))
         .env("AGENTLOFT_HOME", dev_home())
         .env("AGENTLOFT_DAEMON_BIN", bin.join("agentloftd")))
+}
+
+const BUNDLE_ID: &str = "dev.agentloft.Agentloft";
+
+fn bundle() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let debug = args.iter().any(|a| a == "--debug");
+    let profile = if debug { "debug" } else { "release" };
+    let mut build = cargo();
+    build.args(["build", "-p", "loft-app", "-p", "loftd"]);
+    if !debug {
+        build.arg("--release");
+    }
+    run(&mut build)?;
+
+    let target = root().join("target");
+    let app = target.join("bundle/Agentloft.app");
+    let contents = app.join("Contents");
+    let _ = std::fs::remove_dir_all(&app);
+    std::fs::create_dir_all(contents.join("MacOS"))?;
+    std::fs::create_dir_all(contents.join("Resources"))?;
+    for bin in ["agentloft", "agentloftd"] {
+        std::fs::copy(
+            target.join(profile).join(bin),
+            contents.join("MacOS").join(bin),
+        )
+        .with_context(|| format!("copy {bin}"))?;
+    }
+    std::fs::copy(
+        root().join("assets/icon/AppIcon.icns"),
+        contents.join("Resources/AppIcon.icns"),
+    )
+    .context("copy AppIcon.icns")?;
+    std::fs::write(
+        contents.join("Info.plist"),
+        info_plist(env!("CARGO_PKG_VERSION")),
+    )?;
+    std::fs::write(contents.join("PkgInfo"), "APPL????")?;
+
+    // Ad-hoc signature so Gatekeeper treats the local build consistently.
+    let signed = Command::new("codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(&app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !signed {
+        eprintln!("warning: ad-hoc codesign failed; the bundle is unsigned");
+    }
+    println!("{}", app.display());
+    if args.iter().any(|a| a == "--open") {
+        run(Command::new("open").arg(&app))?;
+    }
+    Ok(())
+}
+
+fn info_plist(version: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Agentloft</string>
+  <key>CFBundleDisplayName</key><string>Agentloft</string>
+  <key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
+  <key>CFBundleExecutable</key><string>agentloft</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>CFBundleVersion</key><string>{version}</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSHumanReadableCopyright</key><string>Apache-2.0 — github.com/agentloft/agentloft</string>
+</dict>
+</plist>
+"#
+    )
 }
 
 fn stop_dev() -> Result<()> {

@@ -17,16 +17,25 @@ loft-config = { path = "crates/loft-config" }
 loft-store = { path = "crates/loft-store" }
 loft-harness = { path = "crates/loft-harness" }
 loft-harness-claude = { path = "crates/loft-harness-claude" }
+loft-harness-codex = { path = "crates/loft-harness-codex" }
+loft-harness-acp = { path = "crates/loft-harness-acp" }
 loft-core = { path = "crates/loft-core" }
 loft-client = { path = "crates/loft-client" }
 loft-ui = { path = "crates/loft-ui" }
 loft-testkit = { path = "crates/loft-testkit" }
+loft-git = { path = "crates/loft-git" }
+loft-terminal = { path = "crates/loft-terminal" }
 
 # UI — gpui-kit pins the matching gpui-pre release (ADR-0005)
-gpui-kit = "=0.9.0"
+gpui-kit = { version = "=0.9.0", features = ["tree-sitter-languages"] }
+
+# terminal (ADR-0007): Ghostty's libghostty-vt, built from the pinned Ghostty
+# 1.4.0 source tarball with Zig 0.17 (needs `zig` 0.17.x on PATH or in $ZIG)
+ghostty-vt = { version = "=0.8.0", default-features = false }
+portable-pty = "0.9"
 
 # async / io
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "sync", "time", "signal", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
 bytes = "1"
@@ -35,8 +44,20 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 toml = "0.9"
+toml_edit = "0.25"
+base64 = "0.22"
+ignore = "0.4"
+
+# embedded browser (loft-browser, macOS): versions match wry's objc2 stack
+wry = { version = "0.57.1", default-features = false, features = ["devtools"] }
+objc2 = "0.6.3"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSString", "NSError", "NSData", "NSDictionary", "NSValue", "NSGeometry", "NSObject", "NSURL", "NSSet", "NSDate"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "NSView", "NSResponder", "NSWindow", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKContentWorld", "WKFrameInfo", "WKSnapshotConfiguration", "WKBackForwardList", "WKBackForwardListItem", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKWebsiteDataRecord"] }
+url = "2"
 
 # misc
 anyhow = "1"
@@ -46,6 +67,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 tempfile = "3"
+
+# documents (loft-docs)
+zip = { version = "9.5", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+calamine = { version = "0.38", default-features = false }
+csv = "1.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

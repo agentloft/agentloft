@@ -1,9 +1,9 @@
 //! `agentloft`: the GPUI client. Connects to (or starts) `agentloftd` and
 //! renders its state.
 
-use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 use loft_config::Paths;
-use loft_ui::{AppStore, WorkspaceView};
+use loft_ui::{theme, windows};
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
     let paths = Paths::from_env()?;
@@ -18,25 +18,62 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let handle = runtime.handle().clone();
 
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            let store = cx.new(|cx| AppStore::new(handle.clone(), paths.clone(), cx));
-            let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                cx,
-                move |window, cx| cx.new(|cx| WorkspaceView::new(store.clone(), window, cx)),
-            )
-            .expect("failed to open window");
-            cx.activate(true);
-        });
+    let app = gpui_kit::application().with_assets(loft_ui::assets::Assets);
+    // Clicking the Dock icon with every window closed opens one.
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            windows::open(None, windows::Placement::Window, cx);
+        }
+    });
+    app.run(move |cx| {
+        gpui_kit::init(cx);
+        theme::init(paths.clone(), cx);
+        loft_ui::bind_keys(cx);
+        cx.set_menus(loft_ui::app_menus());
+        dock_icon::set();
+
+        // Live-reload appearance settings from config.toml.
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.update(theme::reload_if_changed);
+            }
+        })
+        .detach();
+
+        windows::init(handle.clone(), paths.clone(), cx);
+        windows::restore(cx);
+        cx.activate(true);
+    });
     drop(runtime);
     Ok(())
+}
+
+/// In a bundle the Dock icon comes from Info.plist (`CFBundleIconFile`);
+/// dev runs (`cargo run`) set it at runtime so the Dock shows the real icon.
+mod dock_icon {
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub fn set() {
+        use objc2::AllocAnyThread as _;
+        use objc2_app_kit::{NSApplication, NSImage};
+        use objc2_foundation::{MainThreadMarker, NSData};
+
+        const PNG: &[u8] = include_bytes!("../../../assets/icon/png/agentloft-512.png");
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let data = NSData::with_bytes(PNG);
+        let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        // SAFETY: called on the main thread with a valid, retained NSImage.
+        unsafe { app.setApplicationIconImage(Some(&image)) };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set() {}
 }
 
 fn init_tracing(paths: &Paths) {

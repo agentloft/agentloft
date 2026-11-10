@@ -26,6 +26,7 @@ impl Harness for FakeHarness {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            client_session_id: true,
             live_model_switch: true,
             live_mode_switch: true,
             ..Default::default()
@@ -46,6 +47,7 @@ impl Harness for FakeHarness {
 
 async fn run(mut ends: SessionEnds, session_id: String) {
     ends.emit(HarnessEvent::SessionReady {
+        models: vec![],
         native_session_id: session_id,
         model: Some("fake-model".into()),
         slash_commands: vec!["help".into()],
@@ -77,6 +79,7 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
     if text.contains("approve") {
         let tool_id = format!("tool-{turn_no}");
         ends.emit(HarnessEvent::ItemStarted {
+            parent: None,
             native_id: tool_id.clone(),
             body: ItemBody::ToolCall {
                 tool: "Bash".into(),
@@ -146,6 +149,7 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
 
     let msg_id = format!("msg-{turn_no}");
     ends.emit(HarnessEvent::ItemStarted {
+        parent: None,
         native_id: msg_id.clone(),
         body: ItemBody::AssistantMessage {
             text: String::new(),
