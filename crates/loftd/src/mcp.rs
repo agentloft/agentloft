@@ -88,7 +88,10 @@ it in the sidebar); it runs in parallel, so spawn several before waiting. `wait_
 waits for them and returns each one's latest reply; `send_to_thread` follows up and \
 `stop_thread` stops one. Spawned threads use this thread's agent, model, reasoning effort and \
 permissions unless the user explicitly asked for something else; `list_agents` lists what's \
-available.";
+available. Agentloft itself: when the user asks to change its settings (theme, colours, fonts, \
+sidebar, agent defaults, folders…), use `get_settings` then `change_setting`; `save_theme` adds a \
+colour theme; `create_project`, `clone_project`, `add_project`, `update_project` (name, icon, \
+new-thread defaults) and `remove_project` manage projects. Changes show in the app at once.";
 
 async fn write(out: &mut tokio::io::Stdout, v: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(v)?;
@@ -223,6 +226,68 @@ pub fn tools() -> Vec<Value> {
             "Stop the current turn of a thread this thread spawned.",
             json!({ "thread_id": { "type": "string" } }),
             &["thread_id"],
+        ),
+        tool(
+            "get_settings",
+            "Read Agentloft's settings: current values (config.toml), every key you can change with its type, and the colour themes there are. Use it before changing settings.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "change_setting",
+            "Change one Agentloft setting for the user (only when they ask), e.g. ui.theme = \"dark\", ui.palette = \"studio\", ui.accent = \"#7c5cff\", ui.font_size = 15, harness.codex.default_model = \"gpt-6\". value null resets it. Takes effect in the app at once.",
+            json!({
+                "key": { "type": "string", "description": "Dotted key from get_settings, e.g. ui.theme" },
+                "value": { "description": "New value (string, number, boolean, list or table), or null for the default" }
+            }),
+            &["key", "value"],
+        ),
+        tool(
+            "save_theme",
+            "Create (or replace, by name) a colour theme and optionally switch to it. `toml` is a theme file: name = \"…\", optional description, then [dark] and [light] tables, each with background, foreground and accent (#rrggbb) and optionally sidebar, surface, border, muted, muted_text, hover, selected, bubble, input.",
+            json!({
+                "toml": { "type": "string" },
+                "select": { "type": "boolean", "default": true, "description": "Switch to it now" }
+            }),
+            &["toml"],
+        ),
+        tool(
+            "create_project",
+            "Create a new project for the user: a git repository (README, first commit) in their new-projects folder, optionally published as a private GitHub repository.",
+            json!({
+                "name": { "type": "string" },
+                "github": { "type": "boolean", "default": false }
+            }),
+            &["name"],
+        ),
+        tool(
+            "clone_project",
+            "Clone a repository as a new project (into the user's Add Project folder): a git URL, or owner/repo with github = true.",
+            json!({
+                "source": { "type": "string" },
+                "github": { "type": "boolean", "default": false }
+            }),
+            &["source"],
+        ),
+        tool(
+            "update_project",
+            "Change a project (by name, path or id): rename it, set its icon (an image file path; null = automatic, its favicon), or the defaults for its new threads (agent, model, effort, workspace = local | worktree | null).",
+            json!({
+                "project": { "type": "string" },
+                "name": { "type": "string" },
+                "icon": { "type": ["string", "null"], "description": "Image file path, or null for automatic" },
+                "agent": { "type": ["string", "null"] },
+                "model": { "type": ["string", "null"] },
+                "effort": { "type": ["string", "null"] },
+                "workspace": { "type": ["string", "null"], "enum": ["local", "worktree", null] }
+            }),
+            &["project"],
+        ),
+        tool(
+            "remove_project",
+            "Remove a project from Agentloft (by name, path or id). Deletes its threads; its files on disk are not touched. Only when the user explicitly asks to remove that project.",
+            json!({ "project": { "type": "string" } }),
+            &["project"],
         ),
         tool(
             "list_projects",
@@ -475,6 +540,166 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 p["current"] = json!(current.is_some() && p["id"].as_str() == current.as_deref());
             }
             json_result(&Value::Array(list))
+        }
+        "get_settings" => match client.request(Request::GetSettings).await {
+            Ok(Response::Json { value }) => json_result(&value),
+            Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
+            Err(err) => text_result(err.message, true),
+        },
+        "change_setting" => {
+            let Some(key) = str_arg("key") else {
+                return Some(text_result("key is required", true));
+            };
+            let value = args.get("value").cloned().unwrap_or(Value::Null);
+            match client.request(Request::ChangeSetting { key, value }).await {
+                Ok(Response::Text { text }) => text_result(text, false),
+                Ok(_) => text_result("Changed.", false),
+                Err(err) => text_result(err.message, true),
+            }
+        }
+        "save_theme" => {
+            let Some(toml) = args.get("toml").and_then(Value::as_str).map(str::to_owned) else {
+                return Some(text_result("toml is required", true));
+            };
+            let select = args.get("select").and_then(Value::as_bool).unwrap_or(true);
+            match client.request(Request::SaveTheme { toml, select }).await {
+                Ok(Response::Text { text }) => text_result(text, false),
+                Ok(_) => text_result("Saved.", false),
+                Err(err) => text_result(err.message, true),
+            }
+        }
+        "create_project" | "clone_project" => {
+            let github = args.get("github").and_then(Value::as_bool).unwrap_or(false);
+            let request = if name == "create_project" {
+                let Some(project) = str_arg("name") else {
+                    return Some(text_result("name is required", true));
+                };
+                Request::CreateProject {
+                    parent: None,
+                    name: project,
+                    github,
+                }
+            } else {
+                let Some(source) = str_arg("source") else {
+                    return Some(text_result("source is required", true));
+                };
+                // Clones go in the user's Add Project folder.
+                let parent = match client.request(Request::GetSettings).await {
+                    Ok(Response::Json { value }) => value["current"]["projects"]["base_dir"]
+                        .as_str()
+                        .map(str::to_owned),
+                    _ => None,
+                }
+                .unwrap_or_else(|| "~".into());
+                Request::CloneProject {
+                    parent,
+                    source,
+                    github,
+                }
+            };
+            match client.request(request).await {
+                Ok(Response::Project { project }) => json_result(&json!({
+                    "project_id": project.id, "name": project.name, "path": project.root_path,
+                })),
+                Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
+                Err(err) => text_result(err.message, true),
+            }
+        }
+        "update_project" | "remove_project" => {
+            let Some(want) = str_arg("project") else {
+                return Some(text_result("project is required", true));
+            };
+            let found = match find_project(client, &want).await {
+                Ok(p) => p,
+                Err(e) => return Some(text_result(e, true)),
+            };
+            let Some(id) = found["id"].as_str().map(|s| ProjectId(s.to_owned())) else {
+                return Some(text_result("project not found", true));
+            };
+            if name == "remove_project" {
+                return Some(
+                    match client
+                        .request(Request::RemoveProject { project_id: id })
+                        .await
+                    {
+                        Ok(_) => text_result(
+                            format!("Removed {} (its files are untouched).", found["name"]),
+                            false,
+                        ),
+                        Err(err) => text_result(err.message, true),
+                    },
+                );
+            }
+            let mut done = Vec::new();
+            if let Some(new_name) = str_arg("name") {
+                if let Err(err) = client
+                    .request(Request::RenameProject {
+                        project_id: id.clone(),
+                        name: new_name.clone(),
+                    })
+                    .await
+                {
+                    return Some(text_result(err.message, true));
+                }
+                done.push(format!("renamed to {new_name}"));
+            }
+            if let Some(icon) = args.get("icon") {
+                let icon = icon.as_str().map(str::to_owned);
+                let auto = icon.is_none();
+                if let Err(err) = client
+                    .request(Request::SetProjectIcon {
+                        project_id: id.clone(),
+                        icon,
+                    })
+                    .await
+                {
+                    return Some(text_result(err.message, true));
+                }
+                done.push(if auto {
+                    "icon set to automatic".into()
+                } else {
+                    "icon set".into()
+                });
+            }
+            let touches = ["agent", "model", "effort", "workspace"]
+                .iter()
+                .any(|k| args.get(*k).is_some());
+            if touches {
+                // Start from the project's current defaults.
+                let mut d: loft_protocol::ProjectDefaults =
+                    serde_json::from_value(found["defaults"].clone()).unwrap_or_default();
+                let opt = |k: &str| args.get(k).map(|v| v.as_str().map(str::to_owned));
+                if let Some(v) = opt("agent") {
+                    d.agent = v.map(HarnessId);
+                }
+                if let Some(v) = opt("model") {
+                    d.model = v;
+                }
+                if let Some(v) = opt("effort") {
+                    d.effort = v;
+                }
+                if let Some(v) = opt("workspace") {
+                    d.worktree = v.map(|w| w == "worktree");
+                }
+                if let Err(err) = client
+                    .request(Request::SetProjectDefaults {
+                        project_id: id.clone(),
+                        defaults: d,
+                    })
+                    .await
+                {
+                    return Some(text_result(err.message, true));
+                }
+                done.push("new-thread defaults set".into());
+            }
+            if done.is_empty() {
+                text_result(
+                    "Nothing to change: pass name, icon, agent, model, effort or workspace.",
+                    true,
+                )
+            } else {
+                text_result(format!("{}: {}.", found["name"], done.join(", ")), false)
+            }
         }
         "add_project" => {
             let Some(path) = str_arg("path") else {

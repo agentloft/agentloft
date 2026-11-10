@@ -1336,3 +1336,85 @@ async fn project_defaults_shape_new_threads() {
     assert_eq!(thread.effort.as_deref(), Some("low"));
     assert_eq!(thread.workspace, ThreadWorkspace::Local);
 }
+
+#[tokio::test]
+async fn agents_change_settings_and_add_themes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_file = dir.path().join("config.toml");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(config_file.clone()),
+            ..Default::default()
+        },
+    );
+    let call = |req: Request| {
+        let core = core.clone();
+        async move { core.handle(req).await }
+    };
+    call(Request::ChangeSetting {
+        key: "ui.theme".into(),
+        value: serde_json::json!("dark"),
+    })
+    .await
+    .unwrap();
+    call(Request::ChangeSetting {
+        key: "harness.codex.default_model".into(),
+        value: serde_json::json!("gpt-6"),
+    })
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(text.contains("theme = \"dark\""), "{text}");
+    assert!(text.contains("default_model = \"gpt-6\""), "{text}");
+    // Unknown keys and wrong values are refused.
+    for (key, value) in [
+        ("ui.nope", serde_json::json!(1)),
+        ("ui.theme", serde_json::json!("purple")),
+        ("ui.palette", serde_json::json!("custom:missing")),
+    ] {
+        assert!(
+            call(Request::ChangeSetting {
+                key: key.into(),
+                value
+            })
+            .await
+            .is_err()
+        );
+    }
+    // A theme, saved and switched to.
+    let theme = r##"name = "Ember"
+[dark]
+background = "#1a1110"
+foreground = "#f5e6e0"
+accent = "#ff7a45"
+[light]
+background = "#fffaf7"
+foreground = "#2a1a14"
+accent = "#d9480f"
+"##;
+    call(Request::SaveTheme {
+        toml: theme.into(),
+        select: true,
+    })
+    .await
+    .unwrap();
+    assert!(dir.path().join("themes/ember.toml").exists());
+    let text = std::fs::read_to_string(&config_file).unwrap();
+    assert!(text.contains("palette = \"custom:ember\""), "{text}");
+    assert!(
+        call(Request::SaveTheme {
+            toml: theme.replace("#ff7a45", "orange"),
+            select: false,
+        })
+        .await
+        .is_err()
+    );
+    // Reading them back.
+    let Response::Json { value } = call(Request::GetSettings).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(value["current"]["ui"]["theme"], "dark");
+    assert_eq!(value["themes"]["custom"][0]["id"], "custom:ember");
+}

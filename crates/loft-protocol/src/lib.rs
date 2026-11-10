@@ -79,6 +79,21 @@ pub enum Request {
         project_id: ProjectId,
         name: String,
     },
+    /// Settings for agents: current values, settable keys, themes
+    /// (`Response::Json`).
+    GetSettings,
+    /// Set one known setting (`ui.theme`, `harness.codex.default_model`…);
+    /// `null` resets it (`Response::Text`).
+    ChangeSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Save a colour theme (its TOML) and optionally switch to it.
+    SaveTheme {
+        toml: String,
+        #[serde(default)]
+        select: bool,
+    },
     /// A project's icon: an image file, or `None` for automatic (answers
     /// `Response::Project`).
     SetProjectIcon {

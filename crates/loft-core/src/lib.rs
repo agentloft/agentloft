@@ -5,6 +5,7 @@
 mod clients;
 mod forks;
 mod handoff;
+mod settings;
 mod terminals;
 mod thread;
 mod workbench;
@@ -564,11 +565,45 @@ impl Core {
                 Ok(Response::Project { project })
             }
             Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
+            Request::GetSettings => self.get_settings(),
+            Request::ChangeSetting { key, value } => self.change_setting(&key, &value),
+            Request::SaveTheme { toml, select } => self.save_theme(&toml, select),
             Request::SetProjectIcon { project_id, icon } => {
                 let mut project = self
                     .with_store(|s| s.project(&project_id))?
                     .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
-                project.icon = icon.filter(|i| !i.trim().is_empty());
+                let icon = icon.map(|i| i.trim().to_owned()).filter(|i| !i.is_empty());
+                // An image from elsewhere (an agent's pick) is copied in,
+                // so it stays put.
+                let icon = match (
+                    icon,
+                    self.opts().config_file.as_ref().and_then(|f| f.parent()),
+                ) {
+                    (Some(src), Some(home))
+                        if !std::path::Path::new(&src).starts_with(home.join("icons")) =>
+                    {
+                        let src = expand_tilde(&src);
+                        if !src.is_file() {
+                            return Err(ErrorBody::new(
+                                ErrorCode::BadRequest,
+                                format!("{} isn't a file", src.display()),
+                            ));
+                        }
+                        let ext = src
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("png")
+                            .to_ascii_lowercase();
+                        let dir = home.join("icons");
+                        let dest = dir.join(format!("{}-{}.{ext}", project_id.as_str(), now_ms()));
+                        std::fs::create_dir_all(&dir)
+                            .and_then(|_| std::fs::copy(&src, &dest))
+                            .map_err(internal)?;
+                        Some(dest.to_string_lossy().into_owned())
+                    }
+                    (icon, _) => icon,
+                };
+                project.icon = icon;
                 self.commit(vec![Event::ProjectUpdated {
                     project: project.clone(),
                 }])?;
@@ -611,6 +646,8 @@ impl Core {
                                     "id": p.id, "name": p.name, "path": p.root_path,
                                     "chats": std::path::Path::new(&p.root_path) == chats,
                                     "threads": count,
+                                    "icon": p.icon,
+                                    "defaults": p.defaults,
                                 })
                             })
                             .collect(),

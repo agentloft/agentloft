@@ -71,6 +71,20 @@ pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
     }
 }
 
+/// Re-read `config.toml` into an open settings window (changed elsewhere).
+pub fn refresh(cx: &mut App) {
+    if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
+        let _ = view.update(cx, |v, cx| {
+            let paths = v.store.read(cx).paths().clone();
+            if let Ok(c) = Config::load(&paths) {
+                v.config = c;
+                v.studio.themes = crate::themes::all(&paths.home);
+            }
+            cx.notify();
+        });
+    }
+}
+
 /// Open the settings window on one project's page.
 pub fn open_project(store: Entity<AppStore>, project: loft_protocol::ProjectId, cx: &mut App) {
     open(store, Some(Section::Projects), cx);

@@ -29,7 +29,7 @@ const TOKENS: [(&str, &str); 7] = [
 ];
 
 pub(super) struct Studio {
-    themes: Vec<Theme>,
+    pub(super) themes: Vec<Theme>,
     editing: Option<Editing>,
     describe: Option<Entity<InputState>>,
     /// Which agent and model designs it.

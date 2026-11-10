@@ -188,7 +188,52 @@ impl AppStore {
         };
         this.reload_agent_prefs(cx);
         this.connect(cx);
+        this.watch_settings(cx);
         this
+    }
+
+    /// Settings can change outside the app (an agent, an editor): watch
+    /// `config.toml` and the themes folder and apply changes as they come.
+    fn watch_settings(&mut self, cx: &mut Context<Self>) {
+        fn stamp(paths: &Paths) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+            let modified =
+                |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let themes = std::fs::read_dir(paths.home.join("themes"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| modified(&e.path()))
+                .max();
+            (modified(&paths.config_file()), themes)
+        }
+        let paths = self.paths.clone();
+        let mut last = stamp(&paths);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                let now = stamp(&paths);
+                if now == last {
+                    continue;
+                }
+                let themes_changed = now.1 != last.1;
+                last = now;
+                let alive = this.update(cx, |store, cx| {
+                    crate::theme::reload_if_changed(cx);
+                    if themes_changed {
+                        crate::theme::apply(cx);
+                    }
+                    store.reload_agent_prefs(cx);
+                    crate::settings::refresh(cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
