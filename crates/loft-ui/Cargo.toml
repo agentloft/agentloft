@@ -16,6 +16,7 @@ loft-client.workspace = true
 loft-config.workspace = true
 loft-docs = { path = "../loft-docs" }
 loft-browser = { path = "../loft-browser" }
+loft-terminal.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
@@ -27,11 +28,9 @@ web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 gpui-kit = { workspace = true, features = ["tree-sitter-languages"] }
-loft-terminal.workspace = true
 tokio.workspace = true
 
-# The browser build (crates/loft-web, ADR-0016): no terminal emulator
-# (libghostty-vt is native), and only tokio's channels.
+# The browser build (crates/loft-web, ADR-0016): only tokio's channels.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gpui-kit = { workspace = true, features = ["syntect"] }
 tokio = { version = "1", default-features = false, features = ["sync"] }

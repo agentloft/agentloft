@@ -362,6 +362,39 @@ impl SettingsView {
             }
         }
 
+        // -- what a browser may do ----------------------------------------------
+        // Unset follows who can reach the listener (on for this computer
+        // only); a choice that matches that is left unset, so opening the
+        // listener up later doesn't carry a shell along with it.
+        let auto_terminal = plan.as_ref().is_ok_and(|plan| plan.local_only());
+        let terminal = web.allow_terminal.unwrap_or(auto_terminal);
+        page = page
+            .child(heading(
+                "In the browser",
+                "What a signed-in browser may do beyond the conversation.",
+                p,
+            ))
+            .child(row(
+                "Terminals",
+                if auto_terminal {
+                    "A shell on this computer, in the browser. On while only this computer can reach Agentloft."
+                } else {
+                    "A shell on this computer, in the browser. Off unless you turn it on, because other devices can reach Agentloft."
+                },
+                Switch::new("web-terminal")
+                    .checked(terminal)
+                    .on_click(cx.listener(move |this, on: &bool, _, cx| {
+                        let value = if *on == auto_terminal {
+                            SettingValue::Unset
+                        } else {
+                            SettingValue::Bool(*on)
+                        };
+                        this.set_web("allow_terminal", value, cx);
+                    }))
+                    .into_any_element(),
+                p,
+            ));
+
         // -- where it listens ---------------------------------------------------
         page = page
             .child(heading(

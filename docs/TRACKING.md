@@ -122,6 +122,7 @@ Built ahead of the PLAN's milestone order, by request.
 - Approvals: by click and by ⌘↩.
 - Settings, inside the window: appearance and themes (a change lands in `config.toml` on the daemon's machine and applies), agents' defaults and models, projects, worktrees, shortcuts, sign out.
 - Side panel: Changes (diffs) and Files with the file viewer; menus draw in-window.
+- Terminals, in the dock under the conversation and as side-panel tabs: the same widget and emulator as the desktop app (libghostty-vt built for wasm), on the daemon's PTYs. Tried: zsh with colours, CJK and emoji, vim, Ctrl+C, scrollback, a two-line paste (bracketed), select all and copy, two shells at once, the shell surviving a reconnect.
 - Images in replies that point at files in the project: fetched through the daemon. A path outside the project stays empty.
 - Light and dark themes; a 2× (HiDPI) screen; the tab title follows the thread; reconnecting after the daemon restarts.
 - Desktop app: Settings ▸ Web access (on/off, pairing link, signed-in browsers, sign out, address, port, TLS, warnings).
@@ -129,7 +130,7 @@ Built ahead of the PLAN's milestone order, by request.
 **How to try it**
 
 ```sh
-cargo xtask web --release     # the web client → target/web (about a minute; 23 MB wasm, 8.8 MB gzipped)
+cargo xtask web --release     # the web client → target/web (about a minute; 24 MB wasm, 9.0 MB gzipped)
 cargo xtask dev               # the app, on ./.dev-home
 ```
 
@@ -146,7 +147,7 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 **What's left**
 - Sending images from the browser (paste, drop, pick), and the image preview's Copy / Save.
 - Images in replies that point at other websites: the page's Content-Security-Policy allows no third-party requests, so they stay empty in the browser.
-- A terminal in the browser (libghostty-vt is native; the browser gets no shell unless `[web] allow_terminal`, and there is no web terminal view).
+- In the browser's terminal: keys the browser keeps for itself (⌘W / Ctrl+W, ⌘T, ⌘N) never reach the shell; prompt glyphs from icon fonts are missing (the client ships JetBrains Mono); a paste has to be the browser's own (⌘V, Ctrl+Shift+V or its menu).
 - Adding a project by browsing folders (the browser can make a new project or clone one, only where projects are kept).
 - Phone-sized layout: it is the desktop layout.
 - Not yet tried: Safari, Firefox, a real agent (Claude, Codex) through the browser, a non-loopback address (tests cover the refusal and TLS on loopback only, so no test opens a network port), `cargo xtask bundle` with the web client in it (the code is there; not run).
@@ -158,15 +159,17 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 1. `RUSTC_BOOTSTRAP=wasm_thread` for the wasm build: one unstable feature gate, one crate, on the pinned compiler.
 2. Default port 4780.
 3. A long-lived pairing link (as asked) rather than one-time codes; "New link" also signs everyone out.
-4. What a browser session may not do: no terminal, no agent binary / arguments / environment, projects only where projects are kept, files by path only inside projects and thread folders. Note that it can still ask an agent to run commands: a session is as powerful as a shell.
+4. What a browser session may not do: no agent binary / arguments / environment, projects only where projects are kept, files by path only inside projects and thread folders. Note that it can still ask an agent to run commands: a session is as powerful as a shell.
 5. Browser shortcuts where the browser keeps the usual keys: new thread Ctrl+Alt+N, new pane Ctrl+Alt+T, settings Ctrl+Alt+,.
 6. Fonts shipped with the web client: Inter, JetBrains Mono, IBM Plex Sans.
 7. A fix that also touches the desktop app: an open Settings window read the store while the store was updating whenever `config.toml` changed (a panic). It now refreshes after the update.
+8. Terminals in the browser: on while only this computer can reach Agentloft (a loopback address, no proxy names), off until you turn them on once other devices can. Settings ▸ Web access ▸ Terminals, or `[web] allow_terminal`.
+9. `vendor/ghostty-vt-sys`: a copy of the published bindings crate with a wasm32 build added, patched in for every target. It goes away when the published crate can do the same.
 
 | # | Item | Status | Evidence |
 |---|---|---|---|
 | 0 | Spike: a gpui-kit view as wasm in a real browser | [x] | Rendered, clicked, typed, IME; `gpui-pre-web` 0.3.11 is viable |
-| 1 | HTTP + WebSocket listener, off by default, loopback by default | [x] | `loftd/src/web/`; `loftd/tests/web.rs` (29 tests) |
+| 1 | HTTP + WebSocket listener, off by default, loopback by default | [x] | `loftd/src/web/`; `loftd/tests/web.rs` (30 tests) |
 | 1 | Non-loopback refused without TLS or `allow_insecure_remote` | [x] | `loft-config` tests; `a_remote_address_without_tls_is_refused` |
 | 1 | Token (256-bit, 0600, constant-time, rotatable), fragment pairing, HttpOnly SameSite=Strict cookie, expiry, revocation | [x] | `web/auth.rs` (15 tests); pairing, cookie, revocation and rotation tests |
 | 1 | Rate limiting of wrong tokens | [x] | `wrong_tokens_are_rate_limited`, limiter unit tests |
@@ -177,7 +180,8 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 | 2 | Transport abstraction in `loft-client` | [x] | `native.rs` (Unix socket), `web.rs` (WebSocket) |
 | 2 | `loft-ui` compiles for wasm32; CI job | [x] | `cargo xtask web`; CI `web` job (build and clippy) |
 | 2 | Disk access through the daemon in the browser | [x] | `loft-ui/src/host.rs`; `UiFiles`, `PutUiState`, `DeleteTheme`, `ProjectIcon`, `ReadPath` |
-| 2 | Native-only pieces get a placeholder, not a crash | [~] | Terminal and embedded browser: placeholder. Folder browser, file dialogs, Finder, editors: left out. Docs viewer (Word, Excel…) and image attachments: untested in the browser |
+| 2 | Native-only pieces get a placeholder, not a crash | [~] | Embedded browser: placeholder. Folder browser, file dialogs, Finder, editors: left out. Docs viewer (Word, Excel…) and image attachments: untested in the browser |
+| 2 | The terminal in the browser | [x] | `loft-terminal` unchanged on libghostty-vt for wasm32 (`vendor/ghostty-vt-sys`); allowed per session by `[web] allow_terminal` (`web_terminals_follow_who_can_reach_the_listener`, `terminals_follow_who_can_reach_the_listener`, `loft-core/src/remote.rs` tests) |
 | 3 | Sidebar, thread view, composer, approvals, settings, diff panel in a browser | [x] | Screenshots during development (not checked in: they show local paths) |
 | 3 | IME, shortcuts, scrolling, light/dark | [x] | See the summary |
 | 4 | Settings ▸ Web access in the desktop app | [~] | Everything but the QR code |

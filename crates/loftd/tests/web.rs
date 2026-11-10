@@ -144,6 +144,12 @@ impl Fixture {
 
     /// An open, greeted WebSocket for a freshly paired browser.
     async fn connected(&self) -> (Socket, String) {
+        let (socket, cookie, _) = self.greeted().await;
+        (socket, cookie)
+    }
+
+    /// The same, with what the daemon said this session may do.
+    async fn greeted(&self) -> (Socket, String, RemoteAccess) {
         let cookie = self.pair().await;
         let mut socket = Socket(
             self.ws(&[("Cookie", &cookie), ("Origin", &self.origin())])
@@ -159,13 +165,12 @@ impl Fixture {
                 capabilities: vec!["browser".into()],
             }))
             .await;
-        match socket.recv().await {
-            ServerMsg::Welcome(welcome) => {
-                assert_eq!(welcome.remote, Some(RemoteAccess { terminal: false }));
-            }
+        // A browser session is always told it is one, whatever it claimed.
+        let access = match socket.recv().await {
+            ServerMsg::Welcome(welcome) => welcome.remote.expect("a remote session"),
             other => panic!("{other:?}"),
-        }
-        (socket, cookie)
+        };
+        (socket, cookie, access)
     }
 
     /// The desktop app's side: a local client on the Unix socket.
@@ -1024,8 +1029,9 @@ async fn the_websocket_carries_the_protocol() {
 
 #[tokio::test]
 async fn a_browser_session_is_held_to_its_limits() {
-    let f = start().await;
-    let (mut socket, _) = f.connected().await;
+    let f = start_with("allow_terminal = false").await;
+    let (mut socket, _, access) = f.greeted().await;
+    assert!(!access.terminal);
     let forbidden = |r: Result<Response, ErrorBody>| {
         matches!(&r, Err(e) if e.code == ErrorCode::Forbidden) || panic!("{r:?}")
     };
@@ -1077,7 +1083,17 @@ async fn a_browser_session_is_held_to_its_limits() {
             )
             .await,
     );
-    // No terminal unless the config allows one.
+    // No terminal once the config says so: not its requests, not its output.
+    forbidden(
+        socket
+            .request(
+                7,
+                Request::ListTerminals {
+                    key_prefix: String::new(),
+                },
+            )
+            .await,
+    );
     socket
         .send(&ClientMsg::Subscribe {
             sub_id: 9,
@@ -1088,6 +1104,42 @@ async fn a_browser_session_is_held_to_its_limits() {
     // The daemon is still up, and ordinary work goes through.
     assert_eq!(socket.request(10, Request::Ping).await, Ok(Response::Pong));
     assert!(f.daemon.web.status().running);
+    f.daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminals_follow_who_can_reach_the_listener() {
+    // Only this machine can reach it: a browser gets a shell, and is told.
+    let f = start().await;
+    let (mut socket, _, access) = f.greeted().await;
+    assert!(access.terminal);
+    let list = Request::ListTerminals {
+        key_prefix: String::new(),
+    };
+    assert!(
+        matches!(
+            socket.request(1, list.clone()).await,
+            Ok(Response::Terminals { .. })
+        ),
+        "terminal requests go through"
+    );
+    f.daemon.shutdown().await;
+
+    // A proxy's or tunnel's name in front of it: not unless asked for.
+    let f = start_with("allowed_hosts = [\"desk.example\"]").await;
+    let (mut socket, _, access) = f.greeted().await;
+    assert!(!access.terminal);
+    let refused = socket.request(1, list.clone()).await;
+    assert!(
+        matches!(&refused, Err(e) if e.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    f.daemon.shutdown().await;
+
+    // Asked for, it is given there too.
+    let f = start_with("allowed_hosts = [\"desk.example\"]\nallow_terminal = true").await;
+    let (_, _, access) = f.greeted().await;
+    assert!(access.terminal);
     f.daemon.shutdown().await;
 }
 

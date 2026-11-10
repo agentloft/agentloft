@@ -2497,8 +2497,6 @@ dependencies = [
 [[package]]
 name = "ghostty-vt-sys"
 version = "0.8.0+ghostty.1.4.0-main.83fb956"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9faa3284f0f76ff399f3728ea253f3b9bb2f9ebb6d512fe87955fe2dfaa0207d"
 dependencies = [
  "flate2",
  "sha2 0.10.9",
@@ -4436,6 +4434,7 @@ dependencies = [
  "gpui-pre",
  "portable-pty",
  "tracing",
+ "web-time",
 ]
 
 [[package]]

@@ -34,6 +34,15 @@ fn forbidden(what: &str) -> ErrorBody {
     )
 }
 
+/// A terminal asked for by a session that isn't given one (`[web]
+/// allow_terminal`).
+fn terminals_off() -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Forbidden,
+        "Terminals are off for browsers. Turn them on in the desktop app: Settings ▸ Web access.",
+    )
+}
+
 /// Settings a remote session may change. Everything else — where agent
 /// binaries live, their arguments and environment, project folders, web
 /// access itself — stays with the desktop app.
@@ -285,7 +294,7 @@ impl Core {
                 if policy.allow_terminal {
                     Ok(())
                 } else {
-                    Err(forbidden("The terminal"))
+                    Err(terminals_off())
                 }
             }
 
@@ -352,7 +361,7 @@ impl Core {
         match topic {
             Topic::Workspace | Topic::Thread(_) => Ok(()),
             Topic::Terminal(_) if policy.allow_terminal => Ok(()),
-            Topic::Terminal(_) => Err(forbidden("The terminal")),
+            Topic::Terminal(_) => Err(terminals_off()),
         }
     }
 }

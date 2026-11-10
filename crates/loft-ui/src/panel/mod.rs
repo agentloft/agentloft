@@ -7,10 +7,6 @@ pub mod changes;
 pub mod dock;
 pub mod docs;
 pub mod files;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod terminal;
-#[cfg(target_arch = "wasm32")]
-#[path = "terminal_web.rs"]
 pub mod terminal;
 pub mod viewer;
 
@@ -728,16 +724,16 @@ impl WorkbenchPanel {
             .shortcut(key)
         };
         let mut entries = Vec::new();
-        // The embedded browser and the terminal are the desktop app's.
+        // The embedded browser is the desktop app's.
         if !crate::host::IS_WEB {
             entries.push(item("Browser", IconName::Globe, 'b', Tab::Browser));
-            entries.push(item(
-                "Terminal",
-                IconName::SquareTerminal,
-                't',
-                Tab::Terminal,
-            ));
         }
+        entries.push(item(
+            "Terminal",
+            IconName::SquareTerminal,
+            't',
+            Tab::Terminal,
+        ));
         entries.push(item("Files", IconName::FolderTree, 'f', Tab::Files));
         entries.push(item("Changes", IconName::GitCompare, 'd', Tab::Changes));
         menu::open(window, at, entries, cx);
@@ -1026,8 +1022,8 @@ fn empty_state(thread_id: &ThreadId, p: &Palette, cx: &mut Context<WorkbenchPane
         (Tab::Files, IconName::FolderTree, "Files", "F"),
         (Tab::Changes, IconName::GitCompare, "Changes", "D"),
     ] {
-        // The embedded browser and the terminal are the desktop app's.
-        if crate::host::IS_WEB && matches!(kind, Tab::Browser | Tab::Terminal) {
+        // The embedded browser is the desktop app's.
+        if crate::host::IS_WEB && matches!(kind, Tab::Browser) {
             continue;
         }
         let id = thread_id.clone();

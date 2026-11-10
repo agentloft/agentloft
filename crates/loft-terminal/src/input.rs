@@ -56,6 +56,11 @@ pub(crate) fn route_key_down(keystroke: &Keystroke, ctx: RouteContext) -> KeyRou
             None => KeyRoute::Ignore,
         };
     }
+    // In a browser, Ctrl+Shift+V is the browser's paste. Leave it alone so
+    // its paste event fires: a page can't read the clipboard on its own.
+    if cfg!(target_arch = "wasm32") && m.control && m.shift && keystroke.key == "v" {
+        return KeyRoute::Ignore;
+    }
     if let Some(bytes) = word_navigation_bytes(keystroke) {
         return KeyRoute::Bytes(bytes);
     }

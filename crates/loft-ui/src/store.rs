@@ -361,12 +361,18 @@ impl AppStore {
         ] {
             self.fetch_models(HarnessId(harness.into()), cx);
         }
+        let allowed = self.terminals_allowed();
         for (id, pane) in terminals {
             if restarted {
                 // The old PTY died with the daemon; the pane opens a new one.
                 let _ = pane.update(cx, |p, cx| p.on_lost(cx));
-            } else {
+            } else if allowed {
                 self.subscribe_terminal(id, pane, cx);
+            } else {
+                // A browser session whose terminals were turned off: the
+                // shell lives on in the daemon, and a later connection that
+                // may use it picks it up again here.
+                self.terminals.insert(id, pane);
             }
         }
         cx.notify();
@@ -945,6 +951,16 @@ impl AppStore {
 
     pub fn paths(&self) -> &Paths {
         &self.paths
+    }
+
+    /// Whether this client may open terminals. The desktop app always may;
+    /// a browser session only when the daemon allows it (`[web]
+    /// allow_terminal`, ADR-0016).
+    pub fn terminals_allowed(&self) -> bool {
+        self.client
+            .as_ref()
+            .and_then(|client| client.welcome().remote.as_ref())
+            .is_none_or(|remote| remote.terminal)
     }
 
     pub fn client(&self) -> Option<Client> {

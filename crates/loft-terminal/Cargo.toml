@@ -10,6 +10,8 @@ publish.workspace = true
 gpui-kit.workspace = true
 ghostty-vt.workspace = true
 tracing.workspace = true
+# `Instant` that also works in the browser build (crates/loft-web).
+web-time = "1"
 
 [dev-dependencies]
 # GPUI's headless test platform for tests/view.rs. Enabled on gpui-pre

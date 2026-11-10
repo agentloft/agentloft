@@ -33,12 +33,22 @@ Two constraints shape everything:
 
 - Views call `host::…` and stay the same. They ask `host::IS_WEB` only to leave out what a browser cannot do.
 
+**The terminal is the same widget too**
+
+- `loft-terminal` and its emulator run in the browser unchanged. libghostty-vt builds for `wasm32-freestanding` as a static archive (Zig, no libc, SIMD off), and links into the wasm like any other object. It costs about 0.25 MB of the gzipped download.
+- The published `ghostty-vt-sys` knows no wasm target and checks 64-bit layouts, so the repository carries a copy with those two things added (`vendor/ghostty-vt-sys`, patched in through `[patch.crates-io]`). Its README lists what differs and how to regenerate the wasm32 bindings.
+- The PTY is the daemon's, as on the desktop (ADR-0007): the browser sends keystrokes and gets output over the same requests.
+- What a browser changes:
+  - Paste comes from the browser's own paste (⌘V, Ctrl+Shift+V, its menu), because a page cannot read the clipboard by itself. It is bracketed like any paste.
+  - Copy and Select All answer to both ⌘ and Ctrl+Shift.
+  - Keys the browser keeps never arrive: ⌘W / Ctrl+W, ⌘T, ⌘N, ⌘Q.
+  - Fonts are the shipped JetBrains Mono, so prompt glyphs from icon fonts are missing.
+
 **Native-only pieces in the browser build**
 
 | Piece | In the browser |
 |---|---|
-| Terminal (libghostty-vt, Zig) | Not offered; a tab that exists shows "Not available in the browser". A browser session gets no shell unless `[web] allow_terminal` is set, and there is no web terminal view yet. |
-| Embedded browser (WKWebView) | Not offered; same placeholder. |
+| Embedded browser (WKWebView) | Not offered; a tab that exists shows "Not available in the browser". |
 | Folder browser, file dialogs, Finder, "Open in editor" | Left out. |
 | Menus and Settings in their own window | Drawn inside the one window. |
 | Dock badge, notifications | None. |
@@ -67,7 +77,7 @@ tls_key  = "~/certs/desk.key"
 allowed_hosts = ["desk.example.ts.net"]
 allow_insecure_remote = false
 session_days = 30
-allow_terminal = false
+allow_terminal = true       # default: true while only this machine can reach the listener
 ```
 
 - The listener follows the config: a change restarts it; a section that breaks the rules leaves it off, with the reason in its status.
@@ -105,7 +115,7 @@ allow_terminal = false
 - May not:
   - stop the daemon, or manage web access (see the pairing link, rotate it, revoke sessions);
   - change what runs: agents' binary paths, launch arguments or environment (`harness.*.path|extra_args|env`), or the project folders (`projects.*`);
-  - open a terminal, unless `allow_terminal`;
+  - open a terminal, unless terminals are allowed. Unset, `allow_terminal` follows who can reach the listener: yes for a loopback address with no `allowed_hosts`, no once another address, a proxy or a tunnel is involved. Set, it is as set. A session learns which in its `Welcome`, and a pane without the right says where to turn it on;
   - add, create or clone a project anywhere but where projects are kept (`projects.new_dir`, and `projects.base_dir` if the user set one);
   - read a file by path outside project roots, thread folders (worktrees), and Agentloft's `attachments` and `icons`. Paths are canonicalized, `..` is refused, and a symlink that leaves those folders is refused. "Outside" and "missing" get the same answer.
   - use the agent-facing requests (`spawn_thread`, `list_threads`, …).
@@ -124,7 +134,7 @@ allow_terminal = false
 
 **Out of scope, stated plainly**
 
-- **A browser session is as powerful as a shell.** It can ask an agent to run commands and approve them. `RemotePolicy` is hygiene: it stops a stolen session from making itself permanent (new binary paths, web settings) or wider (arbitrary files, the terminal). It is not a sandbox.
+- **A browser session is as powerful as a shell.** It can ask an agent to run commands and approve them, and on a local-only listener it gets a terminal outright. `RemotePolicy` is hygiene: it stops a stolen session from making itself permanent (new binary paths, web settings) or wider (arbitrary files; a terminal, once the listener is reachable from elsewhere). It is not a sandbox.
 - A process already running as the user. It can read the token file and the Unix socket.
 - A pairing link the user gives away. Treat it like a password; "New link" replaces it.
 - Cookies are not port-scoped: another server on `localhost` receives ours. It cannot use it from a browser (the `Origin` check), and a remote attacker cannot reach a loopback listener at all. Over HTTPS the `__Host-` cookie is tied to the host.
@@ -144,7 +154,7 @@ Nothing here needs redesign to be reached from another machine or a phone:
 
 - One UI codebase. A view added to `loft-ui` appears in the browser too.
 - The protocol is unchanged, so features work in the browser without new endpoints.
-- The security-sensitive code is small, in one place (`loftd/src/web/`, `loft-core/src/remote.rs`) and covered by tests: 10 policy tests, 25 unit tests and 29 end-to-end tests against a real listener.
+- The security-sensitive code is small, in one place (`loftd/src/web/`, `loft-core/src/remote.rs`) and covered by tests: 10 policy tests, 25 unit tests and 30 end-to-end tests against a real listener.
 
 **Costs**
 
@@ -164,9 +174,11 @@ Nothing here needs redesign to be reached from another machine or a phone:
 2. **Port 4780** as the default.
 3. **A long-lived pairing token** (as asked for) rather than one-time codes. One-time codes would be safer against a leaked link.
 4. **Rotating the link signs everyone out.**
-5. **The browser allow-list**, especially: projects only where projects are kept; no terminal; settings a browser may change.
+5. **The browser allow-list**, especially: projects only where projects are kept; settings a browser may change.
 6. **Shortcut defaults in the browser:** new thread Ctrl+Alt+N, new pane Ctrl+Alt+T, settings Ctrl+Alt+, (the browser keeps ⌘N, ⌘T and ⌘,).
 7. **Shipping fonts** (Inter, JetBrains Mono, IBM Plex Sans; about 3 MB before compression).
+8. **Terminals in the browser are on for a local-only listener** and off, until asked for, once other machines can reach it. The alternative is off everywhere until asked for.
+9. **A patched copy of `ghostty-vt-sys` in `vendor/`** (wasm target, wasm32 bindings) until the published crate has them.
 
 ## Alternatives considered
 

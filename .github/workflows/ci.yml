@@ -56,6 +56,11 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # The terminal in the browser is libghostty-vt built for wasm32, which
+      # needs Zig like the native build does.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
       # The browser-only code paths (cfg(target_arch = "wasm32")) that the
       # native clippy run never sees. RUSTC_BOOTSTRAP: see the `web` task in
       # xtask/src/main.rs.

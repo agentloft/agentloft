@@ -33,7 +33,9 @@ use gpui_kit::{
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// std's clock panics in the browser build; this is std's own elsewhere.
+use web_time::Instant;
 
 gpui_kit::actions!(
     loft_terminal,
@@ -97,7 +99,18 @@ pub fn init(cx: &mut App) {
     }
     cx.set_global(Initialized);
     let ctx = Some(KEY_CONTEXT);
-    let mut bindings = if cfg!(target_os = "macos") {
+    let mut bindings = if cfg!(target_arch = "wasm32") {
+        // In a browser, on any system: both families' keys. No paste key:
+        // a page can't read the clipboard on its own, so the browser's own
+        // paste (⌘V, Ctrl+Shift+V, its menu) brings the text in
+        // (`EntityInputHandler::paste`).
+        vec![
+            KeyBinding::new("cmd-c", Copy, ctx),
+            KeyBinding::new("ctrl-shift-c", Copy, ctx),
+            KeyBinding::new("cmd-a", SelectAll, ctx),
+            KeyBinding::new("ctrl-shift-a", SelectAll, ctx),
+        ]
+    } else if cfg!(target_os = "macos") {
         vec![
             KeyBinding::new("cmd-c", Copy, ctx),
             KeyBinding::new("cmd-v", Paste, ctx),
@@ -994,6 +1007,16 @@ impl EntityInputHandler for TerminalView {
             cx.notify();
         }
         window.invalidate_character_coordinates();
+    }
+
+    /// A paste the platform delivers itself (the browser's paste event):
+    /// bracketed when the program asked for that, like the Paste action.
+    fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = item.text()
+            && !text.is_empty()
+        {
+            Self::paste(self, &text, cx);
+        }
     }
 
     fn replace_text_in_range(

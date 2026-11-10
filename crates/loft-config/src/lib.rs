@@ -191,7 +191,9 @@ pub struct WebConfig {
     /// How long a paired browser stays signed in.
     pub session_days: u32,
     /// Let browser sessions open terminals (a shell on this machine).
-    pub allow_terminal: bool,
+    /// Unset: yes while only this machine can reach the listener (a
+    /// loopback address and no extra host names), no once others can.
+    pub allow_terminal: Option<bool>,
 }
 
 impl Default for WebConfig {
@@ -205,7 +207,7 @@ impl Default for WebConfig {
             allow_insecure_remote: false,
             allowed_hosts: Vec::new(),
             session_days: 30,
-            allow_terminal: false,
+            allow_terminal: None,
         }
     }
 }
@@ -221,6 +223,14 @@ pub struct WebPlan {
     pub allowed_hosts: Vec<String>,
     pub session_ttl: Duration,
     pub allow_terminal: bool,
+}
+
+impl WebPlan {
+    /// Only this machine can reach the listener: a loopback address, and no
+    /// proxy or tunnel names in front of it.
+    pub fn local_only(&self) -> bool {
+        self.addr.ip().is_loopback() && self.allowed_hosts.is_empty()
+    }
 }
 
 impl WebConfig {
@@ -268,14 +278,19 @@ impl WebConfig {
             }
             allowed_hosts.push(host);
         }
-        Ok(WebPlan {
+        let mut plan = WebPlan {
             addr: std::net::SocketAddr::new(ip, self.port),
             tls,
             insecure_remote,
             allowed_hosts,
             session_ttl: Duration::from_secs(u64::from(self.session_days.clamp(1, 365)) * 86_400),
-            allow_terminal: self.allow_terminal,
-        })
+            allow_terminal: false,
+        };
+        // A shell is as much as this machine's own user can already do, so
+        // it comes with a local-only listener. Reachable from elsewhere, it
+        // has to be asked for.
+        plan.allow_terminal = self.allow_terminal.unwrap_or(plan.local_only());
+        Ok(plan)
     }
 }
 
@@ -781,6 +796,43 @@ mod tests {
             ..WebConfig::default()
         };
         assert!(bad.plan().is_err());
+    }
+
+    #[test]
+    fn web_terminals_follow_who_can_reach_the_listener() {
+        // Only this machine: a shell is nothing its user doesn't have.
+        let local = WebConfig::default();
+        assert!(local.plan().unwrap().local_only());
+        assert!(local.plan().unwrap().allow_terminal);
+        // Reachable from elsewhere (another address, or a proxy or tunnel
+        // in front of a loopback one): not unless asked for.
+        let lan = WebConfig {
+            bind: "0.0.0.0".into(),
+            allow_insecure_remote: true,
+            ..WebConfig::default()
+        };
+        let tunnel = WebConfig {
+            allowed_hosts: vec!["desk.example".into()],
+            ..WebConfig::default()
+        };
+        for remote in [&lan, &tunnel] {
+            let plan = remote.plan().unwrap();
+            assert!(!plan.local_only());
+            assert!(!plan.allow_terminal);
+        }
+        // Said outright, either way, it is as said.
+        let asked = WebConfig {
+            allow_terminal: Some(true),
+            ..lan
+        };
+        assert!(asked.plan().unwrap().allow_terminal);
+        let refused = WebConfig {
+            allow_terminal: Some(false),
+            ..WebConfig::default()
+        };
+        assert!(!refused.plan().unwrap().allow_terminal);
+        let cfg: Config = toml::from_str("[web]\nallow_terminal = false\n").unwrap();
+        assert_eq!(cfg.web.allow_terminal, Some(false));
     }
 
     #[test]

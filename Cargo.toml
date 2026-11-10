@@ -2,6 +2,7 @@
 resolver = "3"
 members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -104,3 +105,8 @@ codegen-units = 1
 debug = false
 strip = "debuginfo"
 panic = "abort"
+
+# libghostty-vt's bindings with a wasm32 build added for the browser client
+# (vendor/ghostty-vt-sys/README.md says what differs from crates.io).
+[patch.crates-io]
+ghostty-vt-sys = { path = "vendor/ghostty-vt-sys" }

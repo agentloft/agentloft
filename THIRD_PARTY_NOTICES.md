@@ -102,7 +102,12 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 - Used in: `crates/loft-terminal`, through the `ghostty-vt` / `ghostty-vt-sys`
   crates (Apache-2.0), which build libghostty-vt from Ghostty's source
   tarball (commit `83fb95624b0439ee660c2679b43b38c8b63769cd`, 1.4.0) and link
-  it statically. No Ghostty source is copied into this repository.
+  it statically, into the desktop app and into the web client's wasm. No
+  Ghostty source is copied into this repository.
+- `vendor/ghostty-vt-sys` is a copy of `ghostty-vt-sys` 0.8.0 (Apache-2.0,
+  from https://github.com/prabirshrestha/gpui-cn) with a wasm32 build added;
+  its README lists the changes. Its bindings files are generated from
+  Ghostty's C headers.
 
 ```
 Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors
