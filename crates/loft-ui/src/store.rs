@@ -2090,6 +2090,10 @@ pub enum Row {
     },
 }
 
+/// How long a running turn must sit with nothing in progress before the
+/// timeline says "Thinking…".
+const PENDING_AFTER: Duration = Duration::from_millis(700);
+
 /// One open thread: its mirrored model plus view-side state (display rows,
 /// scroll list, markdown documents, expansion state).
 pub struct ThreadState {
@@ -2105,6 +2109,9 @@ pub struct ThreadState {
     pub cards: Vec<InfoCard>,
     /// Repaints while a turn runs (its elapsed time).
     ticker: Option<gpui_kit::Task<()>>,
+    /// When an item last changed: "Thinking…" waits for a quiet moment so
+    /// it doesn't blink between back-to-back tool calls.
+    last_activity: Option<web_time::Instant>,
     /// A message to scroll to once the thread has loaded (a search hit).
     reveal: Option<ItemId>,
     /// Threads this one's agent started that are still running: their
@@ -2128,6 +2135,7 @@ impl ThreadState {
             markdown: HashMap::new(),
             expanded: HashMap::new(),
             ticker: None,
+            last_activity: None,
             cards: Vec::new(),
             reveal: None,
             live_spawned: Default::default(),
@@ -2305,7 +2313,13 @@ impl ThreadState {
                     .iter()
                     .any(|&i| items[i].status == ItemStatus::InProgress)
                     || model.open_requests().next().is_some();
-                if !busy {
+                // Only once things have gone quiet: the gap between one tool
+                // call ending and the next starting would flash it.
+                let settled = work.is_empty()
+                    || self
+                        .last_activity
+                        .is_none_or(|t| t.elapsed() >= PENDING_AFTER);
+                if !busy && settled {
                     rows.push(Row::Pending);
                 }
                 continue;
@@ -2447,7 +2461,8 @@ impl ThreadState {
         cx.notify();
     }
 
-    /// While a turn runs, repaint every second so "Working for 12s" ticks.
+    /// While a turn runs, repaint every second so "Working for 12s" ticks
+    /// (and "Thinking…" shows once a pause has lasted).
     fn ensure_ticker(&mut self, cx: &mut Context<Self>) {
         let running = self
             .model
@@ -2461,6 +2476,7 @@ impl ThreadState {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |t, cx| {
                     let running = t.model.as_ref().is_some_and(|m| m.running_turn().is_some());
+                    t.sync_rows(None, cx);
                     cx.notify();
                     if !running {
                         t.ticker = None;
@@ -2535,6 +2551,7 @@ impl ThreadState {
         }
         let changed = match &env.event {
             Event::ItemUpserted { item } => {
+                self.last_activity = Some(web_time::Instant::now());
                 let (id, body) = (item.id.clone(), item.body.clone());
                 self.sync_markdown(&id, &body, cx);
                 Some(id)

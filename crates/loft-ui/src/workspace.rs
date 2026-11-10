@@ -5301,6 +5301,44 @@ fn subtitle_line(sub: &Subtitle, branch: Option<&str>, p: &Palette) -> AnyElemen
         .into_any_element()
 }
 
+/// When the running turn started: the open thread's turn if we have it,
+/// else when the thread last changed status (its turn start, mostly).
+fn running_since(
+    store: &Entity<AppStore>,
+    thread: &loft_protocol::Thread,
+    cx: &gpui_kit::App,
+) -> i64 {
+    store
+        .read(cx)
+        .threads
+        .get(&thread.id)
+        .and_then(|t| {
+            t.read(cx)
+                .model
+                .as_ref()?
+                .running_turn()
+                .map(|t| t.started_at_ms)
+        })
+        .unwrap_or(thread.updated_at_ms)
+}
+
+/// "8s", "4m", "1h 12m": short enough for a sidebar row.
+fn short_duration(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+fn now_ms() -> i64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn thread_row(
     store: &Entity<AppStore>,
@@ -5321,7 +5359,19 @@ fn thread_row(
     let editing = renaming.is_some();
     let branch = thread.workspace.branch().map(str::to_owned);
     let trailing: AnyElement = match thread.status {
-        ThreadStatus::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
+        // The spinner already repaints the sidebar every frame, so the
+        // elapsed time stays current without a timer of its own.
+        ThreadStatus::Running => h_flex()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .text_color(p.accent)
+            .child(Spinner::new().xsmall().color(p.accent))
+            .child(format!(
+                "Working {}",
+                short_duration(now_ms() - running_since(store, thread, cx))
+            ))
+            .into_any_element(),
         ThreadStatus::WaitingApproval => div()
             .px_1p5()
             .rounded(px(5.))
