@@ -379,7 +379,11 @@ impl WorkspaceView {
                 use gpui_kit::component::notification::Notification;
                 let note = Notification::new().message(message.clone());
                 let note = if *error {
-                    note.with_type(gpui_kit::component::notification::NotificationType::Error)
+                    // The same error again replaces its toast rather than
+                    // stacking another.
+                    struct ErrorToast;
+                    note.id1::<ErrorToast>(gpui_kit::SharedString::from(message.clone()))
+                        .with_type(gpui_kit::component::notification::NotificationType::Error)
                 } else {
                     note.with_type(gpui_kit::component::notification::NotificationType::Success)
                 };
@@ -2763,14 +2767,13 @@ impl WorkspaceView {
     }
 
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let (projects, all_threads, selected, conn, error, unread, collapsed) = {
+        let (projects, all_threads, selected, conn, unread, collapsed) = {
             let store = self.store.read(cx);
             (
                 store.workspace.projects.clone(),
                 store.workspace.threads.clone(),
                 store.selected.clone(),
                 store.conn.clone(),
-                store.last_error.clone(),
                 store.unread.clone(),
                 store.collapsed.clone(),
             )
@@ -3143,20 +3146,6 @@ impl WorkspaceView {
                     .overflow_y_scroll()
                     .child(list),
             )
-            .when_some(error, |d, e| {
-                d.child(
-                    div()
-                        .mx_3()
-                        .mb_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded(px(8.))
-                        .bg(p.danger_soft)
-                        .text_xs()
-                        .text_color(p.danger)
-                        .child(e),
-                )
-            })
             .child(
                 h_flex()
                     .px_3()
@@ -3353,8 +3342,14 @@ impl WorkspaceView {
             .threads
             .iter()
             .find(|t| t.id == parent.thread_id)
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "another thread".into());
+            .map(|t| t.title.clone());
+        // The thread it came from may have been deleted since: say so, and
+        // don't offer to open it.
+        let exists = title.is_some();
+        let from = match title {
+            Some(title) => format!("“{title}”"),
+            None => "a deleted thread".into(),
+        };
         let spawned = parent.kind == loft_protocol::ForkKind::Spawned;
         let how = match parent.kind {
             loft_protocol::ForkKind::Native => "full context",
@@ -3377,8 +3372,6 @@ impl WorkspaceView {
                     .border_color(p.border)
                     .text_xs()
                     .text_color(p.muted_foreground)
-                    .cursor_pointer()
-                    .hover(|d| d.text_color(p.foreground).bg(p.hover))
                     .child(
                         Icon::new(if spawned {
                             IconName::Bot
@@ -3388,19 +3381,23 @@ impl WorkspaceView {
                         .xsmall(),
                     )
                     .child(div().max_w(px(420.)).truncate().child(if spawned {
-                        format!("Started from “{title}”")
+                        format!("Started from {from}")
                     } else {
-                        format!("Forked from “{title}”")
+                        format!("Forked from {from}")
                     }))
                     .child(
                         div()
                             .text_color(p.faint_foreground)
                             .child(format!("· {how}")),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let id = id.clone();
-                        this.store.update(cx, |s, cx| s.select_thread(id, cx));
-                    })),
+                    .when(exists, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.text_color(p.foreground).bg(p.hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let id = id.clone();
+                                this.store.update(cx, |s, cx| s.select_thread(id, cx));
+                            }))
+                    }),
             )
             .into_any_element()
     }
@@ -3678,8 +3675,8 @@ impl WorkspaceView {
                         .threads
                         .iter()
                         .find(|t| t.id == parent.thread_id)
-                        .map(|t| t.title.clone())
-                        .unwrap_or_else(|| "another thread".into());
+                        .map(|t| format!("“{}”", t.title))
+                        .unwrap_or_else(|| "a deleted thread".into());
                     let how = match parent.kind {
                         loft_protocol::ForkKind::Native => format!(
                             "{} continues with the full conversation.",
@@ -3699,7 +3696,7 @@ impl WorkspaceView {
                             .items_center()
                             .text_sm()
                             .child(Icon::new(IconName::GitFork).small())
-                            .child(format!("Forked from “{title}”")),
+                            .child(format!("Forked from {title}")),
                     )
                     .child(div().text_xs().child(how))
                 })
@@ -5314,6 +5311,44 @@ fn subtitle_line(sub: &Subtitle, branch: Option<&str>, p: &Palette) -> AnyElemen
         .into_any_element()
 }
 
+/// When the running turn started: the open thread's turn if we have it,
+/// else when the thread last changed status (its turn start, mostly).
+fn running_since(
+    store: &Entity<AppStore>,
+    thread: &loft_protocol::Thread,
+    cx: &gpui_kit::App,
+) -> i64 {
+    store
+        .read(cx)
+        .threads
+        .get(&thread.id)
+        .and_then(|t| {
+            t.read(cx)
+                .model
+                .as_ref()?
+                .running_turn()
+                .map(|t| t.started_at_ms)
+        })
+        .unwrap_or(thread.updated_at_ms)
+}
+
+/// "8s", "4m", "1h 12m": short enough for a sidebar row.
+fn short_duration(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+fn now_ms() -> i64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn thread_row(
     store: &Entity<AppStore>,
@@ -5334,7 +5369,19 @@ fn thread_row(
     let editing = renaming.is_some();
     let branch = thread.workspace.branch().map(str::to_owned);
     let trailing: AnyElement = match thread.status {
-        ThreadStatus::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
+        // The spinner already repaints the sidebar every frame, so the
+        // elapsed time stays current without a timer of its own.
+        ThreadStatus::Running => h_flex()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .text_color(p.accent)
+            .child(Spinner::new().xsmall().color(p.accent))
+            .child(format!(
+                "Working {}",
+                short_duration(now_ms() - running_since(store, thread, cx))
+            ))
+            .into_any_element(),
         ThreadStatus::WaitingApproval => div()
             .px_1p5()
             .rounded(px(5.))
