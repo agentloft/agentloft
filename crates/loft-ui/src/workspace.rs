@@ -42,6 +42,7 @@ actions!(
         ShowFiles,
         ShowChanges,
         ShowTerminal,
+        ToggleTerminal,
         ShowBrowser,
         NewWindow,
         NewTab,
@@ -76,7 +77,7 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
         KeyBinding::new("cmd-shift-backspace", DenyRequest, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-e", ShowFiles, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-g", ShowChanges, Some(CONTEXT)),
-        KeyBinding::new("ctrl-`", ShowTerminal, Some(CONTEXT)),
+        KeyBinding::new("ctrl-`", ToggleTerminal, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-b", ShowBrowser, Some(CONTEXT)),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -119,7 +120,8 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
             MenuItem::separator(),
             MenuItem::action("Files", ShowFiles),
             MenuItem::action("Changes", ShowChanges),
-            MenuItem::action("Terminal", ShowTerminal),
+            MenuItem::action("Terminal", ToggleTerminal),
+            MenuItem::action("Terminal in Side Panel", ShowTerminal),
             MenuItem::action("Browser", ShowBrowser),
             MenuItem::separator(),
             MenuItem::action("Command Palette…", OpenPalette),
@@ -186,6 +188,12 @@ pub struct WorkspaceView {
     pub(crate) sidebar_open: bool,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
+    /// Terminals docked under the conversation (Ctrl+`).
+    dock: Entity<crate::panel::dock::TerminalDock>,
+    pub(crate) dock_open: bool,
+    dock_slide: Slide,
+    /// The dock's height as last laid out (it slides, and reopens, at it).
+    dock_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// Where the details button is (its card opens under it).
     details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     sidebar_slide: Slide,
@@ -223,6 +231,7 @@ impl WorkspaceView {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads"));
         let panel = cx.new(|cx| WorkbenchPanel::new(store.clone(), window, cx));
+        let dock = cx.new(|cx| crate::panel::dock::TerminalDock::new(panel.clone(), cx));
         let subs = vec![
             cx.subscribe_in(&store, window, |this, _, event, window, cx| {
                 this.on_store_event(event, window, cx)
@@ -233,6 +242,15 @@ impl WorkspaceView {
                     this.add_annotation(thread_id, note, window, cx)
                 }
                 crate::panel::PanelEvent::Maximized(_) => cx.notify(),
+                crate::panel::PanelEvent::ShowPanel => {
+                    this.panel_open = true;
+                    cx.notify();
+                }
+                crate::panel::PanelEvent::ShowDock => {
+                    this.dock_open = true;
+                    cx.notify();
+                }
+                crate::panel::PanelEvent::HideDock => this.hide_dock(window, cx),
                 // Done annotating with no notes waiting: clear the page.
                 crate::panel::PanelEvent::AnnotatingStopped(thread_id) => {
                     if this.page_notes.get(thread_id).is_none_or(|n| n.is_empty())
@@ -299,6 +317,10 @@ impl WorkspaceView {
             sidebar_open: true,
             panel,
             panel_open: false,
+            dock,
+            dock_open: false,
+            dock_slide: Slide::default(),
+            dock_height: std::rc::Rc::new(std::cell::Cell::new(DOCK_HEIGHT)),
             details_anchor: Default::default(),
             details_open: false,
             peek: None,
@@ -639,6 +661,7 @@ impl WorkspaceView {
                 "terminal" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Terminal, window, cx)),
+                "dock" => self.toggle_terminal(window, cx),
                 "browser" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx)),
@@ -1006,6 +1029,71 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    /// The conversation with the terminal dock under it (sliding in and
+    /// out, then resizable by its top edge).
+    fn with_terminal_dock(
+        &mut self,
+        body: AnyElement,
+        show: bool,
+        p: &Palette,
+        window: &mut Window,
+    ) -> AnyElement {
+        let amount = self.dock_slide.update(show, window);
+        if amount <= 0. {
+            return body;
+        }
+        let height = self.dock_height.get();
+        if amount < 1. {
+            // Mid-slide: the dock at its full height, partly shown (so the
+            // shell isn't resized every frame).
+            return v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().w_full().child(body))
+                .child(
+                    div()
+                        .flex_none()
+                        .w_full()
+                        .h(px(height * amount))
+                        .overflow_hidden()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .child(div().w_full().h(px(height)).child(self.dock.clone())),
+                )
+                .into_any_element();
+        }
+        let measured = self.dock_height.clone();
+        div()
+            .size_full()
+            .child(
+                v_resizable("terminal-dock")
+                    .child(resizable_panel().child(body))
+                    .child(
+                        resizable_panel()
+                            .size(px(height))
+                            .size_range(px(DOCK_MIN_HEIGHT)..px(2000.))
+                            .child(
+                                div()
+                                    .size_full()
+                                    .relative()
+                                    .border_t_1()
+                                    .border_color(p.border)
+                                    .child(self.dock.clone())
+                                    .child(
+                                        gpui_kit::canvas(
+                                            move |bounds, _, _| {
+                                                measured.set(f32::from(bounds.size.height))
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .size_full(),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Show a panel tab (never closes the panel, unlike [`Self::show_tab`]).
     pub(crate) fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         self.panel_open = true;
@@ -1022,6 +1110,35 @@ impl WorkspaceView {
             self.panel_open = true;
             self.panel
                 .update(cx, |panel, cx| panel.show(tab, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+`: open the terminal dock (with a shell) and focus it; when
+    /// open, focus it, or hide it if it has focus already.
+    pub(crate) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.read(cx).selected.is_none() {
+            return;
+        }
+        if self.dock_open && self.panel.read(cx).docked_focused(window, cx) {
+            self.hide_dock(window, cx);
+            return;
+        }
+        self.dock_open = true;
+        self.panel
+            .update(cx, |p, cx| p.ensure_docked(true, window, cx));
+        cx.notify();
+    }
+
+    /// Hide the terminal dock, handing focus back to the composer.
+    fn hide_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_focus = self.panel.read(cx).docked_focused(window, cx);
+        self.dock_open = false;
+        if had_focus
+            && let Some(id) = self.store.read(cx).selected.clone()
+            && let Some(composer) = self.composers.get(&id)
+        {
+            composer.update(cx, |c, cx| c.focus(window, cx));
         }
         cx.notify();
     }
@@ -3085,6 +3202,19 @@ impl WorkspaceView {
                         ),
                 )
                 .child(toggle_button(
+                    "hdr-terminal",
+                    IconName::PanelBottom,
+                    self.dock_open,
+                    p,
+                    cx.listener(|this, _, window, cx| {
+                        if this.dock_open {
+                            this.hide_dock(window, cx);
+                        } else {
+                            this.toggle_terminal(window, cx);
+                        }
+                    }),
+                ))
+                .child(toggle_button(
                     "hdr-panel",
                     IconName::PanelRight,
                     self.panel_open,
@@ -4295,9 +4425,16 @@ impl Render for WorkspaceView {
             None => self.render_welcome(&p, cx),
         };
         let body = self.with_details_dock(body, window, cx);
-        let mut body_slot = Some(body);
         let show_panel = self.panel_open && header_title.is_some();
         let maximized = show_panel && self.panel.read(cx).maximized;
+        let show_dock = self.dock_open && header_title.is_some();
+        if show_dock && self.panel.read(cx).dock_len(cx) == 0 {
+            // A thread picked with the dock open gets a shell of its own.
+            self.panel
+                .update(cx, |p, cx| p.ensure_docked(false, window, cx));
+        }
+        let body = self.with_terminal_dock(body, show_dock, &p, window);
+        let mut body_slot = Some(body);
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
         if show_panel && self.panel_width.get() <= 0. {
@@ -4374,6 +4511,7 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &ShowTerminal, w, cx| this.show_tab(Tab::Terminal, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleTerminal, w, cx| this.toggle_terminal(w, cx)))
             .on_action(
                 cx.listener(|this, _: &ShowBrowser, w, cx| this.show_tab(Tab::Browser, w, cx)),
             )
@@ -5490,6 +5628,10 @@ impl Render for DraggedThread {
             .child(div().truncate().child(self.title.clone()))
     }
 }
+
+/// The terminal dock's first height, and its shortest.
+const DOCK_HEIGHT: f32 = 280.;
+const DOCK_MIN_HEIGHT: f32 = 120.;
 
 /// The side panel's narrowest width.
 const PANEL_MIN: f32 = 340.;

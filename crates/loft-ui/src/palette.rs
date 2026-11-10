@@ -4,8 +4,8 @@
 use crate::panel::Tab;
 use crate::workspace::{
     AddProject, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings, ShowBrowser,
-    ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTheme, WorkspaceView,
-    harness_name,
+    ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTerminal, ToggleTheme,
+    WorkspaceView, harness_name,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
@@ -541,7 +541,13 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
             |v, w, cx| v.show_tab(Tab::Changes, w, cx),
         ),
         entry(
-            "Show terminal",
+            "Toggle terminal",
+            IconName::PanelBottom,
+            Some(Box::new(ToggleTerminal)),
+            |v, w, cx| v.toggle_terminal(w, cx),
+        ),
+        entry(
+            "Show terminal in side panel",
             IconName::SquareTerminal,
             Some(Box::new(ShowTerminal)),
             |v, w, cx| v.show_tab(Tab::Terminal, w, cx),
