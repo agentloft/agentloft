@@ -29,6 +29,8 @@ gpui_kit::assets::icon_assets!(
         Check,
         ChevronDown,
         ChevronUp,
+        ChevronsDownUp,
+        ChevronsUpDown,
         Clock,
         Cloud,
         ChevronRight,

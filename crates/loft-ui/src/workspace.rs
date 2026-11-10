@@ -143,6 +143,8 @@ pub struct WorkspaceView {
     query: String,
     /// The sidebar lists archived threads too.
     show_archived: bool,
+    /// The sidebar thread whose ··· menu is open.
+    row_menu: Option<ThreadId>,
     /// The open `/` or `@` completion popover.
     completion: Option<crate::completion::Completion>,
     completion_seq: u64,
@@ -249,6 +251,7 @@ impl WorkspaceView {
             search,
             query: String::new(),
             show_archived: false,
+            row_menu: None,
             completion: None,
             completion_seq: 0,
             pending_add_project: false,
@@ -2209,7 +2212,7 @@ impl WorkspaceView {
     // -- sidebar ------------------------------------------------------------
 
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let (projects, all_threads, selected, conn, error, unread) = {
+        let (projects, all_threads, selected, conn, error, unread, collapsed) = {
             let store = self.store.read(cx);
             (
                 store.workspace.projects.clone(),
@@ -2218,8 +2221,10 @@ impl WorkspaceView {
                 store.conn.clone(),
                 store.last_error.clone(),
                 store.unread.clone(),
+                store.collapsed.clone(),
             )
         };
+        let all_projects: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
         let query = self.query.clone();
         let mut list = v_flex().gap_4().px_2().pb_4();
 
@@ -2241,39 +2246,33 @@ impl WorkspaceView {
             if !query.is_empty() && threads.is_empty() {
                 continue;
             }
-            let header = h_flex()
-                .gap_2()
-                .items_center()
-                .px_2()
-                .text_color(p.muted_foreground)
-                .child(Icon::new(IconName::Folder).xsmall())
-                .child(
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(project.name.clone()),
-                )
-                .child(icon_button(
-                    format!("new-{}", project.id),
-                    IconName::Plus,
-                    p,
-                    cx.listener(move |this, _, _, cx| {
-                        this.new_thread(Some(project_id.clone()), cx)
-                    }),
-                ));
+            // Searching shows every match, folded or not.
+            let folded = query.is_empty() && collapsed.contains(&project.id);
+            let header = project_header(
+                &self.store,
+                project,
+                &threads,
+                folded,
+                &unread,
+                &all_projects,
+                p,
+                cx.listener(move |this, _, _, cx| this.new_thread(Some(project_id.clone()), cx)),
+            );
             let mut rows = v_flex().gap_px();
-            for (thread, depth) in nest_forks(threads) {
-                rows = rows.child(thread_row(
-                    &self.store,
-                    thread,
-                    depth,
-                    selected.as_ref() == Some(&thread.id),
-                    unread.contains(&thread.id),
-                    p,
-                    cx,
-                ));
+            if !folded {
+                for (thread, depth) in nest_forks(threads) {
+                    let id = thread.id.clone();
+                    rows = rows.child(thread_row(
+                        &self.store,
+                        thread,
+                        depth,
+                        selected.as_ref() == Some(&id),
+                        unread.contains(&id),
+                        self.row_menu.as_ref() == Some(&id),
+                        p,
+                        cx,
+                    ));
+                }
             }
             list = list.child(v_flex().gap_1().child(header).child(rows));
         }
@@ -2558,7 +2557,6 @@ impl WorkspaceView {
                         .child(chip),
                 )
                 .children(branch_chip)
-                .child(thread_menu(&thread, &self.store))
             })
             .when(has_thread, |d| {
                 let anchor = self.details_anchor.clone();
@@ -4130,6 +4128,163 @@ fn nest_forks(threads: Vec<&loft_protocol::Thread>) -> Vec<(&loft_protocol::Thre
     out
 }
 
+/// A project's sidebar heading. Clicking it folds or unfolds its threads;
+/// folded, it still says how many there are and whether any need you.
+#[allow(clippy::too_many_arguments)]
+fn project_header(
+    store: &Entity<AppStore>,
+    project: &loft_protocol::Project,
+    threads: &[&loft_protocol::Thread],
+    folded: bool,
+    unread: &std::collections::HashSet<ThreadId>,
+    all_projects: &[ProjectId],
+    p: &Palette,
+    on_new: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    let id = project.id.clone();
+    let group = SharedString::from(format!("project-{}", project.id));
+    let waiting = threads
+        .iter()
+        .any(|t| t.status == ThreadStatus::WaitingApproval);
+    let running = threads.iter().any(|t| t.status == ThreadStatus::Running);
+    let fresh = threads.iter().any(|t| unread.contains(&t.id));
+    // Folded: what you'd otherwise miss.
+    let summary: Option<AnyElement> = folded.then(|| {
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .when(waiting, |d| {
+                d.child(div().size(px(7.)).rounded_full().bg(p.warning))
+            })
+            .when(running && !waiting, |d| {
+                d.child(Spinner::new().xsmall().color(p.accent))
+            })
+            .when(fresh && !running && !waiting, |d| {
+                d.child(div().size(px(7.)).rounded_full().bg(p.accent))
+            })
+            .when(!threads.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child(threads.len().to_string()),
+                )
+            })
+            .into_any_element()
+    });
+    let toggle = {
+        let (store, id) = (store.clone(), id.clone());
+        move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
+            let id = id.clone();
+            store.update(cx, |s, cx| s.set_collapsed(&[id], !folded, cx));
+        }
+    };
+    let menu = {
+        let (store, all) = (store.clone(), all_projects.to_vec());
+        move |menu: gpui_kit::component::menu::PopupMenu,
+              _: &mut Window,
+              _: &mut Context<gpui_kit::component::menu::PopupMenu>| {
+            use gpui_kit::component::menu::PopupMenuItem;
+            let (s1, a1, s2, a2) = (store.clone(), all.clone(), store.clone(), all.clone());
+            menu.item(
+                PopupMenuItem::new("Collapse All")
+                    .icon(IconName::ChevronsDownUp)
+                    .on_click(move |_, _, cx| {
+                        s1.update(cx, |s, cx| s.set_collapsed(&a1, true, cx))
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Expand All")
+                    .icon(IconName::ChevronsUpDown)
+                    .on_click(move |_, _, cx| {
+                        s2.update(cx, |s, cx| s.set_collapsed(&a2, false, cx))
+                    }),
+            )
+        }
+    };
+    h_flex()
+        .id(SharedString::from(format!("project-head-{}", project.id)))
+        .group(group.clone())
+        .gap_2()
+        .items_center()
+        .pl_2()
+        .pr_1()
+        .h(px(28.))
+        .rounded(px(7.))
+        .cursor_pointer()
+        .text_color(p.muted_foreground)
+        .hover(|d| d.text_color(p.foreground))
+        // The folder turns into a chevron under the pointer.
+        .child(
+            div()
+                .relative()
+                .size(px(14.))
+                .flex_none()
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .group_hover(group.clone(), |d| d.invisible())
+                        .child(
+                            Icon::new(if folded {
+                                IconName::Folder
+                            } else {
+                                IconName::FolderOpen
+                            })
+                            .xsmall(),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .invisible()
+                        .group_hover(group.clone(), |d| d.visible())
+                        .child(
+                            Icon::new(if folded {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall(),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(project.name.clone()),
+        )
+        .children(summary)
+        .child(
+            div()
+                .id(SharedString::from(format!("new-wrap-{}", project.id)))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(icon_button(
+                    format!("new-{}", project.id),
+                    IconName::Plus,
+                    p,
+                    move |e, w, cx| {
+                        cx.stop_propagation();
+                        on_new(e, w, cx)
+                    },
+                )),
+        )
+        .on_click(toggle)
+        .context_menu(menu)
+        .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn thread_row(
     store: &Entity<AppStore>,
@@ -4137,6 +4292,7 @@ fn thread_row(
     depth: usize,
     active: bool,
     unread: bool,
+    menu_open: bool,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
@@ -4187,8 +4343,9 @@ fn thread_row(
         .id(SharedString::from(format!("thread-{}", thread.id)))
         .gap_2()
         .items_center()
-        .pl(px(26. + 14. * depth.min(4) as f32))
-        .pr_2()
+        .group("thread-row")
+        .pl(px(12. + 14. * depth.min(4) as f32))
+        .pr_1p5()
         .py(px(6.))
         .rounded(px(7.))
         .cursor_pointer()
@@ -4207,6 +4364,10 @@ fn thread_row(
                     .text_color(p.faint_foreground),
             )
         })
+        // Which agent runs it.
+        .child(div().flex_none().when(!active, |d| d.opacity(0.85)).child(
+            crate::brand::agent_logo(thread.harness.as_str(), px(14.), p),
+        ))
         .child(div().flex_1().min_w_0().truncate().child(title))
         .when(thread.workspace.branch().is_some(), |d| {
             d.child(
@@ -4215,7 +4376,65 @@ fn thread_row(
                     .text_color(p.faint_foreground),
             )
         })
-        .child(trailing)
+        // Under the pointer, the time (or status) makes way for a ··· menu.
+        .child(
+            div()
+                .relative()
+                .flex_none()
+                .min_w(px(22.))
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .when(menu_open, |d| d.invisible())
+                        .when(!menu_open, |d| {
+                            d.group_hover("thread-row", |d| d.invisible())
+                        })
+                        .child(trailing),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("row-menu-wrap-{}", thread.id)))
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .when(!menu_open, |d| {
+                            d.invisible().group_hover("thread-row", |d| d.visible())
+                        })
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child({
+                            use gpui_kit::component::button::{Button, ButtonVariants as _};
+                            use gpui_kit::component::menu::DropdownMenu as _;
+                            let row = thread.id.clone();
+                            let view = cx.entity().downgrade();
+                            Button::new(SharedString::from(format!("row-menu-{}", thread.id)))
+                                .cursor_pointer()
+                                .icon(IconName::Ellipsis)
+                                .ghost()
+                                .xsmall()
+                                .dropdown_menu_with_anchor(
+                                    gpui_kit::Anchor::TopRight,
+                                    thread_menu_items(thread, store),
+                                )
+                                .on_open_change(move |open, _, cx| {
+                                    let row = row.clone();
+                                    let open = *open;
+                                    _ = view.update(cx, |this, cx| {
+                                        if open {
+                                            this.row_menu = Some(row);
+                                        } else if this.row_menu.as_ref() == Some(&row) {
+                                            this.row_menu = None;
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                ),
+        )
         .on_click(
             cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
                 let id = id.clone();
@@ -4234,56 +4453,7 @@ fn thread_row(
             },
             |d, _, _, cx| cx.new(|_| d.clone()),
         )
-        .context_menu({
-            let store = store.clone();
-            let id = thread.id.clone();
-            let title = thread.title.clone();
-            let harness = thread.harness.clone();
-            move |menu, window, cx| {
-                use gpui_kit::component::menu::PopupMenuItem;
-                let (s1, i1, t1) = (store.clone(), id.clone(), title.clone());
-                let i2 = id.clone();
-                let mut menu = menu
-                    .item(
-                        PopupMenuItem::new("Rename…")
-                            .icon(IconName::SquarePen)
-                            .on_click(move |_, window, cx| {
-                                rename_dialog(s1.clone(), i1.clone(), t1.clone(), window, cx)
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new("Open in New Pane")
-                            .icon(IconName::Columns2)
-                            .on_click({
-                                let store = store.clone();
-                                move |_, _, cx| {
-                                    let id = i2.clone();
-                                    store.update(cx, |s, cx| s.open_pane(id, cx));
-                                }
-                            }),
-                    )
-                    .separator();
-                menu = fork_submenu(menu, &store, &id, &harness, window, cx);
-                let (s, i) = (store.clone(), id.clone());
-                let (s2, i2, t2) = (store.clone(), id.clone(), title.clone());
-                menu.separator()
-                    .item(
-                        PopupMenuItem::new("Archive")
-                            .icon(IconName::Archive)
-                            .on_click(move |_, _, cx| {
-                                let i = i.clone();
-                                s.update(cx, |s, cx| s.archive_thread(i, false, cx));
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new("Delete…")
-                            .icon(IconName::Trash)
-                            .on_click(move |_, window, cx| {
-                                confirm_delete(s2.clone(), i2.clone(), t2.clone(), window, cx)
-                            }),
-                    )
-            }
-        })
+        .context_menu(thread_menu_items(thread, store))
         .into_any_element()
 }
 
@@ -4616,9 +4786,17 @@ fn tilde(path: &str) -> String {
 }
 
 /// The header's thread menu: worktree actions and archive.
-fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyElement {
-    use gpui_kit::component::button::{Button, ButtonVariants as _};
-    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+/// A thread's actions (its sidebar row's ··· button and right-click).
+fn thread_menu_items(
+    thread: &loft_protocol::Thread,
+    store: &Entity<AppStore>,
+) -> impl Fn(
+    gpui_kit::component::menu::PopupMenu,
+    &mut Window,
+    &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu
++ 'static {
+    use gpui_kit::component::menu::PopupMenuItem;
     let store = store.clone();
     let id = thread.id.clone();
     let harness = thread.harness.clone();
@@ -4633,73 +4811,73 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
         thread.status,
         ThreadStatus::Running | ThreadStatus::WaitingApproval
     );
-    Button::new("thread-menu")
-        .cursor_pointer()
-        .icon(IconName::Ellipsis)
-        .ghost()
-        .xsmall()
-        .dropdown_menu(move |mut menu, window, cx| {
-            if let Some((path, branch, base)) = &worktree {
-                let (s, t) = (store.clone(), id.clone());
-                menu = menu
-                    .item(
-                        PopupMenuItem::new(format!("Merge into {base}"))
-                            .icon(IconName::GitMerge)
-                            .disabled(running)
-                            .on_click(move |_, _, cx| {
-                                let t = t.clone();
-                                s.update(cx, |s, cx| s.merge_thread(t, cx));
-                            }),
-                    )
-                    .item({
-                        let (s, t) = (store.clone(), id.clone());
-                        PopupMenuItem::new("Create pull request")
-                            .icon(IconName::GitPullRequest)
-                            .disabled(running)
-                            .on_click(move |_, _, cx| {
-                                let t = t.clone();
-                                s.update(cx, |s, cx| s.create_pull_request(t, cx));
-                            })
-                    })
-                    .item({
-                        let path = path.clone();
-                        PopupMenuItem::new("Reveal worktree in Finder")
-                            .icon(IconName::FolderOpen)
-                            .on_click(move |_, _, cx| {
-                                cx.reveal_path(std::path::Path::new(&path));
-                            })
-                    })
-                    .item({
-                        let branch = branch.clone();
-                        PopupMenuItem::new("Copy branch name")
-                            .icon(IconName::Copy)
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                                    branch.clone(),
-                                ));
-                            })
-                    })
-                    .separator();
-            }
-            let t = id.clone();
+    move |mut menu, window, cx| {
+        let (s1, i1, t1) = (store.clone(), id.clone(), title.clone());
+        menu = menu.item(
+            PopupMenuItem::new("Rename…")
+                .icon(IconName::SquarePen)
+                .on_click(move |_, window, cx| {
+                    rename_dialog(s1.clone(), i1.clone(), t1.clone(), window, cx)
+                }),
+        );
+        let (s, t) = (store.clone(), id.clone());
+        menu = menu
+            .item(
+                PopupMenuItem::new("Open in New Pane")
+                    .icon(IconName::Columns2)
+                    .on_click(move |_, _, cx| {
+                        let id = t.clone();
+                        s.update(cx, |s, cx| s.open_pane(id, cx));
+                    }),
+            )
+            .separator();
+        menu = fork_submenu(menu, &store, &id, &harness, window, cx);
+        if let Some((path, branch, base)) = &worktree {
+            let (s, t) = (store.clone(), id.clone());
+            let (s2, t2) = (store.clone(), id.clone());
+            let (path, branch) = (path.clone(), branch.clone());
             menu = menu
+                .separator()
                 .item(
-                    PopupMenuItem::new("Open in New Pane")
-                        .icon(IconName::Columns2)
-                        .on_click({
-                            let store = store.clone();
-                            move |_, _, cx| {
-                                let id = t.clone();
-                                store.update(cx, |s, cx| s.open_pane(id, cx));
-                            }
+                    PopupMenuItem::new(format!("Merge into {base}"))
+                        .icon(IconName::GitMerge)
+                        .disabled(running)
+                        .on_click(move |_, _, cx| {
+                            let t = t.clone();
+                            s.update(cx, |s, cx| s.merge_thread(t, cx));
                         }),
                 )
-                .separator();
-            menu = fork_submenu(menu, &store, &id, &harness, window, cx).separator();
-            let (s, t) = (store.clone(), id.clone());
-            let (s2, t2, title2) = (store.clone(), id.clone(), title.clone());
-            menu.item(
-                PopupMenuItem::new("Archive thread")
+                .item(
+                    PopupMenuItem::new("Create pull request")
+                        .icon(IconName::GitPullRequest)
+                        .disabled(running)
+                        .on_click(move |_, _, cx| {
+                            let t = t2.clone();
+                            s2.update(cx, |s, cx| s.create_pull_request(t, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Reveal worktree in Finder")
+                        .icon(IconName::FolderOpen)
+                        .on_click(move |_, _, cx| {
+                            cx.reveal_path(std::path::Path::new(&path));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Copy branch name")
+                        .icon(IconName::Copy)
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                                branch.clone(),
+                            ));
+                        }),
+                );
+        }
+        let (s, t) = (store.clone(), id.clone());
+        let (s2, t2, title2) = (store.clone(), id.clone(), title.clone());
+        menu.separator()
+            .item(
+                PopupMenuItem::new("Archive")
                     .icon(IconName::Archive)
                     .on_click(move |_, _, cx| {
                         let t = t.clone();
@@ -4707,14 +4885,13 @@ fn thread_menu(thread: &loft_protocol::Thread, store: &Entity<AppStore>) -> AnyE
                     }),
             )
             .item(
-                PopupMenuItem::new("Delete thread…")
+                PopupMenuItem::new("Delete…")
                     .icon(IconName::Trash)
                     .on_click(move |_, window, cx| {
                         confirm_delete(s2.clone(), t2.clone(), title2.clone(), window, cx)
                     }),
             )
-        })
-        .into_any_element()
+    }
 }
 
 /// "Fork ▸" with one entry per agent: the same agent continues the real

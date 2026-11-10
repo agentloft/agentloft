@@ -103,6 +103,9 @@ pub struct AppStore {
     /// it measures itself).
     pub max_cols: usize,
     pub max_rows: usize,
+    /// Projects folded in the sidebar (shared by every window, kept across
+    /// launches).
+    pub collapsed: std::collections::HashSet<ProjectId>,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
     /// Commands an agent offers in a folder, asked without a session
@@ -139,6 +142,7 @@ pub struct AppStore {
 
 impl AppStore {
     pub fn new(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut Context<Self>) -> Self {
+        let collapsed = load_collapsed(&paths);
         let mut this = Self {
             runtime,
             paths,
@@ -152,6 +156,7 @@ impl AppStore {
             layout: Vec::new(),
             max_cols: 4,
             max_rows: 2,
+            collapsed,
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
@@ -617,6 +622,27 @@ impl AppStore {
     /// The next thread selected (e.g. one being created) gets a new pane.
     pub fn expect_new_pane(&mut self) {
         self.next_in_new_pane = true;
+    }
+
+    /// Fold or unfold projects in the sidebar (and remember it).
+    pub fn set_collapsed(
+        &mut self,
+        projects: &[ProjectId],
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for p in projects {
+            if collapsed {
+                self.collapsed.insert(p.clone());
+            } else {
+                self.collapsed.remove(p);
+            }
+        }
+        let list: Vec<&str> = self.collapsed.iter().map(|p| p.as_str()).collect();
+        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "collapsed": list })) {
+            let _ = std::fs::write(sidebar_file(&self.paths), json);
+        }
+        cx.notify();
     }
 
     /// Where `thread` is shown: (column, row).
@@ -1218,6 +1244,22 @@ async fn pump(
             return;
         }
     }
+}
+
+fn sidebar_file(paths: &Paths) -> std::path::PathBuf {
+    paths.home.join("ui-sidebar.json")
+}
+
+/// The projects folded in the sidebar last time.
+fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
+    std::fs::read(sidebar_file(paths))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("collapsed").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<ProjectId>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
 }
 
 /// Where on a pane a dragged thread is dropped.
