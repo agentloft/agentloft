@@ -28,6 +28,8 @@ enum Target {
     Source(Source),
     /// Run the step's action with what's typed.
     Submit(Source, String),
+    /// New project: also make a private GitHub repository (on/off).
+    TogglePublish,
 }
 
 /// Ways to add a project.
@@ -55,6 +57,8 @@ struct Row {
     shortcut: Option<String>,
     icon: Option<IconName>,
     pinned: Option<bool>,
+    /// A checkbox at the end (an option row).
+    checked: Option<bool>,
 }
 
 impl Row {
@@ -66,6 +70,7 @@ impl Row {
             shortcut: None,
             icon: Some(icon),
             pinned: None,
+            checked: None,
         }
     }
 }
@@ -103,14 +108,24 @@ fn open_at(
     let first = cx.new(|cx| CommandState::new(window, cx));
     let focus = first.clone();
     let at = cx.new(|_| (start, first));
+    // New project: also publish to GitHub?
+    let publish = cx.new(|_| false);
+    store.update(cx, |s, cx| s.ensure_github_login(cx));
     let store = store.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let (current, state) = at.read(cx).clone();
         let query = state.read(cx).query(cx).to_string();
-        let rows = Rc::new(rows(&store, current, &query, cx));
+        let publishing = *publish.read(cx);
+        let rows = Rc::new(rows(&store, current, &query, publishing, cx));
         // Act on a row: open a thread, go to another step, or add a project.
         let pick = {
-            let (rows, view, at, store) = (rows.clone(), view.clone(), at.clone(), store.clone());
+            let (rows, view, at, store, publish) = (
+                rows.clone(),
+                view.clone(),
+                at.clone(),
+                store.clone(),
+                publish.clone(),
+            );
             Rc::new(move |ix: usize, window: &mut Window, cx: &mut App| {
                 let Some(row) = rows.get(ix) else {
                     return;
@@ -134,11 +149,25 @@ fn open_at(
                         });
                     }
                     Target::Source(src) => go(Step::Enter(src), window, cx),
+                    Target::TogglePublish => {
+                        publish.update(cx, |p, _| *p = !*p);
+                        window.refresh();
+                    }
                     Target::Submit(src, text) => {
                         window.close_dialog(cx);
                         let parent = store.read(cx).projects_parent();
                         let request = match src {
-                            Source::New => Request::CreateProject { parent, name: text },
+                            Source::New => Request::CreateProject {
+                                parent: Some(
+                                    store
+                                        .read(cx)
+                                        .new_projects_dir()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                ),
+                                name: text,
+                                github: *publish.read(cx),
+                            },
                             Source::GitHub => Request::CloneProject {
                                 parent,
                                 source: text,
@@ -236,6 +265,17 @@ fn open_at(
                             goto(&keys_at, back, window, cx);
                             return;
                         }
+                        // ⌘↩ creates the new project.
+                        if m.platform && ks.key == "enter" && at == Step::Enter(Source::New) {
+                            if let Some(ix) = keys_rows
+                                .iter()
+                                .position(|r| matches!(r.target, Target::Submit(..)))
+                            {
+                                cx.stop_propagation();
+                                keys_pick(ix, window, cx);
+                            }
+                            return;
+                        }
                         if !m.platform || at != Step::Projects {
                             return;
                         }
@@ -287,7 +327,13 @@ fn goto(at: &Entity<(Step, Entity<CommandState>)>, to: Step, window: &mut Window
 }
 
 /// The rows for a step.
-fn rows(store: &Entity<crate::store::AppStore>, step: Step, query: &str, cx: &App) -> Vec<Row> {
+fn rows(
+    store: &Entity<crate::store::AppStore>,
+    step: Step,
+    query: &str,
+    publishing: bool,
+    cx: &App,
+) -> Vec<Row> {
     match step {
         Step::Projects => project_rows(store, cx),
         Step::Sources => vec![
@@ -316,6 +362,43 @@ fn rows(store: &Entity<crate::store::AppStore>, step: Step, query: &str, cx: &Ap
                 IconName::Github,
             ),
         ],
+        Step::Enter(Source::New) => {
+            let dir = crate::workspace::tilde_path_str(
+                &store.read(cx).new_projects_dir().to_string_lossy(),
+            );
+            let text = query.trim();
+            let mut rows = vec![if text.is_empty() {
+                Row::plain(
+                    Target::Source(Source::New),
+                    "Type a name for the project",
+                    &format!("Goes in {dir}"),
+                    IconName::Info,
+                )
+            } else {
+                Row {
+                    shortcut: Some("⌘↩".into()),
+                    ..Row::plain(
+                        Target::Submit(Source::New, text.to_owned()),
+                        &format!("Create “{text}”"),
+                        &format!("Goes in {dir}/{}", slug(text)),
+                        IconName::FolderGit2,
+                    )
+                }
+            }];
+            // Publishing needs gh signed in.
+            if let Some(Some(login)) = &store.read(cx).github_login {
+                rows.push(Row {
+                    checked: Some(publishing),
+                    ..Row::plain(
+                        Target::TogglePublish,
+                        "Create private repository on GitHub",
+                        login,
+                        IconName::Github,
+                    )
+                });
+            }
+            rows
+        }
         Step::Enter(src) => {
             let parent = crate::workspace::tilde_path_str(&store.read(cx).projects_parent());
             let text = query.trim();
@@ -343,6 +426,24 @@ fn rows(store: &Entity<crate::store::AppStore>, step: Step, query: &str, cx: &Ap
                 icon,
             )]
         }
+    }
+}
+
+/// The folder name a project gets ("Pinball Stats" → pinball-stats).
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let out = out.trim_end_matches('-').to_owned();
+    if out.is_empty() {
+        "project".into()
+    } else {
+        out
     }
 }
 
@@ -386,6 +487,7 @@ fn project_rows(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<Row> {
             shortcut: (n <= 9).then(|| format!("⌘{n}")),
             icon: None,
             pinned: Some(pinned.contains(&p.id)),
+            checked: None,
         });
         // No project sits right under the current one (or first).
         if rows.len() == 1 && is_current {
@@ -412,6 +514,7 @@ fn chat_row() -> Row {
         shortcut: Some("⌥⌘N".into()),
         icon: Some(IconName::MessageSquareDashed),
         pinned: None,
+        checked: None,
     }
 }
 
@@ -502,6 +605,25 @@ fn render_row(row: &Row, toggle_pin: PinFn, cx: &App) -> AnyElement {
                 .when_some_detail(row.detail.clone(), &p),
         )
         .children(pin)
+        .children(row.checked.map(|on| {
+            div()
+                .flex_none()
+                .size(px(18.))
+                .rounded(px(5.))
+                .border_1()
+                .border_color(if on { p.accent } else { p.border })
+                .when(on, |d| d.bg(p.accent))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(on, |d| {
+                    d.child(
+                        gpui_kit::component::Icon::new(IconName::Check)
+                            .size(px(12.))
+                            .text_color(p.accent_foreground),
+                    )
+                })
+        }))
         .children(row.shortcut.clone().map(|k| {
             div()
                 .flex_none()

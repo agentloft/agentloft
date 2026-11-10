@@ -1223,35 +1223,40 @@ async fn threads_can_be_spawned_in_another_project_or_as_a_chat() {
 async fn new_projects_are_fresh_git_repos() {
     let f = fixture();
     let parent = tempfile::tempdir().unwrap();
-    let Response::Project { project } = f
-        .core
-        .handle(Request::CreateProject {
-            parent: parent.path().to_string_lossy().into_owned(),
-            name: "fresh".into(),
-        })
-        .await
-        .unwrap()
-    else {
+    let create = |name: &str| {
+        let core = f.core.clone();
+        let (parent, name) = (
+            parent.path().to_string_lossy().into_owned(),
+            name.to_owned(),
+        );
+        async move {
+            core.handle(Request::CreateProject {
+                parent: Some(parent),
+                name,
+                github: false,
+            })
+            .await
+        }
+    };
+    let Response::Project { project } = create("Fresh Start").await.unwrap() else {
         panic!()
     };
-    assert_eq!(project.name, "fresh");
+    // Named as typed, in a folder named after it, with a README.
+    assert_eq!(project.name, "Fresh Start");
+    let root = std::path::Path::new(&project.root_path);
+    assert_eq!(root.file_name().unwrap(), "fresh-start");
+    assert!(root.join(".git").exists());
+    assert!(root.join("README.md").exists());
+    // The same name again gets a folder of its own.
+    let Response::Project { project: again } = create("Fresh Start").await.unwrap() else {
+        panic!()
+    };
     assert!(
-        std::path::Path::new(&project.root_path)
-            .join(".git")
-            .exists()
+        again.root_path.ends_with("fresh-start-2"),
+        "{}",
+        again.root_path
     );
-    // Not twice, and not a path.
-    for name in ["fresh", "a/b", ""] {
-        assert!(
-            f.core
-                .handle(Request::CreateProject {
-                    parent: parent.path().to_string_lossy().into_owned(),
-                    name: name.into(),
-                })
-                .await
-                .is_err()
-        );
-    }
+    assert!(create("  ").await.is_err());
 }
 
 #[tokio::test]

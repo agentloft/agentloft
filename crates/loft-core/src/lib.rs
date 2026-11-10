@@ -70,6 +70,8 @@ pub struct CoreOptions {
     /// Where per-thread worktrees go (`~/.agentloft/worktrees`).
     /// Where chats (threads without a project) work.
     pub chats_dir: PathBuf,
+    /// Where new projects (made from a name) go.
+    pub projects_dir: PathBuf,
     pub worktrees_dir: PathBuf,
     /// `config.toml`, re-read on `Request::ReloadConfig`.
     pub config_file: Option<PathBuf>,
@@ -86,6 +88,7 @@ impl Default for CoreOptions {
             mcp_bridge: None,
             worktrees_dir: std::env::temp_dir().join("agentloft-worktrees"),
             chats_dir: std::env::temp_dir().join("agentloft-chats"),
+            projects_dir: std::env::temp_dir().join("agentloft-projects"),
             config_file: None,
             attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
         }
@@ -534,7 +537,18 @@ impl Core {
             Request::Ping => Ok(Response::Pong),
             Request::AddProject { path, name } => self.add_project(path, name),
             Request::CreateChat { harness } => self.create_chat(harness),
-            Request::CreateProject { parent, name } => self.create_project(parent, name).await,
+            Request::CreateProject {
+                parent,
+                name,
+                github,
+            } => self.create_project(parent, name, github).await,
+            Request::GitHubLogin => {
+                let env = self.opts().env.clone();
+                let login = worktrees::blocking(move || Ok(loft_git::github_login(&env)))
+                    .await?
+                    .unwrap_or_default();
+                Ok(Response::Text { text: login })
+            }
             Request::RenameProject { project_id, name } => {
                 let name = name.trim().to_owned();
                 if name.is_empty() {
@@ -863,21 +877,58 @@ impl Core {
         Ok(Response::Ok)
     }
 
-    async fn create_project(&self, parent: String, name: String) -> CoreResult<Response> {
+    async fn create_project(
+        &self,
+        parent: Option<String>,
+        name: String,
+        github: bool,
+    ) -> CoreResult<Response> {
         let name = name.trim().to_owned();
-        if name.is_empty() || name.contains('/') || name.starts_with('.') {
-            return Err(ErrorBody::new(ErrorCode::BadRequest, "not a folder name"));
-        }
-        let dir = expand_tilde(&parent).join(&name);
-        if dir.exists() {
+        if name.is_empty() {
             return Err(ErrorBody::new(
-                ErrorCode::Conflict,
-                format!("{} already exists", dir.display()),
+                ErrorCode::BadRequest,
+                "the project needs a name",
             ));
         }
-        let at = dir.clone();
-        worktrees::blocking(move || loft_git::init_repo(&at)).await?;
-        self.add_project(dir.to_string_lossy().into_owned(), Some(name))
+        let parent = match parent {
+            Some(p) => expand_tilde(&p),
+            None => self.opts().projects_dir.clone(),
+        };
+        // "Pinball Stats" → pinball-stats (-2, -3… if taken).
+        let slug = worktrees::slug_or(&name, "project");
+        let mut dir = parent.join(&slug);
+        let mut n = 2;
+        while dir.exists() {
+            dir = parent.join(format!("{slug}-{n}"));
+            n += 1;
+        }
+        let (at, env, title) = (dir.clone(), self.opts().env.clone(), name.clone());
+        let committed = worktrees::blocking(move || {
+            loft_git::init_repo(&at)?;
+            loft_git::first_commit(&at, &title, &env)
+        })
+        .await?;
+        let added = self.add_project(dir.to_string_lossy().into_owned(), Some(name))?;
+        if github {
+            let repo = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(slug);
+            let (at, env) = (dir.clone(), self.opts().env.clone());
+            if let Err(e) =
+                worktrees::blocking(move || loft_git::publish_github(&at, &repo, committed, &env))
+                    .await
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "The project was created, but publishing it to GitHub failed: {}",
+                        e.message
+                    ),
+                ));
+            }
+        }
+        Ok(added)
     }
 
     async fn clone_project(

@@ -346,6 +346,78 @@ pub fn init_repo(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A README naming the project and, when git knows who's committing, a
+/// first commit. Returns whether it committed.
+pub fn first_commit(
+    dir: &Path,
+    name: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<bool> {
+    std::fs::write(dir.join("README.md"), format!("# {name}\n"))
+        .with_context(|| format!("write README in {}", dir.display()))?;
+    let who = |key: &str| {
+        let mut c = git(dir);
+        c.envs(env).args(["config", key]);
+        run(&mut c).map(|v| !v.trim().is_empty()).unwrap_or(false)
+    };
+    if !who("user.name") || !who("user.email") {
+        return Ok(false);
+    }
+    let mut add = git(dir);
+    add.envs(env).args(["add", "-A"]);
+    run(&mut add)?;
+    let mut commit = git(dir);
+    commit
+        .envs(env)
+        .args(["commit", "--quiet", "-m", "Initial commit"]);
+    run(&mut commit)?;
+    Ok(true)
+}
+
+/// A private GitHub repository named `name` for the repo at `dir`, added
+/// as `origin` (and pushed when it has commits), through `gh`.
+pub fn publish_github(
+    dir: &Path,
+    name: &str,
+    push: bool,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if !which("gh", env) {
+        bail!("the GitHub CLI (gh) isn't installed");
+    }
+    let mut cmd = Command::new("gh");
+    cmd.args(["repo", "create", name, "--private", "--source", "."])
+        .args(["--remote", "origin"]);
+    if push {
+        cmd.arg("--push");
+    }
+    cmd.current_dir(dir)
+        .envs(env)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null());
+    let out = cmd.output().context("run gh")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// The GitHub account `gh` is signed in to, if any.
+pub fn github_login(env: &std::collections::HashMap<String, String>) -> Option<String> {
+    if !which("gh", env) {
+        return None;
+    }
+    let out = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .envs(env)
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let login = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !login.is_empty()).then_some(login)
+}
+
 /// Clone `url` into `dest` (which must not exist yet). `env` is the login
 /// environment (credentials, SSH agent); GitHub `owner/repo` goes through
 /// `gh` when it's installed (private repos), else plain https.

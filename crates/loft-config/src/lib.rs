@@ -78,6 +78,11 @@ impl Paths {
         self.home.join("chats")
     }
 
+    /// New projects (made from a name) live here, a folder each.
+    pub fn projects_dir(&self) -> PathBuf {
+        self.home.join("projects")
+    }
+
     /// Create the directory layout. `run/` is private (0700).
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
@@ -142,9 +147,12 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ProjectsConfig {
-    /// Where Add Project starts browsing and where new and cloned projects
-    /// go (`~` allowed); unset = the home folder.
+    /// Where Add Project starts browsing and where clones go (`~`
+    /// allowed); unset = the home folder.
     pub base_dir: Option<String>,
+    /// Where new projects (made from a name) go; unset =
+    /// `~/.agentloft/projects`.
+    pub new_dir: Option<String>,
 }
 
 /// `[worktrees]` in config.toml (PLAN §5.2).

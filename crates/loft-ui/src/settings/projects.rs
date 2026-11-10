@@ -93,12 +93,19 @@ impl SettingsView {
             self.projects.names.insert(project.id.clone(), (input, sub));
         }
 
-        let mut page = v_flex().child(row(
-            "New projects start in",
-            "Where Add Project starts browsing, and where new and cloned projects go. Empty: your home folder.",
-            text_input(&self.input(Field::ProjectsDir)),
-            p,
-        ));
+        let mut page = v_flex()
+            .child(row(
+                "New projects go in",
+                "Where a project made from a name is created (a folder named after it). Empty: ~/.agentloft/projects.",
+                text_input(&self.input(Field::NewProjectsDir)),
+                p,
+            ))
+            .child(row(
+                "Add project starts in",
+                "Where Add Project's folder browser opens, and where clones go. Empty: your home folder.",
+                text_input(&self.input(Field::ProjectsDir)),
+                p,
+            ));
         page = page.child(
             div()
                 .pt_6()

@@ -84,12 +84,20 @@ pub enum Request {
     RemoveProject {
         project_id: ProjectId,
     },
-    /// A new project: an empty git repository named `name` in `parent`
-    /// (answers `Response::Project`).
+    /// A new project named `name`: a git repository (README, first commit)
+    /// in a folder named after it, under `parent` (default: Agentloft's
+    /// projects folder), optionally published as a private GitHub
+    /// repository. Answers `Response::Project`.
     CreateProject {
-        parent: String,
+        #[serde(default)]
+        parent: Option<String>,
         name: String,
+        #[serde(default)]
+        github: bool,
     },
+    /// The GitHub account `gh` is signed in to (`Response::Text`, empty if
+    /// none).
+    GitHubLogin,
     /// A project cloned from `source` (a git URL, or GitHub `owner/repo`
     /// with `github`) into `parent` (answers `Response::Project`).
     CloneProject {

@@ -254,6 +254,7 @@ pub(super) enum Field {
     MonoFont,
     BranchPrefix,
     ProjectsDir,
+    NewProjectsDir,
 }
 
 impl Field {
@@ -263,6 +264,7 @@ impl Field {
             Field::MonoFont => &["ui", "mono_font_family"],
             Field::BranchPrefix => &["worktrees", "branch_prefix"],
             Field::ProjectsDir => &["projects", "base_dir"],
+            Field::NewProjectsDir => &["projects", "new_dir"],
         }
     }
 
@@ -272,6 +274,7 @@ impl Field {
             Field::MonoFont => c.ui.mono_font_family.clone().unwrap_or_default(),
             Field::BranchPrefix => c.worktrees.branch_prefix.clone(),
             Field::ProjectsDir => c.projects.base_dir.clone().unwrap_or_default(),
+            Field::NewProjectsDir => c.projects.new_dir.clone().unwrap_or_default(),
         }
     }
 
@@ -281,6 +284,7 @@ impl Field {
             Field::MonoFont => "Theme monospace font",
             Field::BranchPrefix => "agentloft",
             Field::ProjectsDir => "~/",
+            Field::NewProjectsDir => "~/.agentloft/projects",
         }
     }
 
@@ -288,7 +292,10 @@ impl Field {
     fn value(self, text: &str) -> SettingValue {
         let text = text.trim();
         match (self, text.is_empty()) {
-            (Field::UiFont | Field::MonoFont | Field::ProjectsDir, true) => SettingValue::Unset,
+            (
+                Field::UiFont | Field::MonoFont | Field::ProjectsDir | Field::NewProjectsDir,
+                true,
+            ) => SettingValue::Unset,
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
             _ => SettingValue::Str(text.to_owned()),
         }
@@ -296,7 +303,10 @@ impl Field {
 
     /// Settings the daemon reads (it reloads on change).
     fn is_daemon(self) -> bool {
-        !matches!(self, Field::UiFont | Field::MonoFont | Field::ProjectsDir)
+        !matches!(
+            self,
+            Field::UiFont | Field::MonoFont | Field::ProjectsDir | Field::NewProjectsDir
+        )
     }
 }
 
@@ -337,6 +347,7 @@ impl SettingsView {
             Field::MonoFont,
             Field::BranchPrefix,
             Field::ProjectsDir,
+            Field::NewProjectsDir,
         ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {

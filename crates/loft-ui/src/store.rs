@@ -110,6 +110,9 @@ pub struct AppStore {
     pub folded_threads: std::collections::HashSet<ThreadId>,
     /// Projects pinned to the top (sidebar and pickers), in pin order.
     pub pinned_projects: Vec<ProjectId>,
+    /// The GitHub account `gh` is signed in to: `None` = not asked yet,
+    /// `Some(None)` = asked, none (yet).
+    pub github_login: Option<Option<String>>,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
     /// Commands an agent offers in a folder, asked without a session
@@ -165,6 +168,7 @@ impl AppStore {
             collapsed,
             folded_threads,
             pinned_projects,
+            github_login: None,
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
@@ -898,24 +902,55 @@ impl AppStore {
         });
     }
 
-    /// Where Add Project starts and new and cloned projects go: Settings ▸
-    /// Projects ▸ "New projects start in", else the home folder.
-    pub fn projects_base(&self) -> std::path::PathBuf {
+    /// A `[projects]` folder setting, `~` expanded, if set.
+    fn projects_setting(
+        &self,
+        pick: impl Fn(&loft_config::ProjectsConfig) -> Option<String>,
+    ) -> Option<std::path::PathBuf> {
         let home = std::env::home_dir().unwrap_or_else(|| "/".into());
         loft_config::Config::load(&self.paths)
             .ok()
-            .and_then(|c| c.projects.base_dir)
+            .and_then(|c| pick(&c.projects))
             .map(|d| d.trim().to_owned())
             .filter(|d| !d.is_empty())
             .map(|d| match d.strip_prefix('~') {
                 Some(rest) => home.join(rest.trim_start_matches('/')),
                 None => d.into(),
             })
-            .unwrap_or(home)
+    }
+
+    /// Where Add Project's folder browser opens and clones go: Settings ▸
+    /// Projects ▸ "Add project starts in", else the home folder.
+    pub fn projects_base(&self) -> std::path::PathBuf {
+        self.projects_setting(|p| p.base_dir.clone())
+            .unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| "/".into()))
+    }
+
+    /// Where new projects (made from a name) go: Settings ▸ Projects ▸ "New
+    /// projects go in", else ~/.agentloft/projects.
+    pub fn new_projects_dir(&self) -> std::path::PathBuf {
+        self.projects_setting(|p| p.new_dir.clone())
+            .unwrap_or_else(|| self.paths.projects_dir())
     }
 
     pub fn projects_parent(&self) -> String {
         self.projects_base().to_string_lossy().into_owned()
+    }
+
+    /// Ask (once) which GitHub account `gh` is signed in to.
+    pub fn ensure_github_login(&mut self, cx: &mut Context<Self>) {
+        if self.github_login.is_some() {
+            return;
+        }
+        self.github_login = Some(None);
+        self.request(Request::GitHubLogin, cx, |store, resp, cx| {
+            if let Response::Text { text } = resp
+                && !text.is_empty()
+            {
+                store.github_login = Some(Some(text));
+                cx.notify();
+            }
+        });
     }
 
     pub fn rename_project(&mut self, project_id: ProjectId, name: String, cx: &mut Context<Self>) {
