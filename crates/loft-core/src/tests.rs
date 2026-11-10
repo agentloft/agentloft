@@ -715,7 +715,14 @@ async fn pull_request_pushes_branch_and_calls_gh() {
     let remote = dir.path().join("remote.git");
     git(
         dir.path(),
-        &["init", "-q", "--bare", remote.to_str().unwrap()],
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
     );
     git(
         &repo,

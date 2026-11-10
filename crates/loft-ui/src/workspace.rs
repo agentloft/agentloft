@@ -2623,7 +2623,10 @@ impl WorkspaceView {
                         "new-thread",
                         IconName::SquarePen,
                         p,
-                        cx.listener(|this, _, _, cx| this.new_thread(None, cx)),
+                        // Where it goes: a project, or none.
+                        cx.listener(|this, _, window, cx| {
+                            crate::new_in::open(cx.entity(), &this.store, window, cx)
+                        }),
                     )),
             )
             .child(

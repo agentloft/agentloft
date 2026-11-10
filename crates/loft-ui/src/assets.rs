@@ -70,6 +70,7 @@ gpui_kit::assets::icon_assets!(
         Minus,
         MousePointerClick,
         MessageSquare,
+        MessageSquareDashed,
         Palette,
         MessageSquarePlus,
         User,

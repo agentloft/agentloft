@@ -137,7 +137,7 @@ pub fn open(
 }
 
 /// "↑ ↓ Navigate · Enter Select · Esc Close" under the list.
-fn key_hints(cx: &App) -> gpui_kit::AnyElement {
+pub(crate) fn key_hints(cx: &App) -> gpui_kit::AnyElement {
     use gpui_kit::component::Sizable as _;
     use gpui_kit::{IntoElement as _, div};
     let p = crate::theme::Palette::of(cx);

@@ -16,6 +16,7 @@ mod image_preview;
 mod info_cards;
 mod items;
 mod model_picker;
+mod new_in;
 mod palette;
 pub mod panel;
 pub mod settings;

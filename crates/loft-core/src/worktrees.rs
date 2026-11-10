@@ -571,7 +571,7 @@ mod tests {
             ("main".into(), "main".into())
         );
         let remote = tempfile::tempdir().unwrap();
-        git(remote.path(), &["init", "-q", "--bare"]);
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
         git(
             r,
             &["remote", "add", "origin", &remote.path().to_string_lossy()],

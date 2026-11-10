@@ -400,7 +400,7 @@ mod tests {
         let dir = repo();
         let root = dir.path();
         let remote = tempfile::tempdir().unwrap();
-        run(git(remote.path()).args(["init", "-q", "--bare"])).unwrap();
+        run(git(remote.path()).args(["init", "-q", "--bare", "-b", "main"])).unwrap();
         let url = remote.path().to_string_lossy().into_owned();
         run(git(root).args(["remote", "add", "origin", &url])).unwrap();
         run(git(root).args(["push", "-q", "origin", "main"])).unwrap();
@@ -440,7 +440,7 @@ mod tests {
         let dir = repo();
         let root = dir.path();
         let remote = tempfile::tempdir().unwrap();
-        run(git(remote.path()).args(["init", "-q", "--bare"])).unwrap();
+        run(git(remote.path()).args(["init", "-q", "--bare", "-b", "main"])).unwrap();
         let url = remote.path().to_string_lossy().into_owned();
         run(git(root).args(["remote", "add", "origin", &url])).unwrap();
         let wt_parent = tempfile::tempdir().unwrap();
