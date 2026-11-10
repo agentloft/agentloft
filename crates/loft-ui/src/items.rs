@@ -571,6 +571,10 @@ pub(crate) fn render_item(
             let open = state.is_expanded(&item.id, false);
             let key = item.id.clone();
             let thread = thread.clone();
+            // Agents end a thought with blank lines (and stream them ahead of
+            // the next paragraph); drawn as they are, they leave a hole under
+            // the text.
+            let text = text.trim();
             v_flex()
                 .gap_1()
                 .child(
@@ -608,7 +612,7 @@ pub(crate) fn render_item(
                             .border_color(p.border)
                             .text_sm()
                             .text_color(p.muted_foreground)
-                            .child(text.clone()),
+                            .child(text.to_string()),
                     )
                 })
                 .into_any_element()
