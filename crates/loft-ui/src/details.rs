@@ -31,8 +31,9 @@ const PAD: f32 = 6.;
 const DIVIDER: f32 = 13.;
 /// A section heading ("Subagents").
 const SECTION: f32 = 24.;
-/// The card is no taller than this: its lists scroll.
-const MAX_HEIGHT: f32 = 600.;
+/// Room for the lists (subagents, started threads): a heading and five and
+/// a half rows, the half saying there is more. Longer lists scroll.
+const LISTS_MAX: f32 = SECTION + ROW * 5.5;
 
 /// The thread's subagents, oldest first.
 fn subagents(store: &AppStore, thread_id: &ThreadId, cx: &App) -> Vec<loft_protocol::Item> {
@@ -265,11 +266,11 @@ pub fn open(
     let agents = subagents(store.read(cx), &thread_id, cx).len() as f32;
     let threads = started_threads(store.read(cx), &thread_id).len() as f32;
     let parent = if info.parent.is_some() { 1. } else { 0. };
-    let rows = 3. + parent + agents + threads;
-    let lists = agents.min(1.) + threads.min(1.);
-    let dividers = 1. + parent + lists;
-    let height = PAD * 2. + TALL_ROW + rows * ROW + dividers * DIVIDER + lists * SECTION + 4.;
-    let height = height.min(MAX_HEIGHT);
+    // What the thread is (a line under it when lists follow), then the lists.
+    let sections = agents.min(1.) + threads.min(1.);
+    let top = TALL_ROW + (3. + parent) * ROW + (1. + parent + sections.min(1.)) * DIVIDER;
+    let lists = (agents + threads) * ROW + sections * SECTION + (sections - 1.).max(0.) * DIVIDER;
+    let height = PAD * 2. + top + lists.min(LISTS_MAX) + 4.;
     let win = window.bounds();
     let x = f32::from(win.origin.x + anchor.origin.x + anchor.size.width) - WIDTH;
     let y = f32::from(win.origin.y + anchor.origin.y + anchor.size.height) + 4.;
@@ -808,7 +809,11 @@ impl Render for DetailsCard {
             );
         }
 
-        let mut lists = v_flex().id("details-list").min_h_0().overflow_y_scroll();
+        let mut lists = v_flex()
+            .id("details-list")
+            .min_h_0()
+            .max_h(px(LISTS_MAX))
+            .overflow_y_scroll();
         // Subagents: open one, or stop it while it runs.
         let (agents, harness) = {
             let store = self.store.read(cx);
@@ -964,11 +969,7 @@ impl Render for DetailsCard {
             .font_weight(FontWeight::NORMAL);
         match place {
             // No taller than its column either.
-            Place::Docked => card
-                .w_full()
-                .min_h_0()
-                .max_h(px(MAX_HEIGHT))
-                .into_any_element(),
+            Place::Docked => card.w_full().min_h_0().into_any_element(),
             Place::Window => div()
                 .size_full()
                 .track_focus(&self.focus)
@@ -983,7 +984,6 @@ impl Render for DetailsCard {
                 // As tall as what it lists, within the window.
                 let at = cx.try_global::<Overlay>().map_or(0., |o| f32::from(o.at.y));
                 let room = f32::from(window.viewport_size().height) - at - 8.;
-                let room = room.min(MAX_HEIGHT);
                 div()
                     .w_full()
                     .track_focus(&self.focus)
