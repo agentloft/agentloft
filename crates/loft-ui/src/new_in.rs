@@ -656,7 +656,7 @@ impl DetailExt for gpui_kit::Div {
 }
 
 /// "Matter & Why" → "MW"; "agentloft" → "AT" (first and last letter).
-fn initials(name: &str) -> String {
+pub(crate) fn initials(name: &str) -> String {
     let words: Vec<&str> = name
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -678,7 +678,7 @@ fn initials(name: &str) -> String {
 }
 
 /// A steady colour per project name.
-fn badge_color(name: &str) -> Hsla {
+pub(crate) fn badge_color(name: &str) -> Hsla {
     const HUES: [f32; 8] = [205., 150., 0., 85., 38., 270., 175., 325.];
     let hash = name
         .bytes()

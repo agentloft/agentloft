@@ -79,6 +79,12 @@ pub enum Request {
         project_id: ProjectId,
         name: String,
     },
+    /// What new threads in a project start with (answers
+    /// `Response::Project`).
+    SetProjectDefaults {
+        project_id: ProjectId,
+        defaults: ProjectDefaults,
+    },
     /// Remove a project from Agentloft: its threads are deleted (worktrees
     /// and checkpoints too); the folder on disk is left alone.
     RemoveProject {

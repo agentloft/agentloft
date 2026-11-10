@@ -458,6 +458,7 @@ mod tests {
             name: "p".into(),
             root_path: "/tmp/p".into(),
             created_at_ms: 1,
+            defaults: Default::default(),
         }
     }
 

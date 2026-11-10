@@ -1303,3 +1303,36 @@ async fn removing_a_project_deletes_its_threads_not_its_files() {
     let again = new_thread(&f.core, f._dir.path()).await;
     assert_ne!(again.project_id, thread.project_id);
 }
+
+#[tokio::test]
+async fn project_defaults_shape_new_threads() {
+    let f = fixture();
+    let first = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SetProjectDefaults {
+            project_id: first.project_id.clone(),
+            defaults: loft_protocol::ProjectDefaults {
+                agent: Some(HarnessId(HarnessId::FAKE.into())),
+                model: Some("fast".into()),
+                effort: Some("low".into()),
+                worktree: Some(false),
+            },
+        })
+        .await
+        .unwrap();
+    let Response::Thread { thread } = f
+        .core
+        .handle(Request::CreateThread {
+            project_id: first.project_id.clone(),
+            harness: HarnessId(HarnessId::FAKE.into()),
+            title: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.model.as_deref(), Some("fast"));
+    assert_eq!(thread.effort.as_deref(), Some("low"));
+    assert_eq!(thread.workspace, ThreadWorkspace::Local);
+}

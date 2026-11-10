@@ -30,6 +30,7 @@ gpui_kit::assets::icon_assets!(
         Brain,
         Check,
         ChevronDown,
+        ChevronLeft,
         ChevronUp,
         ChevronsDownUp,
         ChevronsUpDown,

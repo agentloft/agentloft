@@ -564,6 +564,19 @@ impl Core {
                 Ok(Response::Project { project })
             }
             Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
+            Request::SetProjectDefaults {
+                project_id,
+                defaults,
+            } => {
+                let mut project = self
+                    .with_store(|s| s.project(&project_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+                project.defaults = defaults;
+                self.commit(vec![Event::ProjectUpdated {
+                    project: project.clone(),
+                }])?;
+                Ok(Response::Project { project })
+            }
             Request::CloneProject {
                 parent,
                 source,
@@ -852,6 +865,7 @@ impl Core {
             }),
             root_path,
             created_at_ms: now_ms(),
+            defaults: Default::default(),
         };
         self.commit(vec![Event::ProjectAdded {
             project: project.clone(),
@@ -1022,18 +1036,37 @@ impl Core {
         harness: HarnessId,
         title: Option<String>,
     ) -> CoreResult<Response> {
+        let project = self
+            .with_store(|s| s.project(&project_id))?
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+        // The project's own defaults come first (Settings ▸ Projects).
+        let d = project.defaults.clone();
+        let harness = d
+            .agent
+            .clone()
+            .filter(|a| self.harness(a).is_some())
+            .unwrap_or(harness);
         if self.harness(&harness).is_none() {
             return Err(ErrorBody::new(
                 ErrorCode::BadRequest,
                 format!("unknown harness `{harness}`"),
             ));
         }
-        let project = self
-            .with_store(|s| s.project(&project_id))?
-            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let now = now_ms();
-        let workspace = self.default_workspace(&project.root_path);
+        let workspace = match d.worktree {
+            Some(true)
+                if loft_git::repo_root(std::path::Path::new(&project.root_path)).is_some() =>
+            {
+                loft_protocol::ThreadWorkspace::NewWorktree { base: None }
+            }
+            Some(_) => loft_protocol::ThreadWorkspace::Local,
+            None => self.default_workspace(&project.root_path),
+        };
         let (model, permission_mode, effort) = thread_defaults(&self.config(), &harness);
+        // A model and effort set for the project's agent.
+        let own = d.agent.as_ref() == Some(&harness);
+        let model = d.model.clone().filter(|_| own).or(model);
+        let effort = d.effort.clone().filter(|_| own).or(effort);
         let thread = Thread {
             id: ThreadId::new(),
             project_id,

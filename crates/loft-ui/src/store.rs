@@ -953,6 +953,23 @@ impl AppStore {
         });
     }
 
+    /// What new threads in a project start with.
+    pub fn set_project_defaults(
+        &mut self,
+        project_id: ProjectId,
+        defaults: loft_protocol::ProjectDefaults,
+        cx: &mut Context<Self>,
+    ) {
+        self.request(
+            Request::SetProjectDefaults {
+                project_id,
+                defaults,
+            },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
     pub fn rename_project(&mut self, project_id: ProjectId, name: String, cx: &mut Context<Self>) {
         self.request(
             Request::RenameProject { project_id, name },

@@ -9,6 +9,32 @@ pub struct Project {
     pub name: String,
     pub root_path: String,
     pub created_at_ms: i64,
+    /// What new threads in this project start with (unset = the global
+    /// defaults).
+    #[serde(default, skip_serializing_if = "ProjectDefaults::is_empty")]
+    pub defaults: ProjectDefaults,
+}
+
+/// A project's own defaults for new threads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectDefaults {
+    /// The agent new threads use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<HarnessId>,
+    /// Its model (for `agent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// `Some(true)`: a new worktree each; `Some(false)`: the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<bool>,
+}
+
+impl ProjectDefaults {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A thread whose conversation mentions what was searched for.

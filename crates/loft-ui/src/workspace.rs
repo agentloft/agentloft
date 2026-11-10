@@ -4554,7 +4554,7 @@ fn project_header(
             } else {
                 let pinned = store.read(cx).pinned_projects.contains(&this_id);
                 let (s3, i3) = (store.clone(), this_id.clone());
-                let s4 = store.clone();
+                let (s4, i4) = (store.clone(), this_id.clone());
                 let (s5, i5, n5) = (store.clone(), this_id.clone(), this_name.clone());
                 menu.item(
                     PopupMenuItem::new(if pinned { "Unpin" } else { "Pin" })
@@ -4572,11 +4572,7 @@ fn project_header(
                     PopupMenuItem::new("Project Settings…")
                         .icon(IconName::Settings)
                         .on_click(move |_, _, cx| {
-                            crate::settings::open(
-                                s4.clone(),
-                                Some(crate::settings::Section::Projects),
-                                cx,
-                            )
+                            crate::settings::open_project(s4.clone(), i4.clone(), cx)
                         }),
                 )
                 .item(

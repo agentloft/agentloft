@@ -71,6 +71,17 @@ pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
     }
 }
 
+/// Open the settings window on one project's page.
+pub fn open_project(store: Entity<AppStore>, project: loft_protocol::ProjectId, cx: &mut App) {
+    open(store, Some(Section::Projects), cx);
+    if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
+        let _ = view.update(cx, |v, cx| {
+            v.open_project(project);
+            cx.notify();
+        });
+    }
+}
+
 /// Open the settings window on one agent's page.
 pub fn open_agent(store: Entity<AppStore>, harness: &str, cx: &mut App) {
     open(store, Some(Section::Agents), cx);
