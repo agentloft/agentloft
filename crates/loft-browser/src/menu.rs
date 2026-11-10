@@ -257,6 +257,19 @@ impl PopupMenu {
             window.remove_window();
         }
     }
+
+    /// Put the menu away and do what was picked.
+    fn pick(in_window: bool, action: Action, window: &mut Window, cx: &mut App) {
+        Self::dismiss(in_window, window, cx);
+        if in_window {
+            // Actions reach back into the window they were opened from.
+            // Drawn inside it, the menu is being handled by that very
+            // window, which can't be entered again until this is over.
+            cx.defer(move |cx| action(cx));
+        } else {
+            action(cx);
+        }
+    }
 }
 
 impl Focusable for PopupMenu {
@@ -352,8 +365,7 @@ impl Render for PopupMenu {
                             })
                             .when(!disabled, |d| {
                                 d.on_click(move |_, window, cx| {
-                                    Self::dismiss(in_window, window, cx);
-                                    action(cx);
+                                    Self::pick(in_window, action.clone(), window, cx);
                                 })
                             }),
                     );
@@ -380,8 +392,7 @@ impl Render for PopupMenu {
                         _ => None,
                     });
                     if let Some(action) = picked {
-                        Self::dismiss(this.in_window, window, cx);
-                        action(cx);
+                        Self::pick(this.in_window, action, window, cx);
                     }
                 }),
             )

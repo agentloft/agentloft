@@ -54,8 +54,9 @@ actions!(
 const CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 272.;
 const HEADER_HEIGHT: f32 = 52.;
-/// Leaves room for the macOS traffic lights in the transparent title bar.
-const TRAFFIC_LIGHTS_INSET: f32 = 78.;
+/// Leaves room for the macOS traffic lights in the transparent title bar
+/// (a browser tab has none, so only the usual margin there).
+const TRAFFIC_LIGHTS_INSET: f32 = if crate::host::IS_WEB { 16. } else { 78. };
 
 pub fn bind_keys(cx: &mut gpui_kit::App) {
     // Every shortcut, with the user's own keys (Settings → Shortcuts).

@@ -94,6 +94,9 @@ struct StoredSession {
 
 #[derive(Debug, Clone)]
 struct Session {
+    /// Order of signing in (or of loading, after a restart): breaks ties
+    /// between sessions seen in the same millisecond.
+    seq: u64,
     id: String,
     label: String,
     addr: String,
@@ -207,6 +210,7 @@ impl Limiter {
 
 #[derive(Default)]
 struct State {
+    next_seq: u64,
     token: Option<String>,
     sessions: HashMap<Hash, Session>,
     /// Open connections per session id.
@@ -252,16 +256,19 @@ impl Auth {
         let mut state = State::default();
         let now = now_ms();
         if let Ok(text) = std::fs::read_to_string(dir.join("sessions.json"))
-            && let Ok(stored) = serde_json::from_str::<Vec<StoredSession>>(&text)
+            && let Ok(mut stored) = serde_json::from_str::<Vec<StoredSession>>(&text)
         {
+            stored.sort_by_key(|s| (s.last_seen_ms, s.created_ms));
             for s in stored {
                 if s.expires_ms <= now {
                     continue;
                 }
                 if let Some(hash) = unhex(&s.hash) {
+                    state.next_seq += 1;
                     state.sessions.insert(
                         hash,
                         Session {
+                            seq: state.next_seq,
                             id: s.id,
                             label: s.label,
                             addr: s.addr,
@@ -355,7 +362,8 @@ impl Auth {
         let secret = new_secret().map_err(|e| PairError::Internal(e.to_string()))?;
         let hash = sha256(secret.as_bytes());
         let created_ms = now_ms();
-        let session = Session {
+        let mut session = Session {
+            seq: 0,
             // Names the session in lists; derived from the hash, so it
             // can't be turned back into the secret.
             id: hex(&sha256(&hash)[..6]),
@@ -378,7 +386,7 @@ impl Auth {
                 let Some(oldest) = state
                     .sessions
                     .iter()
-                    .min_by_key(|(_, s)| s.last_seen_ms)
+                    .min_by_key(|(_, s)| (s.last_seen_ms, s.seq))
                     .map(|(h, s)| (*h, s.id.clone()))
                 else {
                     break;
@@ -386,6 +394,8 @@ impl Auth {
                 state.sessions.remove(&oldest.0);
                 let _ = self.revoked.send(Revoked::One(oldest.1));
             }
+            state.next_seq += 1;
+            session.seq = state.next_seq;
             state.sessions.insert(hash, session);
         }
         self.save();
@@ -482,7 +492,7 @@ impl Auth {
                 connections: state.connections.get(&s.id).copied().unwrap_or(0),
             })
             .collect();
-        out.sort_by_key(|s| std::cmp::Reverse(s.last_seen_ms));
+        out.sort_by_key(|s| std::cmp::Reverse((s.last_seen_ms, s.created_ms)));
         out
     }
 
