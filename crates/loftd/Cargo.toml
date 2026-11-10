@@ -17,6 +17,9 @@ loft-store.workspace = true
 loft-core.workspace = true
 loft-harness.workspace = true
 loft-harness-claude.workspace = true
+loft-harness-codex.workspace = true
+loft-harness-acp.workspace = true
+loft-client.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
@@ -28,7 +31,6 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
-loft-client.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 futures.workspace = true

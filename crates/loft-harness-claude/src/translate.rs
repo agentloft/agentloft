@@ -16,6 +16,11 @@ use std::collections::{HashMap, HashSet};
 pub enum Out {
     Event(HarnessEvent),
     Send(Value),
+    /// The answer to a query sent with [`Translator::query`].
+    Reply {
+        request_id: String,
+        result: Result<Value, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -31,11 +36,18 @@ pub struct Translator {
     open_blocks: HashMap<(String, u64), (String, DeltaChannel)>,
     /// Message ids whose text/thinking was streamed via `stream_event`.
     streamed_messages: HashSet<String>,
-    /// Tool calls started but without a result yet.
-    open_tools: HashSet<String>,
+    /// Tool calls started but without a result yet → their subagent (the
+    /// Agent call they run under), if any.
+    open_tools: HashMap<String, Option<String>>,
     /// Tool calls the user denied (their error result becomes `Declined`).
     denied_tools: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
+    /// Control requests whose answer someone is waiting for.
+    queries: HashSet<String>,
+    /// Agent tool call id → the task id Claude runs it as (to stop it).
+    tasks: HashMap<String, String>,
+    /// Tasks started and not yet finished: task id → what it is.
+    open_tasks: std::collections::BTreeMap<String, String>,
     interrupt_requested: bool,
     turn_active: bool,
     next_request: u64,
@@ -63,12 +75,29 @@ impl Translator {
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {
+        self.start_turn_with(text, &[])
+    }
+
+    /// A prompt with images, given as `(mime, base64)`.
+    pub fn start_turn_with(&mut self, text: &str, images: &[(String, String)]) -> Vec<Out> {
         self.turn_active = true;
         self.interrupt_requested = false;
+        let content = if images.is_empty() {
+            json!(text)
+        } else {
+            let mut blocks: Vec<Value> = images
+                .iter()
+                .map(|(mime, data)| {
+                    json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}})
+                })
+                .collect();
+            blocks.push(json!({"type": "text", "text": text}));
+            Value::Array(blocks)
+        };
         vec![
             Out::Send(json!({
                 "type": "user",
-                "message": {"role": "user", "content": text},
+                "message": {"role": "user", "content": content},
             })),
             Out::Event(HarnessEvent::TurnStarted),
         ]
@@ -82,6 +111,36 @@ impl Translator {
         let id = self.next_request_id();
         vec![Out::Send(json!({
             "type": "control_request", "request_id": id, "request": {"subtype": "interrupt"}
+        }))]
+    }
+
+    /// Ask Claude for a report; the answer comes back as `Out::Reply`
+    /// with the returned request id.
+    pub fn query(&mut self, kind: loft_protocol::AgentInfoKind) -> (String, Value) {
+        let id = self.next_request_id();
+        self.queries.insert(id.clone());
+        let subtype = match kind {
+            loft_protocol::AgentInfoKind::Context => "get_context_usage",
+            loft_protocol::AgentInfoKind::Usage | loft_protocol::AgentInfoKind::Status => {
+                "get_usage"
+            }
+        };
+        let v = json!({
+            "type": "control_request", "request_id": id,
+            "request": {"subtype": subtype}
+        });
+        (id, v)
+    }
+
+    /// Stop the subagent started by tool call `tool_id`.
+    pub fn stop_subagent(&mut self, tool_id: &str) -> Vec<Out> {
+        let Some(task) = self.tasks.get(tool_id).cloned() else {
+            return vec![];
+        };
+        let id = self.next_request_id();
+        vec![Out::Send(json!({
+            "type": "control_request", "request_id": id,
+            "request": {"subtype": "stop_task", "task_id": task}
         }))]
     }
 
@@ -173,6 +232,7 @@ impl Translator {
     fn on_system(&mut self, v: &Value) -> Vec<Out> {
         match str_at(v, "subtype") {
             Some("init") => vec![Out::Event(HarnessEvent::SessionReady {
+                models: vec![],
                 native_session_id: str_at(v, "session_id").unwrap_or_default().to_owned(),
                 model: str_at(v, "model").map(str::to_owned),
                 slash_commands: v
@@ -185,6 +245,27 @@ impl Translator {
                     })
                     .unwrap_or_default(),
             })],
+            Some("task_started") => {
+                if let (Some(task), Some(tool)) = (str_at(v, "task_id"), str_at(v, "tool_use_id")) {
+                    self.tasks.insert(tool.to_owned(), task.to_owned());
+                }
+                match str_at(v, "task_id") {
+                    Some(task) => {
+                        let what = str_at(v, "description")
+                            .or_else(|| str_at(v, "subagent_type"))
+                            .unwrap_or("a background task")
+                            .to_owned();
+                        self.open_tasks.insert(task.to_owned(), what);
+                        self.background_tasks()
+                    }
+                    None => vec![],
+                }
+            }
+            // A task finished (or stopped, or failed).
+            Some("task_notification") => match str_at(v, "task_id") {
+                Some(task) if self.open_tasks.remove(task).is_some() => self.background_tasks(),
+                _ => vec![],
+            },
             Some("api_retry") => vec![Out::Event(HarnessEvent::Notice {
                 level: NoticeLevel::Warning,
                 text: "Claude API error — retrying…".into(),
@@ -193,11 +274,18 @@ impl Translator {
         }
     }
 
+    fn background_tasks(&self) -> Vec<Out> {
+        vec![Out::Event(HarnessEvent::BackgroundTasks(
+            self.open_tasks.values().cloned().collect(),
+        ))]
+    }
+
     fn on_stream_event(&mut self, v: &Value) -> Vec<Out> {
         let Some(event) = v.get("event") else {
             return vec![];
         };
         let msg_id = str_at(v, "api_message_id").unwrap_or_default().to_owned();
+        let parent = str_at(v, "parent_tool_use_id").map(str::to_owned);
         let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
         match str_at(event, "type") {
             Some("content_block_start") => {
@@ -221,7 +309,11 @@ impl Translator {
                 self.streamed_messages.insert(msg_id.clone());
                 self.open_blocks
                     .insert((msg_id, index), (native_id.clone(), channel));
-                vec![Out::Event(HarnessEvent::ItemStarted { native_id, body })]
+                vec![Out::Event(HarnessEvent::ItemStarted {
+                    native_id,
+                    body,
+                    parent,
+                })]
             }
             Some("content_block_delta") => {
                 let Some((native_id, channel)) = self.open_blocks.get(&(msg_id, index)) else {
@@ -258,8 +350,17 @@ impl Translator {
     fn on_assistant(&mut self, v: &Value) -> Vec<Out> {
         let message = v.get("message").unwrap_or(&Value::Null);
         let msg_id = str_at(message, "id").unwrap_or_default().to_owned();
+        let parent = str_at(v, "parent_tool_use_id").map(str::to_owned);
         let streamed = self.streamed_messages.contains(&msg_id);
         let mut out = Vec::new();
+        // The latest main-thread message marks where a fork can resume.
+        if parent.is_none()
+            && let Some(uuid) = str_at(v, "uuid")
+        {
+            out.push(Out::Event(HarnessEvent::TurnMarker {
+                native_turn: uuid.to_owned(),
+            }));
+        }
         let Some(content) = message.get("content").and_then(Value::as_array) else {
             return out;
         };
@@ -269,6 +370,7 @@ impl Translator {
                     let native_id = format!("{msg_id}:{i}");
                     let text = str_at(block, "text").unwrap_or_default().to_owned();
                     out.push(Out::Event(HarnessEvent::ItemStarted {
+                        parent: parent.clone(),
                         native_id: native_id.clone(),
                         body: ItemBody::AssistantMessage {
                             text: String::new(),
@@ -285,6 +387,7 @@ impl Translator {
                     let native_id = format!("{msg_id}:{i}");
                     let text = str_at(block, "thinking").unwrap_or_default().to_owned();
                     out.push(Out::Event(HarnessEvent::ItemStarted {
+                        parent: parent.clone(),
                         native_id: native_id.clone(),
                         body: ItemBody::Reasoning {
                             text: String::new(),
@@ -301,12 +404,14 @@ impl Translator {
                     let Some(id) = str_at(block, "id") else {
                         continue;
                     };
-                    if !self.open_tools.insert(id.to_owned()) {
+                    if self.open_tools.contains_key(id) {
                         continue;
                     }
+                    self.open_tools.insert(id.to_owned(), parent.clone());
                     let name = str_at(block, "name").unwrap_or("tool").to_owned();
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     out.push(Out::Event(HarnessEvent::ItemStarted {
+                        parent: parent.clone(),
                         native_id: id.to_owned(),
                         body: ItemBody::ToolCall {
                             title: tool_title(&name, &input),
@@ -337,7 +442,7 @@ impl Translator {
             let Some(tool_id) = str_at(block, "tool_use_id") else {
                 continue;
             };
-            if !self.open_tools.remove(tool_id) {
+            if self.open_tools.remove(tool_id).is_none() {
                 continue;
             }
             let is_error = block
@@ -425,6 +530,32 @@ impl Translator {
     }
 
     fn on_control_response(&mut self, v: &Value) -> Vec<Out> {
+        if let Some(id) = v.pointer("/response/request_id").and_then(Value::as_str)
+            && self.queries.remove(id)
+        {
+            let result = if v.pointer("/response/subtype").and_then(Value::as_str) == Some("error")
+            {
+                Err(v
+                    .pointer("/response/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Claude couldn't answer")
+                    .to_owned())
+            } else {
+                Ok(v.pointer("/response/response")
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            };
+            return vec![Out::Reply {
+                request_id: id.to_owned(),
+                result,
+            }];
+        }
+        if v.pointer("/response/response/commands").is_some() {
+            let commands = commands(v);
+            if !commands.is_empty() {
+                return vec![Out::Event(HarnessEvent::CommandsAvailable(commands))];
+            }
+        }
         if v.pointer("/response/subtype").and_then(Value::as_str) == Some("error") {
             let msg = v
                 .pointer("/response/error")
@@ -449,7 +580,18 @@ impl Translator {
                 status: ItemStatus::Completed,
             }));
         }
-        for tool in self.open_tools.drain() {
+        // A subagent's steps outlive the turn when it runs in the background;
+        // they stay open (and get their results later) unless the user
+        // stopped the turn.
+        let interrupted = self.interrupt_requested;
+        let ended: Vec<String> = self
+            .open_tools
+            .iter()
+            .filter(|(_, parent)| parent.is_none() || interrupted)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for tool in ended {
+            self.open_tools.remove(&tool);
             out.push(Out::Event(HarnessEvent::ItemCompleted {
                 native_id: tool,
                 body: None,
@@ -575,9 +717,90 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The slash commands in an `initialize` response.
+pub fn commands(v: &Value) -> Vec<loft_protocol::SlashCommandInfo> {
+    v.pointer("/response/response/commands")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = str_at(c, "name")?.to_owned();
+            Some(loft_protocol::SlashCommandInfo {
+                name,
+                description: str_at(c, "description").unwrap_or_default().to_owned(),
+                argument_hint: str_at(c, "argumentHint").unwrap_or_default().to_owned(),
+                builtin: c.get("builtin").and_then(Value::as_bool).unwrap_or(false),
+                insert: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// The model catalog in an `initialize` control response. Claude's
+/// `default` row only names the recommended model; it marks that model as
+/// the default instead of being listed itself.
+pub fn models(response: &Value) -> Vec<loft_protocol::ModelInfo> {
+    let rows: Vec<&Value> = response
+        .pointer("/response/response/models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| !m["disabled"].as_bool().unwrap_or(false))
+        .collect();
+    let default_model = rows
+        .iter()
+        .find(|m| m["value"] == "default")
+        .and_then(|m| m["resolvedModel"].as_str());
+    let mut default_marked = false;
+    rows.iter()
+        .filter(|m| m["value"] != "default")
+        .filter_map(|m| {
+            let id = m["value"].as_str()?;
+            let resolved = m["resolvedModel"].as_str();
+            let is_default =
+                !default_marked && default_model.is_some() && resolved == default_model;
+            default_marked |= is_default;
+            Some(loft_protocol::ModelInfo {
+                id: id.to_owned(),
+                display_name: m["displayName"].as_str().unwrap_or(id).to_owned(),
+                description: m["description"].as_str().map(str::to_owned),
+                is_default,
+                resolved_id: resolved.filter(|r| *r != id).map(str::to_owned),
+                efforts: m["supportedEffortLevels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.as_str().map(str::to_owned))
+                    .collect(),
+                default_effort: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_from_initialize() {
+        let v = json!({"type": "control_response", "response": {"subtype": "success", "request_id": "loft_1", "response": {"models": [
+            {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default (recommended)"},
+            {"value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5", "description": "Complex work",
+             "supportsEffort": true, "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+            {"value": "claude-haiku-4-5", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku 4.5"},
+            {"value": "old", "displayName": "Old", "disabled": true}
+        ]}}});
+        let models = models(&v);
+        assert_eq!(models.len(), 2, "default row folded in, disabled dropped");
+        assert_eq!(models[0].id, "opus");
+        assert!(models[0].is_default);
+        assert_eq!(models[0].resolved_id.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(models[0].efforts.len(), 5);
+        assert!(!models[1].is_default);
+        assert_eq!(models[1].resolved_id, None, "same as the id");
+        assert!(models[1].efforts.is_empty());
+    }
 
     fn replay(fixture: &str) -> (Translator, Vec<Out>) {
         let mut t = Translator::new();
@@ -689,6 +912,96 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn subagent_items_carry_their_parent() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        let mut agent_id = None;
+        let mut child_parent = None;
+        for line in include_str!("../fixtures/2.1.319-subagent.jsonl").lines() {
+            for out in t.on_line(line) {
+                let Out::Event(HarnessEvent::ItemStarted {
+                    native_id,
+                    body,
+                    parent,
+                }) = out
+                else {
+                    // Auto-allow any approval the subagent asks for.
+                    continue;
+                };
+                if let ItemBody::ToolCall {
+                    tool_kind, tool, ..
+                } = &body
+                {
+                    if *tool_kind == ToolKind::Subagent {
+                        agent_id = Some(native_id.clone());
+                    } else if tool == "Bash" {
+                        child_parent = parent.clone();
+                    }
+                }
+            }
+        }
+        let agent_id = agent_id.expect("an Agent tool call");
+        assert_eq!(child_parent.as_deref(), Some(agent_id.as_str()));
+    }
+
+    #[test]
+    fn initialize_response_lists_commands() {
+        let mut t = Translator::new();
+        let out = t.on_line(r#"{"type":"control_response","response":{"subtype":"success","request_id":"loft_1","response":{"commands":[{"name":"compact","description":"Free up context","argumentHint":"<instructions>","builtin":true},{"name":"pdf","description":"Work with PDFs"}]}}}"#);
+        let [Out::Event(HarnessEvent::CommandsAvailable(cmds))] = out.as_slice() else {
+            panic!("expected the commands");
+        };
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].name, "compact");
+        assert_eq!(cmds[0].argument_hint, "<instructions>");
+        assert!(cmds[0].builtin && !cmds[1].builtin);
+    }
+
+    #[test]
+    fn stopping_a_subagent_sends_stop_task() {
+        let mut t = Translator::new();
+        assert!(t.stop_subagent("toolu_1").is_empty());
+        t.on_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"t9","tool_use_id":"toolu_1"}"#,
+        );
+        let out = t.stop_subagent("toolu_1");
+        let [Out::Send(v)] = out.as_slice() else {
+            panic!("expected one control request");
+        };
+        assert_eq!(v["request"]["subtype"], "stop_task");
+        assert_eq!(v["request"]["task_id"], "t9");
+    }
+
+    #[test]
+    fn open_tasks_are_reported_until_they_finish() {
+        let mut t = Translator::new();
+        let started = |id: &str, what: &str| {
+            format!(
+                r#"{{"type":"system","subtype":"task_started","task_id":"{id}","tool_use_id":"tu_{id}","description":"{what}","is_backgrounded":true}}"#
+            )
+        };
+        let out = t.on_line(&started("a", "sleep 30"));
+        assert!(matches!(events(&out).as_slice(),
+            [HarnessEvent::BackgroundTasks(v)] if v == &vec!["sleep 30".to_owned()]));
+        t.on_line(&started("b", "Review the parser"));
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}"#,
+        );
+        assert!(matches!(events(&out).as_slice(),
+            [HarnessEvent::BackgroundTasks(v)] if v == &vec!["Review the parser".to_owned()]));
+        // A repeat notice changes nothing.
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}"#,
+        );
+        assert!(events(&out).is_empty());
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"b","status":"stopped"}"#,
+        );
+        assert!(matches!(events(&out).as_slice(),
+            [HarnessEvent::BackgroundTasks(v)] if v.is_empty()));
     }
 
     #[test]

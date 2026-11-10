@@ -2,6 +2,7 @@
 //! clients connect to (ADR-0001, PLAN §1.6).
 
 mod conn;
+pub mod mcp;
 mod reaper;
 
 use anyhow::{Context as _, Result};
@@ -16,10 +17,19 @@ use tokio::sync::watch;
 
 pub const BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CARGO_PKG_NAME"));
 
+/// Our executable's mtime at startup (see `Welcome::daemon_exe_mtime_ms`).
+pub static EXE_MTIME: std::sync::LazyLock<Option<i64>> = std::sync::LazyLock::new(|| {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| loft_protocol::file_mtime_ms(&exe))
+});
+
 pub struct DaemonOptions {
     pub paths: Paths,
     pub harnesses: Vec<Arc<dyn Harness>>,
     pub capture_login_env: bool,
+    /// Attach `agentloftd mcp` to agent sessions (None in tests).
+    pub mcp_bridge: Option<loft_core::McpBridge>,
 }
 
 /// A running daemon. Dropping it does not stop it; call [`Daemon::shutdown`].
@@ -59,6 +69,11 @@ impl Daemon {
             CoreOptions {
                 env,
                 config,
+                mcp_bridge: opts.mcp_bridge,
+                worktrees_dir: paths.worktrees_dir(),
+                chats_dir: paths.chats_dir(),
+                config_file: Some(paths.config_file()),
+                attachments_dir: paths.home.join("attachments"),
                 ..CoreOptions::default()
             },
         );
@@ -134,6 +149,25 @@ async fn accept_loop(
         }
     }
     let _ = std::fs::remove_file(paths.socket_file());
+}
+
+/// Wait up to `timeout` for another daemon on this home to release its
+/// lock (an outdated daemon still stopping its agents during an update).
+pub async fn wait_for_lock(paths: &Paths, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match acquire_lock(paths) {
+            // Free: release it again; `Daemon::start` takes it for real.
+            Ok(file) => {
+                drop(file);
+                return;
+            }
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 fn acquire_lock(paths: &Paths) -> Result<File> {

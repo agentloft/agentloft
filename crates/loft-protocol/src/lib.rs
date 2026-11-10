@@ -6,9 +6,11 @@
 
 pub mod ids;
 pub mod model;
+pub mod workbench;
 
 pub use ids::*;
 pub use model::*;
+pub use workbench::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +28,22 @@ pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Hello(Hello),
-    Request { id: u64, body: Request },
-    Subscribe { sub_id: u64, topic: Topic },
-    Unsubscribe { sub_id: u64 },
+    Request {
+        id: u64,
+        body: Request,
+    },
+    Subscribe {
+        sub_id: u64,
+        topic: Topic,
+    },
+    Unsubscribe {
+        sub_id: u64,
+    },
+    /// Reply to a [`ServerMsg::ClientCall`].
+    ClientCallResult {
+        call_id: u64,
+        result: Result<serde_json::Value, ErrorBody>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +51,9 @@ pub struct Hello {
     pub protocol_version: u32,
     pub client_kind: ClientKind,
     pub client_build: String,
+    /// Optional client capabilities, e.g. `"browser"` (can run browser calls).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +75,12 @@ pub enum Request {
         #[serde(default)]
         name: Option<String>,
     },
+    /// A thread without a project (a chat): kept in the built-in "Chats"
+    /// project, working in an empty folder of its own. Answers
+    /// `Response::Thread`.
+    CreateChat {
+        harness: HarnessId,
+    },
     CreateThread {
         project_id: ProjectId,
         harness: HarnessId,
@@ -66,9 +90,23 @@ pub enum Request {
     SendMessage {
         thread_id: ThreadId,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     Interrupt {
         thread_id: ThreadId,
+    },
+    /// Ask the thread's agent for a report (`Response::AgentInfo`): its
+    /// context window, or plan usage and limits.
+    AgentInfo {
+        thread_id: ThreadId,
+        kind: AgentInfoKind,
+    },
+    /// Stop one running subagent (its Agent tool call item), leaving the
+    /// rest of the turn alone.
+    StopSubagent {
+        thread_id: ThreadId,
+        item_id: ItemId,
     },
     RespondRequest {
         thread_id: ThreadId,
@@ -79,9 +117,238 @@ pub enum Request {
         thread_id: ThreadId,
         mode: Option<PermissionMode>,
     },
+    /// Switch the model (`None` = the harness default). Applies from the
+    /// next turn (Claude switches live).
+    SetModel {
+        thread_id: ThreadId,
+        model: Option<String>,
+    },
+    /// Set the reasoning effort (`None` = the model's default). Codex applies
+    /// it from the next turn; Claude restarts its process between turns.
+    SetEffort {
+        thread_id: ThreadId,
+        effort: Option<String>,
+    },
+    /// Change a thread's harness; only allowed before its first message.
+    SetThreadHarness {
+        thread_id: ThreadId,
+        harness: HarnessId,
+    },
+    /// Work in the project checkout or in a new worktree (created on the
+    /// first message); only allowed before the first message.
+    SetThreadWorkspace {
+        thread_id: ThreadId,
+        worktree: bool,
+        /// Where the worktree starts; `None` = the main branch.
+        #[serde(default)]
+        base: Option<WorktreeBase>,
+    },
+    /// A project's branches, for choosing where a worktree starts.
+    ListBranches {
+        project_id: ProjectId,
+    },
+    /// Squash-merge a worktree thread's branch into its base branch in the
+    /// project checkout (uncommitted work is committed to the branch first).
+    /// Answers `Response::Text` with a summary.
+    MergeThread {
+        thread_id: ThreadId,
+        /// Commit message; defaults to the thread title.
+        #[serde(default)]
+        message: Option<String>,
+    },
+    /// Fork a thread (ADR-0011). The same harness forks natively; another
+    /// harness gets a handoff digest back as a `draft` first message for the
+    /// user to review. The fork gets its own worktree from the parent's
+    /// current state unless `share_workspace` (or not a git repo).
+    ForkThread {
+        thread_id: ThreadId,
+        /// Harness for the fork; defaults to the parent's.
+        #[serde(default)]
+        harness: Option<HarnessId>,
+        #[serde(default)]
+        share_workspace: bool,
+        /// Fork from the end of this turn instead of the latest one.
+        #[serde(default)]
+        at_turn: Option<TurnId>,
+    },
+    /// Restore the thread's files to how they were before `turn_id` (undoing
+    /// that turn and every later one). The conversation is kept; the agent
+    /// is told on its next turn. Answers `Response::Text` with a summary.
+    RevertTurn {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    },
+    RenameThread {
+        thread_id: ThreadId,
+        title: String,
+    },
+    /// One self-contained question to an agent, without tools or a thread
+    /// (e.g. "design a colour theme"). Answers `Response::Text`.
+    AskOnce {
+        prompt: String,
+        /// Defaults to Claude Code.
+        #[serde(default)]
+        harness: Option<HarnessId>,
+        /// The agent's default when unset.
+        #[serde(default)]
+        model: Option<String>,
+    },
+    /// Save the composer's unsent text (empty clears it).
+    SetDraft {
+        thread_id: ThreadId,
+        text: String,
+    },
+    /// Bring an archived thread back (its worktree is re-created from the
+    /// kept branch).
+    UnarchiveThread {
+        thread_id: ThreadId,
+    },
+    /// Push a worktree thread's branch and open a GitHub pull request into
+    /// its base with `gh`. Answers `Response::Text` with the PR URL.
+    CreatePullRequest {
+        thread_id: ThreadId,
+    },
+    /// Stop the thread's agent and terminal and remove its worktree (the
+    /// branch is kept). A dirty worktree needs `force`.
+    ArchiveThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Delete a thread for good: stop it, remove its worktree (the branch is
+    /// kept) and checkpoints, and erase its history.
+    DeleteThread {
+        thread_id: ThreadId,
+    },
+    /// Re-read `config.toml` (harness and worktree settings changed).
+    ReloadConfig,
+    /// Is the harness's CLI installed, where, and which version.
+    ProbeHarness {
+        harness: HarnessId,
+    },
+    /// Files under a root matching `query` fuzzily (composer `@` mentions).
+    FindFiles {
+        root: FsRoot,
+        query: String,
+        #[serde(default = "default_find_limit")]
+        limit: u32,
+    },
+    /// The models a harness offers (cached by the daemon).
+    ListModels {
+        harness: HarnessId,
+    },
+    /// The slash commands (and skills) `harness` offers in `cwd`, asked of
+    /// the agent without a session (answers `Response::Commands`).
+    ListCommands {
+        harness: HarnessId,
+        cwd: String,
+    },
     /// Ask the daemon to exit (graceful shutdown or upgrade).
     Shutdown {
         reason: ShutdownReason,
+    },
+    // -- workbench: files, diffs, terminals, browser, thread queries --------
+    ListDir {
+        root: FsRoot,
+        #[serde(default)]
+        rel_path: String,
+    },
+    ReadFile {
+        root: FsRoot,
+        rel_path: String,
+    },
+    GetDiff {
+        thread_id: ThreadId,
+        scope: DiffScope,
+    },
+    /// Open a shell. With `key`, a live terminal opened earlier with the same
+    /// key is returned (resized, unless `cols`/`rows` are 0) instead, so a UI
+    /// restart reattaches.
+    TerminalOpen {
+        root: FsRoot,
+        cols: u16,
+        rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    TerminalInput {
+        id: TerminalId,
+        data: Bytes,
+    },
+    TerminalResize {
+        id: TerminalId,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalClose {
+        id: TerminalId,
+    },
+    /// Live terminals whose key starts with `key_prefix` (a UI rebuilding a
+    /// thread's terminal tabs after a restart).
+    ListTerminals {
+        key_prefix: String,
+    },
+    /// Run a browser command in the user's browser panel (from an agent).
+    BrowserCall {
+        thread_id: ThreadId,
+        command: serde_json::Value,
+    },
+    /// An agent starts another thread (orchestration): a child of `from`,
+    /// with `from`'s agent, model, effort and permissions unless given, in
+    /// `from`'s workspace (or a new worktree from it), sent `prompt` at
+    /// once. Answers `Response::Thread`.
+    SpawnThread {
+        from: ThreadId,
+        prompt: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        harness: Option<HarnessId>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+        #[serde(default)]
+        worktree: bool,
+        /// A thread of its own in the sidebar instead of one under `from`.
+        #[serde(default)]
+        top_level: bool,
+        /// Start it in another project (its name, root path or id) instead
+        /// of `from`'s.
+        #[serde(default)]
+        project: Option<String>,
+        /// Start it as a chat (no project).
+        #[serde(default)]
+        chat: bool,
+    },
+    /// The projects, for agents choosing where to start threads
+    /// (`Response::Json`: id, name, path).
+    ListProjects,
+    /// Where a thread stands, for an orchestrating agent: status, settings,
+    /// its latest reply and who spawned it (`Response::Json`).
+    ThreadOutcome {
+        thread_id: ThreadId,
+    },
+    /// Threads whose messages contain `query` (case-insensitive), most
+    /// recent first, one hit per thread (answers `Response::SearchHits`).
+    SearchThreads {
+        query: String,
+        #[serde(default = "default_search_limit")]
+        limit: u32,
+    },
+    /// Agent-facing thread queries (Agentloft MCP server, ADR-0013).
+    ListThreads {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        project_id: Option<ProjectId>,
+    },
+    ReadThread {
+        thread_id: ThreadId,
+        #[serde(default)]
+        detail: ReadDetail,
     },
 }
 
@@ -99,6 +366,8 @@ pub enum Topic {
     Workspace,
     /// Full timeline of one thread.
     Thread(ThreadId),
+    /// Output of one terminal (snapshot replays the scrollback buffer).
+    Terminal(TerminalId),
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +394,22 @@ pub enum ServerMsg {
         sub_id: u64,
         delta: Delta,
     },
+    TerminalOutput {
+        sub_id: u64,
+        id: TerminalId,
+        data: Bytes,
+    },
+    TerminalExited {
+        sub_id: u64,
+        id: TerminalId,
+        code: Option<i32>,
+    },
+    /// Daemon → client call (e.g. drive the browser panel); answer with
+    /// [`ClientMsg::ClientCallResult`].
+    ClientCall {
+        call_id: u64,
+        call: ClientCall,
+    },
     /// Connection-level error (bad handshake, unsupported version…).
     Fatal(ErrorBody),
 }
@@ -134,6 +419,26 @@ pub struct Welcome {
     pub protocol_version: u32,
     pub daemon_build: String,
     pub daemon_pid: u32,
+    /// Modification time of the daemon's executable when it started. If the
+    /// binary on disk changed since (rebuild, app update), the app restarts
+    /// the daemon once it's idle.
+    #[serde(default)]
+    pub daemon_exe_mtime_ms: Option<i64>,
+}
+
+fn default_search_limit() -> u32 {
+    100
+}
+
+fn default_find_limit() -> u32 {
+    20
+}
+
+/// Modification time of a file in ms since the epoch (exe staleness check).
+pub fn file_mtime_ms(path: &std::path::Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,8 +446,61 @@ pub struct Welcome {
 pub enum Response {
     Pong,
     Ok,
-    Project { project: Project },
-    Thread { thread: Thread },
+    /// The agent's own report, as it gave it (shape depends on the kind).
+    AgentInfo {
+        info: serde_json::Value,
+    },
+    Project {
+        project: Project,
+    },
+    Thread {
+        thread: Thread,
+    },
+    DirListing {
+        entries: Vec<DirEntry>,
+    },
+    File {
+        file: FileContent,
+    },
+    Diff {
+        diff: DiffResult,
+    },
+    Terminal {
+        terminal: TerminalInfo,
+    },
+    Terminals {
+        terminals: Vec<TerminalInfo>,
+    },
+    Branches {
+        branches: BranchList,
+    },
+    Json {
+        value: serde_json::Value,
+    },
+    Text {
+        text: String,
+    },
+    Models {
+        models: Vec<ModelInfo>,
+    },
+    Commands {
+        commands: Vec<SlashCommandInfo>,
+    },
+    SearchHits {
+        hits: Vec<SearchHit>,
+    },
+    HarnessStatus {
+        status: HarnessStatus,
+    },
+    Paths {
+        paths: Vec<String>,
+    },
+    /// A new fork, plus the handoff digest to offer as its first message.
+    Forked {
+        thread: Thread,
+        #[serde(default)]
+        draft: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,6 +554,11 @@ pub enum Snapshot {
         items: Vec<Item>,
         requests: Vec<RuntimeRequest>,
     },
+    Terminal {
+        seq: u64,
+        terminal: TerminalInfo,
+        replay: Bytes,
+    },
 }
 
 /// A committed, persisted domain event with its global sequence number.
@@ -212,14 +575,34 @@ pub struct EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    ProjectAdded { project: Project },
-    ThreadCreated { thread: Thread },
-    ThreadUpdated { thread: Thread },
-    TurnStarted { turn: Turn },
-    TurnUpdated { turn: Turn },
-    ItemUpserted { item: Item },
-    RequestOpened { request: RuntimeRequest },
-    RequestUpdated { request: RuntimeRequest },
+    ProjectAdded {
+        project: Project,
+    },
+    ThreadCreated {
+        thread: Thread,
+    },
+    ThreadUpdated {
+        thread: Thread,
+    },
+    TurnStarted {
+        turn: Turn,
+    },
+    TurnUpdated {
+        turn: Turn,
+    },
+    ItemUpserted {
+        item: Item,
+    },
+    RequestOpened {
+        request: RuntimeRequest,
+    },
+    RequestUpdated {
+        request: RuntimeRequest,
+    },
+    /// The thread and its history are gone.
+    ThreadDeleted {
+        thread_id: ThreadId,
+    },
 }
 
 impl Event {
@@ -233,6 +616,7 @@ impl Event {
             Event::RequestOpened { request } | Event::RequestUpdated { request } => {
                 Some(&request.thread_id)
             }
+            Event::ThreadDeleted { thread_id } => Some(thread_id),
         }
     }
 
@@ -240,7 +624,10 @@ impl Event {
     pub fn is_workspace_event(&self) -> bool {
         matches!(
             self,
-            Event::ProjectAdded { .. } | Event::ThreadCreated { .. } | Event::ThreadUpdated { .. }
+            Event::ProjectAdded { .. }
+                | Event::ThreadCreated { .. }
+                | Event::ThreadUpdated { .. }
+                | Event::ThreadDeleted { .. }
         )
     }
 }
@@ -277,12 +664,14 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 client_kind: ClientKind::LocalUi,
                 client_build: "test".into(),
+                capabilities: vec!["browser".into()],
             }),
             ClientMsg::Request {
                 id: 7,
                 body: Request::SendMessage {
                     thread_id: ThreadId::new(),
                     text: "hi".into(),
+                    attachments: vec![],
                 },
             },
             ClientMsg::Subscribe {
@@ -306,4 +695,16 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
     }
+}
+
+/// A report an agent can give about itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInfoKind {
+    /// What fills the context window.
+    Context,
+    /// Plan limits, session cost and tips.
+    Usage,
+    /// Account, limits and this thread's tokens (Codex's `/status`).
+    Status,
 }

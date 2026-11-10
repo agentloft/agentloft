@@ -41,8 +41,26 @@ impl Paths {
     pub fn run_dir(&self) -> PathBuf {
         self.home.join("run")
     }
+    /// The daemon socket. Unix socket paths are limited to ~104 bytes on
+    /// macOS, so deep data homes fall back to a short per-user directory
+    /// (`/tmp/agentloft-<user>/<hash>.sock`) keyed by the home path.
     pub fn socket_file(&self) -> PathBuf {
-        self.run_dir().join("agentloftd.sock")
+        let preferred = self.run_dir().join("agentloftd.sock");
+        if preferred.as_os_str().len() < MAX_SOCKET_PATH {
+            return preferred;
+        }
+        short_socket_dir().join(format!(
+            "{:016x}.sock",
+            fnv1a(self.home.as_os_str().as_encoded_bytes())
+        ))
+    }
+
+    /// Directory holding the socket (created by [`Paths::ensure_dirs`]).
+    pub fn socket_dir(&self) -> PathBuf {
+        self.socket_file()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.run_dir())
     }
     pub fn lock_file(&self) -> PathBuf {
         self.run_dir().join("agentloftd.lock")
@@ -54,16 +72,45 @@ impl Paths {
         self.home.join("worktrees")
     }
 
+    /// Chats (threads without a project) live here, each in a folder of its
+    /// own; the folder itself is the built-in "Chats" project.
+    pub fn chats_dir(&self) -> PathBuf {
+        self.home.join("chats")
+    }
+
     /// Create the directory layout. `run/` is private (0700).
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
-        let run = self.run_dir();
-        std::fs::create_dir_all(&run).with_context(|| format!("create {}", run.display()))?;
-        set_mode(&run, 0o700)?;
+        for dir in [self.run_dir(), self.socket_dir()] {
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            set_mode(&dir, 0o700)?;
+        }
         Ok(())
     }
+}
+
+/// macOS `sun_path` is 104 bytes including the NUL; keep a margin.
+const MAX_SOCKET_PATH: usize = 100;
+
+fn short_socket_dir() -> PathBuf {
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| {
+            !u.is_empty()
+                && u.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .unwrap_or_else(|| "user".into());
+    PathBuf::from("/tmp").join(format!("agentloft-{user}"))
+}
+
+/// Stable, dependency-free 64-bit FNV-1a hash.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 #[cfg(unix)]
@@ -87,6 +134,27 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 pub struct Config {
     pub ui: UiConfig,
     pub harness: HarnessConfigs,
+    pub worktrees: WorktreeConfig,
+}
+
+/// `[worktrees]` in config.toml (PLAN §5.2).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorktreeConfig {
+    /// New threads: `ask` (pick per thread, local preselected) | `local` |
+    /// `worktree`.
+    pub mode: String,
+    /// Branch prefix for worktree branches.
+    pub branch_prefix: String,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            mode: "ask".into(),
+            branch_prefix: "agentloft".into(),
+        }
+    }
 }
 
 /// Appearance settings (`[ui]` in config.toml). Reloaded live by the app.
@@ -95,6 +163,12 @@ pub struct Config {
 pub struct UiConfig {
     /// `system` | `light` | `dark`
     pub theme: String,
+    /// Colour theme: a built-in id (`loft`, `fjord`, …) or `custom:<file>`
+    /// for one in `~/.agentloft/themes/`.
+    pub palette: String,
+    /// `soft` | `normal` | `high`: how strongly borders and secondary text
+    /// stand out.
+    pub contrast: String,
     /// Accent color as `#rrggbb`; `None` = theme default.
     pub accent: Option<String>,
     /// UI font family; `None` = system UI font.
@@ -115,6 +189,8 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "system".into(),
+            palette: "loft".into(),
+            contrast: "normal".into(),
             accent: None,
             font_family: None,
             mono_font_family: None,
@@ -131,6 +207,8 @@ impl Default for UiConfig {
 pub struct HarnessConfigs {
     pub claude: HarnessConfig,
     pub codex: HarnessConfig,
+    pub opencode: HarnessConfig,
+    pub gemini: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -142,8 +220,16 @@ pub struct HarnessConfig {
     pub default_model: String,
     /// `"harness-default"` or one of the canonical modes.
     pub default_permission_mode: String,
+    /// Reasoning effort for new threads; `"auto"` = the model's default.
+    pub default_effort: String,
     pub idle_timeout_minutes: u64,
     pub extra_args: Vec<String>,
+    /// Off: the agent is hidden from pickers (its threads keep working).
+    pub enabled: bool,
+    /// Extra environment variables for the agent's processes.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Models left out of the pickers.
+    pub hidden_models: Vec<String>,
 }
 
 impl Default for HarnessConfig {
@@ -152,8 +238,12 @@ impl Default for HarnessConfig {
             path: "auto".into(),
             default_model: "auto".into(),
             default_permission_mode: "harness-default".into(),
+            default_effort: "auto".into(),
             idle_timeout_minutes: 15,
             extra_args: Vec::new(),
+            enabled: true,
+            env: Default::default(),
+            hidden_models: Vec::new(),
         }
     }
 }
@@ -161,13 +251,133 @@ impl Default for HarnessConfig {
 impl Config {
     /// Load `config.toml`; a missing file yields defaults.
     pub fn load(paths: &Paths) -> Result<Self> {
-        let file = paths.config_file();
-        match std::fs::read_to_string(&file) {
+        Self::load_file(&paths.config_file())
+    }
+
+    /// Load a config file; a missing file yields defaults.
+    pub fn load_file(file: &Path) -> Result<Self> {
+        match std::fs::read_to_string(file) {
             Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", file.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("read {}", file.display())),
         }
     }
+}
+
+/// Per-project settings in `<repo>/.agentloft/config.toml` (PLAN §5.2),
+/// meant to be committed so the whole team gets them.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectConfig {
+    pub worktree: ProjectWorktreeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectWorktreeConfig {
+    /// Shell command run in a new worktree before the agent starts
+    /// (e.g. `npm install`).
+    pub setup: Option<String>,
+    /// Untracked files to copy into new worktrees: paths relative to the
+    /// repo, `*`/`?` wildcards in the last component (`.env*`,
+    /// `config/*.local.json`).
+    pub copy: Vec<String>,
+}
+
+impl Default for ProjectWorktreeConfig {
+    fn default() -> Self {
+        Self {
+            setup: None,
+            copy: vec![".env*".into()],
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// `<root>/.agentloft/config.toml`; missing or invalid → defaults.
+    pub fn load(root: &Path) -> Self {
+        let file = root.join(".agentloft").join("config.toml");
+        match std::fs::read_to_string(&file) {
+            Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
+                tracing::warn!(file = %file.display(), %err, "invalid project config");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// A value written by the settings UI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingValue {
+    Str(String),
+    Float(f64),
+    Bool(bool),
+    List(Vec<String>),
+    /// A table of strings (e.g. environment variables).
+    Map(Vec<(String, String)>),
+    /// Remove the key (back to the default).
+    Unset,
+}
+
+/// Set one key in `config.toml` (e.g. `["ui", "theme"]`), keeping the rest
+/// of the file — comments and formatting included — as the user wrote it.
+pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result<()> {
+    use toml_edit::{DocumentMut, Item, Table, value as v};
+    let file = paths.config_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
+    };
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("parse {}", file.display()))?;
+    let (last, tables) = key.split_last().context("empty key")?;
+    let mut table = doc.as_table_mut();
+    for name in tables {
+        let entry = table.entry(name).or_insert(Item::Table(Table::new()));
+        table = entry
+            .as_table_mut()
+            .with_context(|| format!("`{name}` is not a table"))?;
+    }
+    match value {
+        SettingValue::Str(s) => {
+            table.insert(last, v(s));
+        }
+        SettingValue::Float(f) => {
+            // Whole numbers stay floats (`14.0`) so serde reads them as f32.
+            table.insert(last, v(f));
+        }
+        SettingValue::Bool(b) => {
+            table.insert(last, v(b));
+        }
+        SettingValue::List(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(item);
+            }
+            table.insert(last, v(array));
+        }
+        SettingValue::Map(pairs) => {
+            let mut inline = toml_edit::InlineTable::new();
+            for (k, val) in pairs {
+                inline.insert(&k, val.into());
+            }
+            table.insert(last, v(inline));
+        }
+        SettingValue::Unset => {
+            table.remove(last);
+        }
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Write-then-rename so a crash never leaves a truncated config.
+    let tmp = file.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -186,8 +396,25 @@ pub fn capture_login_env(timeout: Duration) -> HashMap<String, String> {
         Err(err) => tracing::warn!(%err, "login shell env capture failed; using fallback"),
     }
     let path = env.get("PATH").cloned().unwrap_or_default();
-    env.insert("PATH".into(), with_fallback_dirs(&path));
+    env.insert("PATH".into(), with_fallback_dirs(&stable_path_var(&path)));
     env
+}
+
+/// `PATH` with fnm's per-session directories resolved (see [`stable_path`]),
+/// so Node-based CLIs keep finding `node` after that shell is gone.
+fn stable_path_var(path: &str) -> String {
+    path.split(':')
+        .map(|dir| {
+            if dir.contains("fnm_multishells") {
+                std::fs::canonicalize(dir)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| dir.to_owned())
+            } else {
+                dir.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn run_login_shell_env(timeout: Duration) -> Result<HashMap<String, String>> {
@@ -270,6 +497,22 @@ pub fn which(bin: &str, path: &str) -> Option<PathBuf> {
     path.split(':')
         .map(|dir| Path::new(dir).join(bin))
         .find(|candidate| is_executable(candidate))
+        .map(|found| stable_path(&found))
+}
+
+/// fnm puts each shell session's Node on a temporary `fnm_multishells/<id>`
+/// symlink farm that disappears with that shell; resolve through it so a
+/// path captured once keeps working. (Other shims — Volta, asdf — must stay
+/// as found: they dispatch on the name they were invoked by.)
+fn stable_path(found: &Path) -> PathBuf {
+    if found
+        .components()
+        .any(|c| c.as_os_str() == "fnm_multishells")
+        && let Ok(real) = std::fs::canonicalize(found)
+    {
+        return real;
+    }
+    found.to_path_buf()
 }
 
 #[cfg(unix)]
@@ -287,6 +530,106 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn project_config_defaults_and_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ProjectConfig::load(dir.path()).worktree.copy,
+            vec![".env*".to_owned()]
+        );
+        std::fs::create_dir_all(dir.path().join(".agentloft")).unwrap();
+        std::fs::write(
+            dir.path().join(".agentloft/config.toml"),
+            "[worktree]\nsetup = \"npm ci\"\ncopy = [\".env*\", \"config/*.local.json\"]\n",
+        )
+        .unwrap();
+        let c = ProjectConfig::load(dir.path());
+        assert_eq!(c.worktree.setup.as_deref(), Some("npm ci"));
+        assert_eq!(c.worktree.copy.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_resolves_fnm_session_links_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("node-v24/bin");
+        std::fs::create_dir_all(&real).unwrap();
+        let tool = real.join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = dir.path().join("fnm_multishells/123_456/bin");
+        std::fs::create_dir_all(&session).unwrap();
+        std::os::unix::fs::symlink(&tool, session.join("tool")).unwrap();
+        let shim = dir.path().join("shims");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::os::unix::fs::symlink(&tool, shim.join("tool")).unwrap();
+
+        let found = which("tool", &session.to_string_lossy()).unwrap();
+        assert_eq!(found, std::fs::canonicalize(&tool).unwrap());
+        let found = which("tool", &shim.to_string_lossy()).unwrap();
+        assert_eq!(found, shim.join("tool"), "other shims keep their name");
+    }
+
+    #[test]
+    fn write_setting_keeps_comments_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().to_path_buf());
+        std::fs::write(
+            paths.config_file(),
+            "# my settings\n[ui]\ntheme = \"dark\" # night owl\n",
+        )
+        .unwrap();
+        write_setting(&paths, &["ui", "font_size"], SettingValue::Float(15.0)).unwrap();
+        write_setting(
+            &paths,
+            &["ui", "accent"],
+            SettingValue::Str("#3b82f6".into()),
+        )
+        .unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "default_model"],
+            SettingValue::Str("gpt-5".into()),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(
+            text.contains("# my settings") && text.contains("# night owl"),
+            "{text}"
+        );
+        let cfg = Config::load(&paths).unwrap();
+        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.ui.font_size, 15.0);
+        assert_eq!(cfg.ui.accent.as_deref(), Some("#3b82f6"));
+        assert_eq!(cfg.harness.codex.default_model, "gpt-5");
+        write_setting(&paths, &["ui", "accent"], SettingValue::Unset).unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "enabled"],
+            SettingValue::Bool(false),
+        )
+        .unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "extra_args"],
+            SettingValue::List(vec!["--foo".into(), "bar".into()]),
+        )
+        .unwrap();
+        write_setting(
+            &paths,
+            &["harness", "codex", "env"],
+            SettingValue::Map(vec![("OPENAI_BASE_URL".into(), "http://x".into())]),
+        )
+        .unwrap();
+        let c = Config::load(&paths).unwrap();
+        assert!(!c.harness.codex.enabled);
+        assert_eq!(c.harness.codex.extra_args, ["--foo", "bar"]);
+        assert_eq!(c.harness.codex.env["OPENAI_BASE_URL"], "http://x");
+        assert_eq!(Config::load(&paths).unwrap().ui.accent, None);
+    }
+
     use super::*;
 
     #[test]
@@ -302,6 +645,29 @@ mod tests {
         let p = with_fallback_dirs("/usr/bin:/opt/homebrew/bin");
         assert_eq!(p.matches("/opt/homebrew/bin").count(), 1);
         assert!(p.starts_with("/usr/bin:"));
+    }
+
+    #[test]
+    fn long_homes_get_a_short_socket_path() {
+        let short = Paths::new("/tmp/h");
+        assert_eq!(
+            short.socket_file(),
+            PathBuf::from("/tmp/h/run/agentloftd.sock")
+        );
+        let long = Paths::new(format!("/tmp/{}", "x".repeat(120)));
+        let sock = long.socket_file();
+        assert!(
+            sock.as_os_str().len() < MAX_SOCKET_PATH,
+            "{}",
+            sock.display()
+        );
+        assert!(sock.to_string_lossy().starts_with("/tmp/agentloft-"));
+        // Stable per home, different across homes.
+        assert_eq!(sock, long.socket_file());
+        assert_ne!(
+            sock,
+            Paths::new(format!("/tmp/{}", "y".repeat(120))).socket_file()
+        );
     }
 
     #[test]

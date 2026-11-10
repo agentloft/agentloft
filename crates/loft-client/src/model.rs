@@ -50,6 +50,9 @@ impl WorkspaceModel {
                 }
                 self.sort();
             }
+            Event::ThreadDeleted { thread_id } => {
+                self.threads.retain(|t| &t.id != thread_id);
+            }
             _ => return false,
         }
         true
@@ -132,7 +135,7 @@ impl ThreadModel {
                     None => self.requests.push(request.clone()),
                 }
             }
-            Event::ProjectAdded { .. } => return false,
+            Event::ProjectAdded { .. } | Event::ThreadDeleted { .. } => return false,
         }
         true
     }
@@ -215,10 +218,18 @@ mod tests {
             cwd: "/".into(),
             model: None,
             permission_mode: None,
+            effort: None,
             native_session_id: None,
             status: ThreadStatus::Running,
             created_at_ms: 0,
             updated_at_ms: 0,
+            workspace: Default::default(),
+            parent: None,
+            slash_commands: Vec::new(),
+            command_info: Vec::new(),
+            started_at_ms: None,
+            draft: None,
+            waiting_on: Vec::new(),
         };
         let item = Item {
             id: ItemId::new(),
@@ -228,6 +239,8 @@ mod tests {
             status: ItemStatus::InProgress,
             body: ItemBody::AssistantMessage { text: text.into() },
             updated_at_ms: 0,
+            parent_id: None,
+            started_at_ms: None,
         };
         let id = item.id.clone();
         let m = ThreadModel::from_snapshot(Snapshot::Thread {

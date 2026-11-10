@@ -1,0 +1,29 @@
+[package]
+name = "loft-browser"
+description = "Embedded, agent-drivable web browser panel for GPUI (WKWebView via wry)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tracing.workspace = true
+url.workspace = true
+base64.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wry.workspace = true
+objc2.workspace = true
+block2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-web-kit.workspace = true
+
+[lints]
+workspace = true

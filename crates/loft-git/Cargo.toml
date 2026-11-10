@@ -1,0 +1,17 @@
+[package]
+name = "loft-git"
+description = "Git CLI wrapper: checkpoints and diffs (ADR-0008)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

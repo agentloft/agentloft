@@ -1,22 +1,85 @@
-# Agentloft
+<p align="center">
+  <img src="assets/icon/png/agentloft-128.png" width="112" height="112" alt="Agentloft icon">
+</p>
+
+<h1 align="center">Agentloft</h1>
 
 A native desktop app for running coding agents side by side: **Claude Code**, **OpenAI Codex**, and ACP agents such as Gemini CLI and OpenCode. It is built in Rust with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
-> **Status:** planning. No app code yet.
-> - Start with the [architecture and delivery plan](docs/PLAN.md).
-> - The design decisions are in the [ADRs](docs/adr/README.md).
+> **Status:** early alpha, macOS first. Day-to-day features work end to end. The plan is in [docs/PLAN.md](docs/PLAN.md), the design decisions in the [ADRs](docs/adr/README.md), and per-feature status in [docs/TRACKING.md](docs/TRACKING.md).
 
-## What it will do
+<p align="center">
+  <img src="docs/screenshots/worktree-changes.png" width="900" alt="A thread in its own worktree, with the turn's diff in the side panel">
+</p>
 
-- **Projects and threads.** Each thread can run in its own git worktree, with a checkpoint every turn. That gives you turn and cumulative diffs, revert, and merge-back.
-- **Native protocols.** Agents are driven through their structured protocols (Codex `app-server`, Claude stream-json, ACP), never by scraping their terminal UI. You get exact streaming, approvals, interrupts, resume and forks.
-- **Agents keep running.** A headless daemon (`agentloftd`) owns the agents, so they continue when the window closes or updates.
-- **Window groups.** Several windows, grouped into native tabs, mixing agents from different projects.
-- **Cross-thread context.** Agents can read other threads through a built-in MCP server.
-- **Terminal and remote access.** An integrated terminal, plus optional remote access over your own Tailscale tailnet or SSH.
+## What it does
 
-macOS (Apple Silicon) comes first; Linux and Windows follow.
+**Agents, driven natively.** Claude Code runs through its stream-json control protocol, Codex through `codex app-server`, and OpenCode and Gemini CLI through the Agent Client Protocol. Neither terminal UI is scraped, so you get exact streaming, tool calls, approvals, interrupts and resume.
+- Pick the model and permission mode per thread, from what each agent actually offers.
+- Attach images by paste, drag-and-drop or the paperclip.
+- Complete `/` slash commands and `@` file mentions as you type.
+- Queue messages while a turn runs.
+
+**Workspaces you can trust.**
+- **Worktrees:** a thread can work in its own git worktree on an `agentloft/<slug>` branch. Your project's `.agentloft/config.toml` can name a setup script and untracked files to copy in.
+- **Checkpoints:** every turn is checkpointed into hidden refs. You get per-turn and per-thread diffs, and *Undo changes* on any turn.
+- **Merge-back:** squash-merge into your branch, with a conflict pre-check, or open a GitHub PR through `gh`.
+
+**Forks to any agent.**
+- Fork a thread to the same agent with full context (a native fork).
+- Fork to the other agent from a deterministic handoff summary you review first.
+- Each fork gets its own worktree, starting from the parent's state.
+
+**A real workbench next to the chat.**
+- A file tree, plus a syntax-highlighted viewer, Markdown, images, and Word/Excel/PowerPoint previews.
+- Per-thread diffs.
+- A Ghostty-powered terminal with tabs.
+- A browser that agents drive through Agentloft's built-in MCP server. Agents can also read other threads.
+
+**Built for long-running agents.**
+- **Agents keep running:** a small daemon (`agentloftd`) owns agents, terminals and git, so agents keep working when you close or update the app. After an update, a new daemon takes over once agents go idle.
+- **Windows:** several windows and native tab groups, not tied to projects, restored on relaunch.
+- **Navigation:** a command palette (⌘K).
+- **Attention:** a Dock badge and bounce when an agent needs you, and unread dots in the sidebar.
+- **Settings:** appearance, agents and worktrees, applied live. They're stored in `~/.agentloft/config.toml`, and your comments are kept.
+
+| | |
+|---|---|
+| ![Command palette](docs/screenshots/command-palette.png) | ![Forks nested under their parent](docs/screenshots/forks.png) |
+| ![Terminal running vim](docs/screenshots/terminal-vim.png) | ![Settings](docs/screenshots/settings-appearance.png) |
+
+## Requirements
+
+- macOS on Apple Silicon (Linux and Windows will follow).
+- The agents you want to use, installed and logged in: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Codex](https://github.com/openai/codex) (`codex`). Agentloft finds them on your login shell's `PATH`; Settings → Agents shows what it found.
+- `git`. `gh` is only needed for opening pull requests.
+
+## Building
+
+You need Rust (the version pinned in `rust-toolchain.toml`) and [Zig](https://ziglang.org) 0.17, which builds the Ghostty terminal core.
+
+```sh
+cargo xtask dev            # run the app against an isolated ./.dev-home
+cargo xtask bundle --open  # build target/bundle/Agentloft.app
+cargo xtask ci             # fmt, clippy and tests, as CI runs them
+```
+
+## Layout
+
+| Crate | What it is |
+|---|---|
+| `loft-app` | The app binary |
+| `loft-ui` | GPUI views |
+| `loftd` | The daemon, socket server and MCP server |
+| `loft-core` | Threads, turns, approvals, worktrees, forks, terminals |
+| `loft-store` | SQLite event log and projections |
+| `loft-protocol` | Wire types |
+| `loft-harness*` | The agent adapters (Claude, Codex, ACP) |
+| `loft-git` | Checkpoints, diffs, worktrees |
+| `loft-terminal` | Terminal widget on libghostty-vt |
+| `loft-browser` | Embedded browser |
+| `loft-docs` | Office document previews |
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

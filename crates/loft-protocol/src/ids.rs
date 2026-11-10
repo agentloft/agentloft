@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-macro_rules! uuid_id {
+macro_rules! ids_uuid {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -41,11 +41,12 @@ macro_rules! uuid_id {
     };
 }
 
-uuid_id!(ProjectId);
-uuid_id!(ThreadId);
-uuid_id!(TurnId);
-uuid_id!(ItemId);
-uuid_id!(RequestId);
+ids_uuid!(ProjectId);
+ids_uuid!(ThreadId);
+ids_uuid!(TurnId);
+ids_uuid!(ItemId);
+ids_uuid!(RequestId);
+ids_uuid!(TerminalId);
 
 /// Which harness drives a thread: `claude`, `codex`, `acp:gemini`, …
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -55,6 +56,8 @@ pub struct HarnessId(pub String);
 impl HarnessId {
     pub const CLAUDE: &'static str = "claude";
     pub const CODEX: &'static str = "codex";
+    pub const OPENCODE: &'static str = "opencode";
+    pub const GEMINI: &'static str = "gemini";
     pub const FAKE: &'static str = "fake";
 
     pub fn claude() -> Self {

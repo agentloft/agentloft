@@ -220,6 +220,28 @@ impl Store {
         )
     }
 
+    /// Items whose stored form mentions `text` (case-insensitive for
+    /// ASCII), in timeline order per thread. A coarse prefilter: callers
+    /// check the fields they care about.
+    pub fn items_mentioning(&self, text: &str) -> Result<Vec<Item>> {
+        // Match the text as it appears inside the JSON (quotes, newlines
+        // and backslashes are escaped there), as a literal LIKE pattern.
+        let json = serde_json::to_string(text)?;
+        let inner = &json[1..json.len() - 1];
+        let mut pattern = String::from("%");
+        for c in inner.chars() {
+            if matches!(c, '%' | '_' | '|') {
+                pattern.push('|');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        self.query_data(
+            "SELECT data FROM items WHERE data LIKE ?1 ESCAPE '|' ORDER BY thread_id, ordinal",
+            [pattern],
+        )
+    }
+
     pub fn requests(&self, thread: &ThreadId) -> Result<Vec<RuntimeRequest>> {
         self.query_data(
             "SELECT data FROM requests WHERE thread_id = ?1",
@@ -327,6 +349,7 @@ fn event_type(event: &Event) -> &'static str {
         Event::ItemUpserted { .. } => "item_upserted",
         Event::RequestOpened { .. } => "request_opened",
         Event::RequestUpdated { .. } => "request_updated",
+        Event::ThreadDeleted { .. } => "thread_deleted",
     }
 }
 
@@ -368,6 +391,19 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
             )?;
         }
         Event::ItemUpserted { item } => upsert_item(conn, item)?,
+        Event::ThreadDeleted { thread_id } => {
+            let id = thread_id.as_str();
+            for sql in [
+                "DELETE FROM items WHERE thread_id = ?1",
+                "DELETE FROM turns WHERE thread_id = ?1",
+                "DELETE FROM requests WHERE thread_id = ?1",
+                "DELETE FROM threads WHERE id = ?1",
+                // The log keeps only the deletion itself.
+                "DELETE FROM events WHERE thread_id = ?1 AND type != 'thread_deleted'",
+            ] {
+                conn.execute(sql, params![id])?;
+            }
+        }
         Event::RequestOpened { request } | Event::RequestUpdated { request } => {
             conn.execute(
                 "INSERT INTO requests(id, thread_id, data) VALUES (?1, ?2, ?3)
@@ -420,10 +456,18 @@ mod tests {
             cwd: project.root_path.clone(),
             model: None,
             permission_mode: None,
+            effort: None,
             native_session_id: None,
             status: ThreadStatus::Idle,
             created_at_ms: 1,
             updated_at_ms: 1,
+            workspace: Default::default(),
+            parent: None,
+            slash_commands: Vec::new(),
+            command_info: Vec::new(),
+            started_at_ms: None,
+            draft: None,
+            waiting_on: Vec::new(),
         }
     }
 
@@ -469,6 +513,9 @@ mod tests {
             ended_at_ms: None,
             usage: None,
             error: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            native_turn: None,
         };
         store
             .commit(vec![

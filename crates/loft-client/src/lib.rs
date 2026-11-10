@@ -36,6 +36,22 @@ pub enum ClientEvent {
         sub_id: u64,
         delta: Delta,
     },
+    TerminalOutput {
+        sub_id: u64,
+        id: loft_protocol::TerminalId,
+        data: Vec<u8>,
+    },
+    TerminalExited {
+        sub_id: u64,
+        id: loft_protocol::TerminalId,
+        code: Option<i32>,
+    },
+    /// The daemon asks this client to do something (answer with
+    /// [`Client::respond_call`]).
+    ClientCall {
+        call_id: u64,
+        call: loft_protocol::ClientCall,
+    },
     /// Connection-level error from the daemon.
     Fatal(ErrorBody),
     Disconnected,
@@ -64,6 +80,16 @@ impl Client {
         kind: ClientKind,
         build: &str,
     ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
+        Self::connect_with(socket, kind, build, &[]).await
+    }
+
+    /// Connect advertising `capabilities` (e.g. `"browser"`).
+    pub async fn connect_with(
+        socket: &Path,
+        kind: ClientKind,
+        build: &str,
+        capabilities: &[&str],
+    ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
         let stream = UnixStream::connect(socket)
             .await
             .with_context(|| format!("connect {}", socket.display()))?;
@@ -76,6 +102,7 @@ impl Client {
             protocol_version: PROTOCOL_VERSION,
             client_kind: kind,
             client_build: build.to_owned(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
         });
         sink.send(Bytes::from(serde_json::to_vec(&hello)?)).await?;
         let welcome = match source.next().await {
@@ -128,6 +155,17 @@ impl Client {
                     }
                     ServerMsg::Event { sub_id, event } => ClientEvent::Event { sub_id, event },
                     ServerMsg::Delta { sub_id, delta } => ClientEvent::Delta { sub_id, delta },
+                    ServerMsg::TerminalOutput { sub_id, id, data } => ClientEvent::TerminalOutput {
+                        sub_id,
+                        id,
+                        data: data.0,
+                    },
+                    ServerMsg::TerminalExited { sub_id, id, code } => {
+                        ClientEvent::TerminalExited { sub_id, id, code }
+                    }
+                    ServerMsg::ClientCall { call_id, call } => {
+                        ClientEvent::ClientCall { call_id, call }
+                    }
                     ServerMsg::Fatal(e) => ClientEvent::Fatal(e),
                     ServerMsg::Welcome(_) => continue,
                 };
@@ -191,6 +229,14 @@ impl Client {
         sub_id
     }
 
+    /// Answer a [`ClientEvent::ClientCall`].
+    pub fn respond_call(&self, call_id: u64, result: Result<serde_json::Value, ErrorBody>) {
+        let _ = self
+            .inner
+            .tx
+            .send(ClientMsg::ClientCallResult { call_id, result });
+    }
+
     pub fn unsubscribe(&self, sub_id: u64) {
         let _ = self.inner.tx.send(ClientMsg::Unsubscribe { sub_id });
     }
@@ -222,21 +268,79 @@ pub async fn connect_or_spawn(
     daemon_bin: &Path,
     kind: ClientKind,
     build: &str,
+    capabilities: &[&str],
 ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)> {
     let socket = paths.socket_file();
-    if let Ok(conn) = Client::connect(&socket, kind, build).await {
-        return Ok(conn);
+    if let Ok(conn) = Client::connect_with(&socket, kind, build, capabilities).await {
+        if !is_stale(conn.0.welcome(), daemon_bin) {
+            return Ok(conn);
+        }
+        // The daemon binary changed since it started (rebuild or app update).
+        // Swap it if it's idle; with agents running, keep it for now.
+        let pid = conn.0.welcome().daemon_pid;
+        let asked = conn
+            .0
+            .request(Request::Shutdown {
+                reason: loft_protocol::ShutdownReason::Upgrade,
+            })
+            .await;
+        if asked.is_err() {
+            tracing::info!(pid, "daemon is outdated but busy; using it until idle");
+            return Ok(conn);
+        }
+        tracing::info!(pid, "restarting outdated agentloftd");
+        drop(conn);
+        // Wait for the old process itself to exit: it holds the home's lock
+        // until it has stopped its agents, and the new daemon needs it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while process_alive(pid) {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("the outdated agentloftd (pid {pid}) didn't exit");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     spawn_daemon(paths, daemon_bin)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match Client::connect(&socket, kind, build).await {
+        match Client::connect_with(&socket, kind, build, capabilities).await {
             Ok(conn) => return Ok(conn),
             Err(err) if tokio::time::Instant::now() >= deadline => {
                 return Err(err).context("agentloftd did not come up within 10s");
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
+    }
+}
+
+/// Whether `pid` is still running (signal 0 probes without signalling).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 only checks existence and permission.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// The running daemon's executable differs from the one we'd start.
+fn is_stale(welcome: &loft_protocol::Welcome, daemon_bin: &Path) -> bool {
+    match (
+        welcome.daemon_exe_mtime_ms,
+        loft_protocol::file_mtime_ms(daemon_bin),
+    ) {
+        (Some(running), Some(on_disk)) => running != on_disk,
+        // A daemon from before this check existed is outdated by definition.
+        (None, Some(_)) => true,
+        // No binary to compare against (e.g. tests): keep it.
+        (_, None) => false,
     }
 }
 

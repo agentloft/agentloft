@@ -57,6 +57,7 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
     });
 
     // Handshake.
+    let browser_host;
     let hello = match source.next().await {
         Some(Ok(frame)) => serde_json::from_slice::<ClientMsg>(&frame).ok(),
         _ => None,
@@ -67,10 +68,12 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 || h.protocol_version + 1 == PROTOCOL_VERSION =>
         {
             tracing::debug!(kind = ?h.client_kind, build = %h.client_build, "client connected");
+            browser_host = h.capabilities.iter().any(|c| c == "browser");
             let _ = out_tx.send(ServerMsg::Welcome(Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_build: crate::BUILD.into(),
                 daemon_pid: std::process::id(),
+                daemon_exe_mtime_ms: *crate::EXE_MTIME,
             }));
         }
         Some(ClientMsg::Hello(h)) => {
@@ -96,6 +99,26 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
         }
     }
 
+    static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn_id = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let call_relay = browser_host.then(|| {
+        let mut calls = core.clients().register_browser_host(conn_id);
+        let out = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some(c) = calls.recv().await {
+                if out
+                    .send(ServerMsg::ClientCall {
+                        call_id: c.call_id,
+                        call: c.call,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
+
     let mut subs: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
     while let Some(frame) = source.next().await {
         let Ok(frame) = frame else { break };
@@ -103,17 +126,46 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
             Ok(m) => m,
             Err(err) => {
                 tracing::warn!(%err, "bad client frame");
+                // A newer app asking for something this daemon predates:
+                // answer instead of leaving the request hanging.
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&frame)
+                    && v["type"] == "request"
+                    && let Some(id) = v["id"].as_u64()
+                {
+                    let op = v["body"]["op"].as_str().unwrap_or("?");
+                    let _ = out_tx.send(ServerMsg::Response {
+                        id,
+                        result: Err(ErrorBody::new(
+                            ErrorCode::Unsupported,
+                            format!(
+                                "agentloftd {} doesn't understand `{op}`; it's older than the app. Restart it (quit Agentloft with no agents running) to update.",
+                                crate::BUILD
+                            ),
+                        )),
+                    });
+                }
                 continue;
             }
         };
         match msg {
             ClientMsg::Hello(_) => {}
             ClientMsg::Request { id, body } => {
+                if let Some(result) = core.handle_inline(&body) {
+                    let _ = out_tx.send(ServerMsg::Response { id, result });
+                    continue;
+                }
                 let core = core.clone();
                 let out = out_tx.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     let result = match body {
+                        // An upgrade waits for running turns; a user quit doesn't.
+                        Request::Shutdown {
+                            reason: loft_protocol::ShutdownReason::Upgrade,
+                        } if core.is_busy() => Err(ErrorBody::new(
+                            ErrorCode::Conflict,
+                            "agents are running; the update applies once they're done",
+                        )),
                         Request::Shutdown { reason } => {
                             tracing::info!(?reason, "shutdown requested by client");
                             let _ = shutdown.send(true);
@@ -128,18 +180,29 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 if let Some(old) = subs.remove(&sub_id) {
                     old.abort();
                 }
+                if let Topic::Thread(thread) = &topic {
+                    core.clients().watch(conn_id, sub_id, thread.clone());
+                }
                 let task = tokio::spawn(forward(core.clone(), sub_id, topic, out_tx.clone()));
                 subs.insert(sub_id, task.abort_handle());
             }
             ClientMsg::Unsubscribe { sub_id } => {
+                core.clients().unwatch(conn_id, sub_id);
                 if let Some(task) = subs.remove(&sub_id) {
                     task.abort();
                 }
+            }
+            ClientMsg::ClientCallResult { call_id, result } => {
+                core.clients().complete(call_id, result);
             }
         }
     }
     for (_, task) in subs {
         task.abort();
+    }
+    core.clients().unregister(conn_id);
+    if let Some(relay) = call_relay {
+        relay.abort();
     }
     drop(out_tx);
     let _ = writer.await;
@@ -163,8 +226,10 @@ async fn forward(
                 return;
             }
         };
-        let seq = match &snapshot {
-            Snapshot::Workspace { seq, .. } | Snapshot::Thread { seq, .. } => *seq,
+        let mut seq = match &snapshot {
+            Snapshot::Workspace { seq, .. }
+            | Snapshot::Thread { seq, .. }
+            | Snapshot::Terminal { seq, .. } => *seq,
         };
         if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
             return;
@@ -175,13 +240,48 @@ async fn forward(
                     if env.seq <= seq || !matches_topic(&topic, &env.event) {
                         continue;
                     }
-                    if out.send(ServerMsg::Event { sub_id, event: env }).is_err() {
+                    let event = Arc::unwrap_or_clone(env);
+                    if out.send(ServerMsg::Event { sub_id, event }).is_err() {
                         return;
                     }
                 }
                 Ok(BusMsg::Delta(delta)) => {
                     if topic == Topic::Thread(delta.thread_id.clone())
                         && out.send(ServerMsg::Delta { sub_id, delta }).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(BusMsg::TerminalOutput { id, end }) => {
+                    // `seq` is the stream offset already delivered.
+                    if topic != Topic::Terminal(id.clone()) || end <= seq {
+                        continue;
+                    }
+                    match core.terminal_read_since(&id, seq) {
+                        Ok(Some((data, new_end))) => {
+                            seq = new_end;
+                            if !data.is_empty()
+                                && out
+                                    .send(ServerMsg::TerminalOutput {
+                                        sub_id,
+                                        id,
+                                        data: data.into(),
+                                    })
+                                    .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        // Fell behind the ring (or the terminal closed): resend
+                        // the replay snapshot.
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                Ok(BusMsg::TerminalExited { id, code }) => {
+                    if topic == Topic::Terminal(id.clone())
+                        && out
+                            .send(ServerMsg::TerminalExited { sub_id, id, code })
+                            .is_err()
                     {
                         return;
                     }
@@ -200,5 +300,6 @@ fn matches_topic(topic: &Topic, event: &loft_protocol::Event) -> bool {
     match topic {
         Topic::Workspace => event.is_workspace_event(),
         Topic::Thread(id) => event.thread_id() == Some(id),
+        Topic::Terminal(_) => false,
     }
 }

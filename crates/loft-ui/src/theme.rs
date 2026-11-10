@@ -7,51 +7,6 @@ use gpui_kit::{App, Hsla, Pixels, SharedString, px, rgb};
 use loft_config::{Paths, UiConfig};
 use std::time::SystemTime;
 
-/// Default accent when the user hasn't picked one.
-const DEFAULT_ACCENT: u32 = 0x6e5bff;
-
-struct Neutrals {
-    background: u32,
-    foreground: u32,
-    sidebar: u32,
-    elevated: u32,
-    border: u32,
-    muted: u32,
-    muted_foreground: u32,
-    hover: u32,
-    selected: u32,
-    bubble: u32,
-    input: u32,
-}
-
-const DARK: Neutrals = Neutrals {
-    background: 0x111113,
-    foreground: 0xededef,
-    sidebar: 0x0b0b0c,
-    elevated: 0x19191c,
-    border: 0x26262a,
-    muted: 0x1c1c20,
-    muted_foreground: 0x8d8d96,
-    hover: 0x18181b,
-    selected: 0x222227,
-    bubble: 0x232328,
-    input: 0x2c2c31,
-};
-
-const LIGHT: Neutrals = Neutrals {
-    background: 0xffffff,
-    foreground: 0x1a1a1e,
-    sidebar: 0xf7f7f8,
-    elevated: 0xffffff,
-    border: 0xe7e7ea,
-    muted: 0xf3f3f5,
-    muted_foreground: 0x6f6f7a,
-    hover: 0xefeff2,
-    selected: 0xe8e8ec,
-    bubble: 0xf1f1f4,
-    input: 0xe2e2e6,
-};
-
 /// Colors and metrics a view needs for one frame. Built once per render.
 #[derive(Clone)]
 pub struct Palette {
@@ -117,7 +72,7 @@ impl Palette {
             mono: theme.mono_font_family.clone(),
             mono_size: theme.mono_font_size,
             content_width: px(settings.content_width.clamp(560.0, 1400.0)),
-            row_gap: if compact { px(6.) } else { px(10.) },
+            row_gap: if compact { px(6.) } else { px(12.) },
         }
     }
 }
@@ -142,6 +97,12 @@ pub fn init(paths: Paths, cx: &mut App) {
     apply(cx);
 }
 
+/// The selected theme's id (`ui.palette`).
+pub fn palette_id(cx: &App) -> Option<String> {
+    cx.try_global::<AppearanceState>()
+        .map(|s| s.config.palette.clone())
+}
+
 /// Re-read `config.toml` if it changed; returns whether anything was applied.
 pub fn reload_if_changed(cx: &mut App) -> bool {
     let Some(state) = cx.try_global::<AppearanceState>() else {
@@ -162,14 +123,34 @@ pub fn reload_if_changed(cx: &mut App) -> bool {
     changed
 }
 
-/// Toggle light/dark (persisted only for this session).
+/// Toggle light/dark and save it as `ui.theme`, as Settings does; the
+/// config file is the source of truth, so an unsaved switch would be undone
+/// by the next settings reload.
 pub fn toggle_mode(cx: &mut App) {
-    let dark = cx.theme().mode.is_dark();
-    if cx.has_global::<AppearanceState>() {
-        cx.global_mut::<AppearanceState>().config.theme =
-            if dark { "light".into() } else { "dark".into() };
+    let next = if cx.theme().mode.is_dark() {
+        "light"
+    } else {
+        "dark"
+    };
+    let Some(state) = cx.try_global::<AppearanceState>() else {
+        return;
+    };
+    let paths = state.paths.clone();
+    match loft_config::write_setting(
+        &paths,
+        &["ui", "theme"],
+        loft_config::SettingValue::Str(next.into()),
+    ) {
+        Ok(()) => {
+            reload_if_changed(cx);
+        }
+        Err(err) => {
+            // Still switch for this session.
+            tracing::warn!("couldn't save the theme: {err:#}");
+            cx.global_mut::<AppearanceState>().config.theme = next.into();
+            apply(cx);
+        }
     }
-    apply(cx);
 }
 
 /// Apply the current settings (call again when the system appearance flips).
@@ -184,39 +165,56 @@ pub fn apply(cx: &mut App) {
         _ => ThemeMode::from(cx.window_appearance()),
     };
     Theme::change(mode, None, cx);
-    let neutrals = if mode.is_dark() { &DARK } else { &LIGHT };
-    let accent: Hsla = config
+    let home = cx
+        .try_global::<AppearanceState>()
+        .map(|s| s.paths.home.clone())
+        .unwrap_or_default();
+    let palette = crate::themes::find(&home, &config.palette);
+    let sw = palette.swatch(
+        mode.is_dark(),
+        crate::themes::contrast_factor(&config.contrast),
+    );
+    let accent_hex = config
         .accent
         .as_deref()
-        .and_then(parse_hex)
-        .unwrap_or_else(|| rgb(DEFAULT_ACCENT).into());
+        .and_then(crate::themes::parse_color)
+        .unwrap_or(sw.accent);
+    let accent: Hsla = rgb(accent_hex).into();
+    let on_accent: Hsla = rgb(crate::themes::text_on(accent_hex)).into();
+    let c = |v: u32| -> Hsla { rgb(v).into() };
     Theme::update(cx, |theme| {
-        let c = &mut theme.colors;
-        c.background = rgb(neutrals.background).into();
-        c.foreground = rgb(neutrals.foreground).into();
-        c.sidebar = rgb(neutrals.sidebar).into();
-        c.sidebar_foreground = rgb(neutrals.foreground).into();
-        c.sidebar_border = rgb(neutrals.border).into();
-        c.popover = rgb(neutrals.elevated).into();
-        c.popover_foreground = rgb(neutrals.foreground).into();
-        c.border = rgb(neutrals.border).into();
-        c.input = rgb(neutrals.input).into();
-        c.muted = rgb(neutrals.muted).into();
-        c.muted_foreground = rgb(neutrals.muted_foreground).into();
-        c.list_hover = rgb(neutrals.hover).into();
-        c.list_active = rgb(neutrals.selected).into();
-        c.secondary = rgb(neutrals.bubble).into();
-        c.secondary_foreground = rgb(neutrals.foreground).into();
-        c.title_bar = rgb(neutrals.sidebar).into();
-        c.primary = accent;
-        c.primary_hover = accent.opacity(0.88);
-        c.primary_foreground = gpui_kit::white();
-        c.button_primary = accent;
-        c.button_primary_hover = accent.opacity(0.88);
-        c.button_primary_active = accent.opacity(0.78);
-        c.button_primary_foreground = gpui_kit::white();
-        c.ring = accent.opacity(0.55);
-        c.selection = accent.opacity(0.28);
+        let colors = &mut theme.colors;
+        colors.background = c(sw.background);
+        colors.foreground = c(sw.foreground);
+        colors.sidebar = c(sw.sidebar);
+        colors.sidebar_foreground = c(sw.foreground);
+        colors.sidebar_border = c(sw.border);
+        colors.popover = c(sw.surface);
+        colors.popover_foreground = c(sw.foreground);
+        colors.border = c(sw.border);
+        colors.input = c(sw.input);
+        colors.muted = c(sw.muted);
+        colors.muted_foreground = c(sw.muted_text);
+        colors.list_hover = c(sw.hover);
+        colors.list_active = c(sw.selected);
+        colors.secondary = c(sw.bubble);
+        colors.secondary_foreground = c(sw.foreground);
+        colors.title_bar = c(sw.sidebar);
+        colors.primary = accent;
+        colors.primary_hover = accent.opacity(0.88);
+        colors.primary_foreground = on_accent;
+        colors.button_primary = accent;
+        colors.button_primary_hover = accent.opacity(0.88);
+        colors.button_primary_active = accent.opacity(0.78);
+        colors.button_primary_foreground = on_accent;
+        colors.ring = accent.opacity(0.55);
+        colors.selection = accent.opacity(0.28);
+        // Behind dialogs: dim the window so the dialog stands out.
+        colors.overlay = if mode.is_dark() {
+            gpui_kit::hsla(0., 0., 0., 0.7)
+        } else {
+            gpui_kit::hsla(220. / 360., 0.2, 0.08, 0.38)
+        };
         if let Some(family) = &config.font_family {
             theme.font_family = family.clone().into();
         }

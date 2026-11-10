@@ -52,6 +52,7 @@ impl Session {
             .request(Request::SendMessage {
                 thread_id: self.model.thread.id.clone(),
                 text: text.into(),
+                attachments: vec![],
             })
             .await
             .unwrap();
@@ -87,6 +88,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         paths: paths.clone(),
         harnesses,
         capture_login_env: true,
+        mcp_bridge: None,
     })
     .await
     .unwrap();
@@ -206,6 +208,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         paths: paths.clone(),
         harnesses,
         capture_login_env: true,
+        mcp_bridge: None,
     })
     .await
     .unwrap();

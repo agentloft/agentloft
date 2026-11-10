@@ -22,6 +22,10 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # loft-terminal builds libghostty-vt, which needs Zig.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -40,8 +44,9 @@ jobs:
       - name: Test headless crates
         run: >
           cargo test
-          -p loft-protocol -p loft-config -p loft-store -p loft-harness
-          -p loft-harness-claude -p loft-core -p loft-client -p loftd
+          -p loft-protocol -p loft-config -p loft-store -p loft-git -p loft-harness
+          -p loft-harness-claude -p loft-harness-codex -p loft-core -p loft-client
+          -p loft-docs -p loftd
 
   deny:
     name: Dependency policy
