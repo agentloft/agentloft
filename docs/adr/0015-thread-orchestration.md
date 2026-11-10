@@ -12,7 +12,7 @@ ADR-0013 gave agents read-only access to other threads and deferred write tools 
 | Tool | What it does |
 |---|---|
 | `list_agents` | Installed agents with their models and efforts, the permission modes, and the calling thread's own settings (the defaults) |
-| `spawn_thread{prompt, title?, agent?, model?, effort?, permission_mode?, worktree?}` | Start a new thread and send it `prompt`; returns its id at once |
+| `spawn_thread{prompt, title?, agent?, model?, effort?, permission_mode?, worktree?, top_level?}` | Start a new thread and send it `prompt`; returns its id at once. With `top_level`, it sits on its own in the sidebar (`ThreadParent.detached`) but stays linked to its caller |
 | `wait_for_threads{thread_ids, timeout_seconds?}` | Wait until the threads stop running (done, failed or waiting for approval); returns each status and latest reply. The default timeout is 50 s, which stays under Codex's MCP tool timeout, so agents call again while threads are still running |
 | `thread_status{thread_id}` | One thread's status, settings and latest reply |
 | `send_to_thread{thread_id, message}` | Follow up with a thread this thread spawned |

@@ -2451,12 +2451,23 @@ impl WorkspaceView {
             );
             let mut rows = v_flex().gap_px();
             if !folded {
-                for (thread, depth) in nest_forks(threads) {
+                let folded_threads = if query.is_empty() {
+                    self.store.read(cx).folded_threads.clone()
+                } else {
+                    Default::default()
+                };
+                for Nested {
+                    thread,
+                    depth,
+                    under,
+                } in nest_forks(threads, &folded_threads)
+                {
                     let id = thread.id.clone();
                     rows = rows.child(thread_row(
                         &self.store,
                         thread,
                         depth,
+                        under,
                         selected.as_ref() == Some(&id),
                         unread.contains(&id),
                         self.row_menu.as_ref() == Some(&id),
@@ -4336,30 +4347,83 @@ fn chip_label(icon: IconName, label: impl Into<SharedString>, p: &Palette) -> An
 
 /// Forks listed under their parent (ADR-0011), keeping the recency order
 /// among siblings. Returns `(thread, depth)`.
-fn nest_forks(threads: Vec<&loft_protocol::Thread>) -> Vec<(&loft_protocol::Thread, usize)> {
+/// A sidebar row: the thread, how deep it nests, and (if it has threads
+/// under it) whether they're folded, how many, and whether any is busy.
+struct Nested<'a> {
+    thread: &'a loft_protocol::Thread,
+    depth: usize,
+    under: Option<Under>,
+}
+
+#[derive(Clone, Copy)]
+struct Under {
+    folded: bool,
+    count: usize,
+    busy: bool,
+}
+
+/// Forks and spawned threads under their parents (unless detached); a
+/// folded thread's descendants are left out.
+fn nest_forks<'a>(
+    threads: Vec<&'a loft_protocol::Thread>,
+    folded: &std::collections::HashSet<ThreadId>,
+) -> Vec<Nested<'a>> {
     let present: std::collections::HashSet<&ThreadId> = threads.iter().map(|t| &t.id).collect();
     let parent_of = |t: &loft_protocol::Thread| {
         t.parent
             .as_ref()
+            .filter(|p| !p.detached)
             .map(|p| &p.thread_id)
             .filter(|id| present.contains(id))
             .cloned()
     };
+    fn descendants<'a>(
+        t: &loft_protocol::Thread,
+        all: &[&'a loft_protocol::Thread],
+        parent_of: &dyn Fn(&loft_protocol::Thread) -> Option<ThreadId>,
+        out: &mut Vec<&'a loft_protocol::Thread>,
+    ) {
+        for child in all.iter().filter(|c| parent_of(c).as_ref() == Some(&t.id)) {
+            out.push(child);
+            descendants(child, all, parent_of, out);
+        }
+    }
     fn push<'a>(
         t: &'a loft_protocol::Thread,
         depth: usize,
         all: &[&'a loft_protocol::Thread],
         parent_of: &dyn Fn(&loft_protocol::Thread) -> Option<ThreadId>,
-        out: &mut Vec<(&'a loft_protocol::Thread, usize)>,
+        folded: &std::collections::HashSet<ThreadId>,
+        out: &mut Vec<Nested<'a>>,
     ) {
-        out.push((t, depth));
+        let mut below = Vec::new();
+        descendants(t, all, parent_of, &mut below);
+        let is_folded = folded.contains(&t.id);
+        let under = (!below.is_empty()).then(|| Under {
+            folded: is_folded,
+            count: below.len(),
+            busy: below.iter().any(|c| {
+                matches!(
+                    c.status,
+                    ThreadStatus::Running | ThreadStatus::WaitingApproval
+                ) || c.is_waiting()
+            }),
+        });
+        out.push(Nested {
+            thread: t,
+            depth,
+            under,
+        });
+        if is_folded {
+            return;
+        }
         for child in all.iter().filter(|c| parent_of(c).as_ref() == Some(&t.id)) {
-            push(child, depth + 1, all, parent_of, out);
+            push(child, depth + 1, all, parent_of, folded, out);
         }
     }
     let mut out = Vec::with_capacity(threads.len());
     for root in threads.iter().filter(|t| parent_of(t).is_none()) {
-        push(root, 0, &threads, &parent_of, &mut out);
+        push(root, 0, &threads, &parent_of, folded, &mut out);
     }
     out
 }
@@ -4528,6 +4592,7 @@ fn thread_row(
     store: &Entity<AppStore>,
     thread: &loft_protocol::Thread,
     depth: usize,
+    under: Option<Under>,
     active: bool,
     unread: bool,
     menu_open: bool,
@@ -4589,12 +4654,64 @@ fn thread_row(
         }
         _ => thread.title.clone(),
     };
+    let indent = 12. + 14. * depth.min(4) as f32;
+    // Threads under this one fold with a chevron in the margin (on hover,
+    // or always while folded).
+    let fold = under.map(|u| {
+        let (store, id) = (store.clone(), thread.id.clone());
+        div()
+            .id(SharedString::from(format!("fold-{}", thread.id)))
+            .absolute()
+            .left(px(indent - 13.))
+            .top_0()
+            .bottom_0()
+            .w(px(12.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_color(p.faint_foreground)
+            .hover(|d| d.text_color(p.foreground))
+            .when(!u.folded, |d| {
+                d.invisible().group_hover("thread-row", |d| d.visible())
+            })
+            .child(
+                Icon::new(if u.folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall(),
+            )
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                let id = id.clone();
+                store.update(cx, |s, cx| s.set_thread_folded(id, !u.folded, cx));
+            })
+    });
+    // Folded: how many are tucked away, and whether any is at work.
+    let tucked = under.filter(|u| u.folded).map(|u| {
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .items_center()
+            .px_1p5()
+            .rounded(px(5.))
+            .bg(p.muted)
+            .text_xs()
+            .text_color(p.muted_foreground)
+            .when(u.busy, |d| d.child(Spinner::new().xsmall().color(p.accent)))
+            .child(format!("+{}", u.count))
+    });
     h_flex()
         .id(SharedString::from(format!("thread-{}", thread.id)))
+        .relative()
         .gap_2()
         .items_center()
         .group("thread-row")
-        .pl(px(12. + 14. * depth.min(4) as f32))
+        .children(fold)
+        .pl(px(indent))
         .pr_1p5()
         .py(px(6.))
         .rounded(px(7.))
@@ -4607,18 +4724,21 @@ fn thread_row(
         })
         .when(active, |d| d.bg(p.selected))
         .when(!active, |d| d.hover(|d| d.bg(p.hover)))
-        // A fork, or a thread another agent started.
-        .when_some(thread.parent.as_ref(), |d, parent| {
-            d.child(
-                Icon::new(if parent.kind == loft_protocol::ForkKind::Spawned {
-                    IconName::CornerDownRight
-                } else {
-                    IconName::GitFork
-                })
-                .xsmall()
-                .text_color(p.faint_foreground),
-            )
-        })
+        // A fork, or a thread another agent started (under its parent).
+        .when_some(
+            thread.parent.as_ref().filter(|p| !p.detached),
+            |d, parent| {
+                d.child(
+                    Icon::new(if parent.kind == loft_protocol::ForkKind::Spawned {
+                        IconName::CornerDownRight
+                    } else {
+                        IconName::GitFork
+                    })
+                    .xsmall()
+                    .text_color(p.faint_foreground),
+                )
+            },
+        )
         // Which agent runs it.
         .child(div().flex_none().when(!active, |d| d.opacity(0.85)).child(
             crate::brand::agent_logo(thread.harness.as_str(), px(14.), p),
@@ -4672,6 +4792,7 @@ fn thread_row(
                     .text_color(p.faint_foreground),
             )
         })
+        .children(tucked)
         // Under the pointer, the time (or status) makes way for a ··· menu.
         .child(
             div()

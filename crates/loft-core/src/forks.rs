@@ -44,6 +44,7 @@ pub(crate) struct SpawnSpec {
     pub effort: Option<String>,
     pub permission_mode: Option<loft_protocol::PermissionMode>,
     pub worktree: bool,
+    pub top_level: bool,
 }
 
 impl Core {
@@ -148,6 +149,7 @@ impl Core {
                 thread_id: parent.id.clone(),
                 turn_id: None,
                 kind: ForkKind::Spawned,
+                detached: spec.top_level,
             }),
             slash_commands: Vec::new(),
             command_info: Vec::new(),
@@ -293,6 +295,7 @@ impl Core {
                 } else {
                     ForkKind::Handoff
                 },
+                detached: false,
             }),
             slash_commands: if same {
                 parent.slash_commands.clone()

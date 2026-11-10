@@ -189,7 +189,8 @@ pub fn tools() -> Vec<Value> {
                 "model": { "type": "string", "description": "Model id from list_agents (default: this thread's, or the agent's default)" },
                 "effort": { "type": "string", "description": "Reasoning effort, e.g. low | medium | high | xhigh | max" },
                 "permission_mode": { "type": "string", "enum": ["read-only", "ask-all", "accept-edits", "auto", "full-access"] },
-                "worktree": { "type": "boolean", "description": "Work in a new git worktree branched from this thread's current state instead of sharing this checkout (use when agents edit files in parallel)", "default": false }
+                "worktree": { "type": "boolean", "description": "Work in a new git worktree branched from this thread's current state instead of sharing this checkout (use when agents edit files in parallel)", "default": false },
+                "top_level": { "type": "boolean", "description": "Show it as a separate top-level thread in the sidebar instead of nested under this one (when the user asks for separate, standalone or top-level threads). You can still wait for, message and stop it.", "default": false }
             }),
             &["prompt"],
         ),
@@ -468,6 +469,10 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 permission_mode,
                 worktree: args
                     .get("worktree")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                top_level: args
+                    .get("top_level")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             };

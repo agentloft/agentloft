@@ -106,6 +106,8 @@ pub struct AppStore {
     /// Projects folded in the sidebar (shared by every window, kept across
     /// launches).
     pub collapsed: std::collections::HashSet<ProjectId>,
+    /// Threads whose forks / spawned threads are folded in the sidebar.
+    pub folded_threads: std::collections::HashSet<ThreadId>,
     /// The next thread selected goes into a new pane (not the focused one).
     next_in_new_pane: bool,
     /// Commands an agent offers in a folder, asked without a session
@@ -143,6 +145,7 @@ pub struct AppStore {
 impl AppStore {
     pub fn new(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut Context<Self>) -> Self {
         let collapsed = load_collapsed(&paths);
+        let folded_threads = load_folded_threads(&paths);
         let mut this = Self {
             runtime,
             paths,
@@ -157,6 +160,7 @@ impl AppStore {
             max_cols: 4,
             max_rows: 2,
             collapsed,
+            folded_threads,
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
@@ -690,11 +694,29 @@ impl AppStore {
                 self.collapsed.remove(p);
             }
         }
-        let list: Vec<&str> = self.collapsed.iter().map(|p| p.as_str()).collect();
-        if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({ "collapsed": list })) {
+        self.save_sidebar();
+        cx.notify();
+    }
+
+    /// Fold or unfold the threads under `thread` in the sidebar.
+    pub fn set_thread_folded(&mut self, thread: ThreadId, folded: bool, cx: &mut Context<Self>) {
+        if folded {
+            self.folded_threads.insert(thread);
+        } else {
+            self.folded_threads.remove(&thread);
+        }
+        self.save_sidebar();
+        cx.notify();
+    }
+
+    fn save_sidebar(&self) {
+        let projects: Vec<&str> = self.collapsed.iter().map(|p| p.as_str()).collect();
+        let threads: Vec<&str> = self.folded_threads.iter().map(|t| t.as_str()).collect();
+        if let Ok(json) = serde_json::to_vec_pretty(
+            &serde_json::json!({ "collapsed": projects, "folded_threads": threads }),
+        ) {
             let _ = std::fs::write(sidebar_file(&self.paths), json);
         }
-        cx.notify();
     }
 
     /// Where `thread` is shown: (column, row).
@@ -1309,6 +1331,17 @@ fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("collapsed").cloned())
         .and_then(|v| serde_json::from_value::<Vec<ProjectId>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn load_folded_threads(paths: &Paths) -> std::collections::HashSet<ThreadId> {
+    std::fs::read(sidebar_file(paths))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("folded_threads").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<ThreadId>>(v).ok())
         .unwrap_or_default()
         .into_iter()
         .collect()

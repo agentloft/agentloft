@@ -1063,6 +1063,7 @@ async fn spawned_threads_inherit_settings_and_report_back() {
                 effort: None,
                 permission_mode: None,
                 worktree: false,
+                top_level: false,
             })
             .await
         }

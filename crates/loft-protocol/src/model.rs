@@ -156,6 +156,10 @@ pub struct ThreadParent {
     #[serde(default)]
     pub turn_id: Option<TurnId>,
     pub kind: ForkKind,
+    /// Shown as a thread of its own in the sidebar, not under its parent
+    /// (still linked: who started it can follow it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

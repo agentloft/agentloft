@@ -729,6 +729,7 @@ impl Core {
                 effort,
                 permission_mode,
                 worktree,
+                top_level,
             } => {
                 self.spawn_thread(forks::SpawnSpec {
                     from,
@@ -739,6 +740,7 @@ impl Core {
                     effort,
                     permission_mode,
                     worktree,
+                    top_level,
                 })
                 .await
             }

@@ -306,6 +306,9 @@ pub enum Request {
         permission_mode: Option<PermissionMode>,
         #[serde(default)]
         worktree: bool,
+        /// A thread of its own in the sidebar instead of one under `from`.
+        #[serde(default)]
+        top_level: bool,
     },
     /// Where a thread stands, for an orchestrating agent: status, settings,
     /// its latest reply and who spawned it (`Response::Json`).
