@@ -564,6 +564,16 @@ impl Core {
                 Ok(Response::Project { project })
             }
             Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
+            Request::SetProjectIcon { project_id, icon } => {
+                let mut project = self
+                    .with_store(|s| s.project(&project_id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+                project.icon = icon.filter(|i| !i.trim().is_empty());
+                self.commit(vec![Event::ProjectUpdated {
+                    project: project.clone(),
+                }])?;
+                Ok(Response::Project { project })
+            }
             Request::SetProjectDefaults {
                 project_id,
                 defaults,
@@ -866,6 +876,7 @@ impl Core {
             root_path,
             created_at_ms: now_ms(),
             defaults: Default::default(),
+            icon: None,
         };
         self.commit(vec![Event::ProjectAdded {
             project: project.clone(),

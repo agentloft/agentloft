@@ -13,6 +13,9 @@ pub struct Project {
     /// defaults).
     #[serde(default, skip_serializing_if = "ProjectDefaults::is_empty")]
     pub defaults: ProjectDefaults,
+    /// An image chosen as its icon (else its favicon, else initials).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// A project's own defaults for new threads.

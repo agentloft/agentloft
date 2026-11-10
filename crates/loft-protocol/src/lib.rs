@@ -79,6 +79,13 @@ pub enum Request {
         project_id: ProjectId,
         name: String,
     },
+    /// A project's icon: an image file, or `None` for automatic (answers
+    /// `Response::Project`).
+    SetProjectIcon {
+        project_id: ProjectId,
+        #[serde(default)]
+        icon: Option<String>,
+    },
     /// What new threads in a project start with (answers
     /// `Response::Project`).
     SetProjectDefaults {

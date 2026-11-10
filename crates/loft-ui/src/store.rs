@@ -953,6 +953,49 @@ impl AppStore {
         });
     }
 
+    /// Use the image at `path` as the project's icon (`None`: automatic).
+    /// A chosen file is copied into ~/.agentloft/icons, so it stays put.
+    pub fn set_project_icon(
+        &mut self,
+        project_id: ProjectId,
+        path: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let icon = match path {
+            None => None,
+            Some(src) => {
+                let dir = self.paths.home.join("icons");
+                let ext = src
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png")
+                    .to_ascii_lowercase();
+                // A new name each time: images are cached by path.
+                let dest = dir.join(format!(
+                    "{}-{}.{ext}",
+                    project_id.as_str(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis())
+                ));
+                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&src, &dest)) {
+                    Ok(_) => Some(dest.to_string_lossy().into_owned()),
+                    Err(e) => {
+                        self.last_error = Some(format!("Couldn't use that image: {e}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        };
+        crate::project_icon::forget();
+        self.request(
+            Request::SetProjectIcon { project_id, icon },
+            cx,
+            |_, _, _| {},
+        );
+    }
+
     /// What new threads in a project start with.
     pub fn set_project_defaults(
         &mut self,

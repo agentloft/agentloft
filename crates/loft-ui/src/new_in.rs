@@ -8,7 +8,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::{IndexPath, WindowExt as _};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, Hsla, InteractiveElement as _, IntoElement as _,
+    AnyElement, App, AppContext as _, Entity, InteractiveElement as _, IntoElement as _,
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
@@ -59,6 +59,8 @@ struct Row {
     pinned: Option<bool>,
     /// A checkbox at the end (an option row).
     checked: Option<bool>,
+    /// A project row's project (for its icon).
+    project: Option<loft_protocol::Project>,
 }
 
 impl Row {
@@ -71,6 +73,7 @@ impl Row {
             icon: Some(icon),
             pinned: None,
             checked: None,
+            project: None,
         }
     }
 }
@@ -488,6 +491,7 @@ fn project_rows(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<Row> {
             icon: None,
             pinned: Some(pinned.contains(&p.id)),
             checked: None,
+            project: Some(p.clone()),
         });
         // No project sits right under the current one (or first).
         if rows.len() == 1 && is_current {
@@ -515,28 +519,17 @@ fn chat_row() -> Row {
         icon: Some(IconName::MessageSquareDashed),
         pinned: None,
         checked: None,
+        project: None,
     }
 }
 
 fn render_row(row: &Row, toggle_pin: PinFn, cx: &App) -> AnyElement {
     let p = Palette::of(cx);
     let badge: AnyElement = match (&row.target, row.icon) {
-        (Target::Project(_), _) => {
-            let color = badge_color(&row.name);
-            div()
-                .size(px(22.))
-                .flex_none()
-                .rounded(px(5.))
-                .bg(color.opacity(0.18))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(10.))
-                .font_weight(gpui_kit::FontWeight::BOLD)
-                .text_color(color)
-                .child(initials(&row.name))
-                .into_any_element()
-        }
+        (Target::Project(_), _) => match &row.project {
+            Some(project) => crate::project_icon::badge(project, 22., &p),
+            None => crate::project_icon::initials_badge(&row.name, 22., &p),
+        },
         (_, Some(icon)) => gpui_kit::component::Icon::new(icon)
             .text_color(p.muted_foreground)
             .into_any_element(),
@@ -652,50 +645,5 @@ impl DetailExt for gpui_kit::Div {
             ),
             None => self,
         }
-    }
-}
-
-/// "Matter & Why" → "MW"; "agentloft" → "AT" (first and last letter).
-pub(crate) fn initials(name: &str) -> String {
-    let words: Vec<&str> = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let first = |w: &str| w.chars().next().map(|c| c.to_ascii_uppercase());
-    match words.as_slice() {
-        [] => "?".into(),
-        [one] => {
-            let chars: Vec<char> = one.chars().collect();
-            let mut s = String::new();
-            s.extend(chars.first().map(|c| c.to_ascii_uppercase()));
-            if chars.len() > 1 {
-                s.extend(chars.last().map(|c| c.to_ascii_uppercase()));
-            }
-            s
-        }
-        [a, b, ..] => first(a).into_iter().chain(first(b)).collect(),
-    }
-}
-
-/// A steady colour per project name.
-pub(crate) fn badge_color(name: &str) -> Hsla {
-    const HUES: [f32; 8] = [205., 150., 0., 85., 38., 270., 175., 325.];
-    let hash = name
-        .bytes()
-        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    gpui_kit::hsla(HUES[hash as usize % HUES.len()] / 360., 0.75, 0.62, 1.)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::initials;
-
-    #[test]
-    fn initials_read_like_names() {
-        assert_eq!(initials("Matter & Why"), "MW");
-        assert_eq!(initials("agentloft"), "AT");
-        assert_eq!(initials("dev"), "DV");
-        assert_eq!(initials("x"), "X");
-        assert_eq!(initials("stickfigure-studio"), "SS");
     }
 }

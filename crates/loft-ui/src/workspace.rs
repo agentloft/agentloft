@@ -2557,7 +2557,7 @@ impl WorkspaceView {
                 // Under the title (top-level rows): its project.
                 let subtitle = (depth == 0).then(|| match project {
                     Some(pr) if chats.contains(&pr.id) => Subtitle::NoProject,
-                    Some(pr) => Subtitle::Project(pr.name.clone()),
+                    Some(pr) => Subtitle::Project(pr.clone()),
                     None => Subtitle::NoProject,
                 });
                 rows = rows.child(thread_row(
@@ -4809,16 +4809,15 @@ fn project_header(
                         .items_center()
                         .justify_center()
                         .group_hover(group.clone(), |d| d.invisible())
-                        .child(
-                            Icon::new(if chats {
-                                IconName::MessageSquare
-                            } else if folded {
-                                IconName::Folder
-                            } else {
-                                IconName::FolderOpen
-                            })
-                            .xsmall(),
-                        ),
+                        // The project's icon (favicon, chosen image or
+                        // initials); chats get a bubble.
+                        .child(if chats {
+                            Icon::new(IconName::MessageSquare)
+                                .xsmall()
+                                .into_any_element()
+                        } else {
+                            crate::project_icon::badge(project, 14., p)
+                        }),
                 )
                 .child(
                     div()
@@ -4870,31 +4869,16 @@ fn project_header(
 
 /// The line under a thread's title in the Threads sidebar: its project.
 enum Subtitle {
-    Project(String),
+    Project(loft_protocol::Project),
     NoProject,
 }
 
 fn subtitle_line(sub: &Subtitle, branch: Option<&str>, p: &Palette) -> AnyElement {
     let (badge, name): (AnyElement, String) = match sub {
-        Subtitle::Project(name) => {
-            let color = crate::new_in::badge_color(name);
-            (
-                div()
-                    .size(px(15.))
-                    .flex_none()
-                    .rounded(px(4.))
-                    .bg(color.opacity(0.18))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(7.5))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(color)
-                    .child(crate::new_in::initials(name))
-                    .into_any_element(),
-                name.clone(),
-            )
-        }
+        Subtitle::Project(project) => (
+            crate::project_icon::badge(project, 15., p),
+            project.name.clone(),
+        ),
         Subtitle::NoProject => (
             Icon::new(IconName::MessageSquareDashed)
                 .xsmall()

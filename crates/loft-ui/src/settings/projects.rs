@@ -78,7 +78,6 @@ impl SettingsView {
             .overflow_hidden();
         for (ix, project) in projects.iter().enumerate() {
             let id = project.id.clone();
-            let color = crate::new_in::badge_color(&project.name);
             rows = rows.child(
                 h_flex()
                     .id(SharedString::from(format!("project-row-{id}")))
@@ -91,20 +90,7 @@ impl SettingsView {
                     .when(ix > 0, |d| {
                         d.border_t_1().border_color(p.border.opacity(0.6))
                     })
-                    .child(
-                        div()
-                            .size(px(24.))
-                            .flex_none()
-                            .rounded(px(6.))
-                            .bg(color.opacity(0.18))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(color)
-                            .child(crate::new_in::initials(&project.name)),
-                    )
+                    .child(crate::project_icon::badge(project, 24., p))
                     .child(
                         v_flex()
                             .flex_1()
@@ -286,6 +272,19 @@ impl SettingsView {
                 .into_any_element()
         };
         let pin_id = id.clone();
+        let icon_hint = if project.icon.is_some() {
+            "A chosen image.".to_owned()
+        } else {
+            match crate::project_icon::favicon(std::path::Path::new(&project.root_path)) {
+                Some(f) => format!(
+                    "Automatic: {}",
+                    f.strip_prefix(&project.root_path)
+                        .map(|r| r.display().to_string())
+                        .unwrap_or_default()
+                ),
+                None => "Automatic: no favicon found, so its initials.".into(),
+            }
+        };
         v_flex()
             // Back to the list.
             .child(
@@ -352,6 +351,12 @@ impl SettingsView {
                         p,
                     ))
                     .child(row(
+                        "Project icon",
+                        &icon_hint,
+                        self.icon_controls(&project, p, cx),
+                        p,
+                    ))
+                    .child(row(
                         "Pin",
                         "Pinned projects come first in the sidebar and project pickers.",
                         Switch::new("project-pin")
@@ -390,6 +395,57 @@ impl SettingsView {
                     p,
                 )),
             ))
+            .into_any_element()
+    }
+
+    /// The icon, "Choose file…", and "Reset" once one was chosen.
+    fn icon_controls(
+        &self,
+        project: &loft_protocol::Project,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (pick_id, reset_id) = (project.id.clone(), project.id.clone());
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(crate::project_icon::badge(project, 26., p))
+            .child(
+                Button::new("project-icon-file")
+                    .small()
+                    .outline()
+                    .label("Choose file…")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Use as icon".into()),
+                        });
+                        let (store, id) = (this.store.clone(), pick_id.clone());
+                        cx.spawn(async move |_, cx| {
+                            if let Ok(Ok(Some(paths))) = rx.await
+                                && let Some(path) = paths.into_iter().next()
+                            {
+                                store.update(cx, |s, cx| s.set_project_icon(id, Some(path), cx));
+                            }
+                        })
+                        .detach();
+                    })),
+            )
+            .when(project.icon.is_some(), |d| {
+                d.child(
+                    Button::new("project-icon-reset")
+                        .small()
+                        .ghost()
+                        .label("Reset")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = reset_id.clone();
+                            this.store
+                                .update(cx, |s, cx| s.set_project_icon(id, None, cx));
+                        })),
+                )
+            })
             .into_any_element()
     }
 
