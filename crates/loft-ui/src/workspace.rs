@@ -2645,6 +2645,12 @@ impl WorkspaceView {
                 store.collapsed.clone(),
             )
         };
+        // Drafts (new threads not sent yet) go first; everything else stays
+        // most recent first. A draft keeps its creation time so typing
+        // doesn't re-sort, which would otherwise sink it under any thread
+        // that did something since.
+        let mut all_threads = all_threads;
+        all_threads.sort_by_key(|t| t.is_started() || t.parent.is_some());
         let all_projects: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
         let query = self.query.clone();
         // Rows picked together (gone threads drop out).
