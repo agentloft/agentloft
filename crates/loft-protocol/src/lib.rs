@@ -405,6 +405,29 @@ pub enum Request {
         #[serde(default = "default_search_limit")]
         limit: u32,
     },
+    /// A file by its path on the daemon's machine (`~`, `file://` and paths
+    /// relative to `thread_id`'s folder allowed): images in replies,
+    /// attachments, project icons. For a browser session the path must
+    /// resolve inside a project, a thread's folder, or Agentloft's own
+    /// attachments and icons (ADR-0016). Answers `Response::File`.
+    ReadPath {
+        path: String,
+        #[serde(default)]
+        thread_id: Option<ThreadId>,
+    },
+    // -- web access (ADR-0016); local clients only -------------------------
+    /// Web access as it stands: listening or not, the pairing link, and the
+    /// browsers signed in (answers `Response::WebStatus`, as do the next
+    /// three).
+    WebStatus,
+    /// Replace the pairing token and sign every browser out.
+    WebRotateToken,
+    /// Sign one browser out.
+    WebRevokeSession {
+        id: String,
+    },
+    /// Sign every browser out (the pairing link keeps working).
+    WebRevokeAllSessions,
     /// Agent-facing thread queries (Agentloft MCP server, ADR-0013).
     ListThreads {
         #[serde(default)]
@@ -491,6 +514,19 @@ pub struct Welcome {
     /// the daemon once it's idle.
     #[serde(default)]
     pub daemon_exe_mtime_ms: Option<i64>,
+    /// Set for a browser (or other remote) session: what it may do beyond
+    /// the defaults (ADR-0016). Absent for local clients, which may do
+    /// everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteAccess>,
+}
+
+/// The limits of a remote session, so its UI can hide what it can't use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAccess {
+    /// Terminals (a shell on the daemon's machine) are allowed.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 fn default_search_limit() -> u32 {
@@ -562,6 +598,9 @@ pub enum Response {
     Paths {
         paths: Vec<String>,
     },
+    WebStatus {
+        status: WebStatus,
+    },
     /// A new fork, plus the handoff digest to offer as its first message.
     Forked {
         thread: Thread,
@@ -603,6 +642,9 @@ pub enum ErrorCode {
     Harness,
     Internal,
     IncompatibleVersion,
+    /// This connection isn't allowed to do that (a browser session asking
+    /// for something only the desktop app may do).
+    Forbidden,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -775,6 +817,57 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
     }
+}
+
+/// Web access as the daemon sees it (Settings ▸ Web access).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WebStatus {
+    /// `[web] enabled` in config.toml.
+    pub enabled: bool,
+    /// The listener is up.
+    pub running: bool,
+    /// Why it isn't, when it should be (bad address, port in use, a
+    /// non-loopback address without TLS, unreadable certificate…).
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Where it listens: `http://127.0.0.1:4780`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// `url` with the pairing token in its fragment. Secret: opening it
+    /// signs a browser in.
+    #[serde(default)]
+    pub pairing_url: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    /// Reachable from other machines.
+    #[serde(default)]
+    pub remote: bool,
+    /// Reachable from other machines over plain HTTP.
+    #[serde(default)]
+    pub insecure_remote: bool,
+    /// The web client's files were found (`cargo xtask web`, or the app
+    /// bundle's copy).
+    #[serde(default)]
+    pub bundle: bool,
+    #[serde(default)]
+    pub sessions: Vec<WebSession>,
+}
+
+/// A browser signed in to web access.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WebSession {
+    /// Names the session for revoking it; not a secret.
+    pub id: String,
+    /// "Chrome on macOS", from the browser's User-Agent.
+    pub label: String,
+    /// The address it signed in from.
+    pub addr: String,
+    pub created_ms: i64,
+    pub last_seen_ms: i64,
+    pub expires_ms: i64,
+    /// Connections open right now.
+    #[serde(default)]
+    pub connections: u32,
 }
 
 /// A report an agent can give about itself.

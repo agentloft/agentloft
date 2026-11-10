@@ -83,6 +83,27 @@ impl Paths {
         self.home.join("projects")
     }
 
+    /// Images uploaded with messages.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.home.join("attachments")
+    }
+
+    /// Project icons the user chose.
+    pub fn icons_dir(&self) -> PathBuf {
+        self.home.join("icons")
+    }
+
+    /// Colour themes the user (or an agent) added.
+    pub fn themes_dir(&self) -> PathBuf {
+        self.home.join("themes")
+    }
+
+    /// Web access secrets: the pairing token and signed-in sessions
+    /// (private, 0700; see ADR-0016).
+    pub fn web_dir(&self) -> PathBuf {
+        self.home.join("web")
+    }
+
     /// Create the directory layout. `run/` is private (0700).
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
@@ -141,6 +162,130 @@ pub struct Config {
     pub harness: HarnessConfigs,
     pub worktrees: WorktreeConfig,
     pub projects: ProjectsConfig,
+    pub web: WebConfig,
+}
+
+/// `[web]` in config.toml: Agentloft in a browser, served by the daemon
+/// (ADR-0016). Off by default, and local-only unless told otherwise.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebConfig {
+    pub enabled: bool,
+    /// The address to listen on: an IP (`127.0.0.1`, `::1`, a LAN or
+    /// tailnet address, `0.0.0.0`) or `localhost`.
+    pub bind: String,
+    /// `0` picks a free port.
+    pub port: u16,
+    /// PEM certificate chain and private key; both or neither (`~` allowed).
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// Serve plain HTTP on a non-loopback address. Anyone on that network
+    /// can read the traffic; meant only for a link that is already
+    /// encrypted (a VPN or tailnet interface).
+    pub allow_insecure_remote: bool,
+    /// Extra names browsers may reach the listener by (the `Host` header),
+    /// e.g. a reverse proxy's or tunnel's hostname.
+    pub allowed_hosts: Vec<String>,
+    /// How long a paired browser stays signed in.
+    pub session_days: u32,
+    /// Let browser sessions open terminals (a shell on this machine).
+    pub allow_terminal: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".into(),
+            port: WebConfig::DEFAULT_PORT,
+            tls_cert: None,
+            tls_key: None,
+            allow_insecure_remote: false,
+            allowed_hosts: Vec::new(),
+            session_days: 30,
+            allow_terminal: false,
+        }
+    }
+}
+
+/// A `[web]` section that passed the safety rules: where to listen and how.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebPlan {
+    pub addr: std::net::SocketAddr,
+    /// Certificate chain and key files when serving HTTPS.
+    pub tls: Option<(PathBuf, PathBuf)>,
+    /// Plain HTTP on a non-loopback address, explicitly allowed.
+    pub insecure_remote: bool,
+    pub allowed_hosts: Vec<String>,
+    pub session_ttl: Duration,
+    pub allow_terminal: bool,
+}
+
+impl WebConfig {
+    pub const DEFAULT_PORT: u16 = 4780;
+
+    /// Check the section against the safety rules. A non-loopback address
+    /// is refused unless TLS is configured or `allow_insecure_remote` is set.
+    pub fn plan(&self) -> Result<WebPlan, String> {
+        let bind = self.bind.trim();
+        let ip: std::net::IpAddr = if bind.eq_ignore_ascii_case("localhost") {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            bind.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse()
+                .map_err(|_| format!("`{bind}` isn't an IP address"))?
+        };
+        let file = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(expand_tilde)
+        };
+        let tls = match (file(&self.tls_cert), file(&self.tls_key)) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            _ => return Err("TLS needs both a certificate and a key".into()),
+        };
+        let insecure_remote = !ip.is_loopback() && tls.is_none();
+        if insecure_remote && !self.allow_insecure_remote {
+            return Err(format!(
+                "{ip} is reachable from other machines: add a TLS certificate, \
+                 or set allow_insecure_remote"
+            ));
+        }
+        let mut allowed_hosts = Vec::new();
+        for host in &self.allowed_hosts {
+            let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+            let valid = !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+            if !valid {
+                return Err(format!("`{host}` isn't a host name"));
+            }
+            allowed_hosts.push(host);
+        }
+        Ok(WebPlan {
+            addr: std::net::SocketAddr::new(ip, self.port),
+            tls,
+            insecure_remote,
+            allowed_hosts,
+            session_ttl: Duration::from_secs(u64::from(self.session_days.clamp(1, 365)) * 86_400),
+            allow_terminal: self.allow_terminal,
+        })
+    }
+}
+
+/// `~` and `~/…` resolved against the user's home folder.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some("") => std::env::home_dir().unwrap_or_else(|| PathBuf::from(path)),
+        Some(rest) if rest.starts_with('/') => std::env::home_dir()
+            .map(|home| home.join(rest.trim_start_matches('/')))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        _ => PathBuf::from(path),
+    }
 }
 
 /// `[projects]` in config.toml.
@@ -556,6 +701,85 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn web_is_off_and_local_by_default() {
+        let web = WebConfig::default();
+        assert!(!web.enabled);
+        let plan = web.plan().unwrap();
+        assert!(plan.addr.ip().is_loopback());
+        assert_eq!(plan.addr.port(), WebConfig::DEFAULT_PORT);
+        assert!(plan.tls.is_none() && !plan.insecure_remote);
+    }
+
+    #[test]
+    fn web_refuses_a_remote_bind_without_tls() {
+        let remote = |bind: &str| WebConfig {
+            bind: bind.into(),
+            ..WebConfig::default()
+        };
+        for bind in ["0.0.0.0", "192.168.1.20", "100.64.0.7", "::", "fd7a::1"] {
+            let err = remote(bind).plan().unwrap_err();
+            assert!(err.contains("TLS"), "{bind}: {err}");
+        }
+        for bind in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.2"] {
+            assert!(remote(bind).plan().is_ok(), "{bind}");
+        }
+        assert!(
+            remote("example.com").plan().is_err(),
+            "names other than localhost"
+        );
+
+        // TLS, or the explicit override, allows it.
+        let tls = WebConfig {
+            tls_cert: Some("/etc/tls/cert.pem".into()),
+            tls_key: Some("/etc/tls/key.pem".into()),
+            ..remote("0.0.0.0")
+        };
+        let plan = tls.plan().unwrap();
+        assert!(plan.tls.is_some() && !plan.insecure_remote);
+        let insecure = WebConfig {
+            allow_insecure_remote: true,
+            ..remote("0.0.0.0")
+        };
+        assert!(insecure.plan().unwrap().insecure_remote);
+        // The override doesn't mark a loopback listener as insecure.
+        let local = WebConfig {
+            allow_insecure_remote: true,
+            ..WebConfig::default()
+        };
+        assert!(!local.plan().unwrap().insecure_remote);
+    }
+
+    #[test]
+    fn web_tls_needs_both_files_and_clean_host_names() {
+        let half = WebConfig {
+            tls_cert: Some("cert.pem".into()),
+            ..WebConfig::default()
+        };
+        assert!(half.plan().is_err());
+        let hosts = WebConfig {
+            allowed_hosts: vec![" Desk.Tailnet.ts.net. ".into()],
+            ..WebConfig::default()
+        };
+        assert_eq!(hosts.plan().unwrap().allowed_hosts, ["desk.tailnet.ts.net"]);
+        let bad = WebConfig {
+            allowed_hosts: vec!["evil.example/path".into()],
+            ..WebConfig::default()
+        };
+        assert!(bad.plan().is_err());
+    }
+
+    #[test]
+    fn web_section_parses() {
+        let cfg: Config =
+            toml::from_str("[web]\nenabled = true\nport = 0\nallowed_hosts = [\"desk.example\"]\n")
+                .unwrap();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.port, 0);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.session_days, 30);
+    }
 
     #[test]
     fn project_config_defaults_and_overrides() {

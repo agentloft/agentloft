@@ -26,6 +26,7 @@ async fn daemon(paths: &Paths) -> Daemon {
             exe: env!("CARGO_BIN_EXE_agentloftd").into(),
             home: paths.home.clone(),
         }),
+        web_bundle: None,
     })
     .await
     .unwrap()

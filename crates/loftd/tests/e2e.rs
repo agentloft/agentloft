@@ -18,6 +18,7 @@ async fn start(paths: &Paths) -> Daemon {
         harnesses,
         capture_login_env: false,
         mcp_bridge: None,
+        web_bundle: None,
     })
     .await
     .unwrap()
@@ -51,6 +52,7 @@ async fn full_turn_over_socket_with_reconnect() {
         harnesses: vec![],
         capture_login_env: false,
         mcp_bridge: None,
+        web_bundle: None,
     })
     .await;
     assert!(second.is_err(), "single-instance lock");

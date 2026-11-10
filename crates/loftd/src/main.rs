@@ -85,6 +85,7 @@ async fn run(paths: Paths) -> Result<()> {
         harnesses,
         capture_login_env: true,
         mcp_bridge,
+        web_bundle: None,
     })
     .await
     {

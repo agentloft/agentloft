@@ -167,20 +167,25 @@ impl Core {
     }
 
     pub(crate) fn read_file(&self, root: &FsRoot, rel: &str) -> CoreResult<FileContent> {
-        use std::io::Read as _;
         let (_, path) = self.resolve(root, rel)?;
-        let meta = std::fs::metadata(&path).map_err(|e| bad(format!("{rel}: {e}")))?;
+        self.read_file_at(&path, rel)
+    }
+
+    /// Read `path` (already checked by the caller), reported under `name`.
+    pub(crate) fn read_file_at(&self, path: &Path, name: &str) -> CoreResult<FileContent> {
+        use std::io::Read as _;
+        let meta = std::fs::metadata(path).map_err(|e| bad(format!("{name}: {e}")))?;
         if meta.is_dir() {
-            return Err(bad(format!("{rel} is a directory")));
+            return Err(bad(format!("{name} is a directory")));
         }
-        let file = std::fs::File::open(&path).map_err(|e| bad(format!("{rel}: {e}")))?;
+        let file = std::fs::File::open(path).map_err(|e| bad(format!("{name}: {e}")))?;
         let mut bytes = Vec::with_capacity(meta.len().min(MAX_READ) as usize);
         file.take(MAX_READ)
             .read_to_end(&mut bytes)
             .map_err(internal)?;
         let sniff = &bytes[..bytes.len().min(8192)];
         Ok(FileContent {
-            rel_path: rel.to_owned(),
+            rel_path: name.to_owned(),
             abs_path: path.to_string_lossy().into_owned(),
             size: meta.len(),
             binary: sniff.contains(&0),

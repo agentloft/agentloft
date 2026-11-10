@@ -21,17 +21,31 @@ loft-harness-codex.workspace = true
 loft-harness-acp.workspace = true
 loft-client.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 futures.workspace = true
 bytes.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+base64.workspace = true
+
+# Web access (ADR-0016): HTTP/1.1 + WebSocket listener, optional TLS.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+sha2 = "0.10"
+subtle = "2"
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true
+# TLS test: a throwaway self-signed certificate.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 serde_json.workspace = true
 futures.workspace = true
 tokio-util.workspace = true

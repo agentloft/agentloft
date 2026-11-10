@@ -89,6 +89,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         harnesses,
         capture_login_env: true,
         mcp_bridge: None,
+        web_bundle: None,
     })
     .await
     .unwrap();
@@ -209,6 +210,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         harnesses,
         capture_login_env: true,
         mcp_bridge: None,
+        web_bundle: None,
     })
     .await
     .unwrap();

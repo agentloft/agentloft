@@ -5,6 +5,7 @@
 mod clients;
 mod forks;
 mod handoff;
+mod remote;
 mod settings;
 mod terminals;
 mod thread;
@@ -21,6 +22,7 @@ use loft_protocol::{
     Topic, TurnStatus,
 };
 use loft_store::{Store, now_ms};
+pub use remote::RemotePolicy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -117,6 +119,8 @@ pub struct Core {
     pending_setup: Mutex<HashMap<ThreadId, String>>,
     /// File lists per directory for `FindFiles`, briefly cached.
     file_index: Mutex<HashMap<PathBuf, FileIndex>>,
+    /// Bumped whenever the live config is replaced.
+    config_rev: tokio::sync::watch::Sender<u64>,
     opts: CoreOptions,
 }
 
@@ -147,6 +151,7 @@ impl Core {
             commands: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
             file_index: Mutex::new(HashMap::new()),
+            config_rev: tokio::sync::watch::channel(0).0,
             opts,
         })
     }
@@ -199,11 +204,16 @@ impl Core {
     }
 
     /// The current config (reloaded by the settings window).
-    pub(crate) fn config(&self) -> loft_config::Config {
+    pub fn config(&self) -> loft_config::Config {
         self.config
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Changes whenever the config is reloaded (`borrow` is a counter).
+    pub fn config_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.config_rev.subscribe()
     }
 
     /// Validate and store uploaded images; the agent gets file paths.
@@ -404,6 +414,7 @@ impl Core {
         let config = loft_config::Config::load_file(file)
             .map_err(|e| ErrorBody::new(ErrorCode::BadRequest, format!("{e:#}")))?;
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+        self.config_rev.send_modify(|rev| *rev += 1);
         // Binary paths may have changed.
         lock(&self.models).clear();
         tracing::info!("config reloaded");
@@ -731,6 +742,22 @@ impl Core {
                 ErrorCode::Unsupported,
                 "shutdown is handled by the daemon",
             )),
+            Request::WebStatus
+            | Request::WebRotateToken
+            | Request::WebRevokeSession { .. }
+            | Request::WebRevokeAllSessions => Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                "web access is handled by the daemon",
+            )),
+            Request::ReadPath { path, thread_id } => {
+                let core = self.clone();
+                let file = tokio::task::spawn_blocking(move || {
+                    core.read_path(&path, thread_id.as_ref(), false)
+                })
+                .await
+                .map_err(internal)??;
+                Ok(Response::File { file })
+            }
             Request::ListDir { root, rel_path } => {
                 let core = self.clone();
                 let entries = tokio::task::spawn_blocking(move || core.list_dir(&root, &rel_path))
