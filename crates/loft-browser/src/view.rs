@@ -66,6 +66,8 @@ pub enum BrowserEvent {
     Annotation(Annotation),
     /// The user took a screenshot of the page (PNG).
     Screenshot(Vec<u8>),
+    /// Annotation mode was turned off.
+    AnnotatingStopped,
 }
 
 /// A note the user pinned to an element of the page.
@@ -241,8 +243,22 @@ pub struct BrowserView {
     more_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The user's page zoom (1.0 = 100%), on top of any device scaling.
     user_zoom: f32,
+    /// While a dialog is open the native page (which draws above
+    /// everything) gives way to a still picture of itself, so the dialog's
+    /// dimmed backdrop covers it like the rest of the window.
+    freeze: Freeze,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// See [`BrowserView::freeze`].
+enum Freeze {
+    Live,
+    /// A dialog opened; the picture is on its way (the page stays live).
+    Pending,
+    Still(std::sync::Arc<gpui_kit::Image>),
+    /// No picture: hide the page.
+    Hidden,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
@@ -324,6 +340,7 @@ impl BrowserView {
             device_anchor: Rc::default(),
             more_anchor: Rc::default(),
             user_zoom: 1.0,
+            freeze: Freeze::Live,
             _tasks: tasks,
             _subscriptions: subscriptions,
         }
@@ -414,12 +431,15 @@ impl BrowserView {
             return;
         }
         self.annotating = on;
-        if !on && let Some(native) = &self.native {
-            // Fire and forget: nothing to wait for.
-            drop(native.call_js(
-                "if (window.__loftAnnotate) window.__loftAnnotate.stop();",
-                JsWorld::Agent,
-            ));
+        if !on {
+            if let Some(native) = &self.native {
+                // Fire and forget: nothing to wait for.
+                drop(native.call_js(
+                    "if (window.__loftAnnotate) window.__loftAnnotate.stop();",
+                    JsWorld::Agent,
+                ));
+            }
+            cx.emit(BrowserEvent::AnnotatingStopped);
         }
         cx.notify();
     }
@@ -434,14 +454,67 @@ impl BrowserView {
 
     /// The page, at `zoom` times the user's zoom.
     fn page_zoomed(&self, native: Rc<NativeWebView>, zoom: f32) -> AnyElement {
+        let page = match &self.freeze {
+            Freeze::Live | Freeze::Pending => Surface::new(native, self.page_shown())
+                .zoom(f64::from(zoom * self.user_zoom))
+                .into_any_element(),
+            Freeze::Still(picture) => {
+                use gpui_kit::StyledImage as _;
+                gpui_kit::img(picture.clone())
+                    .size_full()
+                    .object_fit(gpui_kit::ObjectFit::Fill)
+                    .into_any_element()
+            }
+            Freeze::Hidden => div().size_full().into_any_element(),
+        };
         div()
             .flex_1()
             .min_h_0()
             .size_full()
             .flex()
             .flex_col()
-            .child(Surface::new(native, self.page_shown()).zoom(f64::from(zoom * self.user_zoom)))
+            .child(page)
             .into_any_element()
+    }
+
+    /// Swap the live page for a picture while a dialog is open (see
+    /// [`Self::freeze`]), and back once it closes.
+    fn follow_dialogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        let covered = window.has_active_dialog(cx);
+        match (&self.freeze, covered) {
+            (Freeze::Live, true) if self.visible => {
+                let Some(native) = &self.native else {
+                    return;
+                };
+                self.freeze = Freeze::Pending;
+                let rx = native.screenshot();
+                cx.spawn(async move |this, cx| {
+                    let shot = rx.await.ok().and_then(Result::ok);
+                    let _ = this.update(cx, |this, cx| {
+                        if matches!(this.freeze, Freeze::Pending) {
+                            this.freeze = match shot {
+                                Some(shot) => {
+                                    Freeze::Still(std::sync::Arc::new(gpui_kit::Image::from_bytes(
+                                        gpui_kit::ImageFormat::Png,
+                                        shot.png,
+                                    )))
+                                }
+                                None => Freeze::Hidden,
+                            };
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            (Freeze::Live, _) => {}
+            (_, false) => {
+                self.freeze = Freeze::Live;
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     /// A PNG of the page as shown (pins included), for attaching.
@@ -548,6 +621,18 @@ impl BrowserView {
                 }
             });
         anchored(button, self.more_anchor.clone())
+    }
+
+    /// Remove note `n`'s pin and outline from the page.
+    pub fn remove_annotation(&mut self, n: u32) {
+        if let Some(native) = &self.native {
+            drop(native.call_js(
+                &format!(
+                    "if (window.__loftAnnotate && window.__loftAnnotate.remove) window.__loftAnnotate.remove({n});"
+                ),
+                JsWorld::Agent,
+            ));
+        }
     }
 
     /// Remove the numbered pins from the page (after the notes were sent).
@@ -953,6 +1038,7 @@ impl BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_dialogs(window, cx);
         if !self.editing_address
             && let Some(text) = self.pending_address.take()
         {

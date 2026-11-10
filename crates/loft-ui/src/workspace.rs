@@ -219,6 +219,14 @@ impl WorkspaceView {
                     this.add_annotation(thread_id, note, window, cx)
                 }
                 crate::panel::PanelEvent::Maximized(_) => cx.notify(),
+                // Done annotating with no notes waiting: clear the page.
+                crate::panel::PanelEvent::AnnotatingStopped(thread_id) => {
+                    if this.page_notes.get(thread_id).is_none_or(|n| n.is_empty())
+                        && let Some(browser) = this.panel.read(cx).existing_browser(thread_id, cx)
+                    {
+                        browser.update(cx, |b, _| b.clear_annotations());
+                    }
+                }
                 crate::panel::PanelEvent::Screenshot(thread_id, png) => {
                     if let Some(image) =
                         crate::attachments::PendingImage::png("screenshot.png", png.clone())
@@ -832,12 +840,23 @@ impl WorkspaceView {
         if let Some(list) = self.page_notes.get_mut(thread_id)
             && ix < list.len()
         {
-            list.remove(ix);
-            if list.is_empty() {
+            let note = list.remove(ix);
+            let empty = list.is_empty();
+            if empty {
                 // No notes left: the picture of them goes too.
                 if let Some(images) = self.attachments.get_mut(thread_id) {
                     images.retain(|a| a.name != PAGE_NOTES_IMAGE);
                 }
+            }
+            // And its pin leaves the page.
+            if let Some(browser) = self.panel.read(cx).existing_browser(thread_id, cx) {
+                browser.update(cx, |b, _| {
+                    if empty {
+                        b.clear_annotations();
+                    } else {
+                        b.remove_annotation(note.n);
+                    }
+                });
             }
         }
         cx.notify();

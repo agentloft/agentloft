@@ -120,6 +120,8 @@ pub enum PanelEvent {
     Screenshot(ThreadId, Vec<u8>),
     /// The panel was expanded to fill the window, or brought back.
     Maximized(bool),
+    /// `thread`'s browser left annotation mode.
+    AnnotatingStopped(ThreadId),
 }
 
 pub struct WorkbenchPanel {
@@ -304,6 +306,9 @@ impl WorkbenchPanel {
             }
             loft_browser::BrowserEvent::Screenshot(png) => {
                 cx.emit(PanelEvent::Screenshot(id.clone(), png.clone()))
+            }
+            loft_browser::BrowserEvent::AnnotatingStopped => {
+                cx.emit(PanelEvent::AnnotatingStopped(id.clone()))
             }
             // Titles and loading state show on the tab.
             _ => cx.notify(),

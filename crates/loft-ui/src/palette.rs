@@ -80,7 +80,8 @@ pub fn open(
         let mut command = Command::new(&state)
             .placeholder("Search threads, messages, settings and commands…")
             .bordered(false)
-            .max_h(px(460.));
+            .max_h(px(460.))
+            .footer(|_, _, cx| key_hints(cx));
         for (label, entries) in all.iter() {
             command = command.group(
                 CommandGroup::new()
@@ -89,6 +90,22 @@ pub fn open(
             );
         }
         let (found_q, store_q) = (found.clone(), store.clone());
+        // Esc clears what's typed, then closes (the field would otherwise
+        // keep the key to itself).
+        let esc_state = state.clone();
+        use gpui_kit::InteractiveElement as _;
+        let esc =
+            gpui_kit::div().capture_key_down(move |event: &gpui_kit::KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                cx.stop_propagation();
+                if esc_state.read(cx).query(cx).is_empty() {
+                    window.close_dialog(cx);
+                } else {
+                    esc_state.update(cx, |s, cx| s.set_query("", window, cx));
+                }
+            });
         dialog
             .w(px(640.))
             .p_0()
@@ -96,24 +113,78 @@ pub fn open(
             .margin_top(px(96.))
             .close_button(false)
             .child(
-                command
-                    .on_query(move |query, window, cx| {
-                        search_messages(&found_q, &store_q, query, window, cx)
-                    })
-                    .on_confirm(move |ix: IndexPath, window, cx| {
-                        let Some(run) = all
-                            .get(ix.section)
-                            .and_then(|(_, entries)| entries.get(ix.row))
-                            .map(|e| e.run.clone())
-                        else {
-                            return;
-                        };
-                        window.close_dialog(cx);
-                        view.update(cx, |v, cx| run(v, window, cx));
-                    }),
+                esc.child(
+                    command
+                        .on_query(move |query, window, cx| {
+                            search_messages(&found_q, &store_q, query, window, cx)
+                        })
+                        .on_confirm(move |ix: IndexPath, window, cx| {
+                            let Some(run) = all
+                                .get(ix.section)
+                                .and_then(|(_, entries)| entries.get(ix.row))
+                                .map(|e| e.run.clone())
+                            else {
+                                return;
+                            };
+                            window.close_dialog(cx);
+                            view.update(cx, |v, cx| run(v, window, cx));
+                        }),
+                ),
             )
     });
     focus.update(cx, |s, cx| s.focus(window, cx));
+}
+
+/// "↑ ↓ Navigate · Enter Select · Esc Close" under the list.
+fn key_hints(cx: &App) -> gpui_kit::AnyElement {
+    use gpui_kit::component::Sizable as _;
+    use gpui_kit::{IntoElement as _, div};
+    let p = crate::theme::Palette::of(cx);
+    let key = |child: gpui_kit::AnyElement| {
+        div()
+            .h(px(18.))
+            .min_w(px(18.))
+            .px(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .bg(p.muted)
+            .border_1()
+            .border_color(p.border)
+            .text_color(p.foreground)
+            .child(child)
+    };
+    let word = |w: &'static str| div().child(w).into_any_element();
+    let icon = |i: IconName| {
+        gpui_kit::component::Icon::new(i)
+            .xsmall()
+            .into_any_element()
+    };
+    let hint = |keys: Vec<gpui_kit::AnyElement>, what: &'static str| {
+        gpui_kit::component::h_flex()
+            .gap_1()
+            .items_center()
+            .children(keys.into_iter().map(key))
+            .child(div().ml(px(2.)).child(what))
+    };
+    gpui_kit::component::h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_2()
+        .items_center()
+        .border_t_1()
+        .border_color(p.border)
+        .text_xs()
+        .text_color(p.muted_foreground)
+        .child(hint(
+            vec![icon(IconName::ArrowUp), icon(IconName::ArrowDown)],
+            "Navigate",
+        ))
+        .child(hint(vec![word("Enter")], "Select"))
+        .child(hint(vec![word("Esc")], "Close"))
+        .into_any_element()
 }
 
 /// Ask the core which threads' messages mention `query` (after a pause).

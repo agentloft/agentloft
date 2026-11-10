@@ -209,6 +209,12 @@ pub fn apply(cx: &mut App) {
         colors.button_primary_foreground = on_accent;
         colors.ring = accent.opacity(0.55);
         colors.selection = accent.opacity(0.28);
+        // Behind dialogs: dim the window so the dialog stands out.
+        colors.overlay = if mode.is_dark() {
+            gpui_kit::hsla(0., 0., 0., 0.7)
+        } else {
+            gpui_kit::hsla(220. / 360., 0.2, 0.08, 0.38)
+        };
         if let Some(family) = &config.font_family {
             theme.font_family = family.clone().into();
         }

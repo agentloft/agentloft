@@ -120,9 +120,11 @@ if (!window.__loftAnnotate) {
     const sx = window.scrollX, sy = window.scrollY;
     const mark = document.createElement('div');
     mark.className = 'mark';
+    mark.dataset.n = String(n);
     Object.assign(mark.style, { left: r.left + sx + 'px', top: r.top + sy + 'px', width: r.width + 'px', height: r.height + 'px' });
     const pin = document.createElement('div');
     pin.className = 'pin';
+    pin.dataset.n = String(n);
     pin.textContent = String(n);
     Object.assign(pin.style, { left: r.right + sx - 10 + 'px', top: Math.max(0, r.top + sy - 10) + 'px' });
     root.appendChild(mark);
@@ -266,6 +268,12 @@ if (!window.__loftAnnotate) {
       count = 0;
       api.notes = [];
       if (!active) host.remove();
+    },
+    // Remove one note's pin and outline (its chip was removed).
+    remove(n) {
+      root.querySelectorAll(`.pin[data-n="${n}"], .mark[data-n="${n}"]`).forEach((e) => e.remove());
+      api.notes = api.notes.filter((x) => x.n !== n);
+      if (!root.querySelector('.pin')) api.clear();
     },
     take() { const n = api.notes; api.notes = []; return n; },
   };
