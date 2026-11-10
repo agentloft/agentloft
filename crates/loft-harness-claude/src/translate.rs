@@ -46,6 +46,8 @@ pub struct Translator {
     queries: HashSet<String>,
     /// Agent tool call id → the task id Claude runs it as (to stop it).
     tasks: HashMap<String, String>,
+    /// Tasks started and not yet finished: task id → what it is.
+    open_tasks: std::collections::BTreeMap<String, String>,
     interrupt_requested: bool,
     turn_active: bool,
     next_request: u64,
@@ -247,14 +249,35 @@ impl Translator {
                 if let (Some(task), Some(tool)) = (str_at(v, "task_id"), str_at(v, "tool_use_id")) {
                     self.tasks.insert(tool.to_owned(), task.to_owned());
                 }
-                vec![]
+                match str_at(v, "task_id") {
+                    Some(task) => {
+                        let what = str_at(v, "description")
+                            .or_else(|| str_at(v, "subagent_type"))
+                            .unwrap_or("a background task")
+                            .to_owned();
+                        self.open_tasks.insert(task.to_owned(), what);
+                        self.background_tasks()
+                    }
+                    None => vec![],
+                }
             }
+            // A task finished (or stopped, or failed).
+            Some("task_notification") => match str_at(v, "task_id") {
+                Some(task) if self.open_tasks.remove(task).is_some() => self.background_tasks(),
+                _ => vec![],
+            },
             Some("api_retry") => vec![Out::Event(HarnessEvent::Notice {
                 level: NoticeLevel::Warning,
                 text: "Claude API error — retrying…".into(),
             })],
             _ => vec![],
         }
+    }
+
+    fn background_tasks(&self) -> Vec<Out> {
+        vec![Out::Event(HarnessEvent::BackgroundTasks(
+            self.open_tasks.values().cloned().collect(),
+        ))]
     }
 
     fn on_stream_event(&mut self, v: &Value) -> Vec<Out> {
@@ -950,6 +973,35 @@ mod tests {
         };
         assert_eq!(v["request"]["subtype"], "stop_task");
         assert_eq!(v["request"]["task_id"], "t9");
+    }
+
+    #[test]
+    fn open_tasks_are_reported_until_they_finish() {
+        let mut t = Translator::new();
+        let started = |id: &str, what: &str| {
+            format!(
+                r#"{{"type":"system","subtype":"task_started","task_id":"{id}","tool_use_id":"tu_{id}","description":"{what}","is_backgrounded":true}}"#
+            )
+        };
+        let out = t.on_line(&started("a", "sleep 30"));
+        assert!(matches!(events(&out).as_slice(),
+            [HarnessEvent::BackgroundTasks(v)] if v == &vec!["sleep 30".to_owned()]));
+        t.on_line(&started("b", "Review the parser"));
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}"#,
+        );
+        assert!(matches!(events(&out).as_slice(),
+            [HarnessEvent::BackgroundTasks(v)] if v == &vec!["Review the parser".to_owned()]));
+        // A repeat notice changes nothing.
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}"#,
+        );
+        assert!(events(&out).is_empty());
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"b","status":"stopped"}"#,
+        );
+        assert!(matches!(events(&out).as_slice(),
+            [HarnessEvent::BackgroundTasks(v)] if v.is_empty()));
     }
 
     #[test]

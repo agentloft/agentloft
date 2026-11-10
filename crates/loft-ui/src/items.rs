@@ -16,7 +16,7 @@ use gpui_kit::{
 use loft_client::model::ThreadModel;
 use loft_protocol::{
     DecisionKind, Item, ItemBody, ItemStatus, NoticeLevel, RequestKind, RequestStatus,
-    RuntimeRequest, ThreadId, ThreadStatus, ToolKind, TurnStatus,
+    RuntimeRequest, ThreadStatus, ToolKind, TurnStatus,
 };
 
 const OUTPUT_PREVIEW_LINES: usize = 14;
@@ -341,6 +341,7 @@ pub fn render_row(
             steps,
         } => render_work_header(thread, model, *turn_ix, *open, *steps, p),
         Row::Pending => render_pending(p),
+        Row::Waiting => render_waiting(&model.thread.waiting_on, p),
         Row::Card(ix) => crate::info_cards::render(thread, store, state, *ix, p),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
@@ -698,6 +699,38 @@ fn render_pending(p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
+/// The turn is over, but work the agent started in the background isn't:
+/// say what it's waiting on.
+fn render_waiting(tasks: &[String], p: &Palette) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _, pulsating_between};
+    let what = match tasks {
+        [one] => one.clone(),
+        many => format!("{} background tasks", many.len()),
+    };
+    h_flex()
+        .gap_1p5()
+        .items_center()
+        .text_sm()
+        .text_color(p.muted_foreground)
+        .child(Icon::new(IconName::Hourglass).small())
+        .child(div().flex_none().child("Waiting on"))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(p.foreground)
+                .child(what),
+        )
+        .with_animation(
+            "waiting-pulse",
+            Animation::new(std::time::Duration::from_millis(1800))
+                .repeat()
+                .with_easing(pulsating_between(0.5, 1.0)),
+            |d, delta| d.opacity(delta),
+        )
+        .into_any_element()
+}
+
 /// A thought's first line, as its label ("Checking the parser").
 fn reasoning_summary(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
@@ -735,7 +768,9 @@ fn render_tool_group(
     let key = loft_protocol::ItemId(format!("group:{}", items[0].id.0));
 
     let mut col = v_flex().gap_1();
-    if items.len() == 1 {
+    if items.len() > 1 && items.iter().all(|i| crate::store::is_agent(i)) {
+        col = col.child(agents_group(thread, store, state, model, items, p, cx));
+    } else if items.len() == 1 {
         col = col.child(tool_line(thread, store, state, model, items[0], p, cx));
     } else {
         let open = state.is_expanded(&key, running);
@@ -775,6 +810,174 @@ fn render_tool_group(
         col = col.child(approval_card(request, store, p, cwd));
     }
     col.into_any_element()
+}
+
+/// Several agents started together (subagents and/or threads): their
+/// logos stacked and a count, then their cards, open while any runs.
+fn agents_group(
+    thread: &Entity<ThreadState>,
+    store: &Entity<AppStore>,
+    state: &ThreadState,
+    model: &ThreadModel,
+    items: &[&Item],
+    p: &Palette,
+    cx: &App,
+) -> AnyElement {
+    let live = store_live(store, model, cx);
+    // (agent harness, running, failed) per card.
+    let looks: Vec<(String, bool, bool)> = items
+        .iter()
+        .map(|item| {
+            let running = crate::store::agent_running(model, item, &live);
+            let spawned = match &item.body {
+                ItemBody::ToolCall { tool, output, .. }
+                    if tool.ends_with("agentloft__spawn_thread") =>
+                {
+                    output
+                        .as_deref()
+                        .and_then(crate::store::spawned_thread_id)
+                        .and_then(|id| {
+                            store
+                                .read(cx)
+                                .workspace
+                                .threads
+                                .iter()
+                                .find(|t| t.id == id)
+                                .cloned()
+                        })
+                }
+                _ => None,
+            };
+            let harness = spawned
+                .as_ref()
+                .map(|t| t.harness.as_str().to_owned())
+                .unwrap_or_else(|| model.thread.harness.as_str().to_owned());
+            let failed = match &spawned {
+                Some(t) => t.status == ThreadStatus::Error,
+                None => {
+                    matches!(item.status, ItemStatus::Failed)
+                        || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. })
+                }
+            };
+            (harness, running, failed)
+        })
+        .collect();
+    let running = looks.iter().filter(|l| l.1).count();
+    let failed = looks.iter().filter(|l| !l.1 && l.2).count();
+    let done = looks.len() - running - failed;
+    let all_threads = items.iter().all(|i| {
+        matches!(&i.body, ItemBody::ToolCall { tool, .. } if tool.ends_with("agentloft__spawn_thread"))
+    });
+    let noun = if all_threads { "threads" } else { "agents" };
+    let summary = [(running, "running"), (done, "done"), (failed, "failed")]
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, w)| format!("{n} {w}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let key = loft_protocol::ItemId(format!("agents:{}", items[0].id.0));
+    let open = state.is_expanded(&key, running > 0);
+    // Logos overlapping, like a stack of cards.
+    let mut stack = h_flex().flex_none().items_center();
+    for (ix, (harness, _, _)) in looks.iter().take(3).enumerate() {
+        stack = stack.child(
+            div()
+                .size(px(26.))
+                .when(ix > 0, |d| d.ml(px(-9.)))
+                .rounded_full()
+                .bg(p.muted)
+                .border_2()
+                .border_color(p.background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(crate::brand::agent_logo(harness, px(14.), p)),
+        );
+    }
+    let thread_h = thread.clone();
+    let toggle_key = key.clone();
+    let default_open = running > 0;
+    let header = h_flex()
+        .id(SharedString::from(format!("agents-{}", items[0].id)))
+        .gap_3()
+        .items_center()
+        .px_2()
+        .py_1p5()
+        .ml(px(-8.))
+        .rounded(px(10.))
+        .cursor_pointer()
+        .hover(|d| d.bg(p.hover))
+        .child(stack)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.foreground)
+                        .child(format!("{} {noun}", items.len())),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .text_xs()
+                        .text_color(p.muted_foreground)
+                        .when(running > 0, |d| {
+                            d.child(div().size(px(6.)).rounded_full().bg(p.accent))
+                        })
+                        .child(summary),
+                ),
+        )
+        .child(chevron(open))
+        .on_click(move |_, _, cx| {
+            let key = toggle_key.clone();
+            thread_h.update(cx, |t, cx| t.toggle(key, default_open, cx));
+        });
+    let mut card = v_flex().gap_1().child(header);
+    if open {
+        let mut list = v_flex()
+            .px_3()
+            .py_1()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.muted.opacity(0.35));
+        for item in items {
+            list = list.child(
+                div()
+                    .ml(px(8.))
+                    .child(tool_line(thread, store, state, model, item, p, cx)),
+            );
+        }
+        card = card.child(list);
+    }
+    card.into_any_element()
+}
+
+/// The threads this one's agent started that are running now.
+fn store_live(
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    cx: &App,
+) -> std::collections::HashSet<loft_protocol::ThreadId> {
+    store
+        .read(cx)
+        .workspace
+        .threads
+        .iter()
+        .filter(|t| {
+            t.parent.as_ref().is_some_and(|p| {
+                p.thread_id == model.thread.id && p.kind == loft_protocol::ForkKind::Spawned
+            }) && (matches!(
+                t.status,
+                ThreadStatus::Running | ThreadStatus::WaitingApproval
+            ) || t.is_waiting())
+        })
+        .map(|t| t.id.clone())
+        .collect()
 }
 
 /// One tool call. Subagents render as agent cards; file tools open the file.
@@ -860,7 +1063,11 @@ pub(crate) fn tool_line(
             .map(title_of);
         let named = match op {
             "wait_for_threads" => Some((
-                "Waited for",
+                if item.status == ItemStatus::InProgress {
+                    "Waiting for"
+                } else {
+                    "Waited for"
+                },
                 input
                     .get("thread_ids")
                     .and_then(|v| v.as_array())
@@ -1204,20 +1411,6 @@ fn agent_card(
         .into_any_element()
 }
 
-/// The thread id in a `spawn_thread` result (its JSON, or the text around it).
-fn spawned_id(output: &str) -> Option<ThreadId> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output)
-        && let Some(id) = v.get("thread_id").and_then(|v| v.as_str())
-    {
-        return Some(ThreadId(id.to_owned()));
-    }
-    let at = output.find("\"thread_id\"")?;
-    let rest = &output[at + 11..];
-    let start = rest.find('"')? + 1;
-    let len = rest[start..].find('"')?;
-    Some(ThreadId(rest[start..start + len].to_owned()))
-}
-
 /// A thread another agent started (`spawn_thread`): its agent, title and
 /// live status; click to open it (⌘-click: beside this one).
 fn spawned_card(
@@ -1229,15 +1422,17 @@ fn spawned_card(
     p: &Palette,
     cx: &App,
 ) -> AnyElement {
-    let child = output.and_then(spawned_id).and_then(|id| {
-        store
-            .read(cx)
-            .workspace
-            .threads
-            .iter()
-            .find(|t| t.id == id)
-            .cloned()
-    });
+    let child = output
+        .and_then(crate::store::spawned_thread_id)
+        .and_then(|id| {
+            store
+                .read(cx)
+                .workspace
+                .threads
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+        });
     let asked = |k: &str| {
         input
             .get(k)
@@ -1247,6 +1442,7 @@ fn spawned_card(
     let (harness, title, subtitle, dot, running) = match &child {
         Some(t) => {
             let (what, dot, running) = match t.status {
+                _ if t.is_waiting() => ("Waiting on background work", p.accent, true),
                 ThreadStatus::Running => ("Working", p.accent, true),
                 ThreadStatus::WaitingApproval => ("Needs your approval", p.warning, false),
                 ThreadStatus::Error => ("Failed", p.danger, false),

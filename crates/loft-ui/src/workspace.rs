@@ -4343,7 +4343,9 @@ fn project_header(
     let waiting = threads
         .iter()
         .any(|t| t.status == ThreadStatus::WaitingApproval);
-    let running = threads.iter().any(|t| t.status == ThreadStatus::Running);
+    let running = threads
+        .iter()
+        .any(|t| t.status == ThreadStatus::Running || t.is_waiting());
     let fresh = threads.iter().any(|t| unread.contains(&t.id));
     // Folded: what you'd otherwise miss.
     let summary: Option<AnyElement> = folded.then(|| {
@@ -4510,6 +4512,15 @@ fn thread_row(
         ThreadStatus::Error => Icon::new(IconName::CircleAlert)
             .xsmall()
             .text_color(p.danger)
+            .into_any_element(),
+        // Its turn is over but background work it started isn't.
+        _ if thread.is_waiting() => h_flex()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .text_color(p.accent)
+            .child(Icon::new(IconName::Hourglass).xsmall())
+            .child("Waiting")
             .into_any_element(),
         // Finished while you were elsewhere.
         _ if unread => div()

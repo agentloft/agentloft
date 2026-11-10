@@ -464,6 +464,7 @@ impl AppStore {
                     if self.workspace.apply_event(&event) {
                         if let Event::ThreadUpdated { thread } = &event.event {
                             self.on_status_change(&thread.id, before, thread.status, cx);
+                            self.refresh_parent(&thread.id, cx);
                             // A first session may have told the daemon which
                             // models this agent offers (ACP).
                             let session_started =
@@ -566,11 +567,49 @@ impl AppStore {
     // -- actions ------------------------------------------------------------
 
     /// A thread's live state, loading it if needed (without selecting it).
+    /// Threads `parent`'s agent started that are still running.
+    fn live_spawned(&self, parent: &ThreadId) -> std::collections::HashSet<ThreadId> {
+        self.workspace
+            .threads
+            .iter()
+            .filter(|t| {
+                t.parent.as_ref().is_some_and(|p| {
+                    &p.thread_id == parent && p.kind == loft_protocol::ForkKind::Spawned
+                }) && (matches!(
+                    t.status,
+                    loft_protocol::ThreadStatus::Running
+                        | loft_protocol::ThreadStatus::WaitingApproval
+                ) || t.is_waiting())
+            })
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// A spawned thread changed: its parent's cards follow.
+    fn refresh_parent(&mut self, child: &ThreadId, cx: &mut Context<Self>) {
+        let Some(parent) = self
+            .workspace
+            .threads
+            .iter()
+            .find(|t| &t.id == child)
+            .and_then(|t| t.parent.clone())
+            .filter(|p| p.kind == loft_protocol::ForkKind::Spawned)
+        else {
+            return;
+        };
+        if let Some(entity) = self.threads.get(&parent.thread_id).cloned() {
+            let live = self.live_spawned(&parent.thread_id);
+            entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
+        }
+    }
+
     pub fn ensure_thread(&mut self, id: &ThreadId, cx: &mut Context<Self>) -> Entity<ThreadState> {
         if let Some(entity) = self.threads.get(id) {
             return entity.clone();
         }
         let entity = cx.new(|cx| ThreadState::new(id.clone(), cx));
+        let live = self.live_spawned(id);
+        entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
         self.threads.insert(id.clone(), entity.clone());
         if let Some(client) = &self.client {
             let sub = client.subscribe(Topic::Thread(id.clone()));
@@ -1303,6 +1342,8 @@ pub enum Row {
     },
     /// The agent is between steps (or hasn't answered yet).
     Pending,
+    /// No turn running, but background work the agent started is.
+    Waiting,
     /// A report asked for with `/context` or `/usage` (index into `cards`).
     Card(usize),
     TurnFooter {
@@ -1327,6 +1368,9 @@ pub struct ThreadState {
     ticker: Option<gpui_kit::Task<()>>,
     /// A message to scroll to once the thread has loaded (a search hit).
     reveal: Option<ItemId>,
+    /// Threads this one's agent started that are still running: their
+    /// cards stay in view even under a folded "Worked for …".
+    live_spawned: std::collections::HashSet<ThreadId>,
 }
 
 impl ThreadState {
@@ -1341,7 +1385,44 @@ impl ThreadState {
             ticker: None,
             cards: Vec::new(),
             reveal: None,
+            live_spawned: Default::default(),
         }
+    }
+
+    /// Which of the threads this one started are running (from the store).
+    pub fn set_live_spawned(
+        &mut self,
+        live: std::collections::HashSet<ThreadId>,
+        cx: &mut Context<Self>,
+    ) {
+        if live == self.live_spawned {
+            return;
+        }
+        self.live_spawned = live;
+        if self.model.is_none() {
+            return;
+        }
+        self.sync_rows(None, cx);
+        let Some(model) = self.model.as_ref() else {
+            return;
+        };
+        // Agent rows change size as their agents finish (a group folds).
+        let agent_rows: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                matches!(r, Row::ToolGroup { members }
+                    if members.iter().any(|&i| is_agent(&model.items[i])))
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        self.scroller.update(cx, |s, cx| {
+            for row in agent_rows {
+                s.remeasure_items(row..row + 1, cx);
+            }
+        });
+        cx.notify();
     }
 
     /// Scroll to a message: now if it's loaded, else once it is.
@@ -1388,7 +1469,11 @@ impl ThreadState {
         self.rows.iter().position(|r| match r {
             Row::Item(i) => *i == ix,
             Row::ToolGroup { members } => members.contains(&ix),
-            Row::Work { .. } | Row::Pending | Row::TurnFooter { .. } | Row::Card(_) => false,
+            Row::Work { .. }
+            | Row::Pending
+            | Row::Waiting
+            | Row::TurnFooter { .. }
+            | Row::Card(_) => false,
         })
     }
 
@@ -1459,6 +1544,17 @@ impl ThreadState {
                 });
                 if open {
                     push_runs(&mut rows, items, &work);
+                } else {
+                    // Folded, but agents still at work stay in view.
+                    let live: Vec<usize> = work
+                        .iter()
+                        .copied()
+                        .filter(|&i| {
+                            is_agent(&items[i])
+                                && agent_running(model, &items[i], &self.live_spawned)
+                        })
+                        .collect();
+                    push_runs(&mut rows, items, &live);
                 }
             }
             if !done {
@@ -1480,6 +1576,9 @@ impl ThreadState {
                 .collect();
             push_runs(&mut rows, items, &visible);
             rows.push(Row::TurnFooter { turn_ix });
+        }
+        if model.thread.is_waiting() {
+            rows.push(Row::Waiting);
         }
         // Reports sit where they were asked: before the first row holding a
         // later item.
@@ -1768,16 +1867,54 @@ pub enum CardState {
     Failed(String),
 }
 
+/// A subagent (Task/Agent call) or a thread the agent started
+/// (`spawn_thread`): shown as an agent card.
+pub(crate) fn is_agent(item: &loft_protocol::Item) -> bool {
+    matches!(&item.body, ItemBody::ToolCall { tool_kind, tool, .. }
+        if *tool_kind == loft_protocol::ToolKind::Subagent
+            || tool.ends_with("agentloft__spawn_thread"))
+}
+
+/// The thread id in a `spawn_thread` result (its JSON, or the text around it).
+pub(crate) fn spawned_thread_id(output: &str) -> Option<ThreadId> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output)
+        && let Some(id) = v.get("thread_id").and_then(|v| v.as_str())
+    {
+        return Some(ThreadId(id.to_owned()));
+    }
+    let at = output.find("\"thread_id\"")?;
+    let rest = &output[at + 11..];
+    let start = rest.find('"')? + 1;
+    let len = rest[start..].find('"')?;
+    Some(ThreadId(rest[start..start + len].to_owned()))
+}
+
+/// Whether an agent card's agent is still at work.
+pub(crate) fn agent_running(
+    model: &ThreadModel,
+    item: &loft_protocol::Item,
+    live_spawned: &std::collections::HashSet<ThreadId>,
+) -> bool {
+    match &item.body {
+        ItemBody::ToolCall {
+            tool_kind: loft_protocol::ToolKind::Subagent,
+            ..
+        } => crate::items::subagent_status(model, item).running,
+        ItemBody::ToolCall { output, .. } => {
+            item.status == ItemStatus::InProgress
+                || output
+                    .as_deref()
+                    .and_then(spawned_thread_id)
+                    .is_some_and(|id| live_spawned.contains(&id))
+        }
+        _ => false,
+    }
+}
+
 /// Rows for a list of top-level items: consecutive tool calls fold into
-/// one group row.
+/// one group row; consecutive agents share an agents card.
 fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
-    // Subagents (and threads an agent started) get a row of their own
-    // (their card), never a group's.
-    let is_subagent = |i: usize| {
-        matches!(&items[i].body, ItemBody::ToolCall { tool_kind, tool, .. }
-            if *tool_kind == loft_protocol::ToolKind::Subagent
-                || tool.ends_with("agentloft__spawn_thread"))
-    };
+    let is_subagent = |i: usize| is_agent(&items[i]);
     let is_tool = |i: usize| matches!(items[i].body, ItemBody::ToolCall { .. }) && !is_subagent(i);
     let mut k = 0;
     while k < ixs.len() {
@@ -1789,10 +1926,12 @@ fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) 
             }
             rows.push(Row::ToolGroup { members });
         } else if is_subagent(ixs[k]) {
-            rows.push(Row::ToolGroup {
-                members: vec![ixs[k]],
-            });
-            k += 1;
+            let mut members = Vec::new();
+            while k < ixs.len() && is_subagent(ixs[k]) {
+                members.push(ixs[k]);
+                k += 1;
+            }
+            rows.push(Row::ToolGroup { members });
         } else {
             rows.push(Row::Item(ixs[k]));
             k += 1;

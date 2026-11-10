@@ -373,6 +373,7 @@ impl Core {
                 }
             });
         let status = match thread.status {
+            _ if thread.is_waiting() => "waiting_on_background_work",
             loft_protocol::ThreadStatus::Running => "running",
             loft_protocol::ThreadStatus::WaitingApproval => "waiting_for_approval",
             loft_protocol::ThreadStatus::Error => "error",
@@ -397,6 +398,7 @@ impl Core {
             "spawned_by": thread.parent.as_ref()
                 .filter(|p| p.kind == loft_protocol::ForkKind::Spawned)
                 .map(|p| p.thread_id.clone()),
+            "waiting_on": thread.waiting_on,
             "latest_reply": reply,
         }))
     }

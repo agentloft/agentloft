@@ -443,12 +443,18 @@ impl Core {
             events.push(Event::TurnUpdated { turn });
         }
         for mut thread in threads {
-            if matches!(
+            let busy = matches!(
                 thread.status,
                 ThreadStatus::Running | ThreadStatus::WaitingApproval
-            ) {
+            );
+            // Background work died with the agent's process.
+            let waiting = !thread.waiting_on.is_empty();
+            if busy {
                 thread.status = ThreadStatus::Idle;
                 thread.updated_at_ms = now;
+            }
+            if busy || waiting {
+                thread.waiting_on.clear();
                 events.push(Event::ThreadUpdated { thread });
             }
         }
@@ -851,6 +857,7 @@ impl Core {
             command_info: Vec::new(),
             started_at_ms: None,
             draft: None,
+            waiting_on: Vec::new(),
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

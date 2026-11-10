@@ -122,6 +122,17 @@ pub struct Thread {
     /// Unsent composer text, kept across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// Background work the agent started that hasn't finished (what each
+    /// is): with no turn running, the thread is waiting on these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on: Vec<String>,
+}
+
+impl Thread {
+    /// Idle, but waiting on background work it started.
+    pub fn is_waiting(&self) -> bool {
+        !self.waiting_on.is_empty() && matches!(self.status, ThreadStatus::Idle)
+    }
 }
 
 impl Thread {

@@ -796,6 +796,15 @@ impl ThreadActor {
                     self.save_thread()?;
                 }
             }
+            HarnessEvent::BackgroundTasks(tasks) => {
+                if self.thread.waiting_on != tasks {
+                    self.thread.waiting_on = tasks;
+                    // Not activity: keep `updated_at_ms` (sidebar order).
+                    self.core.commit(vec![Event::ThreadUpdated {
+                        thread: self.thread.clone(),
+                    }])?;
+                }
+            }
             HarnessEvent::CommandsAvailable(commands) => {
                 if self.thread.command_info != commands {
                     self.thread.command_info = commands;
@@ -981,6 +990,13 @@ impl ThreadActor {
 
     fn on_session_lost(&mut self, code: Option<i32>, stderr_tail: String) {
         self.session = None;
+        // Its background work went with it.
+        if !self.thread.waiting_on.is_empty() {
+            self.thread.waiting_on.clear();
+            let _ = self.core.commit(vec![Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            }]);
+        }
         if let Some(pid) = self.session_pid.take() {
             self.core.forget_process(pid);
         }

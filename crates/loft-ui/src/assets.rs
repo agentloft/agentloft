@@ -14,6 +14,7 @@ gpui_kit::assets::icon_assets!(
         Bug,
         ChartPie,
         Gauge,
+        Hourglass,
         FileDiff,
         ScrollText,
         Camera,

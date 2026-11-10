@@ -201,7 +201,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "wait_for_threads",
-            "Wait until the given threads stop running (finished, failed or waiting for the user's approval), up to timeout_seconds, and return each one's status and latest reply. If some are still running when it returns, call it again.",
+            "Wait until the given threads are finished (not running and not waiting on background work they started), failed, or waiting for the user's approval, up to timeout_seconds, and return each one's status and latest reply. If some are still running when it returns, call it again.",
             json!({
                 "thread_ids": { "type": "array", "items": { "type": "string" } },
                 "timeout_seconds": { "type": "integer", "default": 50, "minimum": 1, "maximum": 600 }
@@ -517,7 +517,13 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                         Err(e) => json!({ "thread_id": id, "status": "unknown", "error": e }),
                     });
                 }
-                let running = states.iter().filter(|s| s["status"] == "running").count();
+                // Still at it: a turn running, or background work it started.
+                let running = states
+                    .iter()
+                    .filter(|s| {
+                        s["status"] == "running" || s["status"] == "waiting_on_background_work"
+                    })
+                    .count();
                 if running == 0 || std::time::Instant::now() >= deadline {
                     break json_result(&json!({
                         "still_running": running,

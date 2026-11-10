@@ -229,6 +229,7 @@ mod tests {
             command_info: Vec::new(),
             started_at_ms: None,
             draft: None,
+            waiting_on: Vec::new(),
         };
         let item = Item {
             id: ItemId::new(),

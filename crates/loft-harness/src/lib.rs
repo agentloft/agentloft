@@ -110,6 +110,9 @@ pub enum HarnessEvent {
     /// The agent's slash commands with what they do (Claude's initialize
     /// response).
     CommandsAvailable(Vec<loft_protocol::SlashCommandInfo>),
+    /// Work the agent started that is still going (background shells,
+    /// subagents): what each is. Empty once all have finished.
+    BackgroundTasks(Vec<String>),
     TurnStarted,
     ItemStarted {
         native_id: String,

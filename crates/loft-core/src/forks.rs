@@ -153,6 +153,7 @@ impl Core {
             command_info: Vec::new(),
             started_at_ms: None,
             draft: None,
+            waiting_on: Vec::new(),
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
@@ -305,6 +306,7 @@ impl Core {
             },
             started_at_ms: None,
             draft: None,
+            waiting_on: Vec::new(),
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
