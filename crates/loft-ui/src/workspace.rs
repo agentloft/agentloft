@@ -3008,6 +3008,21 @@ impl WorkspaceView {
         };
         let dark = p.dark;
 
+        let search = Input::new(&self.search)
+            .prefix(
+                Icon::new(IconName::Search)
+                    .small()
+                    .text_color(p.muted_foreground),
+            )
+            .cleanable(true);
+        // A browser tab has no traffic lights: search takes their place in
+        // the top strip instead of a row of its own.
+        let (search_on_top, search_below) = if crate::host::IS_WEB {
+            (Some(search), None)
+        } else {
+            (None, Some(search))
+        };
+
         v_flex()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -3021,11 +3036,18 @@ impl WorkspaceView {
                     .id("sidebar-titlebar")
                     .on_click(titlebar_double_click)
                     .h(px(HEADER_HEIGHT))
-                    .pl(px(TRAFFIC_LIGHTS_INSET))
+                    .pl(px(if search_on_top.is_some() {
+                        12.
+                    } else {
+                        TRAFFIC_LIGHTS_INSET
+                    }))
                     .pr_2()
                     .items_center()
                     .justify_end()
                     .gap_1()
+                    .children(
+                        search_on_top.map(|search| div().flex_1().min_w_0().mr_1().child(search)),
+                    )
                     .child(icon_button(
                         "toggle-sidebar",
                         IconName::PanelLeft,
@@ -3045,18 +3067,7 @@ impl WorkspaceView {
                         }),
                     )),
             )
-            .child(
-                div().px_3().pb_3().child(
-                    Input::new(&self.search)
-                        .small()
-                        .prefix(
-                            Icon::new(IconName::Search)
-                                .xsmall()
-                                .text_color(p.muted_foreground),
-                        )
-                        .cleanable(true),
-                ),
-            )
+            .children(search_below.map(|search| div().px_3().pb_3().child(search)))
             .child(
                 h_flex()
                     .px_4()
