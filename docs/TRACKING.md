@@ -3,7 +3,7 @@
 Local, checked-in tracker for [PLAN §7](PLAN.md#7-milestones). Update it in the same PR as the work.
 Legend: `[x]` done and verified · `[~]` partial · `[ ]` not started.
 
-**Latest:** Agentloft in a browser, on `feat/web-client`: see [Web](#web-agentloft-in-a-browser-branch-featweb-client-adr-0016) for what works, how to try it and what to review.
+**Latest:** Agentloft in a browser: see [Web](#web-agentloft-in-a-browser-adr-0016) for what works, how to try it and what to review.
 
 ## M0: Walking skeleton (in progress, branch `m0/scaffold`)
 
@@ -110,7 +110,7 @@ Built ahead of the PLAN's milestone order, by request.
 | Daemon updates | [x] | The daemon reports its executable's mtime. When the binary on disk has changed (rebuild or app update), the app asks an idle daemon to shut down and starts the new one. A busy daemon keeps running until its agents finish. Unknown requests from a newer app get a clear error instead of hanging |
 | App icon, bundle, About, menus | [x] | `cargo xtask bundle` |
 
-## Web: Agentloft in a browser (branch `feat/web-client`, [ADR-0016](adr/0016-web-client.md))
+## Web: Agentloft in a browser ([ADR-0016](adr/0016-web-client.md))
 
 **Summary (2026-11-10).** The same `loft-ui` now runs in a browser as WebAssembly, served by `agentloftd` over a secured HTTP + WebSocket listener. Off by default, this computer only by default.
 

@@ -1,6 +1,6 @@
 # ADR-0016: Agentloft in a browser: the same UI as wasm, over a secured listener in the daemon
 
-- **Status:** Proposed. Built on `feat/web-client`; the decisions marked "to review" are the product owner's to confirm.
+- **Status:** Accepted. Merged to main on 2026-11-10; the decisions marked "to review" are still the product owner's to revisit.
 - **Date:** 2026-11-10
 
 ## Context
