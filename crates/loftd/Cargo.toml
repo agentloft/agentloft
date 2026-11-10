@@ -1,0 +1,41 @@
+[package]
+name = "loftd"
+description = "agentloftd — the Agentloft core daemon (ADR-0001)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "agentloftd"
+path = "src/main.rs"
+
+[dependencies]
+loft-protocol.workspace = true
+loft-config.workspace = true
+loft-store.workspace = true
+loft-core.workspace = true
+loft-harness.workspace = true
+loft-harness-claude.workspace = true
+loft-harness-codex.workspace = true
+loft-harness-acp.workspace = true
+loft-client.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "loft-harness-codex"
+description = "Codex harness: `codex app-server` JSON-RPC over stdio (ADR-0004)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+loft-protocol.workspace = true
+loft-harness.workspace = true
+loft-config.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

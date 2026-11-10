@@ -24,7 +24,7 @@ Agentloft is a native desktop app, written in Rust with GPUI, that runs several 
 | 4 | Codex: `codex app-server` JSON-RPC over stdio, with Rust types **generated from the schema of a pinned Codex version**. | Proposed | [0004](adr/0004-codex-app-server-generated-types.md) |
 | 5 | GPUI through **gpui-kit's exact `gpui-pre` pin**, kept current with a regular bump cadence. | Proposed | [0005](adr/0005-gpui-pinning-and-staying-current.md) |
 | 6 | **SQLite** (rusqlite, WAL): CRUD tables plus an append-only per-thread event log. **TOML** config. Everything lives under `~/.agentloft`. | Proposed | [0006](adr/0006-storage-sqlite-event-log-toml.md) |
-| 7 | Terminal: PTYs are owned by the daemon. The UI renders them with **`alacritty_terminal`** and a custom GPUI element. | Proposed | [0007](adr/0007-terminal-architecture.md) |
+| 7 | Terminal: PTYs are owned by the daemon. The UI renders them with **libghostty-vt** (`ghostty-vt`, Zig 0.17 build) and a custom GPUI element, with `alacritty_terminal` as the fallback backend. | Accepted (amended) | [0007](adr/0007-terminal-architecture.md) |
 | 8 | Git through the **`git` CLI**. Per-thread worktrees under `~/.agentloft/worktrees`. Checkpoints stored as hidden refs. | Proposed | [0008](adr/0008-git-worktrees-checkpoints.md) |
 | 9 | **Apache-2.0**. The dependency policy blocks GPL and AGPL; enforced by `cargo-deny`. | Decided | [0009](adr/0009-license-and-dependency-policy.md) |
 | 10 | Tokio in the daemon, GPUI's executor in the UI, and a thin client bridge between them. | Proposed | [0010](adr/0010-async-runtimes.md) |
@@ -259,7 +259,7 @@ Notice{level, text}   Error{fatal, text}   SessionExited{code, signal}
 | approval "always/session" | ✅ `updatedPermissions` | ✅ `acceptForSession`, execpolicy amendment | ✅ `allow_always` |
 | native fork | ✅ `--resume … --fork-session` (+ `--resume-session-at`) | ✅ `thread/fork{lastTurnId, cwd}` | ⚠️ unstable `session/fork` |
 | native revert | ✅ control `rewind_files` (files only) | ✅ `thread/revert{beforeTurnId}` | ❌ |
-| model listing | ⚠️ initialize response / static aliases (verify) | ✅ `model/list` | ⚠️ config options |
+| model listing | ✅ `initialize` control response `models` (verified 2.1.319) | ✅ `model/list` | ⚠️ config options |
 | slash commands | ✅ from init / initialize | ✅ `skills/list` | ✅ `available_commands_update` |
 | turn diff from agent | ❌ (use checkpoints) | ✅ `turn/diff/updated` (we use checkpoints anyway) | ❌ |
 
@@ -490,7 +490,7 @@ Layout uses gpui-kit `Resizable` and `Dock`. The right dock can be split. The bo
 | Approval card | Custom + `Button` group | Options come from `RequestOpened.options`. Keyboard: `y` once, `a` always, `n` deny, `esc` deny+stop. A count also appears in the sidebar's needs-attention badge. |
 | Composer | gpui-kit **`Input` (multi-line) / `Editor`** with IME, undo, paste hooks | Slash-command popover, `@file` fuzzy mentions, image paste/drop. Messages queue while a turn runs, with "steer now" for harnesses that support it. Per-thread draft persisted. |
 | Diff dock | gpui-kit `Diff` | Turn diff, cumulative diff, and comparison against any checkpoint. File list. Revert actions. |
-| Terminal | Custom GPUI element on `alacritty_terminal` ([ADR-0007](adr/0007-terminal-architecture.md)) | Tabs per thread or project. |
+| Terminal | Custom GPUI element on libghostty-vt (`loft-terminal`, [ADR-0007](adr/0007-terminal-architecture.md)) | Tabs per thread; ⌘-click URLs. |
 | Command palette | gpui-kit `Command` | All GPUI actions. |
 | Settings | gpui-kit `Settings`/forms; edits `config.toml` through the daemon | Harnesses (path, version, auth status, default model and mode), worktrees, appearance, keymap. |
 | Notifications | gpui-kit `Notification` in-app + macOS user notifications | Turn finished or needs approval while unfocused. |
@@ -678,7 +678,7 @@ Per-project config lives in an optional `<repo>/.agentloft/config.toml`. It hold
 ### 5.5 PTY
 
 - **Daemon side:** `loft-pty` uses `portable-pty` 0.9 (openpty / ConPTY). There is one reader task per PTY. Output goes to a per-terminal **ring buffer** (default 8 MB) and is broadcast to subscribers as `TerminalOutput` chunks. Resize and input arrive as commands.
-- **UI side:** parse with `alacritty_terminal::Term` and render with a custom GPUI element.
+- **UI side:** parse with libghostty-vt (`loft-terminal`; `alacritty_terminal` stays a fallback behind `TerminalBackend`) and render with a custom GPUI element.
 - **On reconnect** (UI restart), replay the ring buffer into a fresh `Term`.
 - Terminals survive UI restarts. They do not survive daemon restarts until session holders exist (M9).
 
@@ -856,7 +856,7 @@ Each milestone ends with a demo plus the listed automated tests passing in CI (m
 
 **Scope:**
 - `loft-pty` in the daemon.
-- `alacritty_terminal` element in the UI.
+- Ghostty (libghostty-vt) element in the UI.
 - Tabs per thread or project; cwd set to the thread's workspace.
 - Selection and copy, URL detection, IME, scrollback, search.
 - Resize.
@@ -997,7 +997,6 @@ Each milestone ends with a demo plus the listed automated tests passing in CI (m
   - `--resume`, `--session-id`, `--fork-session`, `--model`, `--mcp-config`, `--json-schema`
 - **Codex:** method, request and notification names were taken from `codex app-server generate-json-schema`. `thread/fork` accepts `lastTurnId` and `cwd`; `thread/revert` takes `beforeTurnId`.
 - **Unverified, to check during M0–M2:**
-  - Whether Claude's `initialize` control response includes a model list.
   - The exact `--resume-session-at` semantics.
   - The exact ACP flags for each long-tail agent.
   - OpenCode 2.x HTTP API details.

@@ -1,0 +1,40 @@
+[package]
+name = "loft-ui"
+description = "Agentloft GPUI views: sidebar, thread timeline, composer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Local times ("Resets Sat 6:00 AM").
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Image dimensions from file headers (reply images keep their proportions).
+imagesize = "0.14"
+loft-protocol.workspace = true
+loft-client.workspace = true
+loft-config.workspace = true
+gpui-kit.workspace = true
+loft-docs = { path = "../loft-docs" }
+loft-browser = { path = "../loft-browser" }
+loft-terminal.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSDockTile", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-foundation = { workspace = true, features = ["NSBundle", "NSString", "NSError", "NSData", "NSDictionary", "NSGeometry"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
+block2 = "0.6"
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
