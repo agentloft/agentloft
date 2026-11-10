@@ -2650,26 +2650,14 @@ impl WorkspaceView {
                     .text_xs()
                     .text_color(p.faint_foreground)
                     .child("PROJECTS")
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(icon_button(
-                                "new-chat",
-                                IconName::MessageSquarePlus,
-                                p,
-                                cx.listener(|this, _, _, cx| {
-                                    this.store.update(cx, |s, cx| s.new_chat(cx))
-                                }),
-                            ))
-                            .child(icon_button(
-                                "add-project",
-                                IconName::FolderPlus,
-                                p,
-                                cx.listener(|this, _, window, cx| {
-                                    this.add_project(window, cx);
-                                }),
-                            )),
-                    ),
+                    .child(icon_button(
+                        "add-project",
+                        IconName::FolderPlus,
+                        p,
+                        cx.listener(|this, _, window, cx| {
+                            this.add_project(window, cx);
+                        }),
+                    )),
             )
             .child(
                 div()
