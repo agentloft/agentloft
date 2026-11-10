@@ -792,7 +792,9 @@ fn render_tool_group(
     } else if items.len() == 1 {
         col = col.child(tool_line(thread, store, state, model, items[0], p, cx));
     } else {
-        let open = state.is_expanded(&key, running);
+        // Closed until opened: opening while a command runs and closing
+        // when it ends made the list jump with every command.
+        let open = state.is_expanded(&key, false);
         let thread_h = thread.clone();
         let toggle_key = key.clone();
         col = col.child(
@@ -809,7 +811,7 @@ fn render_tool_group(
                 .child(chevron(open))
                 .on_click(move |_, _, cx| {
                     let key = toggle_key.clone();
-                    thread_h.update(cx, |t, cx| t.toggle(key, running, cx));
+                    thread_h.update(cx, |t, cx| t.toggle(key, false, cx));
                 }),
         );
         if open {
