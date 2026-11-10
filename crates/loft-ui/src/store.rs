@@ -223,6 +223,8 @@ pub enum StoreEvent {
     Notify { message: String, error: bool },
     /// Archiving needs confirmation (e.g. the worktree is dirty).
     ConfirmArchive { thread_id: ThreadId, reason: String },
+    /// Put queued message `id` back in the composer to edit it.
+    EditQueued { thread_id: ThreadId, id: u64 },
 }
 
 impl gpui_kit::EventEmitter<StoreEvent> for AppStore {}
@@ -945,6 +947,7 @@ impl AppStore {
         let live = self.live_spawned(id);
         entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
         self.threads.insert(id.clone(), entity.clone());
+        self.queue_changed(id, cx);
         if self.ws_ready
             && let Some(client) = &self.client
         {
@@ -1764,10 +1767,26 @@ impl AppStore {
         cx.notify();
     }
 
+    /// The queue of `thread_id` changed: its timeline shows it.
+    fn queue_changed(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
+        let ids: Vec<u64> = self
+            .queued
+            .get(thread_id)
+            .map(|q| q.iter().map(|m| m.id).collect())
+            .unwrap_or_default();
+        if let Some(thread) = self.threads.get(thread_id) {
+            thread.update(cx, |t, cx| t.set_queued(ids, cx));
+        }
+        cx.notify();
+    }
+
     /// Queue a message for when the current turn ends.
     pub fn enqueue(&mut self, thread_id: ThreadId, message: Queued, cx: &mut Context<Self>) {
-        self.queued.entry(thread_id).or_default().push_back(message);
-        cx.notify();
+        self.queued
+            .entry(thread_id.clone())
+            .or_default()
+            .push_back(message);
+        self.queue_changed(&thread_id, cx);
     }
 
     /// Where queued message `id` is in line now.
@@ -1781,7 +1800,7 @@ impl AppStore {
         {
             q.remove(index);
         }
-        cx.notify();
+        self.queue_changed(thread_id, cx);
     }
 
     /// Send a queued message now, into the running turn (the agent reads
@@ -1797,8 +1816,8 @@ impl AppStore {
         else {
             return;
         };
+        self.queue_changed(&thread_id, cx);
         self.steer(thread_id, message, Some(index), cx);
-        cx.notify();
     }
 
     /// A message into the running turn. If it can't go in (the agent can't
@@ -1843,7 +1862,7 @@ impl AppStore {
         let q = self.queued.entry(thread_id.clone()).or_default();
         let at = at.unwrap_or(q.len()).min(q.len());
         q.insert(at, message);
-        cx.notify();
+        self.queue_changed(&thread_id, cx);
         if let Some(thread) = self.threads.get(&thread_id).cloned() {
             self.flush_queue(&thread_id, &thread, cx);
         }
@@ -1856,7 +1875,7 @@ impl AppStore {
         if let Some(q) = self.queued.get_mut(thread_id)
             && move_in_line(q, id, to)
         {
-            cx.notify();
+            self.queue_changed(thread_id, cx);
         }
     }
 
@@ -1869,7 +1888,7 @@ impl AppStore {
     ) -> Option<Queued> {
         let index = self.queued_index(thread_id, id)?;
         let message = self.queued.get_mut(thread_id)?.remove(index);
-        cx.notify();
+        self.queue_changed(thread_id, cx);
         message
     }
 
@@ -1889,6 +1908,7 @@ impl AppStore {
             return;
         };
         self.flushing.insert(id.clone());
+        let thread_id = id.clone();
         let attachments = next.images.iter().map(|i| i.to_attachment()).collect();
         let fut = client.request(Request::SendMessage {
             thread_id: id.clone(),
@@ -1907,11 +1927,11 @@ impl AppStore {
                         store.fail(err.message, cx);
                     }
                 }
-                cx.notify();
+                store.queue_changed(&id, cx);
             });
         })
         .detach();
-        cx.notify();
+        self.queue_changed(&thread_id, cx);
     }
 
     pub fn send_message(
@@ -2088,6 +2108,9 @@ pub enum Row {
     TurnFooter {
         turn_ix: usize,
     },
+    /// A message of yours waiting for the turn to end (its id in the
+    /// store's queue): the last rows, in the order they'll go.
+    Queued(u64),
 }
 
 /// How long a running turn must sit with nothing in progress before the
@@ -2117,6 +2140,9 @@ pub struct ThreadState {
     /// Threads this one's agent started that are still running: their
     /// cards stay in view even under a folded "Worked for …".
     live_spawned: std::collections::HashSet<ThreadId>,
+    /// Your messages waiting for the turn to end, in order (ids in the
+    /// store's queue): they close the timeline.
+    queued: Vec<u64>,
     /// Where your messages' rows were drawn this frame (row → bounds), and
     /// which of them were in view at the last paint (the turn map's lit
     /// ticks).
@@ -2139,9 +2165,28 @@ impl ThreadState {
             cards: Vec::new(),
             reveal: None,
             live_spawned: Default::default(),
+            queued: Vec::new(),
             drawn_messages: Default::default(),
             visible_messages: Default::default(),
         }
+    }
+
+    /// The messages waiting in line for this thread (from the store). A
+    /// new one is brought into view.
+    pub fn set_queued(&mut self, queued: Vec<u64>, cx: &mut Context<Self>) {
+        if queued == self.queued {
+            return;
+        }
+        let grew = queued.len() > self.queued.len();
+        self.queued = queued;
+        if self.model.is_none() {
+            return;
+        }
+        self.sync_rows(None, cx);
+        if grew {
+            self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
+        }
+        cx.notify();
     }
 
     /// Which of the threads this one started are running (from the store).
@@ -2228,7 +2273,8 @@ impl ThreadState {
             | Row::Pending
             | Row::Waiting
             | Row::TurnFooter { .. }
-            | Row::Card(_) => false,
+            | Row::Card(_)
+            | Row::Queued(_) => false,
         })
     }
 
@@ -2349,6 +2395,7 @@ impl ThreadState {
                 .unwrap_or(rows.len());
             rows.insert(at, Row::Card(ix));
         }
+        rows.extend(self.queued.iter().map(|id| Row::Queued(*id)));
         std::mem::replace(&mut self.rows, rows)
     }
 

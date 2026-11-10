@@ -463,9 +463,21 @@ impl Translator {
     fn on_user(&mut self, v: &Value) -> Vec<Out> {
         // Our own message echoed back: Claude has taken it in.
         if v.get("isReplay").and_then(Value::as_bool) == Some(true) {
+            // Claude's own note about a command it ran for us ("Set model
+            // to …" after `set_model`) comes back the same way. It is not
+            // a message of ours and nothing answers it.
+            if v.pointer("/message/content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    let text = text.trim_start();
+                    text.starts_with("<local-command-") || text.starts_with("<command-")
+                })
+            {
+                return vec![];
+            }
             self.echoes = true;
-            self.unechoed.pop_front();
-            if !self.turn_active {
+            let ours = self.unechoed.pop_front().is_some();
+            if ours && !self.turn_active {
                 // A message sent mid-turn that Claude only got to after the
                 // turn ended: it runs as a turn of its own.
                 self.turn_active = true;
@@ -1023,6 +1035,24 @@ mod tests {
             t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"y"}}"#);
         assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
         assert!(t.turn_active());
+    }
+
+    #[test]
+    fn a_model_change_after_a_turn_starts_no_turn() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"x"}}"#);
+        assert!(completed(&t.on_line(RESULT)));
+        t.set_model(Some("sonnet"));
+        let out = t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"<local-command-stdout>Set model to `sonnet (claude-sonnet-5-5)`</local-command-stdout>"}}"#);
+        assert!(events(&out).is_empty());
+        assert!(!t.turn_active());
+        // Mid-turn, the note doesn't stand in for a message still on its way.
+        t.start_turn("x");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"x"}}"#);
+        t.steer_with("y", &[]);
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"<local-command-stdout>Set model to `opus`</local-command-stdout>"}}"#);
+        assert!(!completed(&t.on_line(RESULT)), "the steer is still to come");
     }
 
     #[test]

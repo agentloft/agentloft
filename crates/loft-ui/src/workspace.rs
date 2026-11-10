@@ -401,6 +401,9 @@ impl WorkspaceView {
                     browser.update(cx, |b, cx| b.navigate(url, cx));
                 }
             }
+            StoreEvent::EditQueued { thread_id, id } => {
+                self.edit_queued(thread_id, *id, window, cx);
+            }
             StoreEvent::ConfirmArchive { thread_id, reason } => {
                 confirm_archive(
                     thread_id.clone(),
@@ -1573,190 +1576,6 @@ impl WorkspaceView {
                 .child(rail)
                 .into_any_element(),
         )
-    }
-
-    /// Messages waiting for the current turn to end, the top one next:
-    /// dashed bubbles you can send now (into the running turn), reorder
-    /// (drag, or the arrows), take back to edit, or drop.
-    fn queued_list(
-        &self,
-        thread_id: &ThreadId,
-        queued: &[crate::store::Queued],
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        use gpui_kit::StyledImage as _;
-        if queued.is_empty() {
-            return None;
-        }
-        let mut list = v_flex().gap_3().pb_2();
-        let count = queued.len();
-        for (ix, q) in queued.iter().enumerate() {
-            let mut thumbs = h_flex().gap_1p5().flex_wrap().justify_end();
-            for (n, image) in q.images.iter().enumerate() {
-                thumbs = thumbs.child(
-                    div()
-                        .id(SharedString::from(format!("queued-{ix}-img-{n}")))
-                        .size(px(44.))
-                        .rounded(px(8.))
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(p.border)
-                        .child(
-                            gpui_kit::img(image.preview.clone())
-                                .size_full()
-                                .object_fit(gpui_kit::ObjectFit::Cover),
-                        ),
-                );
-            }
-            let preview: String = q.text.chars().take(400).collect();
-            let action = |id: &str, icon: Option<IconName>, label: Option<&'static str>| {
-                h_flex()
-                    .id(SharedString::from(format!("{id}-{ix}")))
-                    .gap_1()
-                    .items_center()
-                    .px_1p5()
-                    .py(px(3.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(p.muted_foreground)
-                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                    .children(icon.map(|i| Icon::new(i).xsmall()))
-                    .children(label)
-            };
-            let (t1, t2, t3) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
-            let (t_up, t_down, t_drop) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
-            let my_id = q.id;
-            let prev_id = ix.checked_sub(1).map(|i| queued[i].id);
-            let next_id = queued.get(ix + 1).map(|m| m.id);
-            let drag = DraggedQueued {
-                thread_id: thread_id.clone(),
-                id: my_id,
-                text: q
-                    .text
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("Image")
-                    .to_owned(),
-            };
-            let drop_accent = p.accent;
-            let steer_tip = match crate::keymap::hint("steer", cx) {
-                k if k.is_empty() => "Send into the running turn now".to_owned(),
-                k => format!("Send into the running turn now ({k} while typing)"),
-            };
-            list = list.child(
-                v_flex()
-                    .items_end()
-                    .gap_1()
-                    .child(
-                        v_flex()
-                            .id(SharedString::from(format!("queued-bubble-{ix}")))
-                            .max_w(gpui_kit::relative(0.85))
-                            .gap_2()
-                            .px_4()
-                            .py_2p5()
-                            .rounded(px(16.))
-                            .border_1()
-                            .border_dashed()
-                            .border_color(p.border)
-                            .text_sm()
-                            .text_color(p.muted_foreground)
-                            // Drag one onto another to put it there.
-                            .when(count > 1, |d| {
-                                d.cursor_grab()
-                                    .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
-                                    .drag_over::<DraggedQueued>(move |d, _, _, _| {
-                                        d.border_color(drop_accent).border_2()
-                                    })
-                                    .on_drop(cx.listener(move |this, d: &DraggedQueued, _, cx| {
-                                        if d.thread_id == t_drop {
-                                            let id = t_drop.clone();
-                                            this.store.update(cx, |s, cx| {
-                                                s.move_queued(&id, d.id, my_id, cx)
-                                            });
-                                        }
-                                    }))
-                            })
-                            .when(!q.images.is_empty(), |d| d.child(thumbs))
-                            .when(!preview.is_empty(), |d| {
-                                d.child(div().line_clamp(4).child(preview))
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            .items_center()
-                            .when(count > 1 && ix == 0, |d| {
-                                d.child(
-                                    div()
-                                        .px_1p5()
-                                        .text_xs()
-                                        .text_color(p.faint_foreground)
-                                        .child("Next"),
-                                )
-                            })
-                            .when_some(prev_id, |d, prev_id| {
-                                d.child(
-                                    action("queued-up", Some(IconName::ChevronUp), None)
-                                        .tooltip(|window, cx| {
-                                            gpui_kit::component::tooltip::Tooltip::new("Move up")
-                                                .build(window, cx)
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let id = t_up.clone();
-                                            this.store.update(cx, |s, cx| {
-                                                s.move_queued(&id, my_id, prev_id, cx)
-                                            });
-                                        })),
-                                )
-                            })
-                            .when_some(next_id, |d, next_id| {
-                                d.child(
-                                    action("queued-down", Some(IconName::ChevronDown), None)
-                                        .tooltip(|window, cx| {
-                                            gpui_kit::component::tooltip::Tooltip::new("Move down")
-                                                .build(window, cx)
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let id = t_down.clone();
-                                            this.store.update(cx, |s, cx| {
-                                                s.move_queued(&id, my_id, next_id, cx)
-                                            });
-                                        })),
-                                )
-                            })
-                            .child(
-                                action("queued-send", Some(IconName::ArrowUp), Some("Send now"))
-                                    .tooltip(move |window, cx| {
-                                        gpui_kit::component::tooltip::Tooltip::new(
-                                            steer_tip.clone(),
-                                        )
-                                        .build(window, cx)
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let id = t1.clone();
-                                        this.store
-                                            .update(cx, |s, cx| s.send_queued_now(id, my_id, cx));
-                                    })),
-                            )
-                            .child(
-                                action("queued-edit", Some(IconName::SquarePen), None).on_click(
-                                    cx.listener(move |this, _, window, cx| {
-                                        this.edit_queued(&t2, my_id, window, cx)
-                                    }),
-                                ),
-                            )
-                            .child(action("queued-drop", Some(IconName::X), None).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    let id = t3.clone();
-                                    this.store.update(cx, |s, cx| s.dequeue(&id, my_id, cx));
-                                }),
-                            )),
-                    ),
-            );
-        }
-        Some(list.into_any_element())
     }
 
     /// Put a queued message back in the composer (text and images).
@@ -3491,17 +3310,6 @@ impl WorkspaceView {
             .as_ref()
             .and_then(|m| m.thread.parent.clone());
         let fork_bar = fork_parent.map(|parent| self.fork_bar(parent, p, cx));
-        let queued_list = {
-            let id = thread.read(cx).id.clone();
-            let queued: Vec<crate::store::Queued> = self
-                .store
-                .read(cx)
-                .queued
-                .get(&id)
-                .map(|q| q.iter().cloned().collect())
-                .unwrap_or_default();
-            self.queued_list(&id, &queued, p, cx)
-        };
         let turn_map = self.turn_map(&thread, p, cx);
         let state = thread.read(cx);
         let Some(model) = state.model.as_ref() else {
@@ -3572,7 +3380,12 @@ impl WorkspaceView {
             })
             .collect();
         let waiting = pinned.is_empty() && model.open_requests().next().is_some();
-        let empty = model.items.is_empty();
+        // Nothing said yet, and nothing waiting to be.
+        let empty = model.items.is_empty()
+            && !state
+                .rows
+                .iter()
+                .any(|r| matches!(r, crate::store::Row::Queued(_)));
         let harness_choices = self.store.read(cx).available_harnesses();
         // A chat (no project): no worktrees, and it says so.
         let is_chat = {
@@ -3845,7 +3658,6 @@ impl WorkspaceView {
                         .min_w_0()
                         .max_w(p.content_width)
                         .gap_1()
-                        .children(queued_list)
                         .when(!pinned.is_empty(), |d| {
                             d.child(v_flex().gap_2().pb_2().children(pinned))
                         })
@@ -5861,9 +5673,9 @@ impl Render for DraggedThread {
 /// A queued message being dragged to a new place in line.
 #[derive(Clone)]
 pub(crate) struct DraggedQueued {
-    thread_id: ThreadId,
-    id: u64,
-    text: String,
+    pub(crate) thread_id: ThreadId,
+    pub(crate) id: u64,
+    pub(crate) text: String,
 }
 
 impl Render for DraggedQueued {

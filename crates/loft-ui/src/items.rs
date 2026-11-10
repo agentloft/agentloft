@@ -379,6 +379,7 @@ pub fn render_row(
         Row::Pending => render_pending(p),
         Row::Waiting => render_waiting(&model.thread.waiting_on, p),
         Row::Card(ix) => crate::info_cards::render(thread, store, state, *ix, p),
+        Row::Queued(id) => render_queued(&state.id, store, *id, p, cx),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
             render_turn_footer(store, model, *turn_ix, agents, p)
@@ -735,6 +736,199 @@ fn render_pending(p: &Palette) -> AnyElement {
                 .repeat()
                 .with_easing(pulsating_between(0.45, 1.0)),
             |d, delta| d.opacity(delta),
+        )
+        .into_any_element()
+}
+
+/// A message waiting for the current turn to end, where it will land in
+/// the conversation: a dashed bubble you can send now (into the running
+/// turn), reorder (drag, or the arrows), take back to edit, or drop. The
+/// top one goes next.
+fn render_queued(
+    thread_id: &loft_protocol::ThreadId,
+    store: &Entity<AppStore>,
+    id: u64,
+    p: &Palette,
+    cx: &App,
+) -> AnyElement {
+    use crate::store::StoreEvent;
+    use crate::workspace::DraggedQueued;
+    use gpui_kit::{AppContext as _, StyledImage as _};
+    let Some(queue) = store.read(cx).queued.get(thread_id) else {
+        return div().into_any_element();
+    };
+    let Some(ix) = queue.iter().position(|m| m.id == id) else {
+        return div().into_any_element();
+    };
+    let q = &queue[ix];
+    let count = queue.len();
+    let prev_id = ix.checked_sub(1).map(|i| queue[i].id);
+    let next_id = queue.get(ix + 1).map(|m| m.id);
+    let mut thumbs = h_flex().gap_1p5().flex_wrap().justify_end();
+    for (n, image) in q.images.iter().enumerate() {
+        thumbs = thumbs.child(
+            div()
+                .id(SharedString::from(format!("queued-{id}-img-{n}")))
+                .size(px(44.))
+                .rounded(px(8.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(p.border)
+                .child(
+                    gpui_kit::img(image.preview.clone())
+                        .size_full()
+                        .object_fit(gpui_kit::ObjectFit::Cover),
+                ),
+        );
+    }
+    let preview: String = q.text.chars().take(400).collect();
+    let action = |name: &str, icon: Option<IconName>, label: Option<&'static str>| {
+        h_flex()
+            .id(SharedString::from(format!("{name}-{id}")))
+            .gap_1()
+            .items_center()
+            .px_1p5()
+            .py(px(3.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_xs()
+            .text_color(p.muted_foreground)
+            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+            .children(icon.map(|i| Icon::new(i).xsmall()))
+            .children(label)
+    };
+    let tip = |text: &'static str| {
+        move |window: &mut Window, cx: &mut App| {
+            gpui_kit::component::tooltip::Tooltip::new(text).build(window, cx)
+        }
+    };
+    let drag = DraggedQueued {
+        thread_id: thread_id.clone(),
+        id,
+        text: q
+            .text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("Image")
+            .to_owned(),
+    };
+    let drop_accent = p.accent;
+    let steer_tip = match crate::keymap::hint("steer", cx) {
+        k if k.is_empty() => "Send into the running turn now".to_owned(),
+        k => format!("Send into the running turn now ({k} while typing)"),
+    };
+    // Each button acts on this message in this thread's queue.
+    let on = |act: fn(
+        &mut AppStore,
+        loft_protocol::ThreadId,
+        u64,
+        u64,
+        &mut gpui_kit::Context<AppStore>,
+    ),
+              other: u64| {
+        let (store, thread_id) = (store.clone(), thread_id.clone());
+        move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+            let thread_id = thread_id.clone();
+            store.update(cx, |s, cx| act(s, thread_id, id, other, cx));
+        }
+    };
+    let (drop_store, drop_thread) = (store.clone(), thread_id.clone());
+    v_flex()
+        .items_end()
+        .gap_1()
+        .child(
+            v_flex()
+                .id(SharedString::from(format!("queued-bubble-{id}")))
+                .max_w(relative(0.85))
+                .gap_2()
+                .px_4()
+                .py_2p5()
+                .rounded(px(16.))
+                .border_1()
+                .border_dashed()
+                .border_color(p.border)
+                .text_sm()
+                .text_color(p.muted_foreground)
+                // Drag one onto another to put it there.
+                .when(count > 1, |d| {
+                    d.cursor_grab()
+                        .on_drag(drag, |d, _, _, cx| cx.new(|_| d.clone()))
+                        .drag_over::<DraggedQueued>(move |d, _, _, _| {
+                            d.border_color(drop_accent).border_2()
+                        })
+                        .on_drop(move |d: &DraggedQueued, _, cx| {
+                            if d.thread_id == drop_thread {
+                                drop_store
+                                    .update(cx, |s, cx| s.move_queued(&drop_thread, d.id, id, cx));
+                            }
+                        })
+                })
+                .when(!q.images.is_empty(), |d| d.child(thumbs))
+                .when(!preview.is_empty(), |d| {
+                    d.child(div().line_clamp(4).child(preview))
+                }),
+        )
+        .child(
+            h_flex()
+                .gap_0p5()
+                .items_center()
+                .child(
+                    div()
+                        .px_1p5()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child(if count > 1 && ix == 0 {
+                            "Queued · next"
+                        } else {
+                            "Queued"
+                        }),
+                )
+                .when_some(prev_id, |d, prev_id| {
+                    d.child(
+                        action("queued-up", Some(IconName::ChevronUp), None)
+                            .tooltip(tip("Move up"))
+                            .on_click(on(
+                                |s, thread, id, to, cx| s.move_queued(&thread, id, to, cx),
+                                prev_id,
+                            )),
+                    )
+                })
+                .when_some(next_id, |d, next_id| {
+                    d.child(
+                        action("queued-down", Some(IconName::ChevronDown), None)
+                            .tooltip(tip("Move down"))
+                            .on_click(on(
+                                |s, thread, id, to, cx| s.move_queued(&thread, id, to, cx),
+                                next_id,
+                            )),
+                    )
+                })
+                .child(
+                    action("queued-send", Some(IconName::ArrowUp), Some("Send now"))
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(steer_tip.clone())
+                                .build(window, cx)
+                        })
+                        .on_click(on(
+                            |s, thread, id, _, cx| s.send_queued_now(thread, id, cx),
+                            0,
+                        )),
+                )
+                .child(
+                    action("queued-edit", Some(IconName::SquarePen), None)
+                        .tooltip(tip("Edit"))
+                        .on_click(on(
+                            |_, thread_id, id, _, cx| {
+                                cx.emit(StoreEvent::EditQueued { thread_id, id })
+                            },
+                            0,
+                        )),
+                )
+                .child(
+                    action("queued-drop", Some(IconName::X), None)
+                        .tooltip(tip("Remove"))
+                        .on_click(on(|s, thread, id, _, cx| s.dequeue(&thread, id, cx), 0)),
+                ),
         )
         .into_any_element()
 }
