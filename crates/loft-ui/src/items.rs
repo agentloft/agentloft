@@ -32,7 +32,7 @@ pub(crate) fn local_image_path(raw: &str, cwd: &str) -> Option<std::path::PathBu
     }
     let path = raw.strip_prefix("file://").unwrap_or(raw);
     Some(match path.strip_prefix("~/") {
-        Some(rest) => std::env::home_dir().unwrap_or_default().join(rest),
+        Some(rest) => crate::host::user_home().join(rest),
         None => std::path::Path::new(cwd).join(path),
     })
 }
@@ -43,7 +43,8 @@ pub(crate) fn local_images(
     cwd: String,
 ) -> impl Fn(&gpui_kit::SharedUri) -> gpui_kit::ImageSource + Send + Sync + 'static {
     move |uri: &gpui_kit::SharedUri| match local_image_path(uri.as_ref(), &cwd) {
-        Some(path) => gpui_kit::ImageSource::from(path),
+        // From this computer's disk, or through the daemon in a browser.
+        Some(path) => crate::host::image_or_blank(&path, None),
         None => gpui_kit::ImageSource::from(uri.clone()),
     }
 }
@@ -415,7 +416,7 @@ pub(crate) fn render_item(
                         .border_color(p.border)
                         .cursor_pointer()
                         .child(
-                            gpui_kit::img(path.clone())
+                            gpui_kit::img(crate::host::image_or_blank(&path, None))
                                 .size_full()
                                 .object_fit(gpui_kit::ObjectFit::Cover),
                         )

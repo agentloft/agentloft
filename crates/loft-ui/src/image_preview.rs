@@ -58,7 +58,7 @@ impl Pic {
     fn element(&self) -> gpui_kit::Img {
         match self {
             Pic::Loaded { image, .. } => img(image.clone()),
-            Pic::File { path, .. } => img(path.clone()),
+            Pic::File { path, .. } => img(crate::host::image_or_blank(path, None)),
         }
     }
 }

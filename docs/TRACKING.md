@@ -122,7 +122,8 @@ Built ahead of the PLAN's milestone order, by request.
 - Approvals: by click and by ⌘↩.
 - Settings, inside the window: appearance and themes (a change lands in `config.toml` on the daemon's machine and applies), agents' defaults and models, projects, worktrees, shortcuts, sign out.
 - Side panel: Changes (diffs) and Files with the file viewer; menus draw in-window.
-- Light and dark themes; reconnecting after the daemon restarts.
+- Images in replies that point at files in the project: fetched through the daemon. A path outside the project stays empty.
+- Light and dark themes; a 2× (HiDPI) screen; the tab title follows the thread; reconnecting after the daemon restarts.
 - Desktop app: Settings ▸ Web access (on/off, pairing link, signed-in browsers, sign out, address, port, TLS, warnings).
 
 **How to try it**
@@ -144,10 +145,11 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 
 **What's left**
 - Sending images from the browser (paste, drop, pick), and the image preview's Copy / Save.
+- Images in replies that point at other websites: the page's Content-Security-Policy allows no third-party requests, so they stay empty in the browser.
 - A terminal in the browser (libghostty-vt is native; the browser gets no shell unless `[web] allow_terminal`, and there is no web terminal view).
 - Adding a project by browsing folders (the browser can make a new project or clone one, only where projects are kept).
 - Phone-sized layout: it is the desktop layout.
-- Not yet tried: Safari, Firefox, a real HiDPI screen (headless emulation of one misreports canvas size), a real agent (Claude, Codex) through the browser, a non-loopback address (tests cover the refusal and TLS on loopback only, so no test opens a network port), `cargo xtask bundle` with the web client in it (the code is there; not run).
+- Not yet tried: Safari, Firefox, a real agent (Claude, Codex) through the browser, a non-loopback address (tests cover the refusal and TLS on loopback only, so no test opens a network port), `cargo xtask bundle` with the web client in it (the code is there; not run).
 - Dialogs show a few stray pixels at their bottom corners in the browser.
 - A QR code for the pairing link.
 - ADR-0014's device keys and Tailscale modes (the listener is ready for them).

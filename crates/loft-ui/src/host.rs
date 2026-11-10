@@ -39,6 +39,23 @@ pub fn load_config(paths: &Paths) -> anyhow::Result<Config> {
     }
 }
 
+/// Something to draw the image at `path` with, right now: the image, or
+/// (in the browser, until it has been fetched) nothing visible.
+pub fn image_or_blank(path: &Path, thread: Option<&ThreadId>) -> gpui_kit::ImageSource {
+    /// A 1×1 transparent GIF.
+    const BLANK: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+    ];
+    thread_local! {
+        static BLANK_IMAGE: std::sync::Arc<gpui_kit::Image> = std::sync::Arc::new(
+            gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Gif, BLANK.to_vec()),
+        );
+    }
+    image(path, thread).unwrap_or_else(|| BLANK_IMAGE.with(|blank| blank.clone().into()))
+}
+
 /// An image's format from its first bytes, else from its file name.
 pub fn image_format(path: &Path, bytes: &[u8]) -> Option<gpui_kit::ImageFormat> {
     use gpui_kit::ImageFormat as F;
