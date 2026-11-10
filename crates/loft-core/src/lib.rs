@@ -578,7 +578,9 @@ impl Core {
             Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
             Request::GetSettings => self.get_settings(),
             Request::ChangeSetting { key, value } => self.change_setting(&key, &value),
-            Request::SaveTheme { toml, select } => self.save_theme(&toml, select),
+            Request::SaveTheme { toml, select, id } => {
+                self.save_theme(&toml, select, id.as_deref())
+            }
             Request::SetProjectIcon { project_id, icon } => {
                 let mut project = self
                     .with_store(|s| s.project(&project_id))?
@@ -749,6 +751,18 @@ impl Core {
                 ErrorCode::Unsupported,
                 "web access is handled by the daemon",
             )),
+            Request::UiFiles { known } => Ok(Response::UiFiles {
+                files: self.ui_files(known.as_deref(), false)?.map(Box::new),
+            }),
+            Request::PutUiState { name, json } => self.put_ui_state(&name, &json),
+            Request::DeleteTheme { id } => self.delete_theme(&id),
+            Request::ProjectIcon { project_id } => {
+                let core = self.clone();
+                let file = tokio::task::spawn_blocking(move || core.project_icon(&project_id))
+                    .await
+                    .map_err(internal)??;
+                Ok(Response::File { file })
+            }
             Request::ReadPath { path, thread_id } => {
                 let core = self.clone();
                 let file = tokio::task::spawn_blocking(move || {

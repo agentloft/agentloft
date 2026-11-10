@@ -227,6 +227,12 @@ impl Core {
             | Request::GetDiff { .. }
             // Confined in `handle_remote`.
             | Request::ReadPath { .. }
+            // The settings files (secrets hidden in `handle_remote`), shared
+            // UI state, and icons the daemon finds itself.
+            | Request::UiFiles { .. }
+            | Request::PutUiState { .. }
+            | Request::DeleteTheme { .. }
+            | Request::ProjectIcon { .. }
             // Settings: read (secrets hidden) and the harmless keys.
             | Request::GetSettings
             | Request::SaveTheme { .. }
@@ -317,6 +323,9 @@ impl Core {
                 Ok(Response::File { file })
             }
             Request::GetSettings => self.handle(Request::GetSettings).await.map(redact_settings),
+            Request::UiFiles { known } => Ok(Response::UiFiles {
+                files: self.ui_files(known.as_deref(), true)?.map(Box::new),
+            }),
             other => self.handle(other).await,
         }
     }
@@ -674,6 +683,117 @@ mod tests {
             panic!()
         };
         assert!(value.to_string().contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn settings_files_reach_the_browser_without_secrets() {
+        let (f, _) = fixture().await;
+        let home = f.dir.path().join("home");
+        std::fs::create_dir_all(home.join("themes")).unwrap();
+        std::fs::write(home.join("themes/mine.toml"), "name = \"Mine\"\n").unwrap();
+
+        let Response::UiFiles { files: Some(files) } =
+            remote(&f, Request::UiFiles { known: None }).await.unwrap()
+        else {
+            panic!()
+        };
+        assert!(!files.config_toml.contains("sk-secret"));
+        assert!(files.config_toml.contains("ANTHROPIC_API_KEY"));
+        assert!(!files.config_toml.contains("[web]"));
+        assert_eq!(files.themes.len(), 1);
+        assert_eq!(files.themes[0].name, "mine");
+        assert_eq!(std::path::Path::new(&files.home), home);
+        assert!(files.sidebar.is_none());
+
+        // Unchanged since: nothing is sent again.
+        let again = remote(
+            &f,
+            Request::UiFiles {
+                known: Some(files.stamp.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, Response::UiFiles { files: None });
+
+        // Sidebar state is saved, and shows up as a change.
+        let put = |name: &str, json: &str| Request::PutUiState {
+            name: name.into(),
+            json: json.into(),
+        };
+        remote(&f, put("sidebar", "{\"collapsed\":[]}"))
+            .await
+            .unwrap();
+        let Response::UiFiles { files: Some(after) } = remote(
+            &f,
+            Request::UiFiles {
+                known: Some(files.stamp),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(after.sidebar.as_deref(), Some("{\"collapsed\":[]}"));
+        // Only the named state, only JSON, only so much of it.
+        assert!(remote(&f, put("../config", "{}")).await.is_err());
+        assert!(remote(&f, put("session", "{}")).await.is_err());
+        assert!(remote(&f, put("sidebar", "not json")).await.is_err());
+        let huge = format!("\"{}\"", "x".repeat(300 * 1024));
+        assert!(remote(&f, put("sidebar", &huge)).await.is_err());
+
+        // A local client gets the config as it is.
+        let Response::UiFiles { files: Some(local) } = f
+            .core
+            .handle(Request::UiFiles { known: None })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(local.config_toml.contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn themes_are_deleted_by_name_only() {
+        let (f, _) = fixture().await;
+        let home = f.dir.path().join("home");
+        std::fs::create_dir_all(home.join("themes")).unwrap();
+        std::fs::write(home.join("themes/mine.toml"), "name = \"Mine\"\n").unwrap();
+        let delete = |id: &str| Request::DeleteTheme { id: id.into() };
+        for id in [
+            "custom:../config",
+            "custom:../../secret",
+            "custom:mine/../../config",
+            "custom:",
+            "/etc/passwd",
+            "custom:Mine.toml",
+        ] {
+            assert!(remote(&f, delete(id)).await.is_err(), "{id}");
+        }
+        assert!(home.join("config.toml").exists());
+        assert!(remote(&f, delete("custom:mine")).await.is_ok());
+        assert!(!home.join("themes/mine.toml").exists());
+        assert!(
+            remote(&f, delete("custom:mine")).await.is_err(),
+            "already gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projects_icon_is_found_by_the_daemon() {
+        let (f, _) = fixture().await;
+        let icon = |id: &ProjectId| Request::ProjectIcon {
+            project_id: id.clone(),
+        };
+        let none = remote(&f, icon(&f.project_id)).await.unwrap_err();
+        assert_eq!(none.code, ErrorCode::NotFound);
+        std::fs::write(f.project.join("favicon.png"), b"png!").unwrap();
+        let Response::File { file } = remote(&f, icon(&f.project_id)).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(file.bytes.0, b"png!");
+        assert!(remote(&f, icon(&ProjectId::new())).await.is_err());
     }
 
     #[tokio::test]

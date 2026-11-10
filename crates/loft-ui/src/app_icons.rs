@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Pixel size the icons are drawn at (shown at 16–20 points, Retina).
+#[cfg(target_os = "macos")]
 const PIXELS: f64 = 64.;
 
 thread_local! {

@@ -10,9 +10,8 @@ use loft_client::model::{ThreadModel, WorkspaceModel};
 use loft_client::{Client, ClientEvent};
 use loft_config::Paths;
 use loft_protocol::{
-    Attachment, ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId,
-    ItemStatus, ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId,
-    ThreadStatus, Topic,
+    Attachment, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId, ItemStatus,
+    ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId, ThreadStatus, Topic,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -154,7 +153,7 @@ pub enum ConnState {
 }
 
 pub struct AppStore {
-    runtime: tokio::runtime::Handle,
+    runtime: crate::host::Runtime,
     paths: Paths,
     client: Option<Client>,
     pub conn: ConnState,
@@ -219,7 +218,7 @@ pub struct AppStore {
 }
 
 impl AppStore {
-    pub fn new(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut Context<Self>) -> Self {
+    pub fn new(runtime: crate::host::Runtime, paths: Paths, cx: &mut Context<Self>) -> Self {
         let collapsed = load_collapsed(&paths);
         let folded_threads = load_folded_threads(&paths);
         let pinned_projects = load_list::<ProjectId>(&paths, "pinned_projects");
@@ -268,13 +267,10 @@ impl AppStore {
     /// `config.toml` and the themes folder and apply changes as they come.
     fn watch_settings(&mut self, cx: &mut Context<Self>) {
         fn stamp(paths: &Paths) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
-            let modified =
-                |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-            let themes = std::fs::read_dir(paths.home.join("themes"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| modified(&e.path()))
+            let modified = crate::host::modified;
+            let themes = crate::host::list_files(&paths.themes_dir())
+                .iter()
+                .filter_map(|file| modified(file))
                 .max();
             (modified(&paths.config_file()), themes)
         }
@@ -311,23 +307,9 @@ impl AppStore {
     fn connect(&mut self, cx: &mut Context<Self>) {
         self.conn = ConnState::Connecting;
         cx.notify();
-        let paths = self.paths.clone();
-        let task = self.runtime.spawn(async move {
-            loft_client::connect_or_spawn(
-                &paths,
-                &loft_client::daemon_binary(),
-                ClientKind::LocalUi,
-                BUILD,
-                &["browser"],
-            )
-            .await
-        });
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = match task.await {
-                Ok(r) => r,
-                Err(e) => Err(anyhow::anyhow!(e)),
-            };
-            match result {
+        let connecting = crate::host::connect(self.runtime.clone(), self.paths.clone(), BUILD);
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| match connecting.await {
                 Ok((client, rx)) => {
                     let ok = this
                         .update(cx, |store, cx| store.on_connected(client, cx))
@@ -345,8 +327,8 @@ impl AppStore {
                     cx.background_executor().timer(Duration::from_secs(2)).await;
                     let _ = this.update(cx, |store, cx| store.connect(cx));
                 }
-            }
-        })
+            },
+        )
         .detach();
     }
 
@@ -365,6 +347,7 @@ impl AppStore {
         self.terminal_subs.clear();
         self.terminals.retain(|_, pane| pane.upgrade().is_some());
         let terminals = std::mem::take(&mut self.terminals);
+        crate::host::set_client(Some(client.clone()));
         self.client = Some(client);
         self.probe_harnesses(cx);
         // Model pickers (Codex asks its CLI; answers are cached daemon-side).
@@ -423,7 +406,7 @@ impl AppStore {
     /// Gemini) once their CLI is found.
     /// Re-read the per-agent picker settings (on/off, hidden models).
     pub fn reload_agent_prefs(&mut self, cx: &mut Context<Self>) {
-        let Ok(config) = loft_config::Config::load(&self.paths) else {
+        let Ok(config) = crate::host::load_config(&self.paths) else {
             return;
         };
         self.disabled_agents.clear();
@@ -526,6 +509,7 @@ impl AppStore {
 
     fn on_disconnected(&mut self, cx: &mut Context<Self>) {
         self.client = None;
+        crate::host::set_client(None);
         self.conn = ConnState::Disconnected("connection to agentloftd lost".into());
         cx.notify();
         // Reconnect (respawning the daemon if it died).
@@ -853,7 +837,7 @@ impl AppStore {
         if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({
             "collapsed": projects, "folded_threads": threads, "pinned_projects": pinned,
         })) {
-            let _ = std::fs::write(sidebar_file(&self.paths), json);
+            let _ = crate::host::write(&sidebar_file(&self.paths), &json);
         }
     }
 
@@ -1024,8 +1008,8 @@ impl AppStore {
         &self,
         pick: impl Fn(&loft_config::ProjectsConfig) -> Option<String>,
     ) -> Option<std::path::PathBuf> {
-        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
-        loft_config::Config::load(&self.paths)
+        let home = crate::host::user_home();
+        crate::host::load_config(&self.paths)
             .ok()
             .and_then(|c| pick(&c.projects))
             .map(|d| d.trim().to_owned())
@@ -1040,7 +1024,7 @@ impl AppStore {
     /// Projects ▸ "Add project starts in", else the home folder.
     pub fn projects_base(&self) -> std::path::PathBuf {
         self.projects_setting(|p| p.base_dir.clone())
-            .unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| "/".into()))
+            .unwrap_or_else(crate::host::user_home)
     }
 
     /// Where new projects (made from a name) go: Settings ▸ Projects ▸ "New
@@ -1091,8 +1075,8 @@ impl AppStore {
                 let dest = dir.join(format!(
                     "{}-{}.{ext}",
                     project_id.as_str(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
+                    web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_millis())
                 ));
                 match std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&src, &dest)) {
@@ -1746,7 +1730,7 @@ fn sidebar_file(paths: &Paths) -> std::path::PathBuf {
 
 /// The projects folded in the sidebar last time.
 fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
-    std::fs::read(sidebar_file(paths))
+    crate::host::read(&sidebar_file(paths))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("collapsed").cloned())
@@ -1757,7 +1741,7 @@ fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
 }
 
 fn load_list<T: serde::de::DeserializeOwned>(paths: &Paths, key: &str) -> Vec<T> {
-    std::fs::read(sidebar_file(paths))
+    crate::host::read(&sidebar_file(paths))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get(key).cloned())
@@ -1766,7 +1750,7 @@ fn load_list<T: serde::de::DeserializeOwned>(paths: &Paths, key: &str) -> Vec<T>
 }
 
 fn load_folded_threads(paths: &Paths) -> std::collections::HashSet<ThreadId> {
-    std::fs::read(sidebar_file(paths))
+    crate::host::read(&sidebar_file(paths))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("folded_threads").cloned())

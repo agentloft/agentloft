@@ -7,6 +7,10 @@ pub mod changes;
 pub mod dock;
 pub mod docs;
 pub mod files;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod terminal;
+#[cfg(target_arch = "wasm32")]
+#[path = "terminal_web.rs"]
 pub mod terminal;
 pub mod viewer;
 
@@ -723,12 +727,19 @@ impl WorkbenchPanel {
             })
             .shortcut(key)
         };
-        let entries = vec![
-            item("Browser", IconName::Globe, 'b', Tab::Browser),
-            item("Terminal", IconName::SquareTerminal, 't', Tab::Terminal),
-            item("Files", IconName::FolderTree, 'f', Tab::Files),
-            item("Changes", IconName::GitCompare, 'd', Tab::Changes),
-        ];
+        let mut entries = Vec::new();
+        // The embedded browser and the terminal are the desktop app's.
+        if !crate::host::IS_WEB {
+            entries.push(item("Browser", IconName::Globe, 'b', Tab::Browser));
+            entries.push(item(
+                "Terminal",
+                IconName::SquareTerminal,
+                't',
+                Tab::Terminal,
+            ));
+        }
+        entries.push(item("Files", IconName::FolderTree, 'f', Tab::Files));
+        entries.push(item("Changes", IconName::GitCompare, 'd', Tab::Changes));
         menu::open(window, at, entries, cx);
     }
 }
@@ -989,6 +1000,9 @@ impl Render for WorkbenchPanel {
             Some(Open::Files) => panel.files.clone().into_any_element(),
             Some(Open::Changes) => panel.changes.clone().into_any_element(),
             Some(Open::Terminal { pane, .. }) => pane.clone().into_any_element(),
+            Some(Open::Browser { .. }) if crate::host::IS_WEB => {
+                crate::host_ui::not_in_browser(IconName::Globe, "Browser", &p)
+            }
             Some(Open::Browser { view }) => view.clone().into_any_element(),
             Some(Open::File { viewer, .. }) => viewer.clone().into_any_element(),
             Some(Open::Agent { view, .. }) => view.clone().into_any_element(),
@@ -1012,6 +1026,10 @@ fn empty_state(thread_id: &ThreadId, p: &Palette, cx: &mut Context<WorkbenchPane
         (Tab::Files, IconName::FolderTree, "Files", "F"),
         (Tab::Changes, IconName::GitCompare, "Changes", "D"),
     ] {
+        // The embedded browser and the terminal are the desktop app's.
+        if crate::host::IS_WEB && matches!(kind, Tab::Browser | Tab::Terminal) {
+            continue;
+        }
         let id = thread_id.clone();
         list = list.child(
             h_flex()

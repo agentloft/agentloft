@@ -12,6 +12,8 @@ mod completion;
 mod details;
 mod file_icons;
 mod folder_picker;
+pub mod host;
+mod host_ui;
 mod image_preview;
 mod info_cards;
 mod items;

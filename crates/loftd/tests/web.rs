@@ -773,7 +773,17 @@ async fn responses_are_hardened_and_never_cors() {
         ] {
             assert!(csp.contains(part), "{path}: {part} in {csp}");
         }
-        assert!(!csp.contains("unsafe-inline") && !csp.contains("'unsafe-eval'"));
+        // No inline or evaluated script, ever; inline styles only as
+        // attributes (GPUI's canvas), never as style sheets.
+        for directive in csp.split(';').map(str::trim) {
+            let relaxed =
+                directive.contains("'unsafe-inline'") || directive.contains("'unsafe-eval'");
+            assert!(
+                !relaxed || directive.starts_with("style-src-attr "),
+                "{directive}"
+            );
+        }
+        assert!(csp.contains("style-src 'self';"));
         assert_eq!(reply.header("x-content-type-options"), Some("nosniff"));
         assert_eq!(reply.header("x-frame-options"), Some("DENY"));
         assert_eq!(reply.header("referrer-policy"), Some("no-referrer"));

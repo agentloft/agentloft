@@ -389,7 +389,12 @@ impl Core {
 
     /// Save a colour theme (TOML, as in ~/.agentloft/themes) and, with
     /// `select`, switch to it.
-    pub(crate) fn save_theme(&self, text: &str, select: bool) -> CoreResult<Response> {
+    pub(crate) fn save_theme(
+        &self,
+        text: &str,
+        select: bool,
+        id: Option<&str>,
+    ) -> CoreResult<Response> {
         let check: ThemeCheck =
             toml::from_str(text).map_err(|e| bad(format!("not a theme file: {e}")))?;
         if check.name.trim().is_empty() {
@@ -414,8 +419,17 @@ impl Core {
         let dir = self.home()?.join("themes");
         std::fs::create_dir_all(&dir).map_err(crate::internal)?;
         // The same name replaces that theme; a new one gets its own file.
-        let base = theme_slug(&check.name);
-        let stem = base.clone();
+        let stem = match id {
+            Some(id) => {
+                let stem = id.strip_prefix("custom:").unwrap_or(id);
+                // A file name of our own making, or nothing.
+                if stem.is_empty() || theme_slug(stem) != stem {
+                    return Err(bad(format!("`{id}` isn't a theme id")));
+                }
+                stem.to_owned()
+            }
+            None => theme_slug(&check.name),
+        };
         std::fs::write(dir.join(format!("{stem}.toml")), text).map_err(crate::internal)?;
         let id = format!("custom:{stem}");
         if select {
@@ -431,9 +445,165 @@ impl Core {
     }
 }
 
+/// Largest piece of UI state a client may store.
+const MAX_UI_STATE: usize = 256 * 1024;
+/// Themes sent to a client at once.
+const MAX_THEMES: usize = 200;
+
+fn stamp_of(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => format!(
+            "{}:{}",
+            meta.len(),
+            loft_protocol::file_mtime_ms(path).unwrap_or(0)
+        ),
+        Err(_) => "-".into(),
+    }
+}
+
+/// `config.toml` as a remote session may see it: agents' environment
+/// values (often API keys) replaced, web access left out. Text that doesn't
+/// parse is withheld altogether.
+pub(crate) fn redact_config(text: &str) -> String {
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return String::new();
+    };
+    doc.remove("web");
+    if let Some(agents) = doc.get_mut("harness").and_then(|h| h.as_table_like_mut()) {
+        for (_, agent) in agents.iter_mut() {
+            let Some(env) = agent
+                .as_table_like_mut()
+                .and_then(|a| a.get_mut("env"))
+                .and_then(|e| e.as_table_like_mut())
+            else {
+                continue;
+            };
+            for (_, value) in env.iter_mut() {
+                *value = toml_edit::value("•••");
+            }
+        }
+    }
+    doc.to_string()
+}
+
+impl Core {
+    /// The settings files behind the UI (`Request::UiFiles`); `None` when
+    /// they still match `known`.
+    pub(crate) fn ui_files(
+        &self,
+        known: Option<&str>,
+        remote: bool,
+    ) -> CoreResult<Option<loft_protocol::UiFiles>> {
+        let home = self.home()?;
+        let paths = Paths::new(&home);
+        let mut themes: Vec<PathBuf> = std::fs::read_dir(paths.themes_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .take(MAX_THEMES)
+            .collect();
+        themes.sort();
+        let sidebar = home.join("ui-sidebar.json");
+        let mut stamp = format!("{}|{}", stamp_of(&paths.config_file()), stamp_of(&sidebar));
+        for theme in &themes {
+            stamp.push_str(&format!(
+                "|{}={}",
+                theme.file_name().unwrap_or_default().to_string_lossy(),
+                stamp_of(theme)
+            ));
+        }
+        if known == Some(stamp.as_str()) {
+            return Ok(None);
+        }
+        let config = std::fs::read_to_string(paths.config_file()).unwrap_or_default();
+        Ok(Some(loft_protocol::UiFiles {
+            stamp,
+            config_toml: if remote {
+                redact_config(&config)
+            } else {
+                config
+            },
+            themes: themes
+                .iter()
+                .filter_map(|p| {
+                    Some(loft_protocol::UiFile {
+                        name: p.file_stem()?.to_string_lossy().into_owned(),
+                        text: std::fs::read_to_string(p).ok()?,
+                    })
+                })
+                .collect(),
+            sidebar: std::fs::read_to_string(&sidebar).ok(),
+            user_home: std::env::home_dir()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            home: home.to_string_lossy().into_owned(),
+        }))
+    }
+
+    /// Save shared UI state (`Request::PutUiState`).
+    pub(crate) fn put_ui_state(&self, name: &str, json: &str) -> CoreResult<Response> {
+        let file = match name {
+            "sidebar" => self.home()?.join("ui-sidebar.json"),
+            _ => return Err(bad(format!("no UI state named `{name}`"))),
+        };
+        if json.len() > MAX_UI_STATE {
+            return Err(bad("that's too much UI state"));
+        }
+        serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|e| bad(format!("not JSON: {e}")))?;
+        let tmp = file.with_extension("json.tmp");
+        std::fs::write(&tmp, json)
+            .and_then(|()| std::fs::rename(&tmp, &file))
+            .map_err(crate::internal)?;
+        Ok(Response::Ok)
+    }
+
+    /// Delete a colour theme the user added (`Request::DeleteTheme`).
+    pub(crate) fn delete_theme(&self, id: &str) -> CoreResult<Response> {
+        let stem = id.strip_prefix("custom:").unwrap_or(id);
+        // A file name of our own making: nothing that could leave the folder.
+        if stem.is_empty() || theme_slug(stem) != stem {
+            return Err(bad(format!("no theme `{id}`")));
+        }
+        let file = self.home()?.join("themes").join(format!("{stem}.toml"));
+        match std::fs::remove_file(&file) {
+            Ok(()) => Ok(Response::Ok),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("no theme `{id}`"),
+            )),
+            Err(e) => Err(crate::internal(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_is_redacted_for_remote_sessions() {
+        let text = "# mine\n[ui]\ntheme = \"dark\"\n\n[harness.claude]\npath = \"/opt/claude\"\nenv = { ANTHROPIC_API_KEY = \"sk-secret\", DEBUG = \"1\" }\n\n[harness.codex.env]\nOPENAI_API_KEY = \"sk-other\"\n\n[web]\nenabled = true\ntls_key = \"/etc/key.pem\"\n";
+        let out = redact_config(text);
+        assert!(
+            !out.contains("sk-secret") && !out.contains("sk-other"),
+            "{out}"
+        );
+        assert!(out.contains("ANTHROPIC_API_KEY") && out.contains("OPENAI_API_KEY"));
+        assert!(!out.contains("[web]") && !out.contains("key.pem"));
+        // The rest is as the user wrote it, and still parses.
+        assert!(out.contains("# mine") && out.contains("theme = \"dark\""));
+        let config: loft_config::Config = toml::from_str(&out).unwrap();
+        assert_eq!(config.harness.claude.env["DEBUG"], "•••");
+        assert!(!config.web.enabled);
+        // Unparseable text is withheld, not passed along.
+        assert_eq!(
+            redact_config("[harness.claude\nenv = { K = \"sk-secret\" }"),
+            ""
+        );
+    }
 
     #[test]
     fn only_known_keys_with_the_right_values() {

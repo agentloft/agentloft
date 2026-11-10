@@ -5,25 +5,19 @@ use crate::panel::docs::{DocPreview, doc_kind};
 use crate::store::AppStore;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::input::{
-    FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, InputHighlighterFactory, Rope,
-};
-use gpui_kit::component::highlighter::SyntaxHighlighter;
+use gpui_kit::base::input::Rope;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, AsyncWindowContext, Context, Entity, FontWeight, HighlightStyle, Image,
-    ImageFormat, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Task, WeakEntity,
-    Window, div, img, prelude::FluentBuilder as _, px,
+    AppContext as _, AsyncWindowContext, Context, Entity, FontWeight, Image, ImageFormat,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Task, WeakEntity, Window, div,
+    img, prelude::FluentBuilder as _, px,
 };
 use loft_protocol::{FileContent, FsRoot, Request, Response};
-use std::cell::RefCell;
-use std::ops::Range;
-use std::rc::Rc;
 use std::sync::Arc;
 
 enum Content {
@@ -148,11 +142,7 @@ impl FileViewer {
             // rather than plain and then repainted. The previous content stays
             // up meanwhile.
             let rope = Rope::from(text.as_str());
-            let parse = cx.background_spawn(async move {
-                let mut highlighter = SyntaxHighlighter::new(language);
-                highlighter.update(None, &rope, None);
-                highlighter
-            });
+            let parse = cx.background_spawn(async move { preparse::parse(language, &rope) });
             self.pending = Some(cx.spawn_in(
                 window,
                 async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
@@ -182,11 +172,7 @@ impl FileViewer {
         };
         let text = text.clone();
         let rope = Rope::from(&*text);
-        let parse = cx.background_spawn(async move {
-            let mut highlighter = SyntaxHighlighter::new("markdown");
-            highlighter.update(None, &rope, None);
-            highlighter
-        });
+        let parse = cx.background_spawn(async move { preparse::parse("markdown", &rope) });
         self.pending = Some(cx.spawn_in(
             window,
             async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
@@ -219,95 +205,137 @@ impl FileViewer {
 fn code_editor(
     language: &str,
     text: &str,
-    highlighter: SyntaxHighlighter,
+    parsed: preparse::Parsed,
     window: &mut Window,
     cx: &mut Context<FileViewer>,
 ) -> Entity<EditorState> {
     let language = language.to_owned();
     let text = text.to_owned();
-    // Hand the editor the tree parsed in the background. If the editor ever
-    // drops its highlighter and asks again, the new one parses on first use.
-    let ready = Rc::new(RefCell::new(Some(highlighter)));
-    let factory: InputHighlighterFactory = Rc::new(move |language| {
-        let inner = ready
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| SyntaxHighlighter::new(language));
-        Some(Box::new(Parsed(inner)) as Box<dyn InputHighlighter>)
-    });
     cx.new(|cx| {
         let mut state = EditorState::new(window, cx)
             .language(language)
             .line_number(true)
             .soft_wrap(false);
-        state.set_highlighter_factory(factory, cx);
+        preparse::install(&mut state, parsed, cx);
         state.set_value(text, window, cx);
         state
     })
 }
 
-/// A tree-sitter highlighter that's already parsed its text. The stock one
-/// parses for at most 2ms on the main thread, then shows the file plain and
-/// finishes in the background after a 150ms debounce.
-struct Parsed(SyntaxHighlighter);
+/// Highlighting a file before it is shown, so it appears already coloured.
+/// That needs tree-sitter (the desktop build); the browser build's syntect
+/// highlighter colours as the editor goes.
+#[cfg(not(target_arch = "wasm32"))]
+mod preparse {
+    use gpui_kit::base::input::{
+        FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, InputHighlighterFactory,
+        Rope,
+    };
+    use gpui_kit::component::highlighter::SyntaxHighlighter;
+    use gpui_kit::component::input::EditorState;
+    use gpui_kit::{Context, HighlightStyle, SharedString, Window};
+    use std::cell::RefCell;
+    use std::ops::Range;
+    use std::rc::Rc;
 
-impl InputHighlighter for Parsed {
-    fn language(&self) -> SharedString {
-        self.0.language().clone()
+    pub(super) type Parsed = SyntaxHighlighter;
+
+    pub(super) fn parse(language: &str, rope: &Rope) -> Parsed {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        highlighter.update(None, rope, None);
+        highlighter
     }
 
-    fn update(
-        &mut self,
-        _edit: Option<InputEdit>,
-        text: &Rope,
-        _folding: bool,
-        _window: &mut Window,
-        _cx: &mut Context<EditorState>,
-    ) {
-        // The viewer is read-only, so the text only changes wholesale. When it
-        // matches what was parsed this returns at once.
-        self.0.update(None, text, None);
+    /// Hand the editor the tree parsed in the background. If the editor ever
+    /// drops its highlighter and asks again, the new one parses on first use.
+    pub(super) fn install(state: &mut EditorState, parsed: Parsed, cx: &mut Context<EditorState>) {
+        let ready = Rc::new(RefCell::new(Some(parsed)));
+        let factory: InputHighlighterFactory = Rc::new(move |language| {
+            let inner = ready
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| SyntaxHighlighter::new(language));
+            Some(Box::new(Ready(inner)) as Box<dyn InputHighlighter>)
+        });
+        state.set_highlighter_factory(factory, cx);
     }
 
-    fn styles(
-        &self,
-        range: &Range<usize>,
-        resolver: &dyn HighlightStyleResolver,
-    ) -> Vec<(Range<usize>, HighlightStyle)> {
-        self.0.styles(range, resolver)
-    }
+    /// A tree-sitter highlighter that's already parsed its text. The stock one
+    /// parses for at most 2ms on the main thread, then shows the file plain and
+    /// finishes in the background after a 150ms debounce.
+    struct Ready(SyntaxHighlighter);
 
-    fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
-        let Some(tree) = self.0.tree() else {
-            return Vec::new();
-        };
-        // Named nodes spanning three or more lines fold; walk depth-first,
-        // skipping the insides of nodes too short to fold.
-        let mut ranges: Vec<FoldRange> = Vec::new();
-        let mut cursor = tree.walk();
-        if !cursor.goto_first_child() {
-            return ranges;
+    impl InputHighlighter for Ready {
+        fn language(&self) -> SharedString {
+            self.0.language().clone()
         }
-        'walk: loop {
-            let node = cursor.node();
-            let (start, end) = (node.start_position().row, node.end_position().row);
-            let foldable = node.is_named() && end.saturating_sub(start) >= 2;
-            if foldable {
-                ranges.push(FoldRange::new(start, end));
-                if cursor.goto_first_child() {
-                    continue;
+
+        fn update(
+            &mut self,
+            _edit: Option<InputEdit>,
+            text: &Rope,
+            _folding: bool,
+            _window: &mut Window,
+            _cx: &mut Context<EditorState>,
+        ) {
+            // The viewer is read-only, so the text only changes wholesale. When it
+            // matches what was parsed this returns at once.
+            self.0.update(None, text, None);
+        }
+
+        fn styles(
+            &self,
+            range: &Range<usize>,
+            resolver: &dyn HighlightStyleResolver,
+        ) -> Vec<(Range<usize>, HighlightStyle)> {
+            self.0.styles(range, resolver)
+        }
+
+        fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
+            let Some(tree) = self.0.tree() else {
+                return Vec::new();
+            };
+            // Named nodes spanning three or more lines fold; walk depth-first,
+            // skipping the insides of nodes too short to fold.
+            let mut ranges: Vec<FoldRange> = Vec::new();
+            let mut cursor = tree.walk();
+            if !cursor.goto_first_child() {
+                return ranges;
+            }
+            'walk: loop {
+                let node = cursor.node();
+                let (start, end) = (node.start_position().row, node.end_position().row);
+                let foldable = node.is_named() && end.saturating_sub(start) >= 2;
+                if foldable {
+                    ranges.push(FoldRange::new(start, end));
+                    if cursor.goto_first_child() {
+                        continue;
+                    }
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() || cursor.depth() == 0 {
+                        break 'walk;
+                    }
                 }
             }
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() || cursor.depth() == 0 {
-                    break 'walk;
-                }
-            }
+            ranges.sort_by_key(|r| r.start_line);
+            ranges.dedup_by_key(|r| r.start_line);
+            ranges
         }
-        ranges.sort_by_key(|r| r.start_line);
-        ranges.dedup_by_key(|r| r.start_line);
-        ranges
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod preparse {
+    use gpui_kit::Context;
+    use gpui_kit::base::input::Rope;
+    use gpui_kit::component::input::EditorState;
+
+    pub(super) type Parsed = ();
+
+    pub(super) fn parse(_language: &str, _rope: &Rope) -> Parsed {}
+
+    pub(super) fn install(_: &mut EditorState, _: Parsed, _: &mut Context<EditorState>) {}
 }
 
 pub fn extension(path: &str) -> String {

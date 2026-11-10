@@ -66,8 +66,14 @@ pub fn normalize_address(input: &str, search_template: &str) -> Result<Url, Brow
     }
 
     if input.starts_with('/') && !input.contains(char::is_whitespace) {
+        // `Url::from_file_path` doesn't exist on wasm32 (no file paths
+        // there); the embedded browser doesn't either.
+        #[cfg(not(target_arch = "wasm32"))]
         return Url::from_file_path(input)
             .map_err(|()| BrowserError::InvalidUrl(format!("not an absolute path: {input}")));
+        #[cfg(target_arch = "wasm32")]
+        return Url::parse(&format!("file://{input}"))
+            .map_err(|e| BrowserError::InvalidUrl(format!("{input}: {e}")));
     }
 
     if looks_like_host(input) {

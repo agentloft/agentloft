@@ -645,8 +645,8 @@ pub(crate) fn human_duration(ms: i64) -> String {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
@@ -1802,7 +1802,7 @@ fn render_turn_footer(
 }
 
 /// Which copy button was clicked last, and when (for its ✓).
-static COPIED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+static COPIED: std::sync::Mutex<Option<(String, web_time::Instant)>> = std::sync::Mutex::new(None);
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 pub(crate) fn just_copied(id: &str) -> bool {
@@ -1842,7 +1842,7 @@ fn copy_button(
 /// Remember that copy button `id` was just used (it shows ✓ for a moment).
 pub(crate) fn mark_copied(id: String, window: &mut Window, cx: &mut App) {
     if let Ok(mut c) = COPIED.lock() {
-        *c = Some((id, std::time::Instant::now()));
+        *c = Some((id, web_time::Instant::now()));
     }
     window.refresh();
     // Back to the copy icon afterwards.

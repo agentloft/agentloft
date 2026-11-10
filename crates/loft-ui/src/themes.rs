@@ -419,16 +419,13 @@ pub fn themes_dir(home: &Path) -> PathBuf {
 
 /// Your themes, from `dir` (sorted by name). Broken files are skipped.
 pub fn load_custom(dir: &Path) -> Vec<Theme> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Theme> = read
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
-        .filter_map(|e| {
-            let text = std::fs::read_to_string(e.path()).ok()?;
+    let mut out: Vec<Theme> = crate::host::list_files(dir)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|x| x == "toml"))
+        .filter_map(|path| {
+            let text = crate::host::read_to_string(&path).ok()?;
             let file = parse(&text).ok()?;
-            let id = e.path().file_stem()?.to_string_lossy().into_owned();
+            let id = path.file_stem()?.to_string_lossy().into_owned();
             Some(Theme {
                 id: format!("custom:{id}"),
                 name: file.name.clone(),
@@ -494,27 +491,26 @@ pub fn to_toml(file: &ThemeFile) -> String {
 /// `existing` when overwriting one.
 pub fn save(home: &Path, file: &ThemeFile, existing: Option<&str>) -> anyhow::Result<String> {
     let dir = themes_dir(home);
-    std::fs::create_dir_all(&dir)?;
     let stem = match existing.and_then(|id| id.strip_prefix("custom:")) {
         Some(stem) => stem.to_owned(),
         None => {
             let base = slug(&file.name);
             let mut stem = base.clone();
             let mut n = 2;
-            while dir.join(format!("{stem}.toml")).exists() {
+            while crate::host::exists(&dir.join(format!("{stem}.toml"))) {
                 stem = format!("{base}-{n}");
                 n += 1;
             }
             stem
         }
     };
-    std::fs::write(dir.join(format!("{stem}.toml")), to_toml(file))?;
+    crate::host::write(&dir.join(format!("{stem}.toml")), to_toml(file).as_bytes())?;
     Ok(format!("custom:{stem}"))
 }
 
 pub fn delete(home: &Path, id: &str) -> anyhow::Result<()> {
     if let Some(stem) = id.strip_prefix("custom:") {
-        std::fs::remove_file(themes_dir(home).join(format!("{stem}.toml")))?;
+        crate::host::remove_file(&themes_dir(home).join(format!("{stem}.toml")))?;
     }
     Ok(())
 }

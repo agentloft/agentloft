@@ -238,11 +238,13 @@ fn harden(response: &mut Response<Body>, host: Option<&str>, tls: bool) {
     let ws = host
         .map(|h| format!(" ws://{h} wss://{h}"))
         .unwrap_or_default();
+    // Style *attributes* are allowed because GPUI sizes its canvas and its
+    // hidden text input with them; scripts and stylesheets are ours only.
     let csp = format!(
         "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
-         img-src 'self' data: blob:; font-src 'self'; connect-src 'self'{ws}; \
-         worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; \
-         form-action 'none'; frame-ancestors 'none'"
+         style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; \
+         connect-src 'self'{ws}; worker-src 'self' blob:; manifest-src 'self'; \
+         base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
     if let Ok(csp) = HeaderValue::from_str(&csp) {
         headers.insert(header::CONTENT_SECURITY_POLICY, csp);

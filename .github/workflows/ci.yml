@@ -56,6 +56,13 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # The browser-only code paths (cfg(target_arch = "wasm32")) that the
+      # native clippy run never sees. RUSTC_BOOTSTRAP: see the `web` task in
+      # xtask/src/main.rs.
+      - name: Clippy (wasm32)
+        run: cargo clippy -p loft-web --target wasm32-unknown-unknown -- -D warnings
+        env:
+          RUSTC_BOOTSTRAP: wasm_thread
       # Builds crates/loft-web for wasm32-unknown-unknown and generates the
       # JS glue into target/web.
       - name: Build the web bundle

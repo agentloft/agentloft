@@ -668,7 +668,7 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
                 None,
                 move |_, _, cx| {
                     let value = loft_config::SettingValue::Str(id.clone());
-                    if loft_config::write_setting(&paths, &["ui", "palette"], value).is_ok() {
+                    if crate::host::write_setting(&paths, &["ui", "palette"], value).is_ok() {
                         crate::theme::reload_if_changed(cx);
                     }
                 },

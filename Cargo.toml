@@ -26,8 +26,10 @@ loft-testkit = { path = "crates/loft-testkit" }
 loft-git = { path = "crates/loft-git" }
 loft-terminal = { path = "crates/loft-terminal" }
 
-# UI — gpui-kit pins the matching gpui-pre release (ADR-0005)
-gpui-kit = { version = "=0.9.0", features = ["tree-sitter-languages"] }
+# UI — gpui-kit pins the matching gpui-pre release (ADR-0005). Syntax
+# highlighting is chosen per target in loft-ui: tree-sitter natively, syntect
+# in the browser (tree-sitter's C grammars don't build for wasm32).
+gpui-kit = { version = "=0.9.0" }
 
 # terminal (ADR-0007): Ghostty's libghostty-vt, built from the pinned Ghostty
 # 1.4.0 source tarball with Zig 0.17 (needs `zig` 0.17.x on PATH or in $ZIG)

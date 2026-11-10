@@ -4,11 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
 <title>Agentloft</title>
+<link rel="icon" href="icon.png">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <div id="boot" role="status">Loading Agentloft…</div>
+<main id="pair" hidden>
+  <img src="icon.png" alt="" width="56" height="56">
+  <h1>Pair this browser</h1>
+  <p>In Agentloft on your computer, open <b>Settings ▸ Web access</b> and open the pairing link in this browser, or paste it here.</p>
+  <div class="row">
+    <input id="pair-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Pairing link" aria-label="Pairing link">
+    <button id="pair-button" type="button">Pair</button>
+  </div>
+  <p id="pair-error" role="alert"></p>
+</main>
 <script type="module" src="boot.js"></script>
 </body>
 </html>

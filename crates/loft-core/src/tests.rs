@@ -1441,16 +1441,45 @@ accent = "#d9480f"
     call(Request::SaveTheme {
         toml: theme.into(),
         select: true,
+        id: None,
     })
     .await
     .unwrap();
     assert!(dir.path().join("themes/ember.toml").exists());
+    // Under a given id: only a plain name, never a path.
+    call(Request::SaveTheme {
+        toml: theme.into(),
+        select: false,
+        id: Some("custom:ember-2".into()),
+    })
+    .await
+    .unwrap();
+    assert!(dir.path().join("themes/ember-2.toml").exists());
+    call(Request::DeleteTheme {
+        id: "custom:ember-2".into(),
+    })
+    .await
+    .unwrap();
+    assert!(!dir.path().join("themes/ember-2.toml").exists());
+    for id in ["custom:../ember", "custom:a/b", "custom:", "../../x"] {
+        assert!(
+            call(Request::SaveTheme {
+                toml: theme.into(),
+                select: false,
+                id: Some(id.into()),
+            })
+            .await
+            .is_err(),
+            "{id}"
+        );
+    }
     let text = std::fs::read_to_string(&config_file).unwrap();
     assert!(text.contains("palette = \"custom:ember\""), "{text}");
     assert!(
         call(Request::SaveTheme {
             toml: theme.replace("#ff7a45", "orange"),
             select: false,
+            id: None,
         })
         .await
         .is_err()

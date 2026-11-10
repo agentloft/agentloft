@@ -77,7 +77,7 @@ pub fn refresh(cx: &mut App) {
     if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
         let _ = view.update(cx, |v, cx| {
             let paths = v.store.read(cx).paths().clone();
-            if let Ok(c) = Config::load(&paths) {
+            if let Ok(c) = crate::host::load_config(&paths) {
                 v.config = c;
                 v.studio.themes = crate::themes::all(&paths.home);
             }
@@ -372,7 +372,7 @@ const ACCENTS: [(&str, Option<&str>); 8] = [
 impl SettingsView {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = store.read(cx).paths().clone();
-        let (config, error) = match Config::load(&paths) {
+        let (config, error) = match crate::host::load_config(&paths) {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(format!("{e:#}"))),
         };
@@ -442,12 +442,12 @@ impl SettingsView {
     /// Write one setting, reload, and apply it.
     fn write(&mut self, key: &[&str], value: SettingValue, daemon: bool, cx: &mut Context<Self>) {
         let paths = self.store.read(cx).paths().clone();
-        if let Err(err) = loft_config::write_setting(&paths, key, value) {
+        if let Err(err) = crate::host::write_setting(&paths, key, value) {
             self.error = Some(format!("Couldn't save: {err:#}"));
             cx.notify();
             return;
         }
-        match Config::load(&paths) {
+        match crate::host::load_config(&paths) {
             Ok(c) => {
                 self.config = c;
                 self.error = None;

@@ -562,7 +562,14 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 return Some(text_result("toml is required", true));
             };
             let select = args.get("select").and_then(Value::as_bool).unwrap_or(true);
-            match client.request(Request::SaveTheme { toml, select }).await {
+            match client
+                .request(Request::SaveTheme {
+                    toml,
+                    select,
+                    id: None,
+                })
+                .await
+            {
                 Ok(Response::Text { text }) => text_result(text, false),
                 Ok(_) => text_result("Saved.", false),
                 Err(err) => text_result(err.message, true),

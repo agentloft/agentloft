@@ -5651,7 +5651,7 @@ const SLIDE: std::time::Duration = std::time::Duration::from_millis(180);
 struct Slide {
     open: bool,
     seen: bool,
-    started: Option<std::time::Instant>,
+    started: Option<web_time::Instant>,
 }
 
 impl Slide {
@@ -5666,7 +5666,7 @@ impl Slide {
             let now = self.linear();
             let from = if open { now } else { 1. - now };
             self.open = open;
-            self.started = Some(std::time::Instant::now() - SLIDE.mul_f32(from));
+            self.started = Some(web_time::Instant::now() - SLIDE.mul_f32(from));
         }
         let t = self.linear_progress();
         if t < 1. {

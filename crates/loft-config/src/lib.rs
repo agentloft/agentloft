@@ -1,6 +1,8 @@
 //! Paths under `~/.agentloft`, the user's `config.toml`, and the login-shell
 //! environment used to spawn agent CLIs (PLAN §1.7, §4.1, §4.5).
 
+pub mod icons;
+
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -494,16 +496,29 @@ pub enum SettingValue {
 /// Set one key in `config.toml` (e.g. `["ui", "theme"]`), keeping the rest
 /// of the file — comments and formatting included — as the user wrote it.
 pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result<()> {
-    use toml_edit::{DocumentMut, Item, Table, value as v};
     let file = paths.config_file();
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
     };
-    let mut doc: DocumentMut = text
-        .parse()
-        .with_context(|| format!("parse {}", file.display()))?;
+    let edited =
+        edit_setting(&text, key, value).with_context(|| format!("edit {}", file.display()))?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Write-then-rename so a crash never leaves a truncated config.
+    let tmp = file.with_extension("toml.tmp");
+    std::fs::write(&tmp, edited)?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(())
+}
+
+/// [`write_setting`] on the text of a config file: the text with one key
+/// set, the rest as it was.
+pub fn edit_setting(text: &str, key: &[&str], value: SettingValue) -> Result<String> {
+    use toml_edit::{DocumentMut, Item, Table, value as v};
+    let mut doc: DocumentMut = text.parse().context("parse the config")?;
     let (last, tables) = key.split_last().context("empty key")?;
     let mut table = doc.as_table_mut();
     for name in tables {
@@ -541,14 +556,7 @@ pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result
             table.remove(last);
         }
     }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Write-then-rename so a crash never leaves a truncated config.
-    let tmp = file.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, &file)?;
-    Ok(())
+    Ok(doc.to_string())
 }
 
 // ---------------------------------------------------------------------------

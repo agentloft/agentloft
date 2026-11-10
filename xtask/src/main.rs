@@ -107,6 +107,11 @@ fn web() -> Result<()> {
         .generate(&out)
         .context("wasm-bindgen")?;
     copy_dir(&root().join("crates/loft-web/static"), &out)?;
+    std::fs::copy(
+        root().join("assets/icon/png/agentloft-128.png"),
+        out.join("icon.png"),
+    )
+    .context("copy the icon")?;
     println!("{}", out.display());
     Ok(())
 }

@@ -2,6 +2,10 @@
 //! that covers anything GPUI draws in the main window, so an in-window
 //! menu would open underneath it; a floating window sits above it and the
 //! page keeps running.
+//!
+//! Where there are no extra windows (Agentloft in a browser, which also has
+//! no native page to cover), the same menu is drawn inside the window: the
+//! root view asks for it with [`overlay`].
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
@@ -13,7 +17,8 @@ use gpui_kit::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 thread_local! {
     /// When a menu last closed because the user clicked away: a click on
@@ -125,6 +130,26 @@ fn open_at_xy(window: &Window, x: f32, y: f32, entries: Vec<Entry>, cx: &mut App
                 Entry::Separator => SEPARATOR,
             })
             .sum::<f32>();
+    if IN_WINDOW {
+        // Keep the menu inside the window.
+        let view_size = window.viewport_size();
+        let x = x.min(f32::from(view_size.width) - WIDTH - 4.).max(4.);
+        let y = y.min(f32::from(view_size.height) - height - 4.).max(4.);
+        let view = cx.new(|cx| PopupMenu {
+            entries,
+            focus: cx.focus_handle(),
+            hovered: None,
+            in_window: true,
+        });
+        cx.set_global(InWindowMenu {
+            view,
+            at: point(px(x), px(y)),
+            height,
+            focused: false,
+        });
+        cx.refresh_windows();
+        return;
+    }
     let win = window.bounds();
     let x = f32::from(win.origin.x) + x;
     let y = f32::from(win.origin.y) + y;
@@ -149,10 +174,59 @@ fn open_at_xy(window: &Window, x: f32, y: f32, entries: Vec<Entry>, cx: &mut App
     });
 }
 
+/// Whether menus are drawn inside the window (no popup windows here).
+const IN_WINDOW: bool = cfg!(target_arch = "wasm32");
+
+/// The menu open inside the window, if any.
+struct InWindowMenu {
+    view: gpui_kit::Entity<PopupMenu>,
+    at: gpui_kit::Point<Pixels>,
+    height: f32,
+    focused: bool,
+}
+
+impl gpui_kit::Global for InWindowMenu {}
+
+fn close_in_window(cx: &mut App) {
+    if cx.try_global::<InWindowMenu>().is_some() {
+        CLOSED_AT.set(Some(Instant::now()));
+        cx.remove_global::<InWindowMenu>();
+        cx.refresh_windows();
+    }
+}
+
+/// The in-window menu, for the window's root view to draw above
+/// everything else. `None` when no menu is open (always, where menus get a
+/// window of their own).
+pub fn overlay(window: &mut Window, cx: &mut App) -> Option<gpui_kit::AnyElement> {
+    let menu = cx.try_global::<InWindowMenu>()?;
+    let (view, at, height, focused) = (menu.view.clone(), menu.at, menu.height, menu.focused);
+    if !focused {
+        window.focus(&view.focus_handle(cx), cx);
+        cx.global_mut::<InWindowMenu>().focused = true;
+    }
+    Some(
+        gpui_kit::deferred(
+            gpui_kit::anchored().position(at).child(
+                div()
+                    .occlude()
+                    .w(px(WIDTH))
+                    .h(px(height))
+                    .on_mouse_down_out(|_, _, cx| close_in_window(cx))
+                    .child(view),
+            ),
+        )
+        .with_priority(10)
+        .into_any_element(),
+    )
+}
+
 struct PopupMenu {
     entries: Vec<Entry>,
     focus: FocusHandle,
     hovered: Option<usize>,
+    /// Drawn inside the window rather than in one of its own.
+    in_window: bool,
 }
 
 impl PopupMenu {
@@ -171,6 +245,16 @@ impl PopupMenu {
             entries,
             focus,
             hovered: None,
+            in_window: false,
+        }
+    }
+
+    /// Put the menu away.
+    fn dismiss(in_window: bool, window: &mut Window, cx: &mut App) {
+        if in_window {
+            close_in_window(cx);
+        } else {
+            window.remove_window();
         }
     }
 }
@@ -192,6 +276,7 @@ impl Render for PopupMenu {
             theme.accent,
             theme.primary,
         );
+        let in_window = self.in_window;
         let mut list = v_flex().p(px(PAD));
         for (ix, entry) in self.entries.iter().enumerate() {
             match entry {
@@ -267,7 +352,7 @@ impl Render for PopupMenu {
                             })
                             .when(!disabled, |d| {
                                 d.on_click(move |_, window, cx| {
-                                    window.remove_window();
+                                    Self::dismiss(in_window, window, cx);
                                     action(cx);
                                 })
                             }),
@@ -282,7 +367,7 @@ impl Render for PopupMenu {
                 cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                     let key = event.keystroke.key.as_str();
                     if key == "escape" {
-                        window.remove_window();
+                        Self::dismiss(this.in_window, window, cx);
                         return;
                     }
                     let picked = this.entries.iter().find_map(|e| match e {
@@ -295,7 +380,7 @@ impl Render for PopupMenu {
                         _ => None,
                     });
                     if let Some(action) = picked {
-                        window.remove_window();
+                        Self::dismiss(this.in_window, window, cx);
                         action(cx);
                     }
                 }),

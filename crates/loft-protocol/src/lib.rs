@@ -88,11 +88,15 @@ pub enum Request {
         key: String,
         value: serde_json::Value,
     },
-    /// Save a colour theme (its TOML) and optionally switch to it.
+    /// Save a colour theme (its TOML) and optionally switch to it. Saved
+    /// under `id` (`custom:<name>`) when given, else under a name made from
+    /// the theme's own.
     SaveTheme {
         toml: String,
         #[serde(default)]
         select: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// A project's icon: an image file, or `None` for automatic (answers
     /// `Response::Project`).
@@ -415,6 +419,29 @@ pub enum Request {
         #[serde(default)]
         thread_id: Option<ThreadId>,
     },
+    // -- what the desktop app reads from disk, for clients that can't -------
+    /// The settings files a UI needs (config.toml, colour themes, sidebar
+    /// state), unless they still match `known` (a `UiFiles::stamp`).
+    /// Answers `Response::UiFiles`.
+    UiFiles {
+        #[serde(default)]
+        known: Option<String>,
+    },
+    /// Save a piece of UI state shared by every window and browser
+    /// (`name`: `sidebar`), as JSON.
+    PutUiState {
+        name: String,
+        json: String,
+    },
+    /// Delete a colour theme the user added (`custom:<name>`).
+    DeleteTheme {
+        id: String,
+    },
+    /// A project's icon: the image chosen for it, else the one found in its
+    /// folder (answers `Response::File`; `NotFound` when it has none).
+    ProjectIcon {
+        project_id: ProjectId,
+    },
     // -- web access (ADR-0016); local clients only -------------------------
     /// Web access as it stands: listening or not, the pairing link, and the
     /// browsers signed in (answers `Response::WebStatus`, as do the next
@@ -600,6 +627,11 @@ pub enum Response {
     },
     WebStatus {
         status: WebStatus,
+    },
+    /// `None`: nothing changed since `known`.
+    UiFiles {
+        #[serde(default)]
+        files: Option<Box<UiFiles>>,
     },
     /// A new fork, plus the handoff digest to offer as its first message.
     Forked {
@@ -817,6 +849,32 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<ServerMsg>(&json).unwrap(), msg);
     }
+}
+
+/// The settings files behind the UI, as text (`Request::UiFiles`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UiFiles {
+    /// Changes when any of the files does.
+    pub stamp: String,
+    /// Agentloft's data home on the daemon's machine (`~/.agentloft`).
+    pub home: String,
+    /// The user's home folder there.
+    pub user_home: String,
+    /// `config.toml` (empty if there is none). A browser session gets it
+    /// with agents' environment values hidden and `[web]` left out.
+    pub config_toml: String,
+    /// Colour themes in `<home>/themes`: file stem and TOML.
+    #[serde(default)]
+    pub themes: Vec<UiFile>,
+    /// `ui-sidebar.json`: folded and pinned projects, folded threads.
+    #[serde(default)]
+    pub sidebar: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UiFile {
+    pub name: String,
+    pub text: String,
 }
 
 /// Web access as the daemon sees it (Settings ▸ Web access).

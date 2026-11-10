@@ -14,14 +14,14 @@ use loft_protocol::ThreadId;
 
 /// Process-wide context every window needs to start its store.
 pub struct AppEnv {
-    pub runtime: tokio::runtime::Handle,
+    pub runtime: crate::host::Runtime,
     pub paths: Paths,
     /// Open workspace windows and their stores (for session restore).
     open: Vec<(AnyWindowHandle, gpui_kit::WeakEntity<AppStore>)>,
 }
 impl Global for AppEnv {}
 
-pub fn init(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut App) {
+pub fn init(runtime: crate::host::Runtime, paths: Paths, cx: &mut App) {
     cx.set_global(AppEnv {
         runtime,
         paths,
@@ -62,15 +62,12 @@ struct SavedWindow {
     layout: Vec<Vec<ThreadId>>,
 }
 
-fn session_file(paths: &Paths) -> std::path::PathBuf {
-    paths.home.join("ui-session.json")
-}
-
-fn save_session(cx: &mut App) {
+/// Remember each window's threads and panes for next time.
+pub fn save_session(cx: &mut App) {
     let Some(env) = cx.try_global::<AppEnv>() else {
         return;
     };
-    let file = session_file(&env.paths);
+    let paths = env.paths.clone();
     let open = env.open.clone();
     let mut saved = Vec::new();
     for (ix, (_, store)) in open.into_iter().enumerate() {
@@ -86,7 +83,7 @@ fn save_session(cx: &mut App) {
         });
     }
     if let Ok(json) = serde_json::to_vec_pretty(&saved) {
-        let _ = std::fs::write(file, json);
+        crate::host::save_session(&paths, &json);
     }
 }
 
@@ -94,7 +91,7 @@ fn save_session(cx: &mut App) {
 pub fn restore(cx: &mut App) {
     let saved: Vec<SavedWindow> = cx
         .try_global::<AppEnv>()
-        .and_then(|env| std::fs::read(session_file(&env.paths)).ok())
+        .and_then(|env| crate::host::load_session(&env.paths))
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     if saved.is_empty() {
