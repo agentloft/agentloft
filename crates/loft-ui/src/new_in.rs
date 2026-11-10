@@ -78,11 +78,31 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
+    open_at(Step::Projects, view, store, window, cx)
+}
+
+/// Open straight at "Add a project from…" (⌘O, the sidebar's folder button).
+pub fn open_sources(
+    view: Entity<WorkspaceView>,
+    store: &Entity<crate::store::AppStore>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_at(Step::Sources, view, store, window, cx)
+}
+
+fn open_at(
+    start: Step,
+    view: Entity<WorkspaceView>,
+    store: &Entity<crate::store::AppStore>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     // Each step gets a search field of its own (fresh text, highlight and
     // focus): (step, its field).
     let first = cx.new(|cx| CommandState::new(window, cx));
     let focus = first.clone();
-    let at = cx.new(|_| (Step::Projects, first));
+    let at = cx.new(|_| (start, first));
     let store = store.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let (current, state) = at.read(cx).clone();

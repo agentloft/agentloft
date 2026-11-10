@@ -2661,8 +2661,9 @@ impl WorkspaceView {
                         "add-project",
                         IconName::FolderPlus,
                         p,
+                        // New, local folder, git URL or GitHub.
                         cx.listener(|this, _, window, cx| {
-                            this.add_project(window, cx);
+                            crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
                         }),
                     )),
             )
@@ -4000,7 +4001,7 @@ impl WorkspaceView {
                         "⌘O",
                         p,
                         cx.listener(|this, _, window, cx| {
-                            this.add_project(window, cx);
+                            crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
                         }),
                     ))
                     .when(has_projects, |d| {
@@ -4088,7 +4089,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|_, _: &ToggleTheme, _, cx| theme::toggle_mode(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &AddProject, window, cx| {
-                this.add_project(window, cx);
+                crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
             }))
             .on_action(cx.listener(|_, _: &About, window, cx| show_about(window, cx)))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
