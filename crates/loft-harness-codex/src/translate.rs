@@ -128,6 +128,15 @@ pub struct Translator {
     /// Set the goal active once our turn toward it has started.
     activate_goal: bool,
     next_note: u64,
+    /// Codex's own subagents (collab `spawnAgent`): their thread → the
+    /// spawn call's item, whose card shows them and holds their steps.
+    agents: HashMap<String, String>,
+    /// What each spawn card is called (by item id), for wait/message rows.
+    spawn_titles: HashMap<String, String>,
+    /// Spawn cards still running: item id → the agent's latest reply.
+    open_spawns: HashMap<String, String>,
+    /// Spawns whose agent thread hasn't been seen yet, oldest first.
+    unclaimed: VecDeque<String>,
 }
 
 /// What `/init` asks Codex to do (Codex's own command isn't available over
@@ -207,6 +216,329 @@ impl Translator {
             resume,
             ..Self::default()
         }
+    }
+
+    /// A spawned subagent finished: its card completes with its reply.
+    fn finish_spawn(&mut self, spawn: &str, failed: bool) -> Vec<Out> {
+        let Some(reply) = self.open_spawns.remove(spawn) else {
+            return vec![];
+        };
+        vec![Out::Event(HarnessEvent::ItemCompleted {
+            native_id: spawn.to_owned(),
+            body: None,
+            tool_result: Some(ToolResult {
+                output: reply,
+                is_error: failed,
+            }),
+            status: if failed {
+                ItemStatus::Failed
+            } else {
+                ItemStatus::Completed
+            },
+        })]
+    }
+
+    /// Notifications from a subagent's thread: items become steps of its
+    /// card (ids prefixed: each thread numbers its own items); its turn
+    /// ending completes the card.
+    fn on_agent_notification(&mut self, tid: String, method: &str, p: &Value) -> Vec<Out> {
+        let spawn = match self.agents.get(&tid) {
+            Some(s) => s.clone(),
+            None => match self.unclaimed.pop_front() {
+                Some(s) => {
+                    self.agents.insert(tid.clone(), s.clone());
+                    s
+                }
+                None => return vec![],
+            },
+        };
+        let local = |id: &str| format!("{tid}:{id}");
+        match method {
+            "item/started" => {
+                let item = p.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("collabAgentToolCall") {
+                    return vec![];
+                }
+                match item_started(item, &self.cwd) {
+                    Some(HarnessEvent::ItemStarted {
+                        native_id, body, ..
+                    }) => {
+                        vec![Out::Event(HarnessEvent::ItemStarted {
+                            native_id: local(&native_id),
+                            body,
+                            parent: Some(spawn),
+                        })]
+                    }
+                    _ => vec![],
+                }
+            }
+            "item/completed" => {
+                let item = p.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && let Some(text) = item.get("text").and_then(Value::as_str)
+                    && let Some(reply) = self.open_spawns.get_mut(&spawn)
+                {
+                    *reply = text.to_owned();
+                }
+                match item_completed(item, &self.cwd) {
+                    Some(HarnessEvent::ItemCompleted {
+                        native_id,
+                        body,
+                        tool_result,
+                        status,
+                    }) => vec![Out::Event(HarnessEvent::ItemCompleted {
+                        native_id: local(&native_id),
+                        body,
+                        tool_result,
+                        status,
+                    })],
+                    _ => vec![],
+                }
+            }
+            "item/agentMessage/delta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/textDelta"
+            | "item/commandExecution/outputDelta"
+            | "item/fileChange/outputDelta" => {
+                let channel = match method {
+                    "item/agentMessage/delta" => DeltaChannel::Text,
+                    "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                        DeltaChannel::Reasoning
+                    }
+                    _ => DeltaChannel::Output,
+                };
+                delta(p, channel)
+                    .into_iter()
+                    .map(|o| match o {
+                        Out::Event(HarnessEvent::ItemDelta {
+                            native_id,
+                            channel,
+                            text,
+                        }) => Out::Event(HarnessEvent::ItemDelta {
+                            native_id: local(&native_id),
+                            channel,
+                            text,
+                        }),
+                        other => other,
+                    })
+                    .collect()
+            }
+            "turn/completed" => {
+                let failed = p.pointer("/turn/status").and_then(Value::as_str) == Some("failed");
+                self.finish_spawn(&spawn, failed)
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Codex's subagent lifecycle (`subAgentActivity`): `started` is a new
+    /// agent (its card, titled from its path: `/root/count_files` →
+    /// "Count files"), `completed` / `interrupted` end it. Messages between
+    /// agents (`interacted`) aren't shown.
+    fn on_subagent_activity(&mut self, completed: bool, item: &Value) -> Vec<Out> {
+        let get = |k: &str| item.get(k).and_then(Value::as_str);
+        let (Some(id), Some(agent)) = (get("id"), get("agentThreadId")) else {
+            return vec![];
+        };
+        match get("kind") {
+            Some("started") if !completed => {
+                let leaf = get("agentPath")
+                    .and_then(|p| p.rsplit('/').next())
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or("agent")
+                    .replace(['_', '-'], " ");
+                let mut chars = leaf.chars();
+                let title = chars
+                    .next()
+                    .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default();
+                self.agents.insert(agent.to_owned(), id.to_owned());
+                self.spawn_titles.insert(id.to_owned(), title.clone());
+                self.open_spawns.insert(id.to_owned(), String::new());
+                vec![Out::Event(HarnessEvent::ItemStarted {
+                    native_id: id.to_owned(),
+                    body: ItemBody::ToolCall {
+                        tool: "Agent".into(),
+                        tool_kind: ToolKind::Subagent,
+                        title: title.clone(),
+                        input: json!({
+                            "description": title,
+                            "model": item.get("model"),
+                            "effort": item.get("reasoningEffort"),
+                            "path": get("agentPath"),
+                        }),
+                        output: None,
+                        is_error: false,
+                    },
+                    parent: None,
+                })]
+            }
+            Some("completed" | "interrupted") if completed => match self.agents.get(agent).cloned()
+            {
+                Some(spawn) => self.finish_spawn(&spawn, false),
+                None => vec![],
+            },
+            _ => vec![],
+        }
+    }
+
+    /// Codex's collab tools: `spawnAgent` is an agent card (running until
+    /// its agent's turn ends); the others are rows naming the agents.
+    fn on_collab(&mut self, completed: bool, item: &Value) -> Vec<Out> {
+        let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            return vec![];
+        };
+        let tool = item.get("tool").and_then(Value::as_str).unwrap_or_default();
+        let prompt = item
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let receivers: Vec<String> = item
+            .get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let failed = item.get("status").and_then(Value::as_str) == Some("failed");
+        let names = |me: &Self| {
+            // No targets given: the agents still running.
+            let targets: Vec<String> = if receivers.is_empty() {
+                me.agents
+                    .iter()
+                    .filter(|(_, s)| me.open_spawns.contains_key(*s))
+                    .map(|(t, _)| t.clone())
+                    .collect()
+            } else {
+                receivers.clone()
+            };
+            let list: Vec<String> = targets
+                .iter()
+                .map(|r| {
+                    me.agents
+                        .get(r)
+                        .and_then(|s| me.spawn_titles.get(s))
+                        .map(|t| format!("“{t}”"))
+                        .unwrap_or_else(|| "an agent".into())
+                })
+                .collect();
+            let mut list = list;
+            list.sort();
+            list.join(", ")
+        };
+        // Agents Codex reports as finished.
+        let finished: Vec<(String, bool)> = item
+            .get("agentsStates")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(tid, st)| {
+                        let status = st.get("status").and_then(Value::as_str)?;
+                        let done = matches!(
+                            status,
+                            "completed" | "errored" | "shutdown" | "interrupted" | "notFound"
+                        );
+                        done.then(|| (tid.clone(), status == "errored"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        if tool == "spawnAgent" {
+            if !completed {
+                let title: String = prompt
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("Codex agent")
+                    .chars()
+                    .take(80)
+                    .collect();
+                self.spawn_titles.insert(id.clone(), title.clone());
+                self.open_spawns.insert(id.clone(), String::new());
+                self.unclaimed.push_back(id.clone());
+                out.push(Out::Event(HarnessEvent::ItemStarted {
+                    native_id: id,
+                    body: ItemBody::ToolCall {
+                        tool: "Agent".into(),
+                        tool_kind: ToolKind::Subagent,
+                        title: title.clone(),
+                        input: json!({
+                            "prompt": prompt,
+                            "description": title,
+                            "model": item.get("model"),
+                            "effort": item.get("reasoningEffort"),
+                        }),
+                        output: None,
+                        is_error: false,
+                    },
+                    parent: None,
+                }));
+                return out;
+            }
+            for r in &receivers {
+                self.unclaimed.retain(|s| s != &id);
+                self.agents.insert(r.clone(), id.clone());
+            }
+            if failed {
+                out.extend(self.finish_spawn(&id, true));
+            }
+        } else {
+            let (name, title) = match tool {
+                "wait" => ("Wait for agents", names(self)),
+                "sendInput" | "sendMessage" | "followupTask" => (
+                    "Message agent",
+                    format!("{}: {}", names(self), prompt.lines().next().unwrap_or("")),
+                ),
+                "closeAgent" => ("Close agent", names(self)),
+                "interruptAgent" => ("Stop agent", names(self)),
+                "resumeAgent" => ("Resume agent", names(self)),
+                _ => ("List agents", String::new()),
+            };
+            if !completed {
+                out.push(Out::Event(HarnessEvent::ItemStarted {
+                    native_id: id,
+                    body: ItemBody::ToolCall {
+                        tool: name.into(),
+                        tool_kind: ToolKind::Other,
+                        title,
+                        input: json!({ "agents": receivers }),
+                        output: None,
+                        is_error: false,
+                    },
+                    parent: None,
+                }));
+                return out;
+            }
+            out.push(Out::Event(HarnessEvent::ItemCompleted {
+                native_id: id,
+                body: None,
+                tool_result: None,
+                status: if failed {
+                    ItemStatus::Failed
+                } else {
+                    ItemStatus::Completed
+                },
+            }));
+        }
+        for (tid, errored) in finished {
+            if let Some(spawn) = self.agents.get(&tid).cloned() {
+                if let Some(msg) = item
+                    .pointer(&format!("/agentsStates/{tid}/message"))
+                    .and_then(Value::as_str)
+                    && let Some(reply) = self.open_spawns.get_mut(&spawn)
+                    && reply.is_empty()
+                {
+                    *reply = msg.to_owned();
+                }
+                out.extend(self.finish_spawn(&spawn, errored));
+            }
+        }
+        out
     }
 
     fn request(&mut self, kind: Pending, method: &str, params: Value) -> Value {
@@ -706,6 +1038,27 @@ impl Translator {
     }
 
     fn on_notification(&mut self, method: &str, p: &Value) -> Vec<Out> {
+        // A subagent's own thread: its steps go on its card, nothing else.
+        if let (Some(tid), Some(main)) = (
+            p.get("threadId").and_then(Value::as_str),
+            self.thread_id.as_deref(),
+        ) && tid != main
+        {
+            return self.on_agent_notification(tid.to_owned(), method, p);
+        }
+        if matches!(method, "item/started" | "item/completed") {
+            match p.pointer("/item/type").and_then(Value::as_str) {
+                Some("collabAgentToolCall") => {
+                    let item = p.get("item").cloned().unwrap_or(Value::Null);
+                    return self.on_collab(method == "item/completed", &item);
+                }
+                Some("subAgentActivity") => {
+                    let item = p.get("item").cloned().unwrap_or(Value::Null);
+                    return self.on_subagent_activity(method == "item/completed", &item);
+                }
+                _ => {}
+            }
+        }
         match method {
             "turn/started" => {
                 if let Some(turn) = p.pointer("/turn/id").and_then(Value::as_str) {
@@ -792,6 +1145,11 @@ impl Translator {
                     .drain()
                     .map(|(id, _)| Out::Event(HarnessEvent::RequestResolved { native_id: id }))
                     .collect();
+                // Subagents not heard back from end with the turn.
+                let open: Vec<String> = self.open_spawns.keys().cloned().collect();
+                for spawn in open {
+                    out.extend(self.finish_spawn(&spawn, false));
+                }
                 self.turn_id = None;
                 self.interrupted = false;
                 out.extend(marker);
@@ -1363,6 +1721,122 @@ pub fn models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_subagents_replay_as_cards() {
+        // codex-cli 0.167.0: two subagents (`subAgentActivity`), each in its
+        // own thread, then a summary on the main thread.
+        let mut t = Translator::new("/tmp/probe".into(), None, None, None);
+        t.thread_id = Some("01a1c31c-a89e-7623-93a9-60eed70424c7".into());
+        let mut out = t.start_turn("x");
+        for line in include_str!("../fixtures/0.167.0-subagents.jsonl").lines() {
+            out.extend(t.on_line(line));
+        }
+        let evs = events(&out);
+        let cards: Vec<(&String, &String)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ItemStarted {
+                    native_id,
+                    body:
+                        ItemBody::ToolCall {
+                            tool_kind: ToolKind::Subagent,
+                            title,
+                            ..
+                        },
+                    ..
+                } => Some((native_id, title)),
+                _ => None,
+            })
+            .collect();
+        let titles: Vec<&str> = cards.iter().map(|c| c.1.as_str()).collect();
+        assert_eq!(titles, ["Count files", "List functions"]);
+        for (card, _) in &cards {
+            // Each card got its agent's steps and was completed.
+            assert!(evs.iter().any(
+                |e| matches!(e, HarnessEvent::ItemStarted { parent: Some(p), .. } if p == *card)
+            ));
+            assert!(evs.iter().any(
+                |e| matches!(e, HarnessEvent::ItemCompleted { native_id, .. } if native_id == *card)
+            ));
+        }
+        // Nothing of theirs reached the main timeline, and only the main
+        // turn completed.
+        let top_messages = evs
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    HarnessEvent::ItemStarted {
+                        body: ItemBody::AssistantMessage { .. },
+                        parent: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(top_messages, 2);
+        let turns = evs
+            .iter()
+            .filter(|e| matches!(e, HarnessEvent::TurnCompleted { .. }))
+            .count();
+        assert_eq!(turns, 1);
+    }
+
+    #[test]
+    fn codex_subagents_get_their_own_card_with_their_steps() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        t.thread_id = Some("T".into());
+        let note = |method: &str, params: serde_json::Value| {
+            serde_json::json!({ "method": method, "params": params }).to_string()
+        };
+        let collab = |status: &str,
+                      tool: &str,
+                      receivers: serde_json::Value,
+                      states: serde_json::Value| {
+            serde_json::json!({ "type": "collabAgentToolCall", "id": format!("c-{tool}"), "tool": tool,
+                "status": status, "senderThreadId": "T", "receiverThreadIds": receivers,
+                "agentsStates": states, "prompt": "Map the crates\nthen report" })
+        };
+        // The spawn call: a card titled from its prompt, still running when
+        // Codex reports the call done.
+        let out = t.on_line(&note("item/started", serde_json::json!({ "threadId": "T", "item": collab("inProgress", "spawnAgent", serde_json::json!([]), serde_json::json!({})) })));
+        assert!(
+            matches!(events(&out).as_slice(), [HarnessEvent::ItemStarted { native_id, body: ItemBody::ToolCall { tool_kind: ToolKind::Subagent, title, .. }, parent: None }]
+            if native_id == "c-spawnAgent" && title == "Map the crates")
+        );
+        let out = t.on_line(&note("item/completed", serde_json::json!({ "threadId": "T", "item": collab("completed", "spawnAgent", serde_json::json!(["S"]), serde_json::json!({})) })));
+        assert!(events(&out).is_empty(), "{out:?}");
+        // The agent's own steps belong to the card, not the main timeline.
+        let out = t.on_line(&note("item/started", serde_json::json!({ "threadId": "S", "item": { "type": "commandExecution", "id": "i1", "command": "ls" } })));
+        assert!(
+            matches!(events(&out).as_slice(), [HarnessEvent::ItemStarted { native_id, parent: Some(p), .. }]
+            if native_id == "S:i1" && p == "c-spawnAgent")
+        );
+        let out = t.on_line(&note(
+            "turn/started",
+            serde_json::json!({ "threadId": "S", "turn": { "id": "x" } }),
+        ));
+        assert!(out.is_empty());
+        // Waiting names the agent.
+        let out = t.on_line(&note("item/started", serde_json::json!({ "threadId": "T", "item": collab("inProgress", "wait", serde_json::json!(["S"]), serde_json::json!({})) })));
+        assert!(
+            matches!(events(&out).as_slice(), [HarnessEvent::ItemStarted { body: ItemBody::ToolCall { tool, title, .. }, .. }]
+            if tool == "Wait for agents" && title == "“Map the crates”")
+        );
+        t.on_line(&note("item/completed", serde_json::json!({ "threadId": "S", "item": { "type": "agentMessage", "id": "i2", "text": "Five crates." } })));
+        // Its turn ending completes the card with its reply.
+        let out = t.on_line(&note(
+            "turn/completed",
+            serde_json::json!({ "threadId": "S", "turn": { "id": "x", "status": "completed" } }),
+        ));
+        assert!(
+            matches!(events(&out).as_slice(), [HarnessEvent::ItemCompleted { native_id, tool_result: Some(r), status: ItemStatus::Completed, .. }]
+            if native_id == "c-spawnAgent" && r.output == "Five crates.")
+        );
+        // A thread nobody spawned is ignored.
+        assert!(t.on_line(&note("item/started", serde_json::json!({ "threadId": "Z", "item": { "type": "agentMessage", "id": "q" } }))).is_empty());
+    }
 
     fn events(out: &[Out]) -> Vec<&HarnessEvent> {
         out.iter()

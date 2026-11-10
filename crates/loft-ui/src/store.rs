@@ -1371,6 +1371,12 @@ pub struct ThreadState {
     /// Threads this one's agent started that are still running: their
     /// cards stay in view even under a folded "Worked for …".
     live_spawned: std::collections::HashSet<ThreadId>,
+    /// Where your messages' rows were drawn this frame (row → bounds), and
+    /// which of them were in view at the last paint (the turn map's lit
+    /// ticks).
+    pub drawn_messages:
+        std::rc::Rc<std::cell::RefCell<HashMap<usize, gpui_kit::Bounds<gpui_kit::Pixels>>>>,
+    pub visible_messages: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
 }
 
 impl ThreadState {
@@ -1386,6 +1392,8 @@ impl ThreadState {
             cards: Vec::new(),
             reveal: None,
             live_spawned: Default::default(),
+            drawn_messages: Default::default(),
+            visible_messages: Default::default(),
         }
     }
 

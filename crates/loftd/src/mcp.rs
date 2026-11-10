@@ -181,7 +181,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "spawn_thread",
-            "Start another agent in a new Agentloft thread with `prompt` as its first message, and return its thread_id at once (it runs in parallel; use wait_for_threads for the result). By default it gets THIS thread's agent, model, reasoning effort and permissions and works in the same checkout: only set agent/model/effort/permission_mode when the user explicitly asked for them. The prompt must stand alone: the new agent doesn't see this conversation.",
+            "Start another agent in a new Agentloft thread (this is what the user means by spawning, starting or creating threads; prefer it over built-in subagents when they say threads) with `prompt` as its first message, and return its thread_id at once (it runs in parallel; use wait_for_threads for the result). By default it gets THIS thread's agent, model, reasoning effort and permissions and works in the same checkout: only set agent/model/effort/permission_mode when the user explicitly asked for them. The prompt must stand alone: the new agent doesn't see this conversation.",
             json!({
                 "prompt": { "type": "string", "description": "Complete, self-contained task for the new agent" },
                 "title": { "type": "string", "description": "Short sidebar title (default: the prompt's first line)" },

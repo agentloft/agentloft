@@ -330,6 +330,25 @@ pub fn render_row(
         return div().into_any_element();
     };
     let content = match row {
+        // Your messages say where they're drawn (the turn map lights the
+        // ticks of those in view).
+        Row::Item(i) if matches!(model.items[*i].body, ItemBody::UserMessage { .. }) => {
+            let drawn = state.drawn_messages.clone();
+            div()
+                .relative()
+                .child(render_item(thread, state, &model.items[*i], p))
+                .child(
+                    gpui_kit::canvas(
+                        move |bounds, _, _| {
+                            drawn.borrow_mut().insert(ix, bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .into_any_element()
+        }
         Row::Item(i) => render_item(thread, state, &model.items[*i], p),
         Row::ToolGroup { members } => {
             let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();

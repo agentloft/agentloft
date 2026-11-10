@@ -1289,31 +1289,51 @@ impl WorkspaceView {
         if marks.len() < 2 {
             return None;
         }
-        // Only in the margin beside the text, never over it.
+        // Only in the margin beside the text, never over it: rows keep at
+        // least 24 pt clear, so a narrow pane gets a slimmer rail.
         let width = self.timeline_widths.get(&tid).map_or(0., |w| w.get());
         let content = f32::from(p.content_width).min(width);
         let margin = (width - content) / 2. + 24.;
-        if width <= 0. || margin < 40. {
+        if width <= 0. || margin < 20. {
             return None;
         }
-        // Where the reader is: the last message at or above the top row.
-        let top = state.scroller.read(cx).logical_scroll_top().item_ix;
-        let current = marks.iter().rposition(|(row, ..)| *row <= top).unwrap_or(0);
+        let compact = margin < 40.;
+        let (inset, long, mid, short) = if compact {
+            (4., 15., 12., 7.)
+        } else {
+            (12., 20., 16., 10.)
+        };
+        // Lit: the messages on screen; with none in view (deep in a long
+        // reply), the last one scrolled past.
+        let visible = state.visible_messages.borrow().clone();
+        let lit: Vec<usize> = if visible.is_empty() {
+            let top = state.scroller.read(cx).logical_scroll_top().item_ix;
+            vec![marks.iter().rposition(|(row, ..)| *row <= top).unwrap_or(0)]
+        } else {
+            marks
+                .iter()
+                .enumerate()
+                .filter(|(_, (row, ..))| visible.contains(row))
+                .map(|(ix, _)| ix)
+                .collect()
+        };
         let spacing = match marks.len() {
             0..=40 => 14.,
             41..=80 => 8.,
             _ => 5.,
         };
         let scroller = state.scroller.clone();
-        let mut rail = v_flex().w(px(34.)).items_start();
+        let mut rail = v_flex()
+            .w(px(if compact { 22. } else { 34. }))
+            .items_start();
         for (ix, (row, title, reply)) in marks.into_iter().enumerate() {
             let hovered = self.peek.as_ref() == Some(&(tid.clone(), ix));
-            let is_current = ix == current;
+            let is_current = lit.contains(&ix);
             let scroller = scroller.clone();
             let card = hovered.then(|| {
                 v_flex()
                     .absolute()
-                    .left(px(38.))
+                    .left(px(if compact { 26. } else { 38. }))
                     .top(px(-24.))
                     .w(px(320.))
                     .gap_1()
@@ -1348,7 +1368,7 @@ impl WorkspaceView {
                     .relative()
                     .w_full()
                     .h(px(spacing))
-                    .pl_3()
+                    .pl(px(inset))
                     .items_center()
                     .cursor_pointer()
                     .child(
@@ -1356,11 +1376,11 @@ impl WorkspaceView {
                             .h(px(2.))
                             .rounded(px(1.))
                             .w(px(if is_current {
-                                20.
+                                long
                             } else if hovered {
-                                16.
+                                mid
                             } else {
-                                10.
+                                short
                             }))
                             .bg(if is_current || hovered {
                                 p.foreground.opacity(0.85)
@@ -3242,11 +3262,30 @@ impl WorkspaceView {
                     .children(turn_map)
                     .child({
                         let width = tl_width.clone();
+                        let (drawn, visible) = {
+                            let t = thread.read(cx);
+                            (t.drawn_messages.clone(), t.visible_messages.clone())
+                        };
                         gpui_kit::canvas(
                             move |bounds, window, _| {
                                 let w = f32::from(bounds.size.width);
                                 if (width.get() - w).abs() > 0.5 {
                                     width.set(w);
+                                    window.refresh();
+                                }
+                                // Your messages drawn this frame that are in
+                                // view (the list draws a little beyond it).
+                                let mut now: Vec<usize> = drawn
+                                    .borrow_mut()
+                                    .drain()
+                                    .filter(|(_, b)| {
+                                        b.bottom() > bounds.top() && b.top() < bounds.bottom()
+                                    })
+                                    .map(|(row, _)| row)
+                                    .collect();
+                                now.sort_unstable();
+                                if *visible.borrow() != now {
+                                    *visible.borrow_mut() = now;
                                     window.refresh();
                                 }
                             },
