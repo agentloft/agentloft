@@ -485,6 +485,8 @@ impl ProjectConfig {
 pub enum SettingValue {
     Str(String),
     Float(f64),
+    /// A whole number (a port).
+    Int(i64),
     Bool(bool),
     List(Vec<String>),
     /// A table of strings (e.g. environment variables).
@@ -534,6 +536,9 @@ pub fn edit_setting(text: &str, key: &[&str], value: SettingValue) -> Result<Str
         SettingValue::Float(f) => {
             // Whole numbers stay floats (`14.0`) so serde reads them as f32.
             table.insert(last, v(f));
+        }
+        SettingValue::Int(n) => {
+            table.insert(last, v(n));
         }
         SettingValue::Bool(b) => {
             table.insert(last, v(b));

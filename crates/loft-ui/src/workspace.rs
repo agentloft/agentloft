@@ -2459,7 +2459,8 @@ impl WorkspaceView {
 
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         let path = self.store.read(cx).paths().config_file();
-        if !path.exists() {
+        // A starting config to edit by hand (the desktop app's own disk).
+        if !crate::host::IS_WEB && !path.exists() {
             let _ = std::fs::write(&path, SETTINGS_TEMPLATE);
         }
         crate::settings::open(self.store.clone(), None, cx);
@@ -4702,6 +4703,10 @@ impl Render for WorkspaceView {
                         }),
                 ),
             )
+            // Where there is one window only (a browser tab): settings and
+            // menus that otherwise get a window of their own.
+            .children(crate::settings::overlay(cx))
+            .children(loft_browser::menu::overlay(window, cx))
     }
 }
 

@@ -1612,15 +1612,22 @@ pub(crate) fn approval_card(
         let decision = *decision;
         let store = store.clone();
         let (thread_id, request_id) = (req.thread_id.clone(), req.id.clone());
+        // The default keys, spelled for the device in hand (⌘↩ on a Mac,
+        // Ctrl+Enter elsewhere).
         let hint = match decision {
-            DecisionKind::AllowOnce => "  ⌘⏎",
-            DecisionKind::AllowSession => "  ⌘⇧⏎",
-            DecisionKind::Deny => "  ⌘⇧⌫",
-            DecisionKind::DenyAndStop => "",
+            DecisionKind::AllowOnce => crate::keymap::display("secondary-enter"),
+            DecisionKind::AllowSession => crate::keymap::display("secondary-shift-enter"),
+            DecisionKind::Deny => crate::keymap::display("secondary-shift-backspace"),
+            DecisionKind::DenyAndStop => String::new(),
+        };
+        let label = if hint.is_empty() {
+            decision.label().to_owned()
+        } else {
+            format!("{}  {hint}", decision.label())
         };
         let button = Button::new(SharedString::from(format!("{}-{decision:?}", req.id)))
             .cursor_pointer()
-            .label(format!("{}{hint}", decision.label()))
+            .label(label)
             .small();
         let button = match decision {
             DecisionKind::AllowOnce => button.primary(),

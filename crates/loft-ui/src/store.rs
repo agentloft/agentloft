@@ -293,12 +293,14 @@ impl AppStore {
                         crate::theme::apply(cx);
                     }
                     store.reload_agent_prefs(cx);
-                    crate::settings::refresh(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
                     break;
                 }
+                // After the store's update: an open settings view reads the
+                // store, which it can't while the store is being updated.
+                cx.update(crate::settings::refresh);
             }
         })
         .detach();
@@ -1089,7 +1091,7 @@ impl AppStore {
                 }
             }
         };
-        crate::project_icon::forget();
+        crate::host::forget_project_icons();
         self.request(
             Request::SetProjectIcon { project_id, icon },
             cx,

@@ -89,6 +89,15 @@ async function startApp() {
   }
 }
 
+// The app asks to be signed out (Settings ▸ Sign out of this browser).
+addEventListener("agentloft-sign-out", async () => {
+  try {
+    await fetch("api/logout", { method: "POST" });
+  } finally {
+    location.reload();
+  }
+});
+
 button.addEventListener("click", submit);
 input.addEventListener("keydown", (event) => {
   if (event.key === "Enter") submit();

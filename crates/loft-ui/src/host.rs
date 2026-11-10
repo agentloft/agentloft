@@ -105,6 +105,11 @@ mod imp {
         std::env::home_dir().unwrap_or_else(|| "/".into())
     }
 
+    /// Whether shortcuts use ⌘ and Apple's key symbols.
+    pub fn is_mac() -> bool {
+        cfg!(target_os = "macos")
+    }
+
     pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -182,6 +187,16 @@ mod imp {
         Some(path.to_path_buf().into())
     }
 
+    /// Something to draw a project's icon with, if it has one.
+    pub fn project_icon(project: &loft_protocol::Project) -> Option<gpui_kit::ImageSource> {
+        crate::project_icon::image(project).map(Into::into)
+    }
+
+    /// Icons may have changed: look again.
+    pub fn forget_project_icons() {
+        crate::project_icon::forget();
+    }
+
     /// The window layout to restore (`ui-session.json`).
     pub fn load_session(paths: &Paths) -> Option<Vec<u8>> {
         std::fs::read(paths.home.join("ui-session.json")).ok()
@@ -190,6 +205,9 @@ mod imp {
     pub fn save_session(paths: &Paths, json: &[u8]) {
         let _ = std::fs::write(paths.home.join("ui-session.json"), json);
     }
+
+    /// Signing out is the browser build's (there is no session here).
+    pub fn sign_out() {}
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -241,6 +259,15 @@ mod imp {
         static HOST: RefCell<Host> = RefCell::new(Host::default());
     }
 
+    /// The browser is on an Apple device (set at start-up).
+    static APPLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Whether shortcuts use ⌘ and Apple's key symbols: decided by the
+    /// device the browser runs on, not the one the daemon does.
+    pub fn is_mac() -> bool {
+        APPLE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn with<T>(f: impl FnOnce(&mut Host) -> T) -> T {
         HOST.with(|h| f(&mut h.borrow_mut()))
     }
@@ -256,6 +283,11 @@ mod imp {
     /// Remember the app (to redraw when an image arrives). Call once at
     /// startup.
     pub fn init(cx: &mut gpui_kit::App) {
+        let apple = matches!(
+            cx.platform_info().os,
+            gpui_kit::OperatingSystem::Mac | gpui_kit::OperatingSystem::Ios
+        );
+        APPLE.store(apple, std::sync::atomic::Ordering::Relaxed);
         let app = cx.to_async();
         with(|h| h.app = Some(app));
     }
@@ -415,6 +447,7 @@ mod imp {
         let json = match &value {
             SettingValue::Str(s) => serde_json::json!(s),
             SettingValue::Float(f) => serde_json::json!(f),
+            SettingValue::Int(n) => serde_json::json!(n),
             SettingValue::Bool(b) => serde_json::json!(b),
             SettingValue::List(items) => serde_json::json!(items),
             SettingValue::Map(pairs) => serde_json::Value::Object(
@@ -478,11 +511,14 @@ mod imp {
         .detach();
     }
 
-    pub fn image(path: &Path, thread: Option<&ThreadId>) -> Option<gpui_kit::ImageSource> {
-        let key = match (path.is_absolute(), thread) {
-            (true, _) | (false, None) => path.to_string_lossy().into_owned(),
-            (false, Some(thread)) => format!("{}\u{0}{}", thread.as_str(), path.display()),
-        };
+    /// The picture cached under `key`; if there is none yet, `request` is
+    /// sent for it and the windows redraw when it arrives. `name` helps
+    /// tell its format.
+    fn picture(
+        key: String,
+        name: PathBuf,
+        request: impl FnOnce() -> Request,
+    ) -> Option<gpui_kit::ImageSource> {
         let cached = with(|h| match h.images.get(&key) {
             Some(Picture::Ready(image, _)) => Some(Some(image.clone())),
             Some(Picture::Loading | Picture::Missing) => Some(None),
@@ -495,15 +531,17 @@ mod imp {
             return None;
         };
         with(|h| h.images.insert(key.clone(), Picture::Loading));
-        let request = client.request(Request::ReadPath {
-            path: path.to_string_lossy().into_owned(),
-            thread_id: thread.cloned(),
-        });
-        let path = path.to_path_buf();
+        let pending = client.request(request());
         app.spawn(async move |cx| {
-            let picture = match request.await {
+            let picture = match pending.await {
                 Ok(Response::File { file }) if !file.truncated => {
-                    match image_format(&path, &file.bytes.0) {
+                    // The daemon says where it found it (a project's icon).
+                    let name = if name.as_os_str().is_empty() {
+                        PathBuf::from(&file.abs_path)
+                    } else {
+                        name
+                    };
+                    match image_format(&name, &file.bytes.0) {
                         Some(format) => {
                             let len = file.bytes.0.len();
                             Picture::Ready(
@@ -532,6 +570,47 @@ mod imp {
         None
     }
 
+    pub fn image(path: &Path, thread: Option<&ThreadId>) -> Option<gpui_kit::ImageSource> {
+        let key = match (path.is_absolute(), thread) {
+            (true, _) | (false, None) => path.to_string_lossy().into_owned(),
+            (false, Some(thread)) => format!("{}\u{0}{}", thread.as_str(), path.display()),
+        };
+        picture(key, path.to_path_buf(), || Request::ReadPath {
+            path: path.to_string_lossy().into_owned(),
+            thread_id: thread.cloned(),
+        })
+    }
+
+    const PROJECT_ICON: &str = "project-icon\u{0}";
+
+    /// A project's icon, found and read by the daemon.
+    pub fn project_icon(project: &loft_protocol::Project) -> Option<gpui_kit::ImageSource> {
+        let key = format!(
+            "{PROJECT_ICON}{}\u{0}{}",
+            project.id.as_str(),
+            project.icon.as_deref().unwrap_or("")
+        );
+        picture(key, PathBuf::new(), || Request::ProjectIcon {
+            project_id: project.id.clone(),
+        })
+    }
+
+    pub fn forget_project_icons() {
+        with(|h| {
+            let mut freed = 0;
+            h.images.retain(|key, picture| {
+                if !key.starts_with(PROJECT_ICON) {
+                    return true;
+                }
+                if let Picture::Ready(_, len) = picture {
+                    freed += *len;
+                }
+                false
+            });
+            h.image_bytes = h.image_bytes.saturating_sub(freed);
+        });
+    }
+
     /// Forget what was fetched for `path` (it changed).
     pub fn forget_image(path: &Path) {
         let key = path.to_string_lossy().into_owned();
@@ -540,6 +619,16 @@ mod imp {
                 h.image_bytes = h.image_bytes.saturating_sub(len);
             }
         });
+    }
+
+    /// End this browser's session: the page signs out and goes back to
+    /// pairing (the HTTP side of the session is the page's business).
+    pub fn sign_out() {
+        if let Some(window) = web_sys::window()
+            && let Ok(event) = web_sys::Event::new("agentloft-sign-out")
+        {
+            let _ = window.dispatch_event(&event);
+        }
     }
 
     fn storage() -> Option<web_sys::Storage> {

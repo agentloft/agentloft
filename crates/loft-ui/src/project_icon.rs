@@ -38,7 +38,9 @@ pub fn favicon(root: &Path) -> Option<PathBuf> {
     found
 }
 
-/// The project's image: chosen, else its favicon.
+/// The project's image: chosen, else its favicon. (The desktop app looks on
+/// its own disk; in the browser the daemon looks, see `host::project_icon`.)
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn image(project: &loft_protocol::Project) -> Option<PathBuf> {
     project
         .icon
@@ -81,13 +83,13 @@ pub fn color(name: &str) -> Hsla {
 
 /// The project's icon, `size` points square.
 pub fn badge(project: &loft_protocol::Project, size: f32, p: &Palette) -> AnyElement {
-    match image(project) {
-        Some(path) => div()
+    match crate::host::project_icon(project) {
+        Some(source) => div()
             .size(px(size))
             .flex_none()
             .rounded(px(size * 0.24))
             .overflow_hidden()
-            .child(img(path).size_full().object_fit(ObjectFit::Contain))
+            .child(img(source).size_full().object_fit(ObjectFit::Contain))
             .into_any_element(),
         None => initials_badge(&project.name, size, p),
     }
@@ -112,6 +114,7 @@ pub fn initials_badge(name: &str, size: f32, _p: &Palette) -> AnyElement {
 }
 
 /// Forget cached lookups (after an icon changes).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn forget() {
     FOUND.with(|f| f.borrow_mut().clear());
 }

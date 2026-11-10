@@ -37,7 +37,7 @@ gpui-kit = { workspace = true, features = ["syntect"] }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
 # The window layout lives in the browser's localStorage.
-web-sys = { version = "0.3", features = ["Storage", "Window"] }
+web-sys = { version = "0.3", features = ["Event", "Storage", "Window"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

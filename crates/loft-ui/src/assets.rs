@@ -116,6 +116,11 @@ gpui_kit::assets::icon_assets!(
         Table,
         Trash,
         X,
+        LogOut,
+        GlobeLock,
+        QrCode,
+        KeyRound,
+        MonitorSmartphone,
     ]
 );
 

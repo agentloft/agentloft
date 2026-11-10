@@ -22,6 +22,25 @@ pub struct Shortcut {
     action: fn() -> Box<dyn Action>,
 }
 
+impl Shortcut {
+    /// The keys this shortcut has until the user changes them. In a
+    /// browser, the few the browser keeps for itself (new tab, new window,
+    /// its own settings, quit) get keys of their own or none.
+    pub fn default_keys(&self) -> &'static str {
+        if !crate::host::IS_WEB {
+            return self.default;
+        }
+        match self.id {
+            "new_thread" => "ctrl-alt-n",
+            "new_pane" => "ctrl-alt-t",
+            "settings" => "ctrl-alt-,",
+            // One window per tab, and the browser closes it.
+            "new_window" | "quit" => "",
+            _ => self.default,
+        }
+    }
+}
+
 const WORKSPACE: Option<&str> = Some("Workspace");
 const COMPOSER: Option<&str> = Some("Composer > Input");
 const BROWSER: Option<&str> = Some("BrowserView");
@@ -266,7 +285,7 @@ pub fn keys_for(id: &str, cx: &App) -> Option<String> {
     let keys = overrides(cx)
         .get(id)
         .cloned()
-        .unwrap_or_else(|| shortcut.default.to_owned());
+        .unwrap_or_else(|| shortcut.default_keys().to_owned());
     let keys = normalize(&keys);
     (!keys.is_empty()).then_some(keys)
 }
@@ -283,11 +302,7 @@ pub fn hint(id: &str, cx: &App) -> String {
 
 /// `secondary` spelled out for this OS.
 pub fn normalize(keys: &str) -> String {
-    let secondary = if cfg!(target_os = "macos") {
-        "cmd"
-    } else {
-        "ctrl"
-    };
+    let secondary = if crate::host::is_mac() { "cmd" } else { "ctrl" };
     keys.split_whitespace()
         .map(|stroke| {
             stroke
@@ -302,7 +317,7 @@ pub fn normalize(keys: &str) -> String {
 
 /// `cmd-shift-n` → `⇧⌘N` on macOS, `Ctrl+Shift+N` elsewhere.
 pub fn display(keys: &str) -> String {
-    let mac = cfg!(target_os = "macos");
+    let mac = crate::host::is_mac();
     normalize(keys)
         .split_whitespace()
         .map(|stroke| {
@@ -408,7 +423,7 @@ pub fn apply(cx: &mut App) {
     let overrides = overrides(cx);
     let mut ours = Vec::new();
     for s in SHORTCUTS {
-        let keys = overrides.get(s.id).map_or(s.default, String::as_str);
+        let keys = overrides.get(s.id).map_or(s.default_keys(), String::as_str);
         let keys = normalize(keys);
         if keys.is_empty() {
             continue;

@@ -699,55 +699,63 @@ impl SettingsView {
                 permissions.into_any_element(),
                 p,
             ))
-            .child(section("Runtime", "How Agentloft starts this agent."))
-            .child(stacked(
-                "Binary",
-                "Leave empty to find it on your login shell's PATH.",
-                self.agents
-                    .path
-                    .as_ref()
-                    .map(|i| {
-                        div()
-                            .w_full()
-                            .child(Input::new(i).small())
-                            .into_any_element()
-                    })
-                    .unwrap_or_else(|| div().into_any_element()),
-                p,
-            ))
-            .child(stacked(
-                "Launch arguments",
-                "Extra command-line arguments, added to every session.",
-                self.agents
-                    .args
-                    .as_ref()
-                    .map(|i| {
-                        div()
-                            .w_full()
-                            .child(Input::new(i).small())
-                            .into_any_element()
-                    })
-                    .unwrap_or_else(|| div().into_any_element()),
-                p,
-            ))
-            .child(
-                v_flex()
-                    .gap_2()
-                    .py_3()
+            // Where the agent's binary lives, its arguments and environment
+            // are the desktop app's to set: a browser session isn't allowed
+            // to change what runs (ADR-0016).
+            .when(crate::host::IS_WEB, |d| {
+                d.child(section(
+                    "Runtime",
+                    "The binary, launch arguments and environment are set in the desktop app.",
+                ))
+            })
+            .when(!crate::host::IS_WEB, |d| {
+                d.child(section("Runtime", "How Agentloft starts this agent."))
+                    .child(stacked(
+                        "Binary",
+                        "Leave empty to find it on your login shell's PATH.",
+                        self.agents
+                            .path
+                            .as_ref()
+                            .map(|i| {
+                                div()
+                                    .w_full()
+                                    .child(Input::new(i).small())
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| div().into_any_element()),
+                        p,
+                    ))
+                    .child(stacked(
+                        "Launch arguments",
+                        "Extra command-line arguments, added to every session.",
+                        self.agents
+                            .args
+                            .as_ref()
+                            .map(|i| {
+                                div()
+                                    .w_full()
+                                    .child(Input::new(i).small())
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| div().into_any_element()),
+                        p,
+                    ))
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Environment"),
+                        v_flex()
+                            .gap_2()
+                            .py_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Environment"),
+                            )
+                            .child(div().text_xs().text_color(p.muted_foreground).child(
+                                "API keys, base URLs and other variables for this agent only.",
+                            ))
+                            .child(env),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.muted_foreground)
-                            .child("API keys, base URLs and other variables for this agent only."),
-                    )
-                    .child(env),
-            )
+            })
             .child(section(
                 "Models",
                 "Switch off the ones you don't want in the pickers.",
