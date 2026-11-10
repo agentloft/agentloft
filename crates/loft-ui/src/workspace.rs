@@ -2281,7 +2281,27 @@ impl WorkspaceView {
                 this.finish_rename(true, cx);
             }
         });
-        self.renaming = Some((id, input, sub));
+        self.renaming = Some((id.clone(), input, sub));
+        // A menu that just closed hands focus back to where it opened from;
+        // take it again once that's done.
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(60))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some((r, input, _)) = &this.renaming
+                    && *r == id
+                    && !gpui_kit::Focusable::focus_handle(input.read(cx), cx).is_focused(window)
+                {
+                    let end = input.read(cx).value().len();
+                    input.update(cx, |s, cx| {
+                        s.focus(window, cx);
+                        s.set_selected_range(0..end, cx);
+                    });
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -4549,8 +4569,10 @@ fn thread_row(
                         this.finish_rename(false, cx);
                     }
                 }))
-                // Clicks in the field stay in the field.
+                // Clicks in the field stay in the field; a click anywhere
+                // else saves.
                 .on_click(|_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish_rename(true, cx)))
                 .h(px(22.))
                 .flex()
                 .items_center()
