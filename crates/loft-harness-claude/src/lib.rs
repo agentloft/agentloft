@@ -35,7 +35,7 @@ impl Harness for ClaudeHarness {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             client_session_id: true,
-            steer: false,
+            steer: true,
             live_model_switch: true,
             live_mode_switch: true,
             // `apply_flag_settings` can't express `max`; restart instead.
@@ -171,6 +171,10 @@ async fn run(
                         let images = read_images(&input.images).await;
                         t.start_turn_with(&input.text, &images)
                     }
+                    Some(SessionCommand::Steer(input)) => {
+                        let images = read_images(&input.images).await;
+                        t.steer_with(&input.text, &images)
+                    }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::StopSubagent(native)) => t.stop_subagent(&native),
                     Some(SessionCommand::Query { kind, reply }) => {
@@ -254,6 +258,9 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        // Echo our messages so a mid-turn one can be told apart from the
+        // end of the turn.
+        "--replay-user-messages",
         "--permission-prompt-tool",
         "stdio",
     ]

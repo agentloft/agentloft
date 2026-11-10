@@ -21,7 +21,7 @@ pub enum Out {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     Initialize,
     ThreadStart,
@@ -36,6 +36,9 @@ enum Pending {
     GoalShow,
     /// `/goal pause|resume|clear`: say this once it's done.
     GoalSay(&'static str),
+    /// A message for the running turn (`turn/steer`); if the turn has
+    /// ended meanwhile, it starts the next one.
+    Steer(String, Vec<String>),
     /// One part of a status query.
     Query {
         query: u64,
@@ -134,6 +137,9 @@ pub struct Translator {
     /// We asked for a turn and its `turn/started` hasn't come yet (any other
     /// `turn/started` is Codex starting one itself, e.g. to pursue a goal).
     own_turn_pending: bool,
+    /// Messages for our turn that came before Codex told us its id; they
+    /// go out as `turn/steer` once it does.
+    steer_backlog: Vec<(String, Vec<String>)>,
     /// Set the goal active once our turn toward it has started.
     activate_goal: bool,
     next_note: u64,
@@ -839,6 +845,58 @@ impl Translator {
         out
     }
 
+    /// A message for the running turn (`turn/steer`); with no turn
+    /// running, a new one.
+    pub fn steer_with(&mut self, text: &str, images: &[String]) -> Vec<Out> {
+        let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone()) else {
+            if self.own_turn_pending || !self.queued.is_empty() {
+                // Our turn is on its way: steer it once it has an id.
+                self.steer_backlog.push((text.to_owned(), images.to_vec()));
+                return vec![];
+            }
+            return self.start_turn_with(text, images);
+        };
+        let mut input = vec![json!({ "type": "text", "text": text })];
+        input.extend(
+            images
+                .iter()
+                .map(|path| json!({ "type": "localImage", "path": path })),
+        );
+        vec![Out::Send(self.request(
+            Pending::Steer(text.to_owned(), images.to_vec()),
+            "turn/steer",
+            json!({ "threadId": thread, "expectedTurnId": turn, "input": input }),
+        ))]
+    }
+
+    /// Send the messages that waited for the turn's id.
+    fn flush_steers(&mut self) -> Vec<Out> {
+        std::mem::take(&mut self.steer_backlog)
+            .into_iter()
+            .flat_map(|(text, images)| self.steer_with(&text, &images))
+            .collect()
+    }
+
+    /// Messages still waiting when the turn ended run as the next turn.
+    fn leftover_steers(&mut self) -> Vec<Out> {
+        let backlog = std::mem::take(&mut self.steer_backlog);
+        if backlog.is_empty() {
+            return vec![];
+        }
+        let (text, images) = backlog.into_iter().fold(
+            (String::new(), Vec::new()),
+            |(mut text, mut images), (t, i)| {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&t);
+                images.extend(i);
+                (text, images)
+            },
+        );
+        self.start_turn_with(&text, &images)
+    }
+
     pub fn interrupt(&mut self) -> Vec<Out> {
         let (Some(thread), Some(turn)) = (self.thread_id.clone(), self.turn_id.clone()) else {
             return vec![];
@@ -977,12 +1035,26 @@ impl Translator {
                     ]
                 }
                 Pending::Initialize | Pending::ThreadStart | Pending::TurnStart => {
-                    vec![Out::Event(HarnessEvent::TurnCompleted {
+                    self.own_turn_pending = false;
+                    self.queued.clear();
+                    let mut out = vec![Out::Event(HarnessEvent::TurnCompleted {
                         status: TurnStatus::Failed,
                         usage: None,
                         error: Some(format!("Codex: {msg}")),
-                    })]
+                    })];
+                    // Messages for the failed turn aren't dropped: they
+                    // come back as notices the user can resend.
+                    for (text, _) in std::mem::take(&mut self.steer_backlog) {
+                        out.push(Out::Event(HarnessEvent::Notice {
+                            level: NoticeLevel::Warning,
+                            text: format!("Not sent: {text}"),
+                        }));
+                    }
+                    out
                 }
+                // The turn ended before the message got in: it starts the
+                // next one.
+                Pending::Steer(text, images) => self.start_turn_with(&text, &images),
                 Pending::Skills => vec![Out::Event(HarnessEvent::CommandsAvailable(
                     codex_commands(&[]),
                 ))],
@@ -1045,6 +1117,20 @@ impl Translator {
                 if let Some(turn) = result.pointer("/turn/id").and_then(Value::as_str) {
                     self.turn_id = Some(turn.to_owned());
                 }
+                let steers = self.flush_steers();
+                if !steers.is_empty() {
+                    let mut out = steers;
+                    if std::mem::take(&mut self.activate_goal)
+                        && let Some(thread) = self.thread_id.clone()
+                    {
+                        out.push(Out::Send(self.request(
+                            Pending::Quiet,
+                            "thread/goal/set",
+                            json!({ "threadId": thread, "status": "active", "origin": "user" }),
+                        )));
+                    }
+                    return out;
+                }
                 // Our turn toward a new goal is running: let the goal go.
                 if std::mem::take(&mut self.activate_goal)
                     && let Some(thread) = self.thread_id.clone()
@@ -1058,6 +1144,7 @@ impl Translator {
                 vec![]
             }
             Pending::Other
+            | Pending::Steer(..)
             | Pending::Query { .. }
             | Pending::Quiet
             | Pending::GoalShow
@@ -1093,7 +1180,7 @@ impl Translator {
                     self.turn_id = Some(turn.to_owned());
                 }
                 if std::mem::take(&mut self.own_turn_pending) {
-                    vec![]
+                    self.flush_steers()
                 } else {
                     // Codex started this one itself (e.g. working toward a goal).
                     self.interrupted = false;
@@ -1186,6 +1273,7 @@ impl Translator {
                     usage,
                     error,
                 }));
+                out.extend(self.leftover_steers());
                 out
             }
             "error" => {
@@ -2225,6 +2313,55 @@ mod tests {
         assert_eq!(v["account"]["account"]["email"], "a@b");
         assert!(v["rateLimits"].is_null());
         assert_eq!(v["session"]["cwd"], "/w");
+    }
+
+    fn sent<'a>(out: &'a [Out], method: &str) -> Option<&'a Value> {
+        out.iter().find_map(|o| match o {
+            Out::Send(v) if v["method"] == method => Some(v),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn steering_waits_for_the_turn_id_then_goes_in() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        t.thread_id = Some("T1".into());
+        let out = t.start_turn_with("first", &[]);
+        let start = sent(&out, "turn/start").expect("turn/start")["id"]
+            .as_u64()
+            .unwrap();
+        // Codex hasn't said which turn yet: the message waits.
+        assert!(t.steer_with("second", &[]).is_empty());
+        let out = t.on_line(&format!(
+            r#"{{"id":{start},"result":{{"turn":{{"id":"U1"}}}}}}"#
+        ));
+        let steer = sent(&out, "turn/steer").expect("turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "U1");
+        assert_eq!(steer["params"]["input"][0]["text"], "second");
+        // No new turn for it.
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Out::Event(HarnessEvent::TurnStarted)))
+        );
+        // With the id known, it goes straight in.
+        let out = t.steer_with("third", &[]);
+        assert!(sent(&out, "turn/steer").is_some());
+    }
+
+    #[test]
+    fn a_steer_that_misses_the_turn_starts_the_next() {
+        let mut t = Translator::new("/w".into(), None, None, None);
+        t.thread_id = Some("T1".into());
+        t.turn_id = Some("U1".into());
+        let out = t.steer_with("late", &[]);
+        let id = sent(&out, "turn/steer").unwrap()["id"].as_u64().unwrap();
+        t.turn_id = None; // the turn ended meanwhile
+        let out = t.on_line(&format!(
+            r#"{{"id":{id},"error":{{"message":"no active turn"}}}}"#
+        ));
+        assert!(matches!(out[0], Out::Event(HarnessEvent::TurnStarted)));
+        let start = sent(&out, "turn/start").expect("a new turn");
+        assert_eq!(start["params"]["input"][0]["text"], "late");
     }
 
     #[test]

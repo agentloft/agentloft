@@ -267,6 +267,8 @@ async fn run(
                         let images = read_images(&input.images).await;
                         t.start_turn_with(&input.text, images)
                     }
+                    // ACP can't steer: the core doesn't send this.
+                    Some(SessionCommand::Steer(_)) => vec![],
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::StopSubagent(_)) => vec![],
                     Some(SessionCommand::Query { .. }) => vec![],

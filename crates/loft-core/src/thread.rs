@@ -22,6 +22,11 @@ pub(crate) enum ThreadCmd {
         attachments: Vec<AttachmentRef>,
         reply: Reply,
     },
+    Steer {
+        text: String,
+        attachments: Vec<AttachmentRef>,
+        reply: Reply,
+    },
     Interrupt {
         reply: Reply,
     },
@@ -173,6 +178,13 @@ impl ThreadActor {
                 reply,
             } => {
                 let _ = reply.send(self.send_message(text, attachments));
+            }
+            ThreadCmd::Steer {
+                text,
+                attachments,
+                reply,
+            } => {
+                let _ = reply.send(self.steer(text, attachments));
             }
             ThreadCmd::Interrupt { reply } if self.pending_start.is_some() => {
                 // The prompt never reached the agent; just end the turn.
@@ -421,6 +433,67 @@ impl ThreadActor {
         match self.core.take_pending_setup(&self.thread.id) {
             Some(cmd) => self.run_setup(&turn, cmd)?,
             None => self.capture_checkpoint(&turn, true),
+        }
+        Ok(Response::Ok)
+    }
+
+    /// A message into the running turn, without stopping it: it shows in
+    /// the turn now, and the agent takes it in at its next step. With no
+    /// turn running it's an ordinary message.
+    fn steer(&mut self, text: String, attachments: Vec<AttachmentRef>) -> CoreResult<Response> {
+        let Some(turn) = self.turn.clone() else {
+            return self.send_message(text, attachments);
+        };
+        let can_steer = self
+            .core
+            .harness(&self.thread.harness)
+            .is_some_and(|h| h.capabilities().steer);
+        // Not sent yet (the checkpoint is being taken): it joins the prompt.
+        let joins_prompt = self.pending_start.is_some();
+        if !can_steer && !joins_prompt {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "this agent can't take a message mid-turn; it will be sent when the turn ends",
+            ));
+        }
+        let item = self.new_item(
+            Some(turn.id.clone()),
+            ItemBody::UserMessage {
+                text: text.clone(),
+                attachments: attachments.clone(),
+            },
+            ItemStatus::Completed,
+        )?;
+        self.thread.updated_at_ms = now_ms();
+        self.core.commit(vec![
+            Event::ItemUpserted { item },
+            Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            },
+        ])?;
+        if let Some((prompt, images)) = self.pending_start.as_mut() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&text);
+            images.extend(attachments);
+            return Ok(Response::Ok);
+        }
+        let images = attachments
+            .into_iter()
+            .map(|a| loft_harness::ImageInput {
+                path: a.path.into(),
+                mime: a.mime,
+            })
+            .collect();
+        let sent = self.session.as_ref().is_some_and(|s| {
+            s.commands
+                .send(SessionCommand::Steer(TurnInput { text, images }))
+                .is_ok()
+        });
+        if !sent {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "the agent session closed; the message wasn't sent",
+            ));
         }
         Ok(Response::Ok)
     }

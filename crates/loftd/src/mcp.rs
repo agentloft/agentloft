@@ -217,7 +217,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "send_to_thread",
-            "Send a follow-up message to a thread this thread spawned (it must not be running).",
+            "Send a message to a thread this thread spawned. If it's running, the message steers its current turn (it reads it at its next step, without stopping); otherwise it starts a new turn.",
             json!({ "thread_id": { "type": "string" }, "message": { "type": "string" } }),
             &["thread_id", "message"],
         ),
@@ -863,21 +863,15 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             }
         }
         "send_to_thread" => {
-            let (id, state) = match own_child(client, me, args).await {
+            let (id, _) = match own_child(client, me, args).await {
                 Ok(c) => c,
                 Err(e) => return Some(e),
             };
             let Some(message) = str_arg("message") else {
                 return Some(text_result("message is required", true));
             };
-            if state["status"] == "running" {
-                return Some(text_result(
-                    "that thread is still running: wait_for_threads first, or stop_thread",
-                    true,
-                ));
-            }
             match client
-                .request(Request::SendMessage {
+                .request(Request::Steer {
                     thread_id: id,
                     text: message,
                     attachments: Vec::new(),

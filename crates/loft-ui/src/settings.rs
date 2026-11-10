@@ -20,6 +20,7 @@ use loft_protocol::Request;
 mod agents;
 mod appearance;
 mod projects;
+mod shortcuts;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
 impl Global for SettingsWindow {}
@@ -211,6 +212,11 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Worktrees,
     },
     Findable {
+        label: "Keyboard shortcuts",
+        keywords: "shortcuts hotkeys keys keybindings keymap rebind steer",
+        section: Section::Shortcuts,
+    },
+    Findable {
         label: "Settings file",
         keywords: "about config.toml edit",
         section: Section::About,
@@ -233,6 +239,7 @@ pub enum Section {
     Agents,
     Projects,
     Worktrees,
+    Shortcuts,
     About,
 }
 
@@ -243,11 +250,12 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s))
     }
 
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Appearance,
         Section::Agents,
         Section::Projects,
         Section::Worktrees,
+        Section::Shortcuts,
         Section::About,
     ];
 
@@ -257,6 +265,7 @@ impl Section {
             Section::Agents => "Agents",
             Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
+            Section::Shortcuts => "Shortcuts",
             Section::About => "About",
         }
     }
@@ -267,6 +276,7 @@ impl Section {
             Section::Agents => IconName::Bot,
             Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
+            Section::Shortcuts => IconName::Keyboard,
             Section::About => IconName::Sparkles,
         }
     }
@@ -344,6 +354,7 @@ pub struct SettingsView {
     studio: appearance::Studio,
     agents: agents::AgentsPage,
     projects: projects::ProjectsPage,
+    shortcuts: shortcuts::ShortcutsPage,
     _subs: Vec<Subscription>,
 }
 
@@ -403,6 +414,7 @@ impl SettingsView {
             studio,
             agents: agents::AgentsPage::new(),
             projects: projects::ProjectsPage::default(),
+            shortcuts: shortcuts::ShortcutsPage::default(),
             _subs: subs,
         }
     }
@@ -640,6 +652,7 @@ impl Render for SettingsView {
             Section::Agents => self.agents_page(&p, window, cx),
             Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
+            Section::Shortcuts => self.shortcuts_page(&p, cx),
             Section::About => self.about(&p, cx),
         };
         h_flex()

@@ -181,9 +181,22 @@ fn bad(m: impl Into<String>) -> ErrorBody {
 }
 
 /// The rule for `key`, if it's one agents may set.
+/// `ui.keys.<shortcut>`: a keyboard shortcut.
+const SHORTCUT_KEY: Key = Key {
+    key: "ui.keys.<shortcut>",
+    kind: Kind::Text,
+    about: "Keys for one shortcut, e.g. \"cmd-shift-t\" (\"secondary\" is cmd on macOS, ctrl elsewhere); \"\" turns it off, null restores the default. Shortcuts: new_thread, new_chat, new_pane, new_window, add_project, command_center, search, settings, quit, steer, stop, approve, approve_session, deny, toggle_sidebar, toggle_panel, toggle_terminal, show_files, show_changes, show_browser, toggle_theme, browser_address, browser_reload, browser_back, browser_forward, browser_stop.",
+};
+
 fn rule(key: &str) -> Option<&'static Key> {
     if let Some(k) = KEYS.iter().find(|k| k.key == key) {
         return Some(k);
+    }
+    if let Some(id) = key.strip_prefix("ui.keys.")
+        && !id.is_empty()
+        && id.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+    {
+        return Some(&SHORTCUT_KEY);
     }
     let mut parts = key.splitn(3, '.');
     match (parts.next(), parts.next(), parts.next()) {
@@ -307,6 +320,11 @@ impl Core {
             .iter()
             .map(|k| json!({ "key": k.key, "type": kind_text(k.kind), "about": k.about }))
             .collect();
+        keys.push(json!({
+            "key": SHORTCUT_KEY.key,
+            "type": kind_text(SHORTCUT_KEY.kind),
+            "about": SHORTCUT_KEY.about,
+        }));
         for k in AGENT_KEYS {
             keys.push(json!({
                 "key": format!("harness.<{}>.{}", AGENTS.join("|"), k.key),
@@ -423,6 +441,9 @@ mod tests {
         assert!(rule("harness.codex.default_model").is_some());
         assert!(rule("harness.nope.default_model").is_none());
         assert!(rule("ui.secret").is_none());
+        assert!(rule("ui.keys.new_thread").is_some());
+        assert!(rule("ui.keys.").is_none());
+        assert!(rule("ui.keys.a.b").is_none());
         let theme = rule("ui.theme").unwrap();
         assert!(to_setting(theme, &json!("dark")).is_ok());
         assert!(to_setting(theme, &json!("purple")).is_err());

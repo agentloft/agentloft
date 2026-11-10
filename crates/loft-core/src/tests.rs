@@ -244,6 +244,50 @@ async fn second_turn_rejected_while_running_then_interrupt() {
 }
 
 #[tokio::test]
+async fn steering_goes_into_the_running_turn() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    // Idle: a steer is just a message.
+    f.core
+        .handle(Request::Steer {
+            thread_id: thread.id.clone(),
+            text: "slow one two three four five six".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    f.core
+        .handle(Request::Steer {
+            thread_id: thread.id.clone(),
+            text: "also this".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (_, turns, items, _) = thread_snapshot(&f.core, &thread.id);
+    // One turn, not stopped: both messages in it, and the agent heard the second.
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, TurnStatus::Completed);
+    let users: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::UserMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["slow one two three four five six", "also this"]);
+    assert!(items.iter().any(|i| matches!(&i.body,
+        ItemBody::AssistantMessage { text } if text == "heard: also this")));
+    assert!(
+        items
+            .iter()
+            .all(|i| i.turn_id.as_ref() == Some(&turns[0].id))
+    );
+}
+
+#[tokio::test]
 async fn approval_allow_flow() {
     let f = fixture();
     let thread = new_thread(&f.core, f._dir.path()).await;

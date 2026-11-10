@@ -15,6 +15,7 @@ mod folder_picker;
 mod image_preview;
 mod info_cards;
 mod items;
+pub mod keymap;
 mod model_picker;
 mod new_in;
 mod palette;

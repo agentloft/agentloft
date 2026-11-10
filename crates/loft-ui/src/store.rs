@@ -14,7 +14,7 @@ use loft_protocol::{
     ItemStatus, ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId,
     ThreadStatus, Topic,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -122,6 +122,9 @@ pub struct AppStore {
     pub default_harness: HarnessId,
     /// Messages typed while a turn was running, sent when it ends.
     pub queued: HashMap<ThreadId, std::collections::VecDeque<Queued>>,
+    /// Threads with a queued message on its way (sent, not yet answered):
+    /// the next one waits for it, so two never race for the same turn.
+    flushing: HashSet<ThreadId>,
     /// Last request error, shown in the UI.
     pub last_error: Option<String>,
     /// Text to prefill a thread's composer with (a fork's handoff digest).
@@ -173,6 +176,7 @@ impl AppStore {
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
             queued: HashMap::new(),
+            flushing: HashSet::new(),
             last_error: None,
             drafts: HashMap::new(),
             unread: Default::default(),
@@ -1427,15 +1431,67 @@ impl AppStore {
         cx.notify();
     }
 
-    /// Send a queued message now: it moves to the front and the running
-    /// turn stops, so it goes out as soon as the agent is idle.
+    /// Send a queued message now, into the running turn (the agent reads
+    /// it at its next step; nothing stops). The rest stay queued.
     pub fn send_queued_now(&mut self, thread_id: ThreadId, index: usize, cx: &mut Context<Self>) {
-        if let Some(q) = self.queued.get_mut(&thread_id)
-            && let Some(message) = q.remove(index)
-        {
-            q.push_front(message);
+        let Some(message) = self
+            .queued
+            .get_mut(&thread_id)
+            .and_then(|q| q.remove(index))
+        else {
+            return;
+        };
+        self.steer(thread_id, message, Some(index), cx);
+        cx.notify();
+    }
+
+    /// A message into the running turn. If it can't go in (the agent can't
+    /// take one mid-turn, say), it waits in the queue instead — at `back_at`
+    /// if it came from there — and nothing is lost.
+    pub fn steer(
+        &mut self,
+        thread_id: ThreadId,
+        message: Queued,
+        back_at: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            self.last_error = Some("not connected to agentloftd".into());
+            self.requeue(thread_id, message, back_at, cx);
+            return;
+        };
+        let attachments = message.images.iter().map(|i| i.to_attachment()).collect();
+        let fut = client.request(Request::Steer {
+            thread_id: thread_id.clone(),
+            text: message.text.clone(),
+            attachments,
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = fut.await;
+            let _ = this.update(cx, |store, cx| {
+                if let Err(err) = result {
+                    store.last_error = Some(err.message);
+                    store.requeue(thread_id, message, back_at, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn requeue(
+        &mut self,
+        thread_id: ThreadId,
+        message: Queued,
+        at: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let q = self.queued.entry(thread_id.clone()).or_default();
+        let at = at.unwrap_or(q.len()).min(q.len());
+        q.insert(at, message);
+        cx.notify();
+        if let Some(thread) = self.threads.get(&thread_id).cloned() {
+            self.flush_queue(&thread_id, &thread, cx);
         }
-        self.interrupt(thread_id, cx);
     }
 
     /// Take a queued message back out (to edit it).
@@ -1455,14 +1511,39 @@ impl AppStore {
         let idle = thread.read(cx).model.as_ref().is_some_and(|m| {
             m.running_turn().is_none() && m.thread.status != loft_protocol::ThreadStatus::Running
         });
-        if !idle {
+        if !idle || self.flushing.contains(id) {
             return;
         }
         let Some(next) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
             return;
         };
+        let Some(client) = self.client.clone() else {
+            self.queued.entry(id.clone()).or_default().push_front(next);
+            return;
+        };
+        self.flushing.insert(id.clone());
         let attachments = next.images.iter().map(|i| i.to_attachment()).collect();
-        self.send_message(id.clone(), next.text, attachments, cx);
+        let fut = client.request(Request::SendMessage {
+            thread_id: id.clone(),
+            text: next.text.clone(),
+            attachments,
+        });
+        let id = id.clone();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let result = fut.await;
+            let _ = this.update(cx, |store, cx| {
+                store.flushing.remove(&id);
+                if let Err(err) = result {
+                    // Still first in line: it goes when the agent is free.
+                    store.queued.entry(id.clone()).or_default().push_front(next);
+                    if err.code != loft_protocol::ErrorCode::Conflict {
+                        store.last_error = Some(err.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 

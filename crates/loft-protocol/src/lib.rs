@@ -152,6 +152,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
     },
+    /// A message for the running turn: the agent takes it in at its next
+    /// step, without stopping. With no turn running, it starts one.
+    Steer {
+        thread_id: ThreadId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
     Interrupt {
         thread_id: ThreadId,
     },

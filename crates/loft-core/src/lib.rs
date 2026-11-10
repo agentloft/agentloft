@@ -676,6 +676,23 @@ impl Core {
                 })
                 .await
             }
+            Request::Steer {
+                thread_id,
+                text,
+                attachments,
+            } => {
+                if text.trim().is_empty() && attachments.is_empty() {
+                    return Err(ErrorBody::new(ErrorCode::BadRequest, "empty message"));
+                }
+                let attachments = self.store_attachments(&thread_id, attachments).await?;
+                self.ensure_workspace(&thread_id, &text).await?;
+                self.thread_call(&thread_id, |reply| ThreadCmd::Steer {
+                    text,
+                    attachments,
+                    reply,
+                })
+                .await
+            }
             Request::Interrupt { thread_id } => {
                 self.thread_call(&thread_id, |reply| ThreadCmd::Interrupt { reply })
                     .await

@@ -15,7 +15,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, KeyBinding, ParentElement as _, PathPromptOptions, Render, SharedString,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div,
     prelude::FluentBuilder as _, px,
 };
@@ -46,7 +46,8 @@ actions!(
         ShowBrowser,
         NewWindow,
         NewTab,
-        OpenPalette
+        OpenPalette,
+        SteerMessage
     ]
 );
 
@@ -57,29 +58,8 @@ const HEADER_HEIGHT: f32 = 52.;
 const TRAFFIC_LIGHTS_INSET: f32 = 78.;
 
 pub fn bind_keys(cx: &mut gpui_kit::App) {
-    loft_browser::bind_keys(cx);
-    cx.bind_keys([
-        KeyBinding::new("cmd-n", NewThread, Some(CONTEXT)),
-        KeyBinding::new("alt-cmd-n", NewChat, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-n", NewWindow, None),
-        KeyBinding::new("cmd-t", NewTab, None),
-        KeyBinding::new("cmd-.", Interrupt, Some(CONTEXT)),
-        KeyBinding::new("cmd-b", ToggleSidebar, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-l", ToggleTheme, Some(CONTEXT)),
-        KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
-        KeyBinding::new("cmd-o", AddProject, Some(CONTEXT)),
-        KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-f", FocusSearch, Some(CONTEXT)),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-j", TogglePanel, Some(CONTEXT)),
-        KeyBinding::new("cmd-enter", ApproveOnce, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-enter", ApproveSession, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-backspace", DenyRequest, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-e", ShowFiles, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-g", ShowChanges, Some(CONTEXT)),
-        KeyBinding::new("ctrl-`", ToggleTerminal, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-b", ShowBrowser, Some(CONTEXT)),
-    ]);
+    // Every shortcut, with the user's own keys (Settings → Shortcuts).
+    crate::keymap::apply(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
@@ -1184,31 +1164,22 @@ impl WorkspaceView {
                 .placeholder(placeholder_for(&thread_harness))
         });
         let thread_id = id.clone();
-        let sub = cx.subscribe_in(&composer, window, move |this, state, event, window, cx| {
-            match event {
-                // ⌘⏎ / ⌘⇧⏎ answer an open approval even while typing.
-                InputEvent::PressEnter {
-                    secondary: true,
-                    shift,
-                } if this.open_request(cx).is_some() => {
-                    let decision = if *shift {
-                        loft_protocol::DecisionKind::AllowSession
-                    } else {
-                        loft_protocol::DecisionKind::AllowOnce
-                    };
-                    this.answer(decision, cx);
-                }
-                InputEvent::PressEnter { shift: false, .. } => {
-                    this.submit(&thread_id, state, window, cx);
-                }
-                InputEvent::Change => {
-                    this.refresh_completion(&thread_id, state, cx);
-                    this.queue_draft_save(&thread_id, state, cx);
-                }
-                InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
-                _ => {}
-            }
-        });
+        let sub =
+            cx.subscribe_in(
+                &composer,
+                window,
+                move |this, state, event, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        this.submit(&thread_id, state, window, cx, false);
+                    }
+                    InputEvent::Change => {
+                        this.refresh_completion(&thread_id, state, cx);
+                        this.queue_draft_save(&thread_id, state, cx);
+                    }
+                    InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
+                    _ => {}
+                },
+            );
         self._subs.push(sub);
         // A fork's handoff digest, for the user to review and send.
         if let Some(draft) = self.store.update(cx, |s, _| s.drafts.remove(&id)) {
@@ -1260,12 +1231,35 @@ impl WorkspaceView {
         self.draft_saves.insert(thread_id.clone(), task);
     }
 
+    /// ⌘↩ in the composer: with nothing typed and an approval open, approve
+    /// it; otherwise send what's typed into the running turn right away.
+    fn steer_or_approve(
+        &mut self,
+        thread_id: &ThreadId,
+        composer: &Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let empty = composer.read(cx).value().trim().is_empty()
+            && self.attachments.get(thread_id).is_none_or(|a| a.is_empty())
+            && self.pasted.get(thread_id).is_none_or(|p| p.is_empty())
+            && self.page_notes.get(thread_id).is_none_or(|n| n.is_empty());
+        if empty && self.open_request(cx).is_some() {
+            self.answer(loft_protocol::DecisionKind::AllowOnce, cx);
+            return;
+        }
+        self.submit(thread_id, composer, window, cx, true);
+    }
+
+    /// Send what's typed. While the agent works it waits in the queue, or
+    /// with `steer` goes into the running turn now.
     fn submit(
         &mut self,
         thread_id: &ThreadId,
         composer: &Entity<TextareaState>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        steer: bool,
     ) {
         let typed = composer.read(cx).value().trim().to_owned();
         let has_images = self
@@ -1357,10 +1351,15 @@ impl WorkspaceView {
             images.iter().map(|a| a.to_attachment()).collect();
         let id = thread_id.clone();
         if self.is_running(thread_id, cx) {
-            // Sent automatically when the current turn ends.
-            let queued = crate::store::Queued { text, images };
-            self.store
-                .update(cx, |store, cx| store.enqueue(id, queued, cx));
+            let message = crate::store::Queued { text, images };
+            self.store.update(cx, |store, cx| {
+                if steer {
+                    store.steer(id, message, None, cx);
+                } else {
+                    // Sent automatically when the current turn ends.
+                    store.enqueue(id, message, cx);
+                }
+            });
         } else {
             self.store.update(cx, |store, cx| {
                 store.send_message(id, text, attachments, cx)
@@ -1601,6 +1600,10 @@ impl WorkspaceView {
                     .children(label)
             };
             let (t1, t2, t3) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
+            let steer_tip = match crate::keymap::hint("steer", cx) {
+                k if k.is_empty() => "Send into the running turn now".to_owned(),
+                k => format!("Send into the running turn now ({k} while typing)"),
+            };
             list = list.child(
                 v_flex()
                     .items_end()
@@ -1628,6 +1631,12 @@ impl WorkspaceView {
                             .items_center()
                             .child(
                                 action("queued-send", Some(IconName::ArrowUp), Some("Send now"))
+                                    .tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            steer_tip.clone(),
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let id = t1.clone();
                                         this.store
@@ -3415,6 +3424,7 @@ impl WorkspaceView {
         };
         let thread_id = model.thread.id.clone();
         let running = model.running_turn().is_some();
+        let stop_hint = crate::keymap::hint("stop", cx);
         // Open approvals whose card isn't on screen (a background subagent's
         // step, or a step inside folded work) are pinned above the composer.
         let shown_items: std::collections::HashSet<usize> = state
@@ -3676,7 +3686,7 @@ impl WorkspaceView {
                 p.accent,
                 p.accent_foreground,
                 cx.listener(move |this, _, window, cx| {
-                    this.submit(&id, &composer_h, window, cx);
+                    this.submit(&id, &composer_h, window, cx, false);
                 }),
             )
         };
@@ -3873,8 +3883,21 @@ impl WorkspaceView {
                                 .children(self.paste_chips(&thread_id, p, cx))
                                 .child(
                                     div()
+                                        .key_context("Composer")
                                         .px_2()
                                         .pt_1()
+                                        // ⌘↩ (Ctrl+Enter): into the running turn now.
+                                        .on_action({
+                                            let id = thread_id.clone();
+                                            let composer = composer.clone();
+                                            cx.listener(
+                                                move |this, _: &SteerMessage, window, cx| {
+                                                    this.steer_or_approve(
+                                                        &id, &composer, window, cx,
+                                                    );
+                                                },
+                                            )
+                                        })
                                         .child(Textarea::new(&composer).appearance(false)),
                                 )
                                 .child(
@@ -3910,12 +3933,12 @@ impl WorkspaceView {
                                             h_flex()
                                                 .gap_2()
                                                 .items_center()
-                                                .when(running, |d| {
+                                                .when(running && !stop_hint.is_empty(), |d| {
                                                     d.child(
                                                         div()
                                                             .text_xs()
                                                             .text_color(p.faint_foreground)
-                                                            .child("⌘. to stop"),
+                                                            .child(format!("{stop_hint} to stop")),
                                                     )
                                                 })
                                                 .child(action),
@@ -4368,7 +4391,7 @@ impl WorkspaceView {
                         "welcome-add",
                         IconName::FolderPlus,
                         "Add project",
-                        "⌘O",
+                        crate::keymap::hint("add_project", cx),
                         p,
                         cx.listener(|this, _, window, cx| {
                             crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
@@ -4379,7 +4402,7 @@ impl WorkspaceView {
                             "welcome-new",
                             IconName::SquarePen,
                             "New thread",
-                            "⌘N",
+                            crate::keymap::hint("new_thread", cx),
                             p,
                             cx.listener(|this, _, _, cx| this.new_thread(None, cx)),
                         ))
@@ -4735,7 +4758,7 @@ fn pill_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,
-    shortcut: &'static str,
+    shortcut: String,
     p: &Palette,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
 ) -> AnyElement {

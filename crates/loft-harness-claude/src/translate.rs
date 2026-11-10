@@ -51,6 +51,11 @@ pub struct Translator {
     interrupt_requested: bool,
     turn_active: bool,
     next_request: u64,
+    /// Messages sent and not yet echoed back (`--replay-user-messages`),
+    /// oldest first: `true` for one sent into a running turn.
+    unechoed: std::collections::VecDeque<bool>,
+    /// Whether Claude echoes our messages (older CLIs may not).
+    echoes: bool,
 }
 
 impl Translator {
@@ -82,6 +87,7 @@ impl Translator {
     pub fn start_turn_with(&mut self, text: &str, images: &[(String, String)]) -> Vec<Out> {
         self.turn_active = true;
         self.interrupt_requested = false;
+        self.unechoed.push_back(false);
         let content = if images.is_empty() {
             json!(text)
         } else {
@@ -101,6 +107,31 @@ impl Translator {
             })),
             Out::Event(HarnessEvent::TurnStarted),
         ]
+    }
+
+    /// A message for the running turn: Claude takes it in at its next step
+    /// (the same turn goes on).
+    pub fn steer_with(&mut self, text: &str, images: &[(String, String)]) -> Vec<Out> {
+        if !self.turn_active {
+            return self.start_turn_with(text, images);
+        }
+        self.unechoed.push_back(true);
+        let content = if images.is_empty() {
+            json!(text)
+        } else {
+            let mut blocks: Vec<Value> = images
+                .iter()
+                .map(|(mime, data)| {
+                    json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}})
+                })
+                .collect();
+            blocks.push(json!({"type": "text", "text": text}));
+            Value::Array(blocks)
+        };
+        vec![Out::Send(json!({
+            "type": "user",
+            "message": {"role": "user", "content": content},
+        }))]
     }
 
     pub fn interrupt(&mut self) -> Vec<Out> {
@@ -430,6 +461,19 @@ impl Translator {
     }
 
     fn on_user(&mut self, v: &Value) -> Vec<Out> {
+        // Our own message echoed back: Claude has taken it in.
+        if v.get("isReplay").and_then(Value::as_bool) == Some(true) {
+            self.echoes = true;
+            self.unechoed.pop_front();
+            if !self.turn_active {
+                // A message sent mid-turn that Claude only got to after the
+                // turn ended: it runs as a turn of its own.
+                self.turn_active = true;
+                self.interrupt_requested = false;
+                return vec![Out::Event(HarnessEvent::TurnStarted)];
+            }
+            return vec![];
+        }
         let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
             // A plain-string user message is our own prompt echoed back.
             return vec![];
@@ -571,6 +615,13 @@ impl Translator {
 
     fn on_result(&mut self, v: &Value) -> Vec<Out> {
         let mut out = Vec::new();
+        // A message sent mid-turn that Claude hasn't taken in yet: it goes
+        // on with it straight away, so this turn goes on too.
+        let goes_on =
+            self.echoes && !self.interrupt_requested && self.unechoed.iter().any(|steer| *steer);
+        if !self.echoes {
+            self.unechoed.clear();
+        }
         // Anything still open is finished now.
         for ((_, _), (native_id, _)) in self.open_blocks.drain() {
             out.push(Out::Event(HarnessEvent::ItemCompleted {
@@ -627,10 +678,13 @@ impl Translator {
             cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
             duration_ms: v.get("duration_ms").and_then(Value::as_u64),
         });
-        self.turn_active = false;
-        self.interrupt_requested = false;
         self.streamed_messages.clear();
         self.denied_tools.clear();
+        if goes_on {
+            return out;
+        }
+        self.turn_active = false;
+        self.interrupt_requested = false;
         out.push(Out::Event(HarnessEvent::TurnCompleted {
             status,
             usage,
@@ -912,6 +966,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn completed(out: &[Out]) -> bool {
+        events(out)
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::TurnCompleted { .. }))
+    }
+
+    const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok"}"#;
+
+    #[test]
+    fn a_message_sent_mid_turn_keeps_the_turn_going() {
+        let mut t = Translator::new();
+        t.start_turn("write a story");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"write a story"}}"#);
+        // Into the running turn: no new turn starts.
+        let out = t.steer_with("now say BANANA", &[]);
+        assert!(matches!(&out[..], [Out::Send(v)] if v["message"]["content"] == "now say BANANA"));
+        // Claude finished before taking it in: it goes on with it, so the
+        // turn isn't over yet.
+        assert!(!completed(&t.on_line(RESULT)));
+        assert!(t.turn_active());
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"now say BANANA"}}"#);
+        assert!(completed(&t.on_line(RESULT)));
+        assert!(!t.turn_active());
+    }
+
+    #[test]
+    fn a_message_taken_in_mid_turn_ends_with_the_turn() {
+        let mut t = Translator::new();
+        t.start_turn("run a command");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"run a command"}}"#);
+        t.steer_with("also say BANANA", &[]);
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"also say BANANA"}}"#);
+        assert!(completed(&t.on_line(RESULT)));
+    }
+
+    #[test]
+    fn without_echoes_turns_end_as_before() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.steer_with("y", &[]);
+        assert!(completed(&t.on_line(RESULT)));
+    }
+
+    #[test]
+    fn a_message_left_over_after_a_stop_runs_as_its_own_turn() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"x"}}"#);
+        t.steer_with("y", &[]);
+        t.interrupt();
+        assert!(completed(&t.on_line(RESULT)));
+        let out =
+            t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"y"}}"#);
+        assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
+        assert!(t.turn_active());
     }
 
     #[test]

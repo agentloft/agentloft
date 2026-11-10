@@ -204,6 +204,9 @@ pub struct UiConfig {
     /// Sidebar: `threads` (one list, most recent first, each with its
     /// project) | `projects` (threads grouped under their project).
     pub sidebar: String,
+    /// Shortcuts changed from their defaults: shortcut id → keys
+    /// (`"cmd-shift-t"`; `""` turns it off).
+    pub keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -220,6 +223,7 @@ impl Default for UiConfig {
             density: "comfortable".into(),
             content_width: 780.0,
             sidebar: "threads".into(),
+            keys: Default::default(),
         }
     }
 }
