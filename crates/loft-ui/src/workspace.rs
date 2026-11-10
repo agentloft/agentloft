@@ -150,6 +150,12 @@ pub struct WorkspaceView {
     row_menu: Option<ThreadId>,
     /// Threads sidebar: only this project's threads (`None` = all).
     project_filter: Option<ProjectId>,
+    /// Sidebar threads picked together (shift-click), in sidebar order.
+    multi: Vec<ThreadId>,
+    /// Where a shift-click range starts: the last thread clicked.
+    anchor: Option<ThreadId>,
+    /// The sidebar's thread rows as last drawn, top to bottom.
+    visible_rows: Vec<ThreadId>,
     /// The sidebar thread being renamed in place, and its field.
     renaming: Option<(ThreadId, Entity<InputState>, Subscription)>,
     /// Threads whose messages match the sidebar search, and the search
@@ -273,6 +279,9 @@ impl WorkspaceView {
             show_archived: false,
             row_menu: None,
             project_filter: None,
+            multi: Vec::new(),
+            anchor: None,
+            visible_rows: Vec::new(),
             renaming: None,
             search_hits: HashMap::new(),
             search_seq: 0,
@@ -2352,6 +2361,24 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Shift-click: pick the threads from the last one clicked (or the open
+    /// one) to `id`, as the sidebar lists them.
+    fn select_range(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        let from = self
+            .anchor
+            .clone()
+            .or_else(|| self.store.read(cx).selected.clone());
+        let at = |t: &ThreadId| self.visible_rows.iter().position(|r| r == t);
+        self.multi = match (from.as_ref().and_then(at), at(&id)) {
+            (Some(a), Some(b)) => self.visible_rows[a.min(b)..=a.max(b)].to_vec(),
+            _ => vec![id.clone()],
+        };
+        if self.anchor.is_none() {
+            self.anchor = from;
+        }
+        cx.notify();
+    }
+
     /// Look for the sidebar query in every thread's messages (after a
     /// short pause in typing).
     fn search_messages(&mut self, cx: &mut Context<Self>) {
@@ -2520,6 +2547,11 @@ impl WorkspaceView {
         };
         let all_projects: Vec<ProjectId> = projects.iter().map(|p| p.id.clone()).collect();
         let query = self.query.clone();
+        // Rows picked together (gone threads drop out).
+        self.multi
+            .retain(|id| all_threads.iter().any(|t| &t.id == id));
+        let multi = self.multi.clone();
+        let mut drawn: Vec<ThreadId> = Vec::new();
         let mut list = v_flex().gap_4().px_2().pb_4();
         // Chats (threads without a project) come first.
         let chats: Vec<ProjectId> = {
@@ -2585,12 +2617,13 @@ impl WorkspaceView {
                     Some(pr) => Subtitle::Project(pr.clone()),
                     None => Subtitle::NoProject,
                 });
+                drawn.push(id.clone());
                 rows = rows.child(thread_row(
                     &self.store,
                     thread,
                     depth,
                     under,
-                    selected.as_ref() == Some(&id),
+                    selected.as_ref() == Some(&id) || multi.contains(&id),
                     unread.contains(&id),
                     self.row_menu.as_ref() == Some(&id),
                     self.renaming
@@ -2601,6 +2634,7 @@ impl WorkspaceView {
                         .get(&id)
                         .filter(|_| !thread.title.to_lowercase().contains(&query)),
                     subtitle,
+                    (multi.len() > 1 && multi.contains(&id)).then(|| multi.clone()),
                     p,
                     cx,
                 ));
@@ -2660,12 +2694,13 @@ impl WorkspaceView {
                 } in nest_forks(threads, &folded_threads)
                 {
                     let id = thread.id.clone();
+                    drawn.push(id.clone());
                     rows = rows.child(thread_row(
                         &self.store,
                         thread,
                         depth,
                         under,
-                        selected.as_ref() == Some(&id),
+                        selected.as_ref() == Some(&id) || multi.contains(&id),
                         unread.contains(&id),
                         self.row_menu.as_ref() == Some(&id),
                         self.renaming
@@ -2677,6 +2712,7 @@ impl WorkspaceView {
                             .get(&id)
                             .filter(|_| !thread.title.to_lowercase().contains(&query)),
                         None,
+                        (multi.len() > 1 && multi.contains(&id)).then(|| multi.clone()),
                         p,
                         cx,
                     ));
@@ -2684,6 +2720,8 @@ impl WorkspaceView {
             }
             list = list.child(v_flex().gap_1().child(header).child(rows));
         }
+
+        self.visible_rows = drawn;
 
         // Archived threads: hidden unless asked for; each can be restored.
         let archived: Vec<_> = all_threads
@@ -4276,6 +4314,13 @@ impl Render for WorkspaceView {
 
         v_flex()
             .key_context(CONTEXT)
+            // Esc lets go of threads picked together in the sidebar.
+            .on_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, _, cx| {
+                if e.keystroke.key == "escape" && !this.multi.is_empty() {
+                    this.multi.clear();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &NewThread, _, cx| this.new_thread(None, cx)))
             .on_action(
                 cx.listener(|this, _: &NewChat, _, cx| {
@@ -4946,6 +4991,7 @@ fn thread_row(
     renaming: Option<Entity<InputState>>,
     hit: Option<&loft_protocol::SearchHit>,
     subtitle: Option<Subtitle>,
+    bulk: Option<Vec<ThreadId>>,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
@@ -5212,6 +5258,13 @@ fn thread_row(
             let reveal = hit.map(|h| h.item_id.clone());
             cx.listener(move |this, event: &gpui_kit::ClickEvent, window, cx| {
                 let id = id.clone();
+                // Shift-click: every thread from the last one clicked to here.
+                if event.modifiers().shift {
+                    this.select_range(id, cx);
+                    return;
+                }
+                this.multi.clear();
+                this.anchor = Some(id.clone());
                 // Double-click: rename in place.
                 if event.click_count() == 2 {
                     this.start_rename(id, window, cx);
@@ -5240,7 +5293,15 @@ fn thread_row(
                 |d, _, _, cx| cx.new(|_| d.clone()),
             )
         })
-        .context_menu(thread_menu_items(thread, store, cx.entity().downgrade()))
+        .map(|d| match bulk {
+            // Part of a multi-selection: one menu for all of them.
+            Some(ids) => d
+                .context_menu(bulk_menu_items(ids, store, cx.entity().downgrade()))
+                .into_any_element(),
+            None => d
+                .context_menu(thread_menu_items(thread, store, cx.entity().downgrade()))
+                .into_any_element(),
+        })
         .into_any_element()
 }
 
@@ -5751,6 +5812,115 @@ fn fork_submenu(
 }
 
 /// Confirm, then delete a thread for good.
+/// The menu for several sidebar threads picked together.
+fn bulk_menu_items(
+    ids: Vec<ThreadId>,
+    store: &Entity<AppStore>,
+    view: gpui_kit::WeakEntity<WorkspaceView>,
+) -> impl Fn(
+    gpui_kit::component::menu::PopupMenu,
+    &mut Window,
+    &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu
++ 'static {
+    use gpui_kit::component::menu::PopupMenuItem;
+    let store = store.clone();
+    move |menu, _, _| {
+        let n = ids.len();
+        let clear = {
+            let view = view.clone();
+            move |cx: &mut gpui_kit::App| {
+                let _ = view.update(cx, |v, cx| {
+                    v.multi.clear();
+                    cx.notify();
+                });
+            }
+        };
+        let (s1, i1) = (store.clone(), ids.clone());
+        let (s2, i2, c2) = (store.clone(), ids.clone(), clear.clone());
+        let c3 = clear.clone();
+        let (s4, i4) = (store.clone(), ids.clone());
+        menu.item(
+            PopupMenuItem::new(format!("Open in Panes ({n})"))
+                .icon(IconName::Columns2)
+                .on_click(move |_, _, cx| {
+                    for id in &i1 {
+                        let id = id.clone();
+                        s1.update(cx, |s, cx| s.open_pane(id, cx));
+                    }
+                }),
+        )
+        .item(
+            PopupMenuItem::new(format!("Archive ({n})"))
+                .icon(IconName::Archive)
+                .on_click(move |_, _, cx| {
+                    for id in &i2 {
+                        let id = id.clone();
+                        s2.update(cx, |s, cx| s.archive_thread(id, false, cx));
+                    }
+                    c2(cx);
+                }),
+        )
+        .item(
+            PopupMenuItem::new("Clear Selection")
+                .icon(IconName::X)
+                .on_click(move |_, _, cx| c3(cx)),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(format!("Delete ({n})…"))
+                .icon(IconName::Trash)
+                .on_click(move |_, window, cx| {
+                    confirm_delete_many(s4.clone(), i4.clone(), clear.clone(), window, cx)
+                }),
+        )
+    }
+}
+
+/// "Delete 4 threads?" for a multi-selection.
+fn confirm_delete_many(
+    store: Entity<AppStore>,
+    ids: Vec<ThreadId>,
+    done: impl Fn(&mut gpui_kit::App) + 'static,
+    window: &mut Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+    let done = std::rc::Rc::new(done);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
+        let (store, ids, done) = (store.clone(), ids.clone(), done.clone());
+        dialog
+            .title(format!("Delete {} threads?", ids.len()))
+            .child(
+                "Their conversations, turn history and checkpoints are erased and their agents \
+                 and terminals stopped. Worktrees are removed; their branches are kept. This \
+                 can't be undone.",
+            )
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        DialogClose::new()
+                            .child(Button::new("cancel").cursor_pointer().label("Cancel")),
+                    )
+                    .child(
+                        DialogAction::new()
+                            .child(Button::new("ok").cursor_pointer().danger().label("Delete")),
+                    ),
+            )
+            .on_ok(move |_, _, cx| {
+                for id in &ids {
+                    let id = id.clone();
+                    store.update(cx, |s, cx| s.delete_thread(id, cx));
+                }
+                done(cx);
+                true
+            })
+    });
+}
+
 /// "Remove “name”?": its threads are deleted, its files stay.
 fn confirm_remove_project(
     store: Entity<AppStore>,
