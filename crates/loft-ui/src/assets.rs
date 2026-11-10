@@ -75,6 +75,7 @@ gpui_kit::assets::icon_assets!(
         Palette,
         FolderGit2,
         Link,
+        ListFilter,
         Github,
         Info,
         Pin,

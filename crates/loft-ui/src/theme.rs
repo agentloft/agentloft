@@ -97,6 +97,13 @@ pub fn init(paths: Paths, cx: &mut App) {
     apply(cx);
 }
 
+/// Whether the sidebar groups threads by project (`ui.sidebar =
+/// "projects"`) rather than listing them by recency.
+pub fn sidebar_by_project(cx: &App) -> bool {
+    cx.try_global::<AppearanceState>()
+        .is_some_and(|s| s.config.sidebar == "projects")
+}
+
 /// The selected theme's id (`ui.palette`).
 pub fn palette_id(cx: &App) -> Option<String> {
     cx.try_global::<AppearanceState>()

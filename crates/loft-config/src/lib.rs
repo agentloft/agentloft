@@ -201,6 +201,9 @@ pub struct UiConfig {
     pub density: String,
     /// Max width of the conversation column in px.
     pub content_width: f32,
+    /// Sidebar: `threads` (one list, most recent first, each with its
+    /// project) | `projects` (threads grouped under their project).
+    pub sidebar: String,
 }
 
 impl Default for UiConfig {
@@ -216,6 +219,7 @@ impl Default for UiConfig {
             mono_font_size: 12.5,
             density: "comfortable".into(),
             content_width: 780.0,
+            sidebar: "threads".into(),
         }
     }
 }

@@ -148,6 +148,8 @@ pub struct WorkspaceView {
     show_archived: bool,
     /// The sidebar thread whose ··· menu is open.
     row_menu: Option<ThreadId>,
+    /// Threads sidebar: only this project's threads (`None` = all).
+    project_filter: Option<ProjectId>,
     /// The sidebar thread being renamed in place, and its field.
     renaming: Option<(ThreadId, Entity<InputState>, Subscription)>,
     /// Threads whose messages match the sidebar search, and the search
@@ -270,6 +272,7 @@ impl WorkspaceView {
             query: String::new(),
             show_archived: false,
             row_menu: None,
+            project_filter: None,
             renaming: None,
             search_hits: HashMap::new(),
             search_seq: 0,
@@ -2405,6 +2408,78 @@ impl WorkspaceView {
             || self.search_hits.contains_key(&t.id)
     }
 
+    /// Threads sidebar: show every project's threads, or one's.
+    fn project_filter_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let (projects, chats): (Vec<(ProjectId, String)>, Option<ProjectId>) = {
+            let store = self.store.read(cx);
+            let mut list: Vec<_> = store
+                .workspace
+                .projects
+                .iter()
+                .filter(|p| !store.is_chats(p))
+                .map(|p| (p.id.clone(), p.name.clone()))
+                .collect();
+            list.sort_by_key(|(_, n)| n.to_lowercase());
+            let chats = store
+                .workspace
+                .projects
+                .iter()
+                .find(|p| store.is_chats(p))
+                .map(|p| p.id.clone());
+            (list, chats)
+        };
+        let current = self.project_filter.clone();
+        let view = cx.entity().downgrade();
+        let _ = p;
+        Button::new("project-filter")
+            .cursor_pointer()
+            .ghost()
+            .xsmall()
+            .icon(IconName::ListFilter)
+            .when(current.is_some(), |b| {
+                gpui_kit::component::Selectable::selected(b, true)
+            })
+            .tooltip("Filter by project")
+            .dropdown_menu(move |mut menu, _, _| {
+                let set = |id: Option<ProjectId>| {
+                    let v = view.clone();
+                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
+                        let id = id.clone();
+                        let _ = v.update(cx, |this, cx| {
+                            this.project_filter = id;
+                            cx.notify();
+                        });
+                    }
+                };
+                menu = menu.item(
+                    PopupMenuItem::new("All projects")
+                        .icon(IconName::FolderOpen)
+                        .checked(current.is_none())
+                        .on_click(set(None)),
+                );
+                if let Some(chats) = &chats {
+                    menu = menu.item(
+                        PopupMenuItem::new("No project")
+                            .icon(IconName::MessageSquareDashed)
+                            .checked(current.as_ref() == Some(chats))
+                            .on_click(set(Some(chats.clone()))),
+                    );
+                }
+                menu = menu.separator();
+                for (id, name) in &projects {
+                    menu = menu.item(
+                        PopupMenuItem::new(name.clone())
+                            .checked(current.as_ref() == Some(id))
+                            .on_click(set(Some(id.clone()))),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (projects, all_threads, selected, conn, error, unread, collapsed) = {
             let store = self.store.read(cx);
@@ -2440,7 +2515,75 @@ impl WorkspaceView {
             )
         });
 
-        for project in &projects {
+        // One list, most recent first, each row with its project.
+        let flat = !theme::sidebar_by_project(cx);
+        if flat {
+            let folded_threads = if query.is_empty() {
+                self.store.read(cx).folded_threads.clone()
+            } else {
+                Default::default()
+            };
+            let filter = self
+                .project_filter
+                .clone()
+                .filter(|f| projects.iter().any(|p| &p.id == f));
+            let threads: Vec<_> = all_threads
+                .iter()
+                .filter(|t| t.status != ThreadStatus::Archived)
+                .filter(|t| filter.as_ref().is_none_or(|f| &t.project_id == f))
+                .filter(|t| {
+                    t.is_started()
+                        || t.parent.is_some()
+                        || t.draft_text().is_some()
+                        || selected.as_ref() == Some(&t.id)
+                })
+                .filter(|t| {
+                    let name = projects
+                        .iter()
+                        .find(|p| p.id == t.project_id)
+                        .map_or("", |p| p.name.as_str());
+                    self.search_matches(t, name)
+                })
+                .collect();
+            let mut rows = v_flex().gap_px();
+            for Nested {
+                thread,
+                depth,
+                under,
+            } in nest_forks(threads, &folded_threads)
+            {
+                let id = thread.id.clone();
+                let project = projects.iter().find(|p| p.id == thread.project_id);
+                // Under the title (top-level rows): its project.
+                let subtitle = (depth == 0).then(|| match project {
+                    Some(pr) if chats.contains(&pr.id) => Subtitle::NoProject,
+                    Some(pr) => Subtitle::Project(pr.name.clone()),
+                    None => Subtitle::NoProject,
+                });
+                rows = rows.child(thread_row(
+                    &self.store,
+                    thread,
+                    depth,
+                    under,
+                    selected.as_ref() == Some(&id),
+                    unread.contains(&id),
+                    self.row_menu.as_ref() == Some(&id),
+                    self.renaming
+                        .as_ref()
+                        .filter(|(r, _, _)| *r == id)
+                        .map(|(_, input, _)| input.clone()),
+                    self.search_hits
+                        .get(&id)
+                        .filter(|_| !thread.title.to_lowercase().contains(&query)),
+                    subtitle,
+                    p,
+                    cx,
+                ));
+            }
+            list = list.child(rows);
+        }
+
+        for project in projects.iter().filter(|_| !flat) {
             let project_id = project.id.clone();
             let is_chats = chats.contains(&project.id);
             let threads: Vec<_> = all_threads
@@ -2508,6 +2651,7 @@ impl WorkspaceView {
                         self.search_hits
                             .get(&id)
                             .filter(|_| !thread.title.to_lowercase().contains(&query)),
+                        None,
                         p,
                         cx,
                     ));
@@ -2656,16 +2800,48 @@ impl WorkspaceView {
                     .justify_between()
                     .text_xs()
                     .text_color(p.faint_foreground)
-                    .child("PROJECTS")
-                    .child(icon_button(
-                        "add-project",
-                        IconName::FolderPlus,
-                        p,
-                        // New, local folder, git URL or GitHub.
-                        cx.listener(|this, _, window, cx| {
-                            crate::new_in::open_sources(cx.entity(), &this.store, window, cx)
-                        }),
-                    )),
+                    .child(if flat {
+                        // Filtered to a project: say which.
+                        match &self.project_filter {
+                            Some(f) => self
+                                .store
+                                .read(cx)
+                                .workspace
+                                .projects
+                                .iter()
+                                .find(|p| &p.id == f)
+                                .map(|p| {
+                                    if self.store.read(cx).is_chats(p) {
+                                        "NO PROJECT".to_owned()
+                                    } else {
+                                        p.name.to_uppercase()
+                                    }
+                                })
+                                .unwrap_or_else(|| "THREADS".into()),
+                            None => "THREADS".into(),
+                        }
+                    } else {
+                        "PROJECTS".to_owned()
+                    })
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .when(flat, |d| d.child(self.project_filter_button(p, cx)))
+                            .child(icon_button(
+                                "add-project",
+                                IconName::FolderPlus,
+                                p,
+                                // New, local folder, git URL or GitHub.
+                                cx.listener(|this, _, window, cx| {
+                                    crate::new_in::open_sources(
+                                        cx.entity(),
+                                        &this.store,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -4692,6 +4868,63 @@ fn project_header(
         .into_any_element()
 }
 
+/// The line under a thread's title in the Threads sidebar: its project.
+enum Subtitle {
+    Project(String),
+    NoProject,
+}
+
+fn subtitle_line(sub: &Subtitle, branch: Option<&str>, p: &Palette) -> AnyElement {
+    let (badge, name): (AnyElement, String) = match sub {
+        Subtitle::Project(name) => {
+            let color = crate::new_in::badge_color(name);
+            (
+                div()
+                    .size(px(15.))
+                    .flex_none()
+                    .rounded(px(4.))
+                    .bg(color.opacity(0.18))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(7.5))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child(crate::new_in::initials(name))
+                    .into_any_element(),
+                name.clone(),
+            )
+        }
+        Subtitle::NoProject => (
+            Icon::new(IconName::MessageSquareDashed)
+                .xsmall()
+                .text_color(p.faint_foreground)
+                .into_any_element(),
+            "No project".into(),
+        ),
+    };
+    h_flex()
+        .gap_1p5()
+        .items_center()
+        .min_w_0()
+        .text_xs()
+        .text_color(p.muted_foreground)
+        .child(badge)
+        .child(div().flex_none().max_w(px(140.)).truncate().child(name))
+        .when_some(branch, |d, b| {
+            d.child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .items_center()
+                    .text_color(p.faint_foreground)
+                    .child(Icon::new(IconName::GitBranch).xsmall())
+                    .child(div().truncate().child(b.to_owned())),
+            )
+        })
+        .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn thread_row(
     store: &Entity<AppStore>,
@@ -4703,11 +4936,13 @@ fn thread_row(
     menu_open: bool,
     renaming: Option<Entity<InputState>>,
     hit: Option<&loft_protocol::SearchHit>,
+    subtitle: Option<Subtitle>,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
     let id = thread.id.clone();
     let editing = renaming.is_some();
+    let branch = thread.workspace.branch().map(str::to_owned);
     let trailing: AnyElement = match thread.status {
         ThreadStatus::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
         ThreadStatus::WaitingApproval => div()
@@ -4875,28 +5110,35 @@ fn thread_row(
                 .bg(p.background)
                 .child(Input::new(&input).appearance(false).small().text_sm())
                 .into_any_element(),
-            (None, None) => div()
+            (None, None) if subtitle.is_none() => div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .child(title)
                 .into_any_element(),
-            // Searching: the matching message under the title.
-            (None, Some(hit)) => v_flex()
+            // Title, then its project (Threads sidebar) and/or the message
+            // that matched a search.
+            (None, hit) => v_flex()
                 .flex_1()
                 .min_w_0()
-                .gap(px(1.))
+                .gap(px(2.))
                 .child(div().truncate().child(title))
-                .child(search_snippet(hit, p))
+                .when_some(subtitle.as_ref(), |d, sub| {
+                    d.child(subtitle_line(sub, branch.as_deref(), p))
+                })
+                .when_some(hit, |d, hit| d.child(search_snippet(hit, p)))
                 .into_any_element(),
         })
-        .when(thread.workspace.branch().is_some(), |d| {
-            d.child(
-                Icon::new(IconName::GitBranch)
-                    .xsmall()
-                    .text_color(p.faint_foreground),
-            )
-        })
+        .when(
+            thread.workspace.branch().is_some() && subtitle.is_none(),
+            |d| {
+                d.child(
+                    Icon::new(IconName::GitBranch)
+                        .xsmall()
+                        .text_color(p.faint_foreground),
+                )
+            },
+        )
         .children(tucked)
         // Under the pointer, the time (or status) makes way for a ··· menu.
         .child(
