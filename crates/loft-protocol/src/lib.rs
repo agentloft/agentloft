@@ -287,6 +287,13 @@ pub enum Request {
         thread_id: ThreadId,
         command: serde_json::Value,
     },
+    /// Threads whose messages contain `query` (case-insensitive), most
+    /// recent first, one hit per thread (answers `Response::SearchHits`).
+    SearchThreads {
+        query: String,
+        #[serde(default = "default_search_limit")]
+        limit: u32,
+    },
     /// Agent-facing thread queries (Agentloft MCP server, ADR-0013).
     ListThreads {
         #[serde(default)]
@@ -375,6 +382,10 @@ pub struct Welcome {
     pub daemon_exe_mtime_ms: Option<i64>,
 }
 
+fn default_search_limit() -> u32 {
+    100
+}
+
 fn default_find_limit() -> u32 {
     20
 }
@@ -430,6 +441,9 @@ pub enum Response {
     },
     Commands {
         commands: Vec<SlashCommandInfo>,
+    },
+    SearchHits {
+        hits: Vec<SearchHit>,
     },
     HarnessStatus {
         status: HarnessStatus,

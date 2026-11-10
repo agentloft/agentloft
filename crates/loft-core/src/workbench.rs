@@ -293,6 +293,56 @@ impl Core {
         Ok(serde_json::Value::Array(rows))
     }
 
+    /// Threads whose conversation mentions `query`: the first matching
+    /// message of each, most recently updated thread first.
+    pub(crate) fn search_threads(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> CoreResult<Vec<loft_protocol::SearchHit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (threads, items) =
+            self.with_store(|s| Ok((s.threads()?, s.items_mentioning(query)?)))?;
+        let mut hits: std::collections::HashMap<ThreadId, loft_protocol::SearchHit> =
+            Default::default();
+        for item in items {
+            let (text, from_user) = match &item.body {
+                ItemBody::UserMessage { text, .. } => (text, true),
+                ItemBody::AssistantMessage { text } => (text, false),
+                _ => continue,
+            };
+            let Some((start, end)) = find_ignoring_case(text, query) else {
+                continue;
+            };
+            if let Some(hit) = hits.get_mut(&item.thread_id) {
+                hit.count += 1;
+                continue;
+            }
+            let (snippet, start, end) = snippet(text, start, end);
+            hits.insert(
+                item.thread_id.clone(),
+                loft_protocol::SearchHit {
+                    thread_id: item.thread_id,
+                    item_id: item.id,
+                    from_user,
+                    snippet,
+                    start,
+                    end,
+                    count: 1,
+                },
+            );
+        }
+        let mut out: Vec<_> = threads
+            .into_iter()
+            .filter_map(|t| hits.remove(&t.id).map(|h| (t.updated_at_ms, h)))
+            .collect();
+        out.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        Ok(out.into_iter().take(limit).map(|(_, h)| h).collect())
+    }
+
     /// A readable transcript of a thread for another agent.
     pub(crate) fn read_thread_text(&self, id: &ThreadId, detail: ReadDetail) -> CoreResult<String> {
         let (thread, items) = self.with_store(|s| Ok((s.thread(id)?, s.items(id)?)))?;
@@ -362,5 +412,88 @@ mod find_tests {
             vec!["README.md"],
             "shortest first"
         );
+    }
+}
+
+/// Where `needle` first occurs in `text`, ignoring case: byte offsets into
+/// `text`.
+pub(crate) fn find_ignoring_case(text: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let hay: Vec<(usize, char)> = text
+        .char_indices()
+        .flat_map(|(i, c)| c.to_lowercase().map(move |l| (i, l)))
+        .collect();
+    let at = hay
+        .windows(needle.len())
+        .position(|w| w.iter().map(|x| x.1).eq(needle.iter().copied()))?;
+    let start = hay[at].0;
+    let last = hay[at + needle.len() - 1].0;
+    let end = last + text[last..].chars().next().map_or(1, char::len_utf8);
+    Some((start, end))
+}
+
+/// One line of `text` around the match at `start..end`, with the match's
+/// position in it: a little context before the match, more after.
+pub(crate) fn snippet(text: &str, start: usize, end: usize) -> (String, usize, usize) {
+    const BEFORE: usize = 36;
+    const AFTER: usize = 140;
+    let from = text[..start]
+        .char_indices()
+        .rev()
+        .nth(BEFORE - 1)
+        .map_or(0, |(i, _)| i);
+    let to = text[end..]
+        .char_indices()
+        .nth(AFTER)
+        .map_or(text.len(), |(i, _)| end + i);
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    if from > 0 {
+        out.push('…');
+    }
+    let before = flat(&text[from..start]);
+    out.push_str(&before);
+    // Keep the space between the context and the match.
+    if !before.is_empty() && text[..start].ends_with(char::is_whitespace) {
+        out.push(' ');
+    }
+    let hit_start = out.len();
+    out.push_str(&text[start..end].replace(['\n', '\r', '\t'], " "));
+    let hit_end = out.len();
+    if text[end..to].starts_with(char::is_whitespace) {
+        out.push(' ');
+    }
+    out.push_str(&flat(&text[end..to]));
+    if to < text.len() {
+        out.push('…');
+    }
+    (out, hit_start, hit_end)
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn finds_ignoring_case() {
+        assert_eq!(find_ignoring_case("Hello World", "world"), Some((6, 11)));
+        assert_eq!(find_ignoring_case("ÄBC äbc", "äb"), Some((0, 3)));
+        assert_eq!(find_ignoring_case("abc", "x"), None);
+        assert_eq!(find_ignoring_case("abc", ""), None);
+    }
+
+    #[test]
+    fn snippet_keeps_the_match_in_place() {
+        let text = format!("{}\nthe Needle is here\n\nand more", "x ".repeat(40));
+        let (start, end) = find_ignoring_case(&text, "needle").unwrap();
+        let (s, a, b) = snippet(&text, start, end);
+        assert_eq!(&s[a..b], "Needle");
+        assert!(s.starts_with('…'));
+        assert!(s.ends_with("is here and more"));
+        let (s, a, b) = snippet("needle", 0, 6);
+        assert_eq!((s.as_str(), a, b), ("needle", 0, 6));
     }
 }

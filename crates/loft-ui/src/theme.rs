@@ -97,6 +97,12 @@ pub fn init(paths: Paths, cx: &mut App) {
     apply(cx);
 }
 
+/// The selected theme's id (`ui.palette`).
+pub fn palette_id(cx: &App) -> Option<String> {
+    cx.try_global::<AppearanceState>()
+        .map(|s| s.config.palette.clone())
+}
+
 /// Re-read `config.toml` if it changed; returns whether anything was applied.
 pub fn reload_if_changed(cx: &mut App) -> bool {
     let Some(state) = cx.try_global::<AppearanceState>() else {

@@ -714,6 +714,9 @@ impl Core {
             Request::ArchiveThread { thread_id, force } => {
                 self.archive_thread(&thread_id, force).await
             }
+            Request::SearchThreads { query, limit } => Ok(Response::SearchHits {
+                hits: self.search_threads(&query, limit.min(500) as usize)?,
+            }),
             Request::ListThreads { query, project_id } => Ok(Response::Json {
                 value: self.list_threads_json(query.as_deref(), project_id.as_ref())?,
             }),

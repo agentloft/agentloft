@@ -70,6 +70,127 @@ pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
     }
 }
 
+/// Open the settings window on one agent's page.
+pub fn open_agent(store: Entity<AppStore>, harness: &str, cx: &mut App) {
+    open(store, Some(Section::Agents), cx);
+    let Some(agent) = agents::AGENTS.iter().find(|(id, _)| *id == harness) else {
+        return;
+    };
+    if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
+        let _ = view.update(cx, |v, cx| {
+            v.agents.selected = agent.0;
+            cx.notify();
+        });
+    }
+}
+
+/// The agents the settings window has a page for: (harness id, name).
+pub fn agents() -> &'static [(&'static str, &'static str)] {
+    &agents::AGENTS
+}
+
+/// A setting the command palette can find.
+pub struct Findable {
+    pub label: &'static str,
+    /// Extra words it answers to.
+    pub keywords: &'static str,
+    pub section: Section,
+}
+
+/// Every setting, by the name its row shows (for the command palette).
+pub const FINDABLE: &[Findable] = &[
+    Findable {
+        label: "Light, dark or system mode",
+        keywords: "appearance theme mode light dark system",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Theme",
+        keywords: "appearance themes colours colors palette create generate edit",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Accent colour",
+        keywords: "appearance accent color highlight buttons links",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Contrast",
+        keywords: "appearance borders secondary text",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Density",
+        keywords: "appearance spacing compact comfortable",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Conversation width",
+        keywords: "appearance column width",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Text size",
+        keywords: "appearance font size zoom",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Code text size",
+        keywords: "appearance font size code terminal diff",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Interface font",
+        keywords: "appearance font family typeface",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Monospace font",
+        keywords: "appearance font family code terminal",
+        section: Section::Appearance,
+    },
+    Findable {
+        label: "Agents",
+        keywords: "claude codex opencode gemini installed binary model effort permissions environment",
+        section: Section::Agents,
+    },
+    Findable {
+        label: "New threads: worktree or local",
+        keywords: "worktrees ask local",
+        section: Section::Worktrees,
+    },
+    Findable {
+        label: "Branch prefix",
+        keywords: "worktrees git branch name",
+        section: Section::Worktrees,
+    },
+    Findable {
+        label: "Worktree location",
+        keywords: "worktrees folder directory where",
+        section: Section::Worktrees,
+    },
+    Findable {
+        label: "Per-project setup",
+        keywords: "worktrees setup script copy config.toml",
+        section: Section::Worktrees,
+    },
+    Findable {
+        label: "Settings file",
+        keywords: "about config.toml edit",
+        section: Section::About,
+    },
+    Findable {
+        label: "Data folder",
+        keywords: "about threads events logs storage",
+        section: Section::About,
+    },
+    Findable {
+        label: "Version",
+        keywords: "about agentloft update",
+        section: Section::About,
+    },
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Appearance,
@@ -92,7 +213,7 @@ impl Section {
         Section::About,
     ];
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Section::Appearance => "Appearance",
             Section::Agents => "Agents",
@@ -101,7 +222,7 @@ impl Section {
         }
     }
 
-    fn icon(self) -> IconName {
+    pub fn icon(self) -> IconName {
         match self {
             Section::Appearance => IconName::Sun,
             Section::Agents => IconName::Bot,

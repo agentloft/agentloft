@@ -145,6 +145,10 @@ pub struct WorkspaceView {
     show_archived: bool,
     /// The sidebar thread whose ··· menu is open.
     row_menu: Option<ThreadId>,
+    /// Threads whose messages match the sidebar search, and the search
+    /// those answer.
+    search_hits: HashMap<ThreadId, loft_protocol::SearchHit>,
+    search_seq: u64,
     /// The open `/` or `@` completion popover.
     completion: Option<crate::completion::Completion>,
     completion_seq: u64,
@@ -231,7 +235,8 @@ impl WorkspaceView {
             }),
             cx.subscribe_in(&search, window, |this, state, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.query = state.read(cx).value().to_lowercase();
+                    this.query = state.read(cx).value().trim().to_lowercase();
+                    this.search_messages(cx);
                     cx.notify();
                 }
             }),
@@ -252,6 +257,8 @@ impl WorkspaceView {
             query: String::new(),
             show_archived: false,
             row_menu: None,
+            search_hits: HashMap::new(),
+            search_seq: 0,
             completion: None,
             completion_seq: 0,
             pending_add_project: false,
@@ -1651,10 +1658,10 @@ impl WorkspaceView {
         let focus = picker.read(cx).focus_handle(cx);
         let content = picker.clone();
         window.open_dialog(cx, move |dialog, _, _| {
+            let dialog = dialog.centered();
             dialog
                 .w(px(620.))
                 .p_0()
-                .margin_top(px(80.))
                 .close_button(false)
                 .child(content.clone())
         });
@@ -2211,6 +2218,62 @@ impl WorkspaceView {
 
     // -- sidebar ------------------------------------------------------------
 
+    /// Look for the sidebar query in every thread's messages (after a
+    /// short pause in typing).
+    fn search_messages(&mut self, cx: &mut Context<Self>) {
+        self.search_seq += 1;
+        let seq = self.search_seq;
+        let query = self.query.clone();
+        if query.is_empty() {
+            self.search_hits.clear();
+            return;
+        }
+        let Some(client) = self.store.read(cx).client() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(140))
+                .await;
+            if this
+                .update(cx, |this, _| this.search_seq != seq)
+                .unwrap_or(true)
+            {
+                return;
+            }
+            let result = client
+                .request(loft_protocol::Request::SearchThreads { query, limit: 200 })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.search_seq != seq {
+                    return;
+                }
+                this.search_hits = match result {
+                    Ok(loft_protocol::Response::SearchHits { hits }) => {
+                        hits.into_iter().map(|h| (h.thread_id.clone(), h)).collect()
+                    }
+                    _ => HashMap::new(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Does the sidebar search match this thread: its title, project,
+    /// agent, branch or (from the core) its messages.
+    fn search_matches(&self, t: &loft_protocol::Thread, project: &str) -> bool {
+        let q = &self.query;
+        q.is_empty()
+            || t.title.to_lowercase().contains(q)
+            || project.to_lowercase().contains(q)
+            || harness_name(&t.harness).to_lowercase().contains(q)
+            || t.workspace
+                .branch()
+                .is_some_and(|b| b.to_lowercase().contains(q))
+            || self.search_hits.contains_key(&t.id)
+    }
+
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (projects, all_threads, selected, conn, error, unread, collapsed) = {
             let store = self.store.read(cx);
@@ -2241,7 +2304,7 @@ impl WorkspaceView {
                         || t.draft_text().is_some()
                         || selected.as_ref() == Some(&t.id)
                 })
-                .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
+                .filter(|t| self.search_matches(t, &project.name))
                 .collect();
             if !query.is_empty() && threads.is_empty() {
                 continue;
@@ -2269,6 +2332,10 @@ impl WorkspaceView {
                         selected.as_ref() == Some(&id),
                         unread.contains(&id),
                         self.row_menu.as_ref() == Some(&id),
+                        // A message matched (not just the title): show where.
+                        self.search_hits
+                            .get(&id)
+                            .filter(|_| !thread.title.to_lowercase().contains(&query)),
                         p,
                         cx,
                     ));
@@ -2281,7 +2348,13 @@ impl WorkspaceView {
         let archived: Vec<_> = all_threads
             .iter()
             .filter(|t| t.status == ThreadStatus::Archived)
-            .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
+            .filter(|t| {
+                let project = projects
+                    .iter()
+                    .find(|p| p.id == t.project_id)
+                    .map_or("", |p| p.name.as_str());
+                self.search_matches(t, project)
+            })
             .cloned()
             .collect();
         if !archived.is_empty() {
@@ -3920,6 +3993,7 @@ fn show_about(window: &mut Window, cx: &mut gpui_kit::App) {
     use gpui_kit::component::WindowExt as _;
     let p = Palette::of(cx);
     window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
         dialog.child(
             v_flex()
                 .items_center()
@@ -4293,6 +4367,7 @@ fn thread_row(
     active: bool,
     unread: bool,
     menu_open: bool,
+    hit: Option<&loft_protocol::SearchHit>,
     p: &Palette,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
@@ -4368,7 +4443,22 @@ fn thread_row(
         .child(div().flex_none().when(!active, |d| d.opacity(0.85)).child(
             crate::brand::agent_logo(thread.harness.as_str(), px(14.), p),
         ))
-        .child(div().flex_1().min_w_0().truncate().child(title))
+        .child(match hit {
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(title)
+                .into_any_element(),
+            // Searching: the matching message under the title.
+            Some(hit) => v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.))
+                .child(div().truncate().child(title))
+                .child(search_snippet(hit, p))
+                .into_any_element(),
+        })
         .when(thread.workspace.branch().is_some(), |d| {
             d.child(
                 Icon::new(IconName::GitBranch)
@@ -4435,17 +4525,24 @@ fn thread_row(
                         }),
                 ),
         )
-        .on_click(
+        .on_click({
+            let reveal = hit.map(|h| h.item_id.clone());
             cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
                 let id = id.clone();
                 // ⌘-click: beside the current one, in a pane of its own.
                 if event.modifiers().platform {
-                    this.store.update(cx, |s, cx| s.open_pane(id, cx));
+                    this.store.update(cx, |s, cx| s.open_pane(id.clone(), cx));
                 } else {
-                    this.store.update(cx, |s, cx| s.select_thread(id, cx));
+                    this.store
+                        .update(cx, |s, cx| s.select_thread(id.clone(), cx));
                 }
-            }),
-        )
+                // From a search: show the message that matched.
+                if let Some(item) = reveal.clone() {
+                    let thread = this.store.update(cx, |s, cx| s.ensure_thread(&id, cx));
+                    thread.update(cx, |t, cx| t.reveal(item, cx));
+                }
+            })
+        })
         .on_drag(
             DraggedThread {
                 id: thread.id.clone(),
@@ -4454,6 +4551,61 @@ fn thread_row(
             |d, _, _, cx| cx.new(|_| d.clone()),
         )
         .context_menu(thread_menu_items(thread, store))
+        .into_any_element()
+}
+
+/// A line of a message that matched the sidebar search, the match marked.
+fn search_snippet(hit: &loft_protocol::SearchHit, p: &Palette) -> AnyElement {
+    let (mut text, mut start, mut end) = (hit.snippet.clone(), hit.start, hit.end);
+    let ok = start <= end
+        && end <= text.len()
+        && text.is_char_boundary(start)
+        && text.is_char_boundary(end);
+    // The sidebar is narrow: keep only a few words before the match.
+    const BEFORE: usize = 14;
+    if ok && let Some((cut, _)) = text[..start].char_indices().rev().nth(BEFORE) {
+        let kept = text[cut..].trim_start().to_owned();
+        let shift = text.len() - kept.len();
+        text = format!("…{kept}");
+        let ellipsis = '…'.len_utf8();
+        start = start - shift + ellipsis;
+        end = end - shift + ellipsis;
+    }
+    let range = ok.then_some(start..end);
+    let styled = gpui_kit::StyledText::new(text).with_highlights(range.map(|r| {
+        (
+            r,
+            gpui_kit::HighlightStyle {
+                color: Some(p.foreground),
+                font_weight: Some(FontWeight::SEMIBOLD),
+                background_color: Some(p.accent.opacity(0.22)),
+                ..Default::default()
+            },
+        )
+    }));
+    h_flex()
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .text_color(p.muted_foreground)
+        .child(
+            Icon::new(if hit.from_user {
+                IconName::User
+            } else {
+                IconName::MessageSquare
+            })
+            .xsmall()
+            .text_color(p.faint_foreground),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(styled))
+        .when(hit.count > 1, |d| {
+            d.child(
+                div()
+                    .flex_none()
+                    .text_color(p.faint_foreground)
+                    .child(format!("+{}", hit.count - 1)),
+            )
+        })
         .into_any_element()
 }
 
@@ -4474,6 +4626,7 @@ fn rename_dialog(
     });
     let focus = input.clone();
     window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
         let (store, thread_id, input) = (store.clone(), thread_id.clone(), input.clone());
         dialog
             .title("Rename thread")
@@ -4713,6 +4866,7 @@ fn show_pasted(text: String, window: &mut Window, cx: &mut gpui_kit::App) {
     let size = human_bytes(text.len());
     let body = crate::items::plain_markdown(&text);
     window.open_dialog(cx, move |dialog, _, cx| {
+        let dialog = dialog.centered();
         let p = Palette::of(cx);
         let copy_text = text.clone();
         dialog
@@ -4949,6 +5103,7 @@ fn confirm_delete(
         .find(|t| t.id == thread_id)
         .and_then(|t| t.workspace.branch().map(str::to_owned));
     window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
         let (store, thread_id) = (store.clone(), thread_id.clone());
         let mut text = "Its conversation, turn history and checkpoints are erased and its \
                         agent and terminals are stopped. This can't be undone."
@@ -4991,6 +5146,7 @@ fn confirm_archive(
     use gpui_kit::component::button::{Button, ButtonVariants as _};
     use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
     window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
         let (store, thread_id) = (store.clone(), thread_id.clone());
         dialog
             .title("Archive thread?")

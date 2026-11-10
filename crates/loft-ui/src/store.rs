@@ -1312,6 +1312,8 @@ pub struct ThreadState {
     pub cards: Vec<InfoCard>,
     /// Repaints while a turn runs (its elapsed time).
     ticker: Option<gpui_kit::Task<()>>,
+    /// A message to scroll to once the thread has loaded (a search hit).
+    reveal: Option<ItemId>,
 }
 
 impl ThreadState {
@@ -1325,6 +1327,18 @@ impl ThreadState {
             expanded: HashMap::new(),
             ticker: None,
             cards: Vec::new(),
+            reveal: None,
+        }
+    }
+
+    /// Scroll to a message: now if it's loaded, else once it is.
+    pub fn reveal(&mut self, id: ItemId, cx: &mut Context<Self>) {
+        match self.row_of_item(&id) {
+            Some(row) => self.scroller.update(cx, |s, cx| {
+                s.scroll_to_item(row, cx);
+            }),
+            None if self.model.is_none() => self.reveal = Some(id),
+            None => {}
         }
     }
 
@@ -1645,9 +1659,15 @@ impl ThreadState {
         self.rebuild_rows();
         self.ensure_ticker(cx);
         let count = self.rows.len();
+        let reveal = self.reveal.take().and_then(|id| self.row_of_item(&id));
         self.scroller.update(cx, |s, cx| {
             s.reset(count, cx);
-            s.scroll_to_end(cx);
+            match reveal {
+                Some(row) => {
+                    s.scroll_to_item(row, cx);
+                }
+                None => s.scroll_to_end(cx),
+            }
         });
         cx.notify();
     }

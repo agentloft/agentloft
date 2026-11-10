@@ -11,6 +11,23 @@ pub struct Project {
     pub created_at_ms: i64,
 }
 
+/// A thread whose conversation mentions what was searched for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchHit {
+    pub thread_id: ThreadId,
+    /// The first message that matches.
+    pub item_id: ItemId,
+    /// Whether it was the user's message (else the agent's).
+    pub from_user: bool,
+    /// A line of that message around the match.
+    pub snippet: String,
+    /// Byte range of the match within `snippet`.
+    pub start: usize,
+    pub end: usize,
+    /// How many messages in the thread match.
+    pub count: u32,
+}
+
 /// A slash command the agent accepts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SlashCommandInfo {

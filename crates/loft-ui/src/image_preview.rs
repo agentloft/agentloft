@@ -142,6 +142,7 @@ pub fn open(pic: Pic, window: &mut Window, cx: &mut App) {
     let width = (f32::from(viewport.width) * 0.8).clamp(420., 1200.);
     let height = (f32::from(viewport.height) * 0.68).max(240.);
     window.open_dialog(cx, move |dialog, _, cx| {
+        let dialog = dialog.centered();
         let p = Palette::of(cx);
         let (copy_pic, save_pic) = (pic.clone(), pic.clone());
         dialog

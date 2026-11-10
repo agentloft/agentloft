@@ -993,3 +993,48 @@ fn agent_defaults_for_new_threads() {
     assert_eq!(env["ANTHROPIC_BASE_URL"], "http://proxy");
     assert_eq!(env["PATH"], "/bin");
 }
+
+#[tokio::test]
+async fn search_finds_threads_by_their_messages() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "Fix the \"Quoted\" 100%_bug\nplease".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+
+    let search = |q: &str| {
+        let core = f.core.clone();
+        let q = q.to_owned();
+        async move {
+            match core
+                .handle(Request::SearchThreads {
+                    query: q,
+                    limit: 10,
+                })
+                .await
+                .unwrap()
+            {
+                Response::SearchHits { hits } => hits,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    // The user's message and the agent's echo both match.
+    let hits = search("quoted").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].thread_id, thread.id);
+    assert!(hits[0].from_user);
+    assert_eq!(hits[0].count, 2);
+    assert_eq!(&hits[0].snippet[hits[0].start..hits[0].end], "Quoted");
+    // Quotes, LIKE wildcards and newlines are matched literally.
+    assert_eq!(search("\"quoted\" 100%_").await.len(), 1);
+    assert_eq!(search("100%x").await.len(), 0);
+    assert_eq!(search("bug\nplease").await.len(), 1);
+    assert_eq!(search("nowhere").await.len(), 0);
+}

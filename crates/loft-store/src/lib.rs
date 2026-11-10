@@ -220,6 +220,28 @@ impl Store {
         )
     }
 
+    /// Items whose stored form mentions `text` (case-insensitive for
+    /// ASCII), in timeline order per thread. A coarse prefilter: callers
+    /// check the fields they care about.
+    pub fn items_mentioning(&self, text: &str) -> Result<Vec<Item>> {
+        // Match the text as it appears inside the JSON (quotes, newlines
+        // and backslashes are escaped there), as a literal LIKE pattern.
+        let json = serde_json::to_string(text)?;
+        let inner = &json[1..json.len() - 1];
+        let mut pattern = String::from("%");
+        for c in inner.chars() {
+            if matches!(c, '%' | '_' | '|') {
+                pattern.push('|');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        self.query_data(
+            "SELECT data FROM items WHERE data LIKE ?1 ESCAPE '|' ORDER BY thread_id, ordinal",
+            [pattern],
+        )
+    }
+
     pub fn requests(&self, thread: &ThreadId) -> Result<Vec<RuntimeRequest>> {
         self.query_data(
             "SELECT data FROM requests WHERE thread_id = ?1",

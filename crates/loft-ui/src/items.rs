@@ -1452,6 +1452,7 @@ pub(crate) fn confirm_revert(
         n => format!("the changes made in this turn and the {n} after it"),
     };
     window.open_dialog(cx, move |dialog, _, _| {
+        let dialog = dialog.centered();
         let (store, thread_id, turn_id) = (store.clone(), thread_id.clone(), turn_id.clone());
         dialog
             .title("Undo changes?")
