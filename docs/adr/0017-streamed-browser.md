@@ -18,6 +18,7 @@
 - Headless, with a profile of its own under the Agentloft home (`browser/profile`, mode 0700), so its cookies and logins are separate from the user's everyday browser.
 - Driven over the DevTools protocol on a **pipe** (`--remote-debugging-pipe`), not a port. Only the daemon holds the pipe; no other program on the machine, and no web page, can attach to it.
 - Started with the first page, asked to close when the daemon stops, and stopped five minutes after its last page closes.
+- Settings ▸ Browser (`[browser]` in `config.toml`) holds what both browser panels share, the search engine and the home page, and which browser the daemon runs. A browser session may change the first two, not the last.
 - Downloads are refused. A window a page opens loads in the page that opened it. A script dialog is answered for the page (yes to notices and to leaving, no to questions) until dialogs are shown to the viewer.
 
 ### 2. Pages and pictures

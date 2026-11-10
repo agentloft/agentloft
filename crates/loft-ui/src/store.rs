@@ -207,6 +207,9 @@ pub struct AppStore {
     branches_loading: std::collections::HashSet<ProjectId>,
     /// Agents switched off in Settings (hidden from pickers).
     pub disabled_agents: std::collections::HashSet<String>,
+    /// `[browser]` in the settings (search engine, home page), kept
+    /// current as the settings change.
+    pub browser: loft_config::BrowserConfig,
     /// Models left out of the pickers, per agent.
     pub hidden_models: HashMap<String, Vec<String>>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
@@ -255,6 +258,7 @@ impl AppStore {
             branches: HashMap::new(),
             branches_loading: Default::default(),
             disabled_agents: Default::default(),
+            browser: Default::default(),
             hidden_models: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
@@ -439,6 +443,7 @@ impl AppStore {
         let Ok(config) = crate::host::load_config(&self.paths) else {
             return;
         };
+        self.browser = config.browser.clone();
         self.disabled_agents.clear();
         self.hidden_models.clear();
         for (id, h) in [

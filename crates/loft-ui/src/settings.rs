@@ -19,6 +19,7 @@ use loft_protocol::Request;
 
 mod agents;
 mod appearance;
+mod browser;
 mod projects;
 mod shortcuts;
 mod web;
@@ -278,6 +279,21 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Worktrees,
     },
     Findable {
+        label: "Search engine",
+        keywords: "browser search engine google duckduckgo bing brave kagi ecosia startpage address bar default",
+        section: Section::Browser,
+    },
+    Findable {
+        label: "Home page",
+        keywords: "browser home page new tab start address",
+        section: Section::Browser,
+    },
+    Findable {
+        label: "Browser app",
+        keywords: "browser chrome chromium edge brave executable path web client",
+        section: Section::Browser,
+    },
+    Findable {
         label: "Keyboard shortcuts",
         keywords: "shortcuts hotkeys keys keybindings keymap rebind steer",
         section: Section::Shortcuts,
@@ -305,6 +321,8 @@ pub enum Section {
     Agents,
     Projects,
     Worktrees,
+    /// The browser panel: search engine, home page, which browser.
+    Browser,
     Shortcuts,
     /// Agentloft in a browser (desktop only: a browser session may not
     /// manage its own access).
@@ -319,11 +337,12 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s) || sec.slug() == s)
     }
 
-    const ALL: [Section; 7] = [
+    const ALL: [Section; 8] = [
         Section::Appearance,
         Section::Agents,
         Section::Projects,
         Section::Worktrees,
+        Section::Browser,
         Section::Shortcuts,
         Section::Web,
         Section::About,
@@ -344,6 +363,7 @@ impl Section {
             Section::Agents => "agents",
             Section::Projects => "projects",
             Section::Worktrees => "worktrees",
+            Section::Browser => "browser",
             Section::Shortcuts => "shortcuts",
             Section::Web => "web",
             Section::About => "about",
@@ -356,6 +376,7 @@ impl Section {
             Section::Agents => "Agents",
             Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
+            Section::Browser => "Browser",
             Section::Shortcuts => "Shortcuts",
             Section::Web => "Web access",
             Section::About => "About",
@@ -368,6 +389,7 @@ impl Section {
             Section::Agents => IconName::Bot,
             Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
+            Section::Browser => IconName::Globe,
             Section::Shortcuts => IconName::Keyboard,
             Section::Web => IconName::GlobeLock,
             Section::About => IconName::Sparkles,
@@ -388,6 +410,10 @@ pub(super) enum Field {
     WebCert,
     WebKey,
     WebHosts,
+    /// A search address of the user's own (`browser.search`).
+    BrowserSearch,
+    BrowserHome,
+    BrowserApp,
 }
 
 impl Field {
@@ -403,6 +429,9 @@ impl Field {
             Field::WebCert => &["web", "tls_cert"],
             Field::WebKey => &["web", "tls_key"],
             Field::WebHosts => &["web", "allowed_hosts"],
+            Field::BrowserSearch => &["browser", "search"],
+            Field::BrowserHome => &["browser", "home"],
+            Field::BrowserApp => &["browser", "executable"],
         }
     }
 
@@ -418,6 +447,14 @@ impl Field {
             Field::WebCert => c.web.tls_cert.clone().unwrap_or_default(),
             Field::WebKey => c.web.tls_key.clone().unwrap_or_default(),
             Field::WebHosts => c.web.allowed_hosts.join(", "),
+            // Only an address of one's own is typed; an engine picked by
+            // name leaves the field empty.
+            Field::BrowserSearch => match c.browser.search_engine() {
+                Some(_) => String::new(),
+                None => c.browser.search.clone().unwrap_or_default(),
+            },
+            Field::BrowserHome => c.browser.home.clone().unwrap_or_default(),
+            Field::BrowserApp => c.browser.executable.clone().unwrap_or_default(),
         }
     }
 
@@ -433,6 +470,9 @@ impl Field {
             Field::WebCert => "None",
             Field::WebKey => "None",
             Field::WebHosts => "None",
+            Field::BrowserSearch => "https://example.com/search?q=%s",
+            Field::BrowserHome => "A blank tab",
+            Field::BrowserApp => "Chrome, Chromium, Edge or Brave",
         }
     }
 
@@ -456,6 +496,9 @@ impl Field {
             ) => SettingValue::Unset,
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
             (Field::WebBind | Field::WebPort | Field::WebCert | Field::WebKey, true) => {
+                SettingValue::Unset
+            }
+            (Field::BrowserSearch | Field::BrowserHome | Field::BrowserApp, true) => {
                 SettingValue::Unset
             }
             // Not a port: left as it was (the field shows the old value again).
@@ -484,7 +527,12 @@ impl Field {
     fn is_daemon(self) -> bool {
         !matches!(
             self,
-            Field::UiFont | Field::MonoFont | Field::ProjectsDir | Field::NewProjectsDir
+            Field::UiFont
+                | Field::MonoFont
+                | Field::ProjectsDir
+                | Field::NewProjectsDir
+                | Field::BrowserSearch
+                | Field::BrowserHome
         )
     }
 }
@@ -501,6 +549,7 @@ pub struct SettingsView {
     projects: projects::ProjectsPage,
     shortcuts: shortcuts::ShortcutsPage,
     web: web::WebPage,
+    browser: browser::BrowserPage,
     _subs: Vec<Subscription>,
 }
 
@@ -535,6 +584,9 @@ impl SettingsView {
             Field::WebCert,
             Field::WebKey,
             Field::WebHosts,
+            Field::BrowserSearch,
+            Field::BrowserHome,
+            Field::BrowserApp,
         ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
@@ -568,6 +620,7 @@ impl SettingsView {
             projects: projects::ProjectsPage::default(),
             shortcuts: shortcuts::ShortcutsPage::default(),
             web: web::WebPage::default(),
+            browser: browser::BrowserPage::default(),
             _subs: subs,
         }
     }
@@ -581,6 +634,19 @@ impl SettingsView {
     }
 
     fn save_field(&mut self, field: Field, text: &str, cx: &mut Context<Self>) {
+        // A search address has to have a place for the words; one that
+        // doesn't is said so, not saved.
+        if field == Field::BrowserSearch
+            && !text.trim().is_empty()
+            && loft_config::custom_search_template(text).is_none()
+        {
+            self.error = Some(
+                "A search address starts with https:// and has %s where the words go, like https://example.com/search?q=%s"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let value = field.value(text);
         let unchanged = match &value {
             SettingValue::Str(s) => *s == field.current(&self.config),
@@ -813,6 +879,7 @@ impl Render for SettingsView {
             Section::Agents => self.agents_page(&p, window, cx),
             Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
+            Section::Browser => self.browser_page(&p, cx),
             Section::Shortcuts => self.shortcuts_page(&p, cx),
             Section::Web => self.web_page(&p, cx),
             Section::About => self.about(&p, cx),

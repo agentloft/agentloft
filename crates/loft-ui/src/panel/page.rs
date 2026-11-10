@@ -115,6 +115,16 @@ impl PageView {
         init(cx);
         let address =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter an address"));
+        // A new tab opens the home page, if one is set (typed as one would
+        // type it in the address bar: "example.com" is an address).
+        let home = {
+            let browser = &store.read(cx).browser;
+            browser.home().and_then(|home| {
+                loft_browser::normalize_address(home, &browser.search_template())
+                    .ok()
+                    .map(|url| url.to_string())
+            })
+        };
         let subs = vec![
             cx.subscribe_in(&address, window, Self::on_address_event),
             // The view going away (its thread's panel closed) closes the
@@ -141,7 +151,7 @@ impl PageView {
             editing_address: false,
             pending_address: None,
             info: None,
-            last_url: None,
+            last_url: home,
             opening: false,
             note: None,
             picture: None,
@@ -170,6 +180,11 @@ impl PageView {
 
     pub fn is_loading(&self) -> bool {
         self.opening || self.info.as_ref().is_some_and(|i| i.loading)
+    }
+
+    /// Whether the tab opens on nothing (no home page to go to).
+    pub fn opens_blank(&self) -> bool {
+        self.last_url.is_none()
     }
 
     pub fn focus_address_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -414,8 +429,8 @@ impl PageView {
                 if typed.trim().is_empty() {
                     return;
                 }
-                match loft_browser::normalize_address(&typed, loft_browser::DEFAULT_SEARCH_TEMPLATE)
-                {
+                let search = self.store.read(cx).browser.search_template();
+                match loft_browser::normalize_address(&typed, &search) {
                     Ok(url) => self.navigate(
                         PageNav::Url {
                             url: url.to_string(),

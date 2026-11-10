@@ -61,6 +61,8 @@ fn remote_may_set(key: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
     match parts.as_slice() {
         ["ui", ..] | ["worktrees", _] => true,
+        // How the browser tab behaves; not which program is run for it.
+        ["browser", "search" | "home"] => true,
         ["harness", _, field] => matches!(
             *field,
             "enabled"
@@ -689,6 +691,8 @@ mod tests {
             "web.enabled",
             "web.allow_insecure_remote",
             "web.bind",
+            // Which program the daemon runs as its browser.
+            "browser.executable",
         ] {
             let r = remote(&f, set(key, serde_json::json!("x"))).await;
             assert!(is_forbidden(&r), "{key}: {r:?}");
@@ -697,6 +701,28 @@ mod tests {
             remote(&f, set("ui.theme", serde_json::json!("dark")))
                 .await
                 .is_ok()
+        );
+        // How the browser tab behaves is the viewer's to choose.
+        for (key, value) in [
+            ("browser.search", "google"),
+            ("browser.home", "https://example.com"),
+        ] {
+            let r = remote(&f, set(key, serde_json::json!(value))).await;
+            assert!(r.is_ok(), "{key}: {r:?}");
+        }
+        assert_eq!(
+            f.core.config().browser.search_template(),
+            "https://www.google.com/search?q={}"
+        );
+        // The desktop app may say which browser to run.
+        let local = f
+            .core
+            .handle(set("browser.executable", serde_json::json!("/opt/chrome")))
+            .await;
+        assert!(local.is_ok(), "{local:?}");
+        assert_eq!(
+            f.core.config().browser.executable.as_deref(),
+            Some("/opt/chrome")
         );
         assert!(
             remote(

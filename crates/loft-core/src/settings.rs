@@ -114,6 +114,21 @@ const KEYS: &[Key] = &[
         about: "Worktree branches are <prefix>/<slug>",
     },
     Key {
+        key: "browser.search",
+        kind: Kind::Text,
+        about: "What the browser's address bar searches with: duckduckgo, google, bing, brave, kagi, ecosia, startpage, or an http(s) address with %s where the words go; null = duckduckgo",
+    },
+    Key {
+        key: "browser.home",
+        kind: Kind::Text,
+        about: "Address a new browser tab opens; null = a blank tab",
+    },
+    Key {
+        key: "browser.executable",
+        kind: Kind::Text,
+        about: "Path of the Chromium-family browser run for the web client's browser tab; null = the first of Chrome, Chromium, Edge or Brave installed",
+    },
+    Key {
         key: "projects.new_dir",
         kind: Kind::Text,
         about: "Where new projects go; null = ~/.agentloft/projects",

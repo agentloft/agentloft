@@ -168,14 +168,118 @@ pub struct Config {
     pub browser: BrowserConfig,
 }
 
-/// `[browser]` in config.toml: the daemon's own browser, whose pages are
-/// streamed to the web client (ADR-0017).
+/// `[browser]` in config.toml: the browser panel.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BrowserConfig {
-    /// The Chromium-family browser to run (`~` allowed). Unset: the first
-    /// of Chrome, Chromium, Edge or Brave that is installed.
+    /// What the address bar searches with when words are typed instead of
+    /// an address: an engine by name ([`SEARCH_ENGINES`]: `duckduckgo`,
+    /// `google`, …) or an address with `%s` where the words go. Unset:
+    /// DuckDuckGo.
+    pub search: Option<String>,
+    /// What a new browser tab opens. Unset: a blank tab.
+    pub home: Option<String>,
+    /// The Chromium-family browser the daemon runs for the web client's
+    /// browser tab (ADR-0017; `~` allowed). Unset: the first of Chrome,
+    /// Chromium, Edge or Brave that is installed.
     pub executable: Option<String>,
+}
+
+/// A search engine the address bar can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchEngine {
+    /// Its name in `browser.search`.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Its search address; `{}` stands for the words.
+    pub template: &'static str,
+}
+
+/// The engines offered by name. The first is the default.
+pub const SEARCH_ENGINES: &[SearchEngine] = &[
+    SearchEngine {
+        id: "duckduckgo",
+        name: "DuckDuckGo",
+        template: "https://duckduckgo.com/?q={}",
+    },
+    SearchEngine {
+        id: "google",
+        name: "Google",
+        template: "https://www.google.com/search?q={}",
+    },
+    SearchEngine {
+        id: "bing",
+        name: "Bing",
+        template: "https://www.bing.com/search?q={}",
+    },
+    SearchEngine {
+        id: "brave",
+        name: "Brave Search",
+        template: "https://search.brave.com/search?q={}",
+    },
+    SearchEngine {
+        id: "kagi",
+        name: "Kagi",
+        template: "https://kagi.com/search?q={}",
+    },
+    SearchEngine {
+        id: "ecosia",
+        name: "Ecosia",
+        template: "https://www.ecosia.org/search?q={}",
+    },
+    SearchEngine {
+        id: "startpage",
+        name: "Startpage",
+        template: "https://www.startpage.com/sp/search?query={}",
+    },
+];
+
+/// A search address of the user's own, as a template with `{}` for the
+/// words: an `http(s)` address with `%s` (or `{}`) in it. `None` if it
+/// isn't one.
+pub fn custom_search_template(text: &str) -> Option<String> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    let web = lower.starts_with("https://") || lower.starts_with("http://");
+    let template = if text.contains("%s") {
+        text.replacen("%s", "{}", 1)
+    } else {
+        text.to_owned()
+    };
+    (web && !text.contains(char::is_whitespace) && template.contains("{}")).then_some(template)
+}
+
+impl BrowserConfig {
+    /// The engine `search` names; unset names the default. `None` when it
+    /// holds an address of the user's own (or nothing usable).
+    pub fn search_engine(&self) -> Option<&'static SearchEngine> {
+        match self.search.as_deref().map(str::trim) {
+            None | Some("") => SEARCH_ENGINES.first(),
+            Some(name) => SEARCH_ENGINES
+                .iter()
+                .find(|engine| engine.id.eq_ignore_ascii_case(name)),
+        }
+    }
+
+    /// The address to search with; `{}` stands for the words. Something
+    /// unusable in `search` falls back to the default engine.
+    pub fn search_template(&self) -> String {
+        if let Some(engine) = self.search_engine() {
+            return engine.template.to_owned();
+        }
+        self.search
+            .as_deref()
+            .and_then(custom_search_template)
+            .unwrap_or_else(|| SEARCH_ENGINES[0].template.to_owned())
+    }
+
+    /// The address a new tab opens, if one is set.
+    pub fn home(&self) -> Option<&str> {
+        self.home
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+    }
 }
 
 /// `[web]` in config.toml: Agentloft in a browser, served by the daemon
@@ -862,6 +966,66 @@ mod tests {
         };
         let plan = no_browser.plan().unwrap();
         assert!(plan.allow_terminal && !plan.allow_browser);
+    }
+
+    #[test]
+    fn browser_search_engines_and_addresses() {
+        let with = |search: &str| BrowserConfig {
+            search: Some(search.into()),
+            ..BrowserConfig::default()
+        };
+        // Nothing set: the first engine.
+        let unset = BrowserConfig::default();
+        assert_eq!(unset.search_engine().unwrap().id, "duckduckgo");
+        assert_eq!(unset.search_template(), "https://duckduckgo.com/?q={}");
+        // By name, however it is cased.
+        assert_eq!(
+            with("Google").search_template(),
+            "https://www.google.com/search?q={}"
+        );
+        // An address of one's own, with %s (or {}) for the words.
+        let own = with("https://search.example/?q=%s&lang=en");
+        assert!(own.search_engine().is_none());
+        assert_eq!(
+            own.search_template(),
+            "https://search.example/?q={}&lang=en"
+        );
+        assert_eq!(
+            with("http://localhost:8080/find/{}").search_template(),
+            "http://localhost:8080/find/{}"
+        );
+        // Not an engine and not a usable address: the default, not a dead
+        // address bar.
+        for bad in [
+            "altavista",
+            "https://search.example/",
+            "search.example/?q=%s",
+            "javascript:alert(%s)",
+            "https://search.example/?q=%s and more",
+        ] {
+            assert!(custom_search_template(bad).is_none(), "{bad}");
+            assert_eq!(
+                with(bad).search_template(),
+                unset.search_template(),
+                "{bad}"
+            );
+        }
+        // Every listed engine is a web address with a place for the words.
+        for engine in SEARCH_ENGINES {
+            assert_eq!(
+                custom_search_template(engine.template).as_deref(),
+                Some(engine.template),
+                "{}",
+                engine.id
+            );
+        }
+
+        let cfg: Config =
+            toml::from_str("[browser]\nsearch = \"kagi\"\nhome = \" https://example.com \"\n")
+                .unwrap();
+        assert_eq!(cfg.browser.search_engine().unwrap().name, "Kagi");
+        assert_eq!(cfg.browser.home(), Some("https://example.com"));
+        assert_eq!(BrowserConfig::default().home(), None);
     }
 
     #[test]

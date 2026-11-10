@@ -164,6 +164,9 @@ pub struct WorkbenchPanel {
     /// panel has its place (set by the workspace while laying out). There
     /// is no "back beside the conversation" to offer then.
     pub(crate) cramped: bool,
+    /// The search address the native browser tabs were last given (the
+    /// setting may change while they are open).
+    search: String,
 }
 
 impl gpui_kit::EventEmitter<PanelEvent> for WorkbenchPanel {}
@@ -179,6 +182,7 @@ impl WorkbenchPanel {
             shown: None,
             maximized: false,
             cramped: false,
+            search: String::new(),
         }
     }
 
@@ -367,6 +371,8 @@ impl WorkbenchPanel {
         cx: &mut Context<Self>,
     ) -> Entity<BrowserView> {
         let view = cx.new(|cx| BrowserView::new(window, cx));
+        let search = self.store.read(cx).browser.search_template();
+        view.update(cx, |b, _| b.set_search_template(search));
         let id = thread_id.clone();
         let subs = [cx.subscribe(&view, move |_, _, event, cx| match event {
             loft_browser::BrowserEvent::Annotation(note) => {
@@ -560,11 +566,22 @@ impl WorkbenchPanel {
                     panel.tabs.push(Open::Page { view: view.clone() });
                     panel.active = panel.tabs.len() - 1;
                 }
-                view.update(cx, |v, cx| v.focus_address_bar(window, cx));
+                // A blank tab waits for an address; one with a home page
+                // shows where it went.
+                view.update(cx, |v, cx| {
+                    if v.opens_blank() {
+                        v.focus_address_bar(window, cx);
+                    }
+                });
             }
             Tab::Browser => {
                 let view = self.new_browser(thread_id, window, cx);
-                view.update(cx, |b, cx| b.focus_address_bar(window, cx));
+                // A new tab opens the home page, if one is set.
+                let home = self.store.read(cx).browser.home().map(str::to_owned);
+                view.update(cx, |b, cx| match home {
+                    Some(home) => b.navigate(&home, cx),
+                    None => b.focus_address_bar(window, cx),
+                });
             }
             Tab::File(path) => self.open_file(thread_id, path, window, cx),
             Tab::Agent(id) => self.open_agent(thread_id, id, window, cx),
@@ -898,6 +915,25 @@ fn tab_face(tab: &Open, p: &Palette, cx: &gpui_kit::App) -> (AnyElement, String)
 impl Render for WorkbenchPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        // The search engine was changed in Settings: the native browser
+        // tabs that are open search with it from now on.
+        let search = self.store.read(cx).browser.search_template();
+        if search != self.search {
+            self.search = search;
+            let views: Vec<Entity<BrowserView>> = self
+                .threads
+                .values()
+                .flat_map(|panel| &panel.tabs)
+                .filter_map(|tab| match tab {
+                    Open::Browser { view } => Some(view.clone()),
+                    _ => None,
+                })
+                .collect();
+            for view in views {
+                let search = self.search.clone();
+                view.update(cx, |b, _| b.set_search_template(search));
+            }
+        }
         let Some((thread_id, thread)) = self.selected(cx) else {
             return v_flex()
                 .size_full()

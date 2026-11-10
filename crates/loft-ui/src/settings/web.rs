@@ -31,7 +31,7 @@ pub(super) struct WebPage {
     poll: Option<Task<()>>,
 }
 
-fn heading(title: &str, detail: &str, p: &Palette) -> AnyElement {
+pub(super) fn heading(title: &str, detail: &str, p: &Palette) -> AnyElement {
     v_flex()
         .pt_6()
         .pb_1()
