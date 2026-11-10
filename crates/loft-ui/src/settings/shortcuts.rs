@@ -58,7 +58,10 @@ impl SettingsView {
 
     fn set_keys(&mut self, id: &str, value: SettingValue, cx: &mut Context<Self>) {
         // Back to the default: no entry at all.
-        let default = SHORTCUTS.iter().find(|s| s.id == id).map(|s| s.default);
+        let default = SHORTCUTS
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.default_keys());
         let value = match value {
             SettingValue::Str(k)
                 if Some(keymap::normalize(&k)) == default.map(keymap::normalize) =>

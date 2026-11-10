@@ -2,6 +2,10 @@
 //! of GPUI's content NSView; other platforms get a stub whose constructor
 //! fails with [`crate::BrowserError::Unsupported`].
 
+// Off macOS only the stub is built, so the delegate plumbing below has no
+// caller.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)] // objc2 calls into WebKit/AppKit; each block has a SAFETY note.
 mod macos;

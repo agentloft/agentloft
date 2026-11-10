@@ -9,13 +9,25 @@ publish.workspace = true
 [dependencies]
 loft-protocol.workspace = true
 loft-config.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
 futures.workspace = true
-bytes.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+# Native: the daemon's Unix socket.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+
+# Browser: a WebSocket to the daemon's web listener (ADR-0016). Only
+# tokio's channels work there.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Location", "MessageEvent", "WebSocket", "Window"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

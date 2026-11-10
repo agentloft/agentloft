@@ -32,7 +32,7 @@ pub(crate) fn local_image_path(raw: &str, cwd: &str) -> Option<std::path::PathBu
     }
     let path = raw.strip_prefix("file://").unwrap_or(raw);
     Some(match path.strip_prefix("~/") {
-        Some(rest) => std::env::home_dir().unwrap_or_default().join(rest),
+        Some(rest) => crate::host::user_home().join(rest),
         None => std::path::Path::new(cwd).join(path),
     })
 }
@@ -43,7 +43,8 @@ pub(crate) fn local_images(
     cwd: String,
 ) -> impl Fn(&gpui_kit::SharedUri) -> gpui_kit::ImageSource + Send + Sync + 'static {
     move |uri: &gpui_kit::SharedUri| match local_image_path(uri.as_ref(), &cwd) {
-        Some(path) => gpui_kit::ImageSource::from(path),
+        // From this computer's disk, or through the daemon in a browser.
+        Some(path) => crate::host::image_or_blank(&path, None),
         None => gpui_kit::ImageSource::from(uri.clone()),
     }
 }
@@ -337,6 +338,22 @@ pub fn render_row(
             div()
                 .relative()
                 .child(render_item(thread, state, &model.items[*i], p))
+                // Said while the agent was working: marked as a steer, in
+                // the space a message keeps above itself.
+                .when(crate::store::is_steer(&model.items, *i), |d| {
+                    d.child(
+                        h_flex()
+                            .absolute()
+                            .top_0()
+                            .right(px(4.))
+                            .gap_1()
+                            .items_center()
+                            .text_xs()
+                            .text_color(p.faint_foreground)
+                            .child(Icon::new(IconName::CornerDownRight).xsmall())
+                            .child("Steer"),
+                    )
+                })
                 .child(
                     gpui_kit::canvas(
                         move |bounds, _, _| {
@@ -415,7 +432,7 @@ pub(crate) fn render_item(
                         .border_color(p.border)
                         .cursor_pointer()
                         .child(
-                            gpui_kit::img(path.clone())
+                            gpui_kit::img(crate::host::image_or_blank(&path, None))
                                 .size_full()
                                 .object_fit(gpui_kit::ObjectFit::Cover),
                         )
@@ -645,8 +662,8 @@ pub(crate) fn human_duration(ms: i64) -> String {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
@@ -1612,15 +1629,22 @@ pub(crate) fn approval_card(
         let decision = *decision;
         let store = store.clone();
         let (thread_id, request_id) = (req.thread_id.clone(), req.id.clone());
+        // The default keys, spelled for the device in hand (⌘↩ on a Mac,
+        // Ctrl+Enter elsewhere).
         let hint = match decision {
-            DecisionKind::AllowOnce => "  ⌘⏎",
-            DecisionKind::AllowSession => "  ⌘⇧⏎",
-            DecisionKind::Deny => "  ⌘⇧⌫",
-            DecisionKind::DenyAndStop => "",
+            DecisionKind::AllowOnce => crate::keymap::display("secondary-enter"),
+            DecisionKind::AllowSession => crate::keymap::display("secondary-shift-enter"),
+            DecisionKind::Deny => crate::keymap::display("secondary-shift-backspace"),
+            DecisionKind::DenyAndStop => String::new(),
+        };
+        let label = if hint.is_empty() {
+            decision.label().to_owned()
+        } else {
+            format!("{}  {hint}", decision.label())
         };
         let button = Button::new(SharedString::from(format!("{}-{decision:?}", req.id)))
             .cursor_pointer()
-            .label(format!("{}{hint}", decision.label()))
+            .label(label)
             .small();
         let button = match decision {
             DecisionKind::AllowOnce => button.primary(),
@@ -1802,7 +1826,7 @@ fn render_turn_footer(
 }
 
 /// Which copy button was clicked last, and when (for its ✓).
-static COPIED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+static COPIED: std::sync::Mutex<Option<(String, web_time::Instant)>> = std::sync::Mutex::new(None);
 const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 pub(crate) fn just_copied(id: &str) -> bool {
@@ -1842,7 +1866,7 @@ fn copy_button(
 /// Remember that copy button `id` was just used (it shows ✓ for a moment).
 pub(crate) fn mark_copied(id: String, window: &mut Window, cx: &mut App) {
     if let Ok(mut c) = COPIED.lock() {
-        *c = Some((id, std::time::Instant::now()));
+        *c = Some((id, web_time::Instant::now()));
     }
     window.refresh();
     // Back to the copy icon afterwards.

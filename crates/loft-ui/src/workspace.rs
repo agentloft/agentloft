@@ -54,8 +54,9 @@ actions!(
 const CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 272.;
 const HEADER_HEIGHT: f32 = 52.;
-/// Leaves room for the macOS traffic lights in the transparent title bar.
-const TRAFFIC_LIGHTS_INSET: f32 = 78.;
+/// Leaves room for the macOS traffic lights in the transparent title bar
+/// (a browser tab has none, so only the usual margin there).
+const TRAFFIC_LIGHTS_INSET: f32 = if crate::host::IS_WEB { 16. } else { 78. };
 
 pub fn bind_keys(cx: &mut gpui_kit::App) {
     // Every shortcut, with the user's own keys (Settings → Shortcuts).
@@ -116,6 +117,9 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 pub struct WorkspaceView {
     pub(crate) store: Entity<AppStore>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
+    /// Threads whose composer has something typed in it right now (a
+    /// draft is saved a moment later).
+    typed: std::collections::HashSet<ThreadId>,
     /// Images waiting in each thread's composer.
     attachments: HashMap<ThreadId, Vec<crate::attachments::PendingImage>>,
     /// Large pastes held as chips until sent, per thread.
@@ -268,6 +272,7 @@ impl WorkspaceView {
         Self {
             store,
             composers: HashMap::new(),
+            typed: Default::default(),
             attachments: HashMap::new(),
             pasted: HashMap::new(),
             page_notes: HashMap::new(),
@@ -384,7 +389,11 @@ impl WorkspaceView {
                 self.panel_open = true;
                 self.panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
-                if let Some(browser) = self.panel.update(cx, |p, cx| p.browser(window, cx)) {
+                if crate::host::IS_WEB {
+                    if let Some(page) = self.panel.update(cx, |p, cx| p.page(window, cx)) {
+                        page.update(cx, |v, cx| v.go(url, cx));
+                    }
+                } else if let Some(browser) = self.panel.update(cx, |p, cx| p.browser(window, cx)) {
                     browser.update(cx, |b, cx| b.navigate(url, cx));
                 }
             }
@@ -1175,6 +1184,17 @@ impl WorkspaceView {
                     InputEvent::Change => {
                         this.refresh_completion(&thread_id, state, cx);
                         this.queue_draft_save(&thread_id, state, cx);
+                        // The sidebar lists a new thread once something is
+                        // typed for it (and stops when that is deleted).
+                        let typed = !state.read(cx).value().trim().is_empty();
+                        let was = if typed {
+                            !this.typed.insert(thread_id.clone())
+                        } else {
+                            this.typed.remove(&thread_id)
+                        };
+                        if was != typed {
+                            cx.notify();
+                        }
                     }
                     InputEvent::Blur if this.completion.take().is_some() => cx.notify(),
                     _ => {}
@@ -2459,7 +2479,8 @@ impl WorkspaceView {
 
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         let path = self.store.read(cx).paths().config_file();
-        if !path.exists() {
+        // A starting config to edit by hand (the desktop app's own disk).
+        if !crate::host::IS_WEB && !path.exists() {
             let _ = std::fs::write(&path, SETTINGS_TEMPLATE);
         }
         crate::settings::open(self.store.clone(), None, cx);
@@ -2788,12 +2809,7 @@ impl WorkspaceView {
                 .iter()
                 .filter(|t| t.status != ThreadStatus::Archived)
                 .filter(|t| filter.as_ref().is_none_or(|f| &t.project_id == f))
-                .filter(|t| {
-                    t.is_started()
-                        || t.parent.is_some()
-                        || t.draft_text().is_some()
-                        || selected.as_ref() == Some(&t.id)
-                })
+                .filter(|t| self.lists_thread(t))
                 .filter(|t| {
                     let name = projects
                         .iter()
@@ -2848,14 +2864,7 @@ impl WorkspaceView {
             let threads: Vec<_> = all_threads
                 .iter()
                 .filter(|t| t.project_id == project.id && t.status != ThreadStatus::Archived)
-                // A new thread shows once it has a message or a draft (or
-                // while it's open).
-                .filter(|t| {
-                    t.is_started()
-                        || t.parent.is_some()
-                        || t.draft_text().is_some()
-                        || selected.as_ref() == Some(&t.id)
-                })
+                .filter(|t| self.lists_thread(t))
                 .filter(|t| self.search_matches(t, &project.name))
                 .collect();
             if (is_chats || !query.is_empty()) && threads.is_empty() {
@@ -3006,6 +3015,21 @@ impl WorkspaceView {
         };
         let dark = p.dark;
 
+        let search = Input::new(&self.search)
+            .prefix(
+                Icon::new(IconName::Search)
+                    .small()
+                    .text_color(p.muted_foreground),
+            )
+            .cleanable(true);
+        // A browser tab has no traffic lights: search takes their place in
+        // the top strip instead of a row of its own.
+        let (search_on_top, search_below) = if crate::host::IS_WEB {
+            (Some(search), None)
+        } else {
+            (None, Some(search))
+        };
+
         v_flex()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -3019,11 +3043,18 @@ impl WorkspaceView {
                     .id("sidebar-titlebar")
                     .on_click(titlebar_double_click)
                     .h(px(HEADER_HEIGHT))
-                    .pl(px(TRAFFIC_LIGHTS_INSET))
+                    .pl(px(if search_on_top.is_some() {
+                        12.
+                    } else {
+                        TRAFFIC_LIGHTS_INSET
+                    }))
                     .pr_2()
                     .items_center()
                     .justify_end()
                     .gap_1()
+                    .children(
+                        search_on_top.map(|search| div().flex_1().min_w_0().mr_1().child(search)),
+                    )
                     .child(icon_button(
                         "toggle-sidebar",
                         IconName::PanelLeft,
@@ -3043,18 +3074,7 @@ impl WorkspaceView {
                         }),
                     )),
             )
-            .child(
-                div().px_3().pb_3().child(
-                    Input::new(&self.search)
-                        .small()
-                        .prefix(
-                            Icon::new(IconName::Search)
-                                .xsmall()
-                                .text_color(p.muted_foreground),
-                        )
-                        .cleanable(true),
-                ),
-            )
+            .children(search_below.map(|search| div().px_3().pb_3().child(search)))
             .child(
                 h_flex()
                     .px_4()
@@ -3619,13 +3639,20 @@ impl WorkspaceView {
         let timeline = if empty {
             v_flex()
                 .flex_1()
+                // As wide as the column and no wider: what doesn't fit on
+                // a line wraps onto the next.
+                .w_full()
+                .min_w_0()
+                .px_6()
                 .items_center()
                 .justify_center()
                 .gap_2()
                 .text_color(p.muted_foreground)
                 .child(
                     div()
+                        .max_w_full()
                         .text_xl()
+                        .text_center()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.foreground)
                         .child(if is_chat {
@@ -3686,9 +3713,11 @@ impl WorkspaceView {
                     })
                 })
                 .child(
+                    // Said in full: on a second line if one isn't enough.
                     div()
+                        .w_full()
                         .max_w(px(520.))
-                        .truncate()
+                        .text_center()
                         .text_xs()
                         .text_color(p.faint_foreground)
                         .child(match &model.thread.workspace {
@@ -3816,6 +3845,7 @@ impl WorkspaceView {
                 div().px_6().pb_5().pt_1().flex().justify_center().child(
                     v_flex()
                         .w_full()
+                        .min_w_0()
                         .max_w(p.content_width)
                         .gap_1()
                         .children(queued_list)
@@ -3977,19 +4007,28 @@ impl WorkspaceView {
                                     h_flex()
                                         .items_center()
                                         .justify_between()
+                                        .gap_2()
                                         .child(
                                             h_flex()
                                                 .gap_1()
-                                                .child({
+                                                // In a narrow column the
+                                                // model's name gives way,
+                                                // never the send button.
+                                                .flex_1()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                // Picking files uses this
+                                                // computer's file dialog.
+                                                .when(!crate::host::IS_WEB, |d| {
                                                     let id = thread_id.clone();
-                                                    icon_button(
+                                                    d.child(icon_button(
                                                         "attach",
                                                         IconName::Paperclip,
                                                         p,
                                                         cx.listener(move |this, _, _, cx| {
                                                             this.pick_images(id.clone(), cx)
                                                         }),
-                                                    )
+                                                    ))
                                                 })
                                                 .child(self.model_picker_button(
                                                     &thread_id,
@@ -4004,6 +4043,7 @@ impl WorkspaceView {
                                         )
                                         .child(
                                             h_flex()
+                                                .flex_none()
                                                 .gap_2()
                                                 .items_center()
                                                 .when(running && !stop_hint.is_empty(), |d| {
@@ -4023,6 +4063,20 @@ impl WorkspaceView {
             // Last, so it floats over the conversation.
             .children(preview)
             .into_any_element()
+    }
+
+    /// Whether the sidebar lists `thread`. A new thread isn't one yet: it
+    /// shows once it has a message, or something typed for one (a saved
+    /// draft, text in its composer, or pictures waiting to go with it).
+    fn lists_thread(&self, thread: &loft_protocol::Thread) -> bool {
+        thread.is_started()
+            || thread.parent.is_some()
+            || thread.draft_text().is_some()
+            || self.typed.contains(&thread.id)
+            || self
+                .attachments
+                .get(&thread.id)
+                .is_some_and(|waiting| !waiting.is_empty())
     }
 
     /// "From ⎇ main ▾ · Local | origin" under the workspace picker.
@@ -4522,7 +4576,6 @@ impl Render for WorkspaceView {
         };
         let body = self.with_details_dock(body, window, cx);
         let show_panel = self.panel_open && header_title.is_some();
-        let maximized = show_panel && self.panel.read(cx).maximized;
         let show_dock = self.dock_open && header_title.is_some();
         if show_dock && self.panel.read(cx).dock_len(cx) == 0 {
             // A thread picked with the dock open gets a shell of its own.
@@ -4533,9 +4586,28 @@ impl Render for WorkspaceView {
         let mut body_slot = Some(body);
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
+        // What the conversation and the side panel have to share.
+        let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
+        // Not enough for both at a usable width: the panel takes the
+        // conversation's place, as when it is asked to fill the window,
+        // rather than squeeze the conversation to a sliver.
+        let cramped = room < CONVERSATION_MIN + PANEL_FLOOR;
+        if self.panel.read(cx).cramped != cramped {
+            self.panel.update(cx, |panel, _| panel.cramped = cramped);
+        }
+        let maximized = show_panel && (cramped || self.panel.read(cx).maximized);
+        // The conversation keeps its width: the panel is as wide as what
+        // is left allows, whether it is being dragged or was left wide in
+        // a window that has since shrunk. In a tight window that is less
+        // than the panel would otherwise go down to.
+        let panel_max = (room - CONVERSATION_MIN).max(PANEL_FLOOR);
+        let panel_min = panel_max.min(PANEL_MIN);
         if show_panel && self.panel_width.get() <= 0. {
-            let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
             self.panel_width.set(default_panel_width(room));
+        }
+        if show_panel && !maximized {
+            self.panel_width
+                .set(self.panel_width.get().clamp(panel_min, panel_max));
         }
         let header = self.render_header(header_title, &p, cx);
         let sidebar = (side > 0.).then(|| {
@@ -4670,11 +4742,21 @@ impl Render for WorkspaceView {
                             d.child(
                                 div().flex_1().min_h_0().w_full().child(
                                     h_resizable("workbench")
-                                        .child(resizable_panel().children(body_slot.take()))
+                                        .child(
+                                            resizable_panel()
+                                                // Beside the panel, the
+                                                // conversation keeps a width
+                                                // it can be read and written
+                                                // at; alone, it has the lot.
+                                                .when(show_panel, |d| {
+                                                    d.size_range(px(CONVERSATION_MIN)..px(100_000.))
+                                                })
+                                                .children(body_slot.take()),
+                                        )
                                         .child(
                                             resizable_panel()
                                                 .size(px(self.panel_width.get()))
-                                                .size_range(px(PANEL_MIN)..px(1600.))
+                                                .size_range(px(panel_min)..px(panel_max))
                                                 .visible(show_panel)
                                                 .child(
                                                     div()
@@ -4702,6 +4784,10 @@ impl Render for WorkspaceView {
                         }),
                 ),
             )
+            // Where there is one window only (a browser tab): settings and
+            // menus that otherwise get a window of their own.
+            .children(crate::settings::overlay(cx))
+            .children(loft_browser::menu::overlay(window, cx))
     }
 }
 
@@ -5651,7 +5737,7 @@ const SLIDE: std::time::Duration = std::time::Duration::from_millis(180);
 struct Slide {
     open: bool,
     seen: bool,
-    started: Option<std::time::Instant>,
+    started: Option<web_time::Instant>,
 }
 
 impl Slide {
@@ -5666,7 +5752,7 @@ impl Slide {
             let now = self.linear();
             let from = if open { now } else { 1. - now };
             self.open = open;
-            self.started = Some(std::time::Instant::now() - SLIDE.mul_f32(from));
+            self.started = Some(web_time::Instant::now() - SLIDE.mul_f32(from));
         }
         let t = self.linear_progress();
         if t < 1. {
@@ -5756,8 +5842,18 @@ impl Render for DraggedQueued {
 const DOCK_HEIGHT: f32 = 280.;
 const DOCK_MIN_HEIGHT: f32 = 120.;
 
-/// The side panel's narrowest width.
+/// The side panel's narrowest width while there is room to spare.
 const PANEL_MIN: f32 = 340.;
+
+/// The narrowest the side panel gets when the window is tight: it gives
+/// way before the conversation does.
+const PANEL_FLOOR: f32 = 240.;
+
+/// The conversation's narrowest width beside the side panel: room for the
+/// new-thread choices on one line and the composer's row of controls. A
+/// window with less than this and [`PANEL_FLOOR`] to share shows the panel
+/// alone.
+const CONVERSATION_MIN: f32 = 360.;
 
 /// The side panel's first width: a share of the room beside the sidebar, so
 /// the conversation keeps most of it. Dragging it wider is remembered.
@@ -5911,14 +6007,18 @@ pub(crate) fn tilde_path(path: &std::path::Path) -> String {
     tilde(&path.to_string_lossy())
 }
 
-/// `/Users/me/x` → `~/x`.
+/// `/Users/me/x` → `~/x`. The home is that of the machine the path is on
+/// (the daemon's, in a browser).
 fn tilde(path: &str) -> String {
-    match std::env::home_dir() {
-        Some(home) => match std::path::Path::new(path).strip_prefix(&home) {
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => path.to_owned(),
-        },
-        None => path.to_owned(),
+    let home = crate::host::user_home();
+    // No real home known: nothing to shorten.
+    if home.parent().is_none() {
+        return path.to_owned();
+    }
+    match std::path::Path::new(path).strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_owned(),
     }
 }
 
@@ -6351,7 +6451,12 @@ fn workspace_picker(
     p: &Palette,
 ) -> AnyElement {
     let wants = current.is_new_worktree();
-    let mut row = h_flex().gap_1().text_xs();
+    let mut row = h_flex()
+        .gap_1()
+        .text_xs()
+        .max_w_full()
+        .flex_wrap()
+        .justify_center();
     for (worktree, label, icon) in [
         (false, "Local", IconName::Laptop),
         (true, "New worktree", IconName::GitBranch),
@@ -6405,7 +6510,11 @@ fn harness_picker(
         .p(px(3.))
         .gap(px(3.))
         .rounded(px(10.))
-        .bg(p.muted);
+        .bg(p.muted)
+        // More agents than fit on a line go onto a second one.
+        .max_w_full()
+        .flex_wrap()
+        .justify_center();
     for (id, label) in choices {
         let active = current.as_str() == id;
         let store = store.clone();

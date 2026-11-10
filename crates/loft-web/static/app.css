@@ -1,0 +1,89 @@
+/* The page around the app: loading note and pairing screen. The app itself
+   draws on a canvas. No inline styles anywhere (strict CSP). */
+:root {
+  --bg: #fbfbfa;
+  --fg: #1c1c1a;
+  --muted: #6b6b66;
+  --border: #dcdcd7;
+  --field: #ffffff;
+  --accent: #1c1c1a;
+  --on-accent: #ffffff;
+  --danger: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --fg: #ededeb;
+    --muted: #9a9a94;
+    --border: #33332f;
+    --field: #1f1f1d;
+    --accent: #ededeb;
+    --on-accent: #161615;
+    --danger: #ff7b6b;
+  }
+}
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+[hidden] { display: none !important; }
+#boot {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+  background: var(--bg);
+  z-index: 2;
+}
+#pair {
+  position: fixed;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+  background: var(--bg);
+}
+#pair img { border-radius: 13px; }
+#pair h1 { margin: 6px 0 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+#pair p { margin: 0; max-width: 380px; color: var(--muted); }
+#pair b { color: var(--fg); font-weight: 600; }
+#pair .row { display: flex; gap: 8px; width: 100%; max-width: 380px; margin-top: 10px; }
+#pair input {
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+}
+#pair input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+#pair button {
+  height: 38px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+#pair button:disabled { opacity: 0.5; cursor: default; }
+#pair-error { min-height: 1.5em; color: var(--danger) !important; }

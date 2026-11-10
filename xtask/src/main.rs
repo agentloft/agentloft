@@ -4,6 +4,8 @@
 //!   (the app starts its own isolated `agentloftd`).
 //! - `stop-dev`: ask the dev daemon to shut down.
 //! - `live-claude`: run the live Claude end-to-end test (uses real tokens).
+//! - `web [--release]`: build the browser client into `target/web`
+//!   (wasm + JS glue + static shell); `agentloftd` serves that folder.
 //! - `ci`: fmt check, clippy, tests, cargo-deny — what CI runs.
 //! - `bundle [--debug] [--open]`: build `target/bundle/Agentloft.app`
 //!   (macOS; both binaries, `AppIcon.icns`, Info.plist, ad-hoc signature).
@@ -18,6 +20,7 @@ fn main() -> Result<()> {
         "dev" => dev(),
         "bundle" => bundle(),
         "stop-dev" => stop_dev(),
+        "web" => web(),
         "live-claude" => run(cargo().args([
             "test",
             "-p",
@@ -42,7 +45,7 @@ fn main() -> Result<()> {
             run(cargo().args(["deny", "check"]))
         }
         _ => {
-            eprintln!("usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle>");
+            eprintln!("usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|web>");
             Ok(())
         }
     }
@@ -65,6 +68,84 @@ fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd.status().with_context(|| format!("run {cmd:?}"))?;
     if !status.success() {
         bail!("{cmd:?} failed with {status}");
+    }
+    Ok(())
+}
+
+/// Build the browser client into `target/web`: the wasm module, its JS glue
+/// and the static shell (`crates/loft-web/static`). `--release` optimizes.
+fn web() -> Result<()> {
+    let release = std::env::args().skip(2).any(|a| a == "--release");
+    let mut build = cargo();
+    build
+        .args(["build", "-p", "loft-web", "--target", WASM_TARGET])
+        // gpui-pre-web always compiles `wasm_thread`, which uses one unstable
+        // feature gate. Allow it for that crate only (ADR-0016).
+        .env("RUSTC_BOOTSTRAP", "wasm_thread");
+    let profile = if release {
+        build.args(["--profile", "web-release"]);
+        "web-release"
+    } else {
+        "debug"
+    };
+    run(&mut build)?;
+
+    let out = root().join("target/web");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out)?;
+    let wasm = root()
+        .join("target")
+        .join(WASM_TARGET)
+        .join(profile)
+        .join("loft_web.wasm");
+    wasm_bindgen_cli_support::Bindgen::new()
+        .input_path(&wasm)
+        .web(true)?
+        .typescript(false)
+        .remove_name_section(release)
+        .remove_producers_section(release)
+        .generate(&out)
+        .context("wasm-bindgen")?;
+    copy_dir(&root().join("crates/loft-web/static"), &out)?;
+    std::fs::copy(
+        root().join("assets/icon/png/agentloft-128.png"),
+        out.join("icon.png"),
+    )
+    .context("copy the icon")?;
+    // The daemon serves `<file>.gz` to browsers that accept gzip: the wasm
+    // module shrinks to about a third.
+    for name in ["loft_web_bg.wasm", "loft_web.js"] {
+        gzip(&out.join(name))?;
+    }
+    println!("{}", out.display());
+    Ok(())
+}
+
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+/// Write `<file>.gz` next to `file`.
+fn gzip(file: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let mut name = file.as_os_str().to_owned();
+    name.push(".gz");
+    let out = std::fs::File::create(&name)?;
+    let mut encoder = flate2::write::GzEncoder::new(out, flate2::Compression::new(6));
+    encoder.write_all(&bytes)?;
+    encoder.finish()?;
+    Ok(())
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
     }
     Ok(())
 }
@@ -119,6 +200,14 @@ fn bundle() -> Result<()> {
         info_plist(env!("CARGO_PKG_VERSION")),
     )?;
     std::fs::write(contents.join("PkgInfo"), "APPL????")?;
+    // The web client (`cargo xtask web --release`), if it has been built:
+    // agentloftd looks for it in Resources/web.
+    let web = target.join("web");
+    if web.join("index.html").is_file() {
+        copy_dir(&web, &contents.join("Resources/web")).context("copy the web client")?;
+    } else {
+        eprintln!("note: no web client in the bundle (build it with `cargo xtask web --release`)");
+    }
 
     // Ad-hoc signature so Gatekeeper treats the local build consistently.
     let signed = Command::new("codesign")

@@ -1,6 +1,8 @@
 //! Paths under `~/.agentloft`, the user's `config.toml`, and the login-shell
 //! environment used to spawn agent CLIs (PLAN §1.7, §4.1, §4.5).
 
+pub mod icons;
+
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -83,6 +85,27 @@ impl Paths {
         self.home.join("projects")
     }
 
+    /// Images uploaded with messages.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.home.join("attachments")
+    }
+
+    /// Project icons the user chose.
+    pub fn icons_dir(&self) -> PathBuf {
+        self.home.join("icons")
+    }
+
+    /// Colour themes the user (or an agent) added.
+    pub fn themes_dir(&self) -> PathBuf {
+        self.home.join("themes")
+    }
+
+    /// Web access secrets: the pairing token and signed-in sessions
+    /// (private, 0700; see ADR-0016).
+    pub fn web_dir(&self) -> PathBuf {
+        self.home.join("web")
+    }
+
     /// Create the directory layout. `run/` is private (0700).
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
@@ -141,6 +164,268 @@ pub struct Config {
     pub harness: HarnessConfigs,
     pub worktrees: WorktreeConfig,
     pub projects: ProjectsConfig,
+    pub web: WebConfig,
+    pub browser: BrowserConfig,
+}
+
+/// `[browser]` in config.toml: the browser panel.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BrowserConfig {
+    /// What the address bar searches with when words are typed instead of
+    /// an address: an engine by name ([`SEARCH_ENGINES`]: `duckduckgo`,
+    /// `google`, …) or an address with `%s` where the words go. Unset:
+    /// DuckDuckGo.
+    pub search: Option<String>,
+    /// What a new browser tab opens. Unset: a blank tab.
+    pub home: Option<String>,
+    /// The Chromium-family browser the daemon runs for the web client's
+    /// browser tab (ADR-0017; `~` allowed). Unset: the first of Chrome,
+    /// Chromium, Edge or Brave that is installed.
+    pub executable: Option<String>,
+}
+
+/// A search engine the address bar can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchEngine {
+    /// Its name in `browser.search`.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Its search address; `{}` stands for the words.
+    pub template: &'static str,
+}
+
+/// The engines offered by name. The first is the default.
+pub const SEARCH_ENGINES: &[SearchEngine] = &[
+    SearchEngine {
+        id: "duckduckgo",
+        name: "DuckDuckGo",
+        template: "https://duckduckgo.com/?q={}",
+    },
+    SearchEngine {
+        id: "google",
+        name: "Google",
+        template: "https://www.google.com/search?q={}",
+    },
+    SearchEngine {
+        id: "bing",
+        name: "Bing",
+        template: "https://www.bing.com/search?q={}",
+    },
+    SearchEngine {
+        id: "brave",
+        name: "Brave Search",
+        template: "https://search.brave.com/search?q={}",
+    },
+    SearchEngine {
+        id: "kagi",
+        name: "Kagi",
+        template: "https://kagi.com/search?q={}",
+    },
+    SearchEngine {
+        id: "ecosia",
+        name: "Ecosia",
+        template: "https://www.ecosia.org/search?q={}",
+    },
+    SearchEngine {
+        id: "startpage",
+        name: "Startpage",
+        template: "https://www.startpage.com/sp/search?query={}",
+    },
+];
+
+/// A search address of the user's own, as a template with `{}` for the
+/// words: an `http(s)` address with `%s` (or `{}`) in it. `None` if it
+/// isn't one.
+pub fn custom_search_template(text: &str) -> Option<String> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    let web = lower.starts_with("https://") || lower.starts_with("http://");
+    let template = if text.contains("%s") {
+        text.replacen("%s", "{}", 1)
+    } else {
+        text.to_owned()
+    };
+    (web && !text.contains(char::is_whitespace) && template.contains("{}")).then_some(template)
+}
+
+impl BrowserConfig {
+    /// The engine `search` names; unset names the default. `None` when it
+    /// holds an address of the user's own (or nothing usable).
+    pub fn search_engine(&self) -> Option<&'static SearchEngine> {
+        match self.search.as_deref().map(str::trim) {
+            None | Some("") => SEARCH_ENGINES.first(),
+            Some(name) => SEARCH_ENGINES
+                .iter()
+                .find(|engine| engine.id.eq_ignore_ascii_case(name)),
+        }
+    }
+
+    /// The address to search with; `{}` stands for the words. Something
+    /// unusable in `search` falls back to the default engine.
+    pub fn search_template(&self) -> String {
+        if let Some(engine) = self.search_engine() {
+            return engine.template.to_owned();
+        }
+        self.search
+            .as_deref()
+            .and_then(custom_search_template)
+            .unwrap_or_else(|| SEARCH_ENGINES[0].template.to_owned())
+    }
+
+    /// The address a new tab opens, if one is set.
+    pub fn home(&self) -> Option<&str> {
+        self.home
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+    }
+}
+
+/// `[web]` in config.toml: Agentloft in a browser, served by the daemon
+/// (ADR-0016). Off by default, and local-only unless told otherwise.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WebConfig {
+    pub enabled: bool,
+    /// The address to listen on: an IP (`127.0.0.1`, `::1`, a LAN or
+    /// tailnet address, `0.0.0.0`) or `localhost`.
+    pub bind: String,
+    /// `0` picks a free port.
+    pub port: u16,
+    /// PEM certificate chain and private key; both or neither (`~` allowed).
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// Serve plain HTTP on a non-loopback address. Anyone on that network
+    /// can read the traffic; meant only for a link that is already
+    /// encrypted (a VPN or tailnet interface).
+    pub allow_insecure_remote: bool,
+    /// Extra names browsers may reach the listener by (the `Host` header),
+    /// e.g. a reverse proxy's or tunnel's hostname.
+    pub allowed_hosts: Vec<String>,
+    /// How long a paired browser stays signed in.
+    pub session_days: u32,
+    /// Let browser sessions open terminals (a shell on this machine).
+    /// Unset: yes while only this machine can reach the listener (a
+    /// loopback address and no extra host names), no once others can.
+    pub allow_terminal: Option<bool>,
+    /// Let browser sessions use the daemon's browser: pages loaded on this
+    /// machine, with its network and the logins kept in that browser.
+    /// Unset: as for terminals.
+    pub allow_browser: Option<bool>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".into(),
+            port: WebConfig::DEFAULT_PORT,
+            tls_cert: None,
+            tls_key: None,
+            allow_insecure_remote: false,
+            allowed_hosts: Vec::new(),
+            session_days: 30,
+            allow_terminal: None,
+            allow_browser: None,
+        }
+    }
+}
+
+/// A `[web]` section that passed the safety rules: where to listen and how.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebPlan {
+    pub addr: std::net::SocketAddr,
+    /// Certificate chain and key files when serving HTTPS.
+    pub tls: Option<(PathBuf, PathBuf)>,
+    /// Plain HTTP on a non-loopback address, explicitly allowed.
+    pub insecure_remote: bool,
+    pub allowed_hosts: Vec<String>,
+    pub session_ttl: Duration,
+    pub allow_terminal: bool,
+    pub allow_browser: bool,
+}
+
+impl WebPlan {
+    /// Only this machine can reach the listener: a loopback address, and no
+    /// proxy or tunnel names in front of it.
+    pub fn local_only(&self) -> bool {
+        self.addr.ip().is_loopback() && self.allowed_hosts.is_empty()
+    }
+}
+
+impl WebConfig {
+    pub const DEFAULT_PORT: u16 = 4780;
+
+    /// Check the section against the safety rules. A non-loopback address
+    /// is refused unless TLS is configured or `allow_insecure_remote` is set.
+    pub fn plan(&self) -> Result<WebPlan, String> {
+        let bind = self.bind.trim();
+        let ip: std::net::IpAddr = if bind.eq_ignore_ascii_case("localhost") {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            bind.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse()
+                .map_err(|_| format!("`{bind}` isn't an IP address"))?
+        };
+        let file = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(expand_tilde)
+        };
+        let tls = match (file(&self.tls_cert), file(&self.tls_key)) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            _ => return Err("TLS needs both a certificate and a key".into()),
+        };
+        let insecure_remote = !ip.is_loopback() && tls.is_none();
+        if insecure_remote && !self.allow_insecure_remote {
+            return Err(format!(
+                "{ip} is reachable from other machines: add a TLS certificate, \
+                 or set allow_insecure_remote"
+            ));
+        }
+        let mut allowed_hosts = Vec::new();
+        for host in &self.allowed_hosts {
+            let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+            let valid = !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+            if !valid {
+                return Err(format!("`{host}` isn't a host name"));
+            }
+            allowed_hosts.push(host);
+        }
+        let mut plan = WebPlan {
+            addr: std::net::SocketAddr::new(ip, self.port),
+            tls,
+            insecure_remote,
+            allowed_hosts,
+            session_ttl: Duration::from_secs(u64::from(self.session_days.clamp(1, 365)) * 86_400),
+            allow_terminal: false,
+            allow_browser: false,
+        };
+        // A shell, or a browser on this machine, is as much as this
+        // machine's own user can already do, so both come with a local-only
+        // listener. Reachable from elsewhere, they have to be asked for.
+        plan.allow_terminal = self.allow_terminal.unwrap_or(plan.local_only());
+        plan.allow_browser = self.allow_browser.unwrap_or(plan.local_only());
+        Ok(plan)
+    }
+}
+
+/// `~` and `~/…` resolved against the user's home folder.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some("") => std::env::home_dir().unwrap_or_else(|| PathBuf::from(path)),
+        Some(rest) if rest.starts_with('/') => std::env::home_dir()
+            .map(|home| home.join(rest.trim_start_matches('/')))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        _ => PathBuf::from(path),
+    }
 }
 
 /// `[projects]` in config.toml.
@@ -338,6 +623,8 @@ impl ProjectConfig {
 pub enum SettingValue {
     Str(String),
     Float(f64),
+    /// A whole number (a port).
+    Int(i64),
     Bool(bool),
     List(Vec<String>),
     /// A table of strings (e.g. environment variables).
@@ -349,16 +636,29 @@ pub enum SettingValue {
 /// Set one key in `config.toml` (e.g. `["ui", "theme"]`), keeping the rest
 /// of the file — comments and formatting included — as the user wrote it.
 pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result<()> {
-    use toml_edit::{DocumentMut, Item, Table, value as v};
     let file = paths.config_file();
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
     };
-    let mut doc: DocumentMut = text
-        .parse()
-        .with_context(|| format!("parse {}", file.display()))?;
+    let edited =
+        edit_setting(&text, key, value).with_context(|| format!("edit {}", file.display()))?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Write-then-rename so a crash never leaves a truncated config.
+    let tmp = file.with_extension("toml.tmp");
+    std::fs::write(&tmp, edited)?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(())
+}
+
+/// [`write_setting`] on the text of a config file: the text with one key
+/// set, the rest as it was.
+pub fn edit_setting(text: &str, key: &[&str], value: SettingValue) -> Result<String> {
+    use toml_edit::{DocumentMut, Item, Table, value as v};
+    let mut doc: DocumentMut = text.parse().context("parse the config")?;
     let (last, tables) = key.split_last().context("empty key")?;
     let mut table = doc.as_table_mut();
     for name in tables {
@@ -374,6 +674,9 @@ pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result
         SettingValue::Float(f) => {
             // Whole numbers stay floats (`14.0`) so serde reads them as f32.
             table.insert(last, v(f));
+        }
+        SettingValue::Int(n) => {
+            table.insert(last, v(n));
         }
         SettingValue::Bool(b) => {
             table.insert(last, v(b));
@@ -396,14 +699,7 @@ pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result
             table.remove(last);
         }
     }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Write-then-rename so a crash never leaves a truncated config.
-    let tmp = file.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, &file)?;
-    Ok(())
+    Ok(doc.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +852,192 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn web_is_off_and_local_by_default() {
+        let web = WebConfig::default();
+        assert!(!web.enabled);
+        let plan = web.plan().unwrap();
+        assert!(plan.addr.ip().is_loopback());
+        assert_eq!(plan.addr.port(), WebConfig::DEFAULT_PORT);
+        assert!(plan.tls.is_none() && !plan.insecure_remote);
+    }
+
+    #[test]
+    fn web_refuses_a_remote_bind_without_tls() {
+        let remote = |bind: &str| WebConfig {
+            bind: bind.into(),
+            ..WebConfig::default()
+        };
+        for bind in ["0.0.0.0", "192.168.1.20", "100.64.0.7", "::", "fd7a::1"] {
+            let err = remote(bind).plan().unwrap_err();
+            assert!(err.contains("TLS"), "{bind}: {err}");
+        }
+        for bind in ["127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.2"] {
+            assert!(remote(bind).plan().is_ok(), "{bind}");
+        }
+        assert!(
+            remote("example.com").plan().is_err(),
+            "names other than localhost"
+        );
+
+        // TLS, or the explicit override, allows it.
+        let tls = WebConfig {
+            tls_cert: Some("/etc/tls/cert.pem".into()),
+            tls_key: Some("/etc/tls/key.pem".into()),
+            ..remote("0.0.0.0")
+        };
+        let plan = tls.plan().unwrap();
+        assert!(plan.tls.is_some() && !plan.insecure_remote);
+        let insecure = WebConfig {
+            allow_insecure_remote: true,
+            ..remote("0.0.0.0")
+        };
+        assert!(insecure.plan().unwrap().insecure_remote);
+        // The override doesn't mark a loopback listener as insecure.
+        let local = WebConfig {
+            allow_insecure_remote: true,
+            ..WebConfig::default()
+        };
+        assert!(!local.plan().unwrap().insecure_remote);
+    }
+
+    #[test]
+    fn web_tls_needs_both_files_and_clean_host_names() {
+        let half = WebConfig {
+            tls_cert: Some("cert.pem".into()),
+            ..WebConfig::default()
+        };
+        assert!(half.plan().is_err());
+        let hosts = WebConfig {
+            allowed_hosts: vec![" Desk.Tailnet.ts.net. ".into()],
+            ..WebConfig::default()
+        };
+        assert_eq!(hosts.plan().unwrap().allowed_hosts, ["desk.tailnet.ts.net"]);
+        let bad = WebConfig {
+            allowed_hosts: vec!["evil.example/path".into()],
+            ..WebConfig::default()
+        };
+        assert!(bad.plan().is_err());
+    }
+
+    #[test]
+    fn web_terminals_follow_who_can_reach_the_listener() {
+        // Only this machine: a shell is nothing its user doesn't have.
+        let local = WebConfig::default();
+        assert!(local.plan().unwrap().local_only());
+        assert!(local.plan().unwrap().allow_terminal);
+        // Reachable from elsewhere (another address, or a proxy or tunnel
+        // in front of a loopback one): not unless asked for.
+        let lan = WebConfig {
+            bind: "0.0.0.0".into(),
+            allow_insecure_remote: true,
+            ..WebConfig::default()
+        };
+        let tunnel = WebConfig {
+            allowed_hosts: vec!["desk.example".into()],
+            ..WebConfig::default()
+        };
+        for remote in [&lan, &tunnel] {
+            let plan = remote.plan().unwrap();
+            assert!(!plan.local_only());
+            assert!(!plan.allow_terminal);
+        }
+        // Said outright, either way, it is as said.
+        let asked = WebConfig {
+            allow_terminal: Some(true),
+            ..lan
+        };
+        assert!(asked.plan().unwrap().allow_terminal);
+        let refused = WebConfig {
+            allow_terminal: Some(false),
+            ..WebConfig::default()
+        };
+        assert!(!refused.plan().unwrap().allow_terminal);
+        let cfg: Config = toml::from_str("[web]\nallow_terminal = false\n").unwrap();
+        assert_eq!(cfg.web.allow_terminal, Some(false));
+
+        // The daemon's browser follows the same rule, on its own switch.
+        assert!(local.plan().unwrap().allow_browser);
+        assert!(!tunnel.plan().unwrap().allow_browser);
+        let no_browser = WebConfig {
+            allow_browser: Some(false),
+            ..WebConfig::default()
+        };
+        let plan = no_browser.plan().unwrap();
+        assert!(plan.allow_terminal && !plan.allow_browser);
+    }
+
+    #[test]
+    fn browser_search_engines_and_addresses() {
+        let with = |search: &str| BrowserConfig {
+            search: Some(search.into()),
+            ..BrowserConfig::default()
+        };
+        // Nothing set: the first engine.
+        let unset = BrowserConfig::default();
+        assert_eq!(unset.search_engine().unwrap().id, "duckduckgo");
+        assert_eq!(unset.search_template(), "https://duckduckgo.com/?q={}");
+        // By name, however it is cased.
+        assert_eq!(
+            with("Google").search_template(),
+            "https://www.google.com/search?q={}"
+        );
+        // An address of one's own, with %s (or {}) for the words.
+        let own = with("https://search.example/?q=%s&lang=en");
+        assert!(own.search_engine().is_none());
+        assert_eq!(
+            own.search_template(),
+            "https://search.example/?q={}&lang=en"
+        );
+        assert_eq!(
+            with("http://localhost:8080/find/{}").search_template(),
+            "http://localhost:8080/find/{}"
+        );
+        // Not an engine and not a usable address: the default, not a dead
+        // address bar.
+        for bad in [
+            "altavista",
+            "https://search.example/",
+            "search.example/?q=%s",
+            "javascript:alert(%s)",
+            "https://search.example/?q=%s and more",
+        ] {
+            assert!(custom_search_template(bad).is_none(), "{bad}");
+            assert_eq!(
+                with(bad).search_template(),
+                unset.search_template(),
+                "{bad}"
+            );
+        }
+        // Every listed engine is a web address with a place for the words.
+        for engine in SEARCH_ENGINES {
+            assert_eq!(
+                custom_search_template(engine.template).as_deref(),
+                Some(engine.template),
+                "{}",
+                engine.id
+            );
+        }
+
+        let cfg: Config =
+            toml::from_str("[browser]\nsearch = \"kagi\"\nhome = \" https://example.com \"\n")
+                .unwrap();
+        assert_eq!(cfg.browser.search_engine().unwrap().name, "Kagi");
+        assert_eq!(cfg.browser.home(), Some("https://example.com"));
+        assert_eq!(BrowserConfig::default().home(), None);
+    }
+
+    #[test]
+    fn web_section_parses() {
+        let cfg: Config =
+            toml::from_str("[web]\nenabled = true\nport = 0\nallowed_hosts = [\"desk.example\"]\n")
+                .unwrap();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.port, 0);
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+        assert_eq!(cfg.web.session_days, 30);
+    }
 
     #[test]
     fn project_config_defaults_and_overrides() {

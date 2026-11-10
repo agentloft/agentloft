@@ -7,3 +7,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# Generates the JS glue for the web client (`cargo xtask web`). Must be the
+# exact `wasm-bindgen` version in Cargo.lock (crates/loft-web pins it too).
+wasm-bindgen-cli-support = "=0.2.130"
+# Pre-compressed copies of the web bundle (the daemon serves them as is).
+flate2 = "1"

@@ -26,6 +26,9 @@ pub struct TerminalPane {
     exited: Option<i32>,
     title: Option<String>,
     error: Option<String>,
+    /// Last shown without the right to a terminal (a browser session with
+    /// terminals off); opens its shell once that changes.
+    blocked: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -50,6 +53,7 @@ impl TerminalPane {
             exited: None,
             title: None,
             error: None,
+            blocked: false,
             _subs: vec![sub],
         }
     }
@@ -238,7 +242,16 @@ impl TerminalPane {
         self.opening = true;
         self.view.update(cx, |v, cx| v.reset(cx));
         cx.spawn(async move |this, cx| {
-            let _ = this.update(cx, |this, cx| this.open(cx));
+            let _ = this.update(cx, |this, cx| {
+                if this.store.read(cx).terminals_allowed() {
+                    this.open(cx);
+                } else {
+                    // Not ours to open right now; `render` opens it once
+                    // terminals are allowed again.
+                    this.opening = false;
+                    this.blocked = true;
+                }
+            });
         })
         .detach();
     }
@@ -247,6 +260,28 @@ impl TerminalPane {
 impl Render for TerminalPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        // A browser session the daemon doesn't give a shell to.
+        if !self.store.read(cx).terminals_allowed() {
+            self.blocked = true;
+            return crate::host_ui::unavailable(
+                IconName::SquareTerminal,
+                "Terminals are off for browsers",
+                "Turn them on in the desktop app: Settings ▸ Web access.",
+                &p,
+            );
+        }
+        if std::mem::take(&mut self.blocked) && self.id.is_none() && !self.opening {
+            // Allowed again, and the shell it had is gone: open one.
+            self.error = None;
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    if this.id.is_none() && !this.opening {
+                        this.open(cx);
+                    }
+                });
+            })
+            .detach();
+        }
         let (mono, size) = (p.mono.clone(), p.mono_size);
         self.view.update(cx, |v, cx| v.set_font(mono, size, cx));
         let label = self.title.clone().unwrap_or_else(|| "Terminal".into());
@@ -301,5 +336,6 @@ impl Render for TerminalPane {
                 )
             })
             .child(div().flex_1().min_h_0().child(self.view.clone()))
+            .into_any_element()
     }
 }

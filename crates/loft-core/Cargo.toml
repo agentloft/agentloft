@@ -18,9 +18,12 @@ serde.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+command-fds = { version = "0.3.3", features = ["tokio"] }
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

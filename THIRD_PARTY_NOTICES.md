@@ -52,6 +52,21 @@ GitHub Primer (Studio), Catppuccin (Lavender), Nord (Glacier), Rosé Pine
 (Dusk), Gruvbox (Harvest), Everforest (Evergreen), Tokyo Night (Neon),
 Atom One (Slate) and Dracula (Nightshade). Thanks to their authors.
 
+## Fonts in the web client
+
+The browser has no access to system fonts, so the web client
+(`crates/loft-web/fonts/`) ships its own, each under the SIL Open Font
+License 1.1 (license texts are alongside the files):
+
+- Inter 4.1, https://github.com/rsms/inter (`Inter-LICENSE.txt`): the
+  interface font.
+- JetBrains Mono 2.304, https://github.com/JetBrains/JetBrainsMono
+  (`JetBrainsMono-OFL.txt`): code, diffs and tool output.
+- IBM Plex Sans, https://github.com/IBM/plex (`IBMPlexSans-LICENSE.txt`):
+  the family GPUI's web platform falls back to when a font is missing.
+
+The font files are unmodified.
+
 ## Simple Icons
 
 - Project: Simple Icons, https://simpleicons.org (`simple-icons` 15.0.0)
@@ -87,7 +102,12 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 - Used in: `crates/loft-terminal`, through the `ghostty-vt` / `ghostty-vt-sys`
   crates (Apache-2.0), which build libghostty-vt from Ghostty's source
   tarball (commit `83fb95624b0439ee660c2679b43b38c8b63769cd`, 1.4.0) and link
-  it statically. No Ghostty source is copied into this repository.
+  it statically, into the desktop app and into the web client's wasm. No
+  Ghostty source is copied into this repository.
+- `vendor/ghostty-vt-sys` is a copy of `ghostty-vt-sys` 0.8.0 (Apache-2.0,
+  from https://github.com/prabirshrestha/gpui-cn) with a wasm32 build added;
+  its README lists the changes. Its bindings files are generated from
+  Ghostty's C headers.
 
 ```
 Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors

@@ -154,7 +154,7 @@ pub fn toggle_mode(cx: &mut App) {
         return;
     };
     let paths = state.paths.clone();
-    match loft_config::write_setting(
+    match crate::host::write_setting(
         &paths,
         &["ui", "theme"],
         loft_config::SettingValue::Str(next.into()),
@@ -233,11 +233,17 @@ pub fn apply(cx: &mut App) {
         } else {
             gpui_kit::hsla(220. / 360., 0.2, 0.08, 0.38)
         };
-        if let Some(family) = &config.font_family {
-            theme.font_family = family.clone().into();
+        // The browser has no system fonts: the ones the web client ships.
+        let (ui_font, mono_font) = if crate::host::IS_WEB {
+            (Some("Inter"), Some("JetBrains Mono"))
+        } else {
+            (None, None)
+        };
+        if let Some(family) = config.font_family.as_deref().or(ui_font) {
+            theme.font_family = family.to_owned().into();
         }
-        if let Some(family) = &config.mono_font_family {
-            theme.mono_font_family = family.clone().into();
+        if let Some(family) = config.mono_font_family.as_deref().or(mono_font) {
+            theme.mono_font_family = family.to_owned().into();
         }
         theme.font_size = px(config.font_size.clamp(10.0, 24.0));
         theme.mono_font_size = px(config.mono_font_size.clamp(9.0, 22.0));
@@ -248,10 +254,8 @@ pub fn apply(cx: &mut App) {
 }
 
 fn load(paths: &Paths) -> (UiConfig, Option<SystemTime>) {
-    let mtime = std::fs::metadata(paths.config_file())
-        .and_then(|m| m.modified())
-        .ok();
-    let config = match loft_config::Config::load(paths) {
+    let mtime = crate::host::modified(&paths.config_file());
+    let config = match crate::host::load_config(paths) {
         Ok(c) => c.ui,
         Err(err) => {
             tracing::warn!(%err, "invalid config.toml; keeping defaults");
@@ -271,8 +275,8 @@ pub fn parse_hex(s: &str) -> Option<Hsla> {
 
 /// "now", "5m", "3h", "2d", "4w".
 pub fn relative_time(ms: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(ms);
     let secs = ((now - ms) / 1000).max(0);

@@ -122,22 +122,32 @@ impl SettingsView {
                     .py_3()
                     .text_sm()
                     .text_color(p.muted_foreground)
-                    .child("No projects yet. Add one with ⌘O."),
+                    .child(if crate::host::IS_WEB {
+                        "No projects yet. Add one in the desktop app.".to_owned()
+                    } else {
+                        format!(
+                            "No projects yet. Add one with {}.",
+                            crate::keymap::display("secondary-o")
+                        )
+                    }),
             );
         }
         v_flex()
-            .child(row(
-                "New projects go in",
-                "Where a project made from a name is created (a folder named after it). Empty: ~/.agentloft/projects.",
-                text_input(&self.input(Field::NewProjectsDir)),
-                p,
-            ))
-            .child(row(
-                "Add project starts in",
-                "Where Add Project's folder browser opens, and where clones go. Empty: your home folder.",
-                text_input(&self.input(Field::ProjectsDir)),
-                p,
-            ))
+            // Which folders projects come from is the desktop app's to set.
+            .when(!crate::host::IS_WEB, |d| {
+                d.child(row(
+                    "New projects go in",
+                    "Where a project made from a name is created (a folder named after it). Empty: ~/.agentloft/projects.",
+                    text_input(&self.input(Field::NewProjectsDir)),
+                    p,
+                ))
+                .child(row(
+                    "Add project starts in",
+                    "Where Add Project's folder browser opens, and where clones go. Empty: your home folder.",
+                    text_input(&self.input(Field::ProjectsDir)),
+                    p,
+                ))
+            })
             .child(
                 div()
                     .pt_6()
@@ -410,29 +420,33 @@ impl SettingsView {
             .gap_2()
             .items_center()
             .child(crate::project_icon::badge(project, 26., p))
-            .child(
-                Button::new("project-icon-file")
-                    .small()
-                    .outline()
-                    .label("Choose file…")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-                            files: true,
-                            directories: false,
-                            multiple: false,
-                            prompt: Some("Use as icon".into()),
-                        });
-                        let (store, id) = (this.store.clone(), pick_id.clone());
-                        cx.spawn(async move |_, cx| {
-                            if let Ok(Ok(Some(paths))) = rx.await
-                                && let Some(path) = paths.into_iter().next()
-                            {
-                                store.update(cx, |s, cx| s.set_project_icon(id, Some(path), cx));
-                            }
-                        })
-                        .detach();
-                    })),
-            )
+            // Picking a file needs this computer's file dialog.
+            .when(!crate::host::IS_WEB, |d| {
+                d.child(
+                    Button::new("project-icon-file")
+                        .small()
+                        .outline()
+                        .label("Choose file…")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+                                files: true,
+                                directories: false,
+                                multiple: false,
+                                prompt: Some("Use as icon".into()),
+                            });
+                            let (store, id) = (this.store.clone(), pick_id.clone());
+                            cx.spawn(async move |_, cx| {
+                                if let Ok(Ok(Some(paths))) = rx.await
+                                    && let Some(path) = paths.into_iter().next()
+                                {
+                                    store
+                                        .update(cx, |s, cx| s.set_project_icon(id, Some(path), cx));
+                                }
+                            })
+                            .detach();
+                        })),
+                )
+            })
             .when(project.icon.is_some(), |d| {
                 d.child(
                     Button::new("project-icon-reset")

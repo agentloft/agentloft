@@ -10,9 +10,8 @@ use loft_client::model::{ThreadModel, WorkspaceModel};
 use loft_client::{Client, ClientEvent};
 use loft_config::Paths;
 use loft_protocol::{
-    Attachment, ClientKind, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId,
-    ItemStatus, ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId,
-    ThreadStatus, Topic,
+    Attachment, DecisionKind, Delta, ErrorBody, Event, HarnessId, ItemBody, ItemId, ItemStatus,
+    ProjectId, Request, RequestId, Response, Snapshot, TerminalId, ThreadId, ThreadStatus, Topic,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -57,6 +56,112 @@ fn move_in_line(q: &mut std::collections::VecDeque<Queued>, id: u64, to: u64) ->
     };
     q.insert(at, message);
     true
+}
+
+/// Something the user said (as opposed to the agent's work).
+fn is_said(item: &loft_protocol::Item) -> bool {
+    matches!(item.body, ItemBody::UserMessage { .. })
+}
+
+/// What of a turn's `work` stays in view while it is folded under "Worked
+/// for …": what the user said along the way (a steer is part of the
+/// conversation, not of the agent's work) and agents still at work.
+fn shown_when_folded(
+    items: &[loft_protocol::Item],
+    work: &[usize],
+    still_running: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    work.iter()
+        .copied()
+        .filter(|&i| is_said(&items[i]) || still_running(i))
+        .collect()
+}
+
+/// Whether item `ix` is something the user said into a turn already under
+/// way (a steer), not the message that started it.
+pub fn is_steer(items: &[loft_protocol::Item], ix: usize) -> bool {
+    let Some(item) = items.get(ix).filter(|item| is_said(item)) else {
+        return false;
+    };
+    let Some(turn) = &item.turn_id else {
+        return false;
+    };
+    items[..ix]
+        .iter()
+        .rev()
+        .take_while(|earlier| earlier.turn_id.as_ref() == Some(turn))
+        .any(|earlier| earlier.parent_id.is_none() && !is_said(earlier))
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+    use loft_protocol::{Item, ItemStatus, TurnId};
+
+    fn item(turn: &TurnId, body: ItemBody) -> Item {
+        Item {
+            id: ItemId::new(),
+            thread_id: ThreadId::new(),
+            turn_id: Some(turn.clone()),
+            ordinal: 0,
+            status: ItemStatus::Completed,
+            body,
+            updated_at_ms: 0,
+            parent_id: None,
+            started_at_ms: None,
+        }
+    }
+
+    fn said(turn: &TurnId, text: &str) -> Item {
+        item(
+            turn,
+            ItemBody::UserMessage {
+                text: text.into(),
+                attachments: Vec::new(),
+            },
+        )
+    }
+
+    fn note(turn: &TurnId, text: &str) -> Item {
+        item(turn, ItemBody::AssistantMessage { text: text.into() })
+    }
+
+    #[test]
+    fn a_steer_stays_in_view_when_the_work_is_folded() {
+        let (first, second) = (TurnId::new(), TurnId::new());
+        let items = vec![
+            said(&first, "do some work"),
+            note(&first, "looking"),
+            said(&first, "stop"),
+            note(&first, "one more thing"),
+            note(&first, "Stopped."),
+            said(&second, "thanks"),
+        ];
+        // The prompt opens its turn; what is said into it later steers it.
+        assert!(!is_steer(&items, 0));
+        assert!(is_steer(&items, 2));
+        assert!(!is_steer(&items, 1), "not something the user said");
+        assert!(!is_steer(&items, 5), "the next turn's own prompt");
+        assert!(!is_steer(&items, 99));
+
+        // Folded, the steer shows and the agent's steps don't.
+        let work = [1, 2, 3];
+        assert_eq!(shown_when_folded(&items, &work, |_| false), [2]);
+        // An agent still running stays too, in order.
+        assert_eq!(shown_when_folded(&items, &work, |i| i == 3), [2, 3]);
+        assert!(shown_when_folded(&items, &[1, 3], |_| false).is_empty());
+    }
+
+    #[test]
+    fn two_messages_sent_together_are_both_the_prompt() {
+        let turn = TurnId::new();
+        let items = vec![
+            said(&turn, "first"),
+            said(&turn, "and this"),
+            note(&turn, "ok"),
+        ];
+        assert!(!is_steer(&items, 0) && !is_steer(&items, 1));
+    }
 }
 
 #[cfg(test)]
@@ -154,7 +259,7 @@ pub enum ConnState {
 }
 
 pub struct AppStore {
-    runtime: tokio::runtime::Handle,
+    runtime: crate::host::Runtime,
     paths: Paths,
     client: Option<Client>,
     pub conn: ConnState,
@@ -208,18 +313,24 @@ pub struct AppStore {
     branches_loading: std::collections::HashSet<ProjectId>,
     /// Agents switched off in Settings (hidden from pickers).
     pub disabled_agents: std::collections::HashSet<String>,
+    /// `[browser]` in the settings (search engine, home page), kept
+    /// current as the settings change.
+    pub browser: loft_config::BrowserConfig,
     /// Models left out of the pickers, per agent.
     pub hidden_models: HashMap<String, Vec<String>>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
     terminals: HashMap<TerminalId, WeakEntity<TerminalPane>>,
     terminal_subs: HashMap<u64, TerminalId>,
+    /// Pages of the daemon's browser being shown, and their subscriptions.
+    pages: HashMap<loft_protocol::PageId, WeakEntity<crate::panel::page::PageView>>,
+    page_subs: HashMap<u64, loft_protocol::PageId>,
     /// Daemon pid of the current connection: a new pid means the daemon
     /// restarted and its PTYs are gone.
     daemon_pid: Option<u32>,
 }
 
 impl AppStore {
-    pub fn new(runtime: tokio::runtime::Handle, paths: Paths, cx: &mut Context<Self>) -> Self {
+    pub fn new(runtime: crate::host::Runtime, paths: Paths, cx: &mut Context<Self>) -> Self {
         let collapsed = load_collapsed(&paths);
         let folded_threads = load_folded_threads(&paths);
         let pinned_projects = load_list::<ProjectId>(&paths, "pinned_projects");
@@ -253,9 +364,12 @@ impl AppStore {
             branches: HashMap::new(),
             branches_loading: Default::default(),
             disabled_agents: Default::default(),
+            browser: Default::default(),
             hidden_models: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
+            pages: HashMap::new(),
+            page_subs: HashMap::new(),
             daemon_pid: None,
         };
         this.reload_agent_prefs(cx);
@@ -268,13 +382,10 @@ impl AppStore {
     /// `config.toml` and the themes folder and apply changes as they come.
     fn watch_settings(&mut self, cx: &mut Context<Self>) {
         fn stamp(paths: &Paths) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
-            let modified =
-                |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-            let themes = std::fs::read_dir(paths.home.join("themes"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| modified(&e.path()))
+            let modified = crate::host::modified;
+            let themes = crate::host::list_files(&paths.themes_dir())
+                .iter()
+                .filter_map(|file| modified(file))
                 .max();
             (modified(&paths.config_file()), themes)
         }
@@ -297,12 +408,14 @@ impl AppStore {
                         crate::theme::apply(cx);
                     }
                     store.reload_agent_prefs(cx);
-                    crate::settings::refresh(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
                     break;
                 }
+                // After the store's update: an open settings view reads the
+                // store, which it can't while the store is being updated.
+                cx.update(crate::settings::refresh);
             }
         })
         .detach();
@@ -311,23 +424,9 @@ impl AppStore {
     fn connect(&mut self, cx: &mut Context<Self>) {
         self.conn = ConnState::Connecting;
         cx.notify();
-        let paths = self.paths.clone();
-        let task = self.runtime.spawn(async move {
-            loft_client::connect_or_spawn(
-                &paths,
-                &loft_client::daemon_binary(),
-                ClientKind::LocalUi,
-                BUILD,
-                &["browser"],
-            )
-            .await
-        });
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = match task.await {
-                Ok(r) => r,
-                Err(e) => Err(anyhow::anyhow!(e)),
-            };
-            match result {
+        let connecting = crate::host::connect(self.runtime.clone(), self.paths.clone(), BUILD);
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| match connecting.await {
                 Ok((client, rx)) => {
                     let ok = this
                         .update(cx, |store, cx| store.on_connected(client, cx))
@@ -345,8 +444,8 @@ impl AppStore {
                     cx.background_executor().timer(Duration::from_secs(2)).await;
                     let _ = this.update(cx, |store, cx| store.connect(cx));
                 }
-            }
-        })
+            },
+        )
         .detach();
     }
 
@@ -365,6 +464,7 @@ impl AppStore {
         self.terminal_subs.clear();
         self.terminals.retain(|_, pane| pane.upgrade().is_some());
         let terminals = std::mem::take(&mut self.terminals);
+        crate::host::set_client(Some(client.clone()));
         self.client = Some(client);
         self.probe_harnesses(cx);
         // Model pickers (Codex asks its CLI; answers are cached daemon-side).
@@ -376,12 +476,35 @@ impl AppStore {
         ] {
             self.fetch_models(HarnessId(harness.into()), cx);
         }
+        // Pages: the ones the daemon still has are watched again; after a
+        // restart its browser is gone, and each view opens a new page.
+        self.page_subs.clear();
+        self.pages.retain(|_, view| view.upgrade().is_some());
+        let pages_allowed = self.pages_allowed();
+        for (id, view) in std::mem::take(&mut self.pages) {
+            if restarted {
+                let _ = view.update(cx, |v, cx| v.on_lost(cx));
+            } else if pages_allowed {
+                self.subscribe_page(id, view);
+            } else {
+                // A browser session whose browser was turned off: the page
+                // lives on in the daemon, and a later connection that may
+                // use it picks it up again here.
+                self.pages.insert(id, view);
+            }
+        }
+        let allowed = self.terminals_allowed();
         for (id, pane) in terminals {
             if restarted {
                 // The old PTY died with the daemon; the pane opens a new one.
                 let _ = pane.update(cx, |p, cx| p.on_lost(cx));
-            } else {
+            } else if allowed {
                 self.subscribe_terminal(id, pane, cx);
+            } else {
+                // A browser session whose terminals were turned off: the
+                // shell lives on in the daemon, and a later connection that
+                // may use it picks it up again here.
+                self.terminals.insert(id, pane);
             }
         }
         cx.notify();
@@ -423,9 +546,10 @@ impl AppStore {
     /// Gemini) once their CLI is found.
     /// Re-read the per-agent picker settings (on/off, hidden models).
     pub fn reload_agent_prefs(&mut self, cx: &mut Context<Self>) {
-        let Ok(config) = loft_config::Config::load(&self.paths) else {
+        let Ok(config) = crate::host::load_config(&self.paths) else {
             return;
         };
+        self.browser = config.browser.clone();
         self.disabled_agents.clear();
         self.hidden_models.clear();
         for (id, h) in [
@@ -503,6 +627,49 @@ impl AppStore {
         self.terminals.insert(id, pane);
     }
 
+    /// Watch a page of the daemon's browser for `view`.
+    pub fn subscribe_page(
+        &mut self,
+        id: loft_protocol::PageId,
+        view: WeakEntity<crate::panel::page::PageView>,
+    ) {
+        self.page_subs.retain(|_, page| *page != id);
+        if let Some(client) = &self.client {
+            let sub = client.subscribe(Topic::Page(id.clone()));
+            self.page_subs.insert(sub, id.clone());
+        }
+        self.pages.insert(id, view);
+    }
+
+    pub fn forget_page(&mut self, id: &loft_protocol::PageId) {
+        self.pages.remove(id);
+        let subs: Vec<u64> = self
+            .page_subs
+            .iter()
+            .filter(|(_, page)| *page == id)
+            .map(|(sub, _)| *sub)
+            .collect();
+        for sub in subs {
+            self.page_subs.remove(&sub);
+            if let Some(client) = &self.client {
+                client.unsubscribe(sub);
+            }
+        }
+    }
+
+    fn page_view(&self, sub_id: u64) -> Option<WeakEntity<crate::panel::page::PageView>> {
+        self.pages.get(self.page_subs.get(&sub_id)?).cloned()
+    }
+
+    /// Whether this client may use the daemon's browser (a browser session
+    /// only when the daemon allows it: `[web] allow_browser`, ADR-0017).
+    pub fn pages_allowed(&self) -> bool {
+        self.client
+            .as_ref()
+            .and_then(|client| client.welcome().remote.as_ref())
+            .is_none_or(|remote| remote.browser)
+    }
+
     pub fn forget_terminal(&mut self, id: &TerminalId) {
         self.terminals.remove(id);
         let subs: Vec<u64> = self
@@ -526,6 +693,7 @@ impl AppStore {
 
     fn on_disconnected(&mut self, cx: &mut Context<Self>) {
         self.client = None;
+        crate::host::set_client(None);
         self.conn = ConnState::Disconnected("connection to agentloftd lost".into());
         cx.notify();
         // Reconnect (respawning the daemon if it died).
@@ -548,6 +716,15 @@ impl AppStore {
                     if let Some(pane) = self.terminal_pane(sub_id) {
                         let _ =
                             pane.update(cx, |p, cx| p.on_replay(&replay.0, terminal.exited, cx));
+                    }
+                } else if let Snapshot::Page { page, frame, .. } = snapshot {
+                    if let Some(view) = self.page_view(sub_id) {
+                        let _ = view.update(cx, |v, cx| {
+                            v.on_state(page, cx);
+                            if let Some(frame) = frame {
+                                v.on_frame(sub_id, frame.seq, frame.jpeg.0, cx);
+                            }
+                        });
                     }
                 } else if Some(sub_id) == self.ws_sub {
                     self.workspace.apply_snapshot(snapshot);
@@ -630,6 +807,31 @@ impl AppStore {
             ClientEvent::TerminalExited { sub_id, code, .. } => {
                 if let Some(pane) = self.terminal_pane(sub_id) {
                     let _ = pane.update(cx, |p, cx| p.on_exit(code, cx));
+                }
+            }
+            ClientEvent::PageFrame {
+                sub_id, seq, jpeg, ..
+            } => match self.page_view(sub_id) {
+                Some(view) => {
+                    let _ = view.update(cx, |v, cx| v.on_frame(sub_id, seq, jpeg, cx));
+                }
+                // Nobody to show it to: don't hold the stream up.
+                None => {
+                    if let Some(client) = &self.client {
+                        client.ack_page_frame(sub_id, seq);
+                    }
+                }
+            },
+            ClientEvent::PageState { sub_id, page } => {
+                if let Some(view) = self.page_view(sub_id) {
+                    let _ = view.update(cx, |v, cx| v.on_state(page, cx));
+                }
+            }
+            ClientEvent::PageClosed { sub_id, id, reason } => {
+                let view = self.page_view(sub_id);
+                self.forget_page(&id);
+                if let Some(view) = view {
+                    let _ = view.update(cx, |v, cx| v.on_closed(reason, cx));
                 }
             }
             ClientEvent::ClientCall { call_id, call } => match call {
@@ -853,7 +1055,7 @@ impl AppStore {
         if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({
             "collapsed": projects, "folded_threads": threads, "pinned_projects": pinned,
         })) {
-            let _ = std::fs::write(sidebar_file(&self.paths), json);
+            let _ = crate::host::write(&sidebar_file(&self.paths), &json);
         }
     }
 
@@ -961,6 +1163,16 @@ impl AppStore {
         &self.paths
     }
 
+    /// Whether this client may open terminals. The desktop app always may;
+    /// a browser session only when the daemon allows it (`[web]
+    /// allow_terminal`, ADR-0016).
+    pub fn terminals_allowed(&self) -> bool {
+        self.client
+            .as_ref()
+            .and_then(|client| client.welcome().remote.as_ref())
+            .is_none_or(|remote| remote.terminal)
+    }
+
     pub fn client(&self) -> Option<Client> {
         self.client.clone()
     }
@@ -1024,8 +1236,8 @@ impl AppStore {
         &self,
         pick: impl Fn(&loft_config::ProjectsConfig) -> Option<String>,
     ) -> Option<std::path::PathBuf> {
-        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
-        loft_config::Config::load(&self.paths)
+        let home = crate::host::user_home();
+        crate::host::load_config(&self.paths)
             .ok()
             .and_then(|c| pick(&c.projects))
             .map(|d| d.trim().to_owned())
@@ -1040,7 +1252,7 @@ impl AppStore {
     /// Projects ▸ "Add project starts in", else the home folder.
     pub fn projects_base(&self) -> std::path::PathBuf {
         self.projects_setting(|p| p.base_dir.clone())
-            .unwrap_or_else(|| std::env::home_dir().unwrap_or_else(|| "/".into()))
+            .unwrap_or_else(crate::host::user_home)
     }
 
     /// Where new projects (made from a name) go: Settings ▸ Projects ▸ "New
@@ -1051,7 +1263,13 @@ impl AppStore {
     }
 
     pub fn projects_parent(&self) -> String {
-        self.projects_base().to_string_lossy().into_owned()
+        // A browser session may only clone where projects are kept.
+        let parent = if crate::host::IS_WEB {
+            self.new_projects_dir()
+        } else {
+            self.projects_base()
+        };
+        parent.to_string_lossy().into_owned()
     }
 
     /// Ask (once) which GitHub account `gh` is signed in to.
@@ -1091,8 +1309,8 @@ impl AppStore {
                 let dest = dir.join(format!(
                     "{}-{}.{ext}",
                     project_id.as_str(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
+                    web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_millis())
                 ));
                 match std::fs::create_dir_all(&dir).and_then(|_| std::fs::copy(&src, &dest)) {
@@ -1105,7 +1323,7 @@ impl AppStore {
                 }
             }
         };
-        crate::project_icon::forget();
+        crate::host::forget_project_icons();
         self.request(
             Request::SetProjectIcon { project_id, icon },
             cx,
@@ -1746,7 +1964,7 @@ fn sidebar_file(paths: &Paths) -> std::path::PathBuf {
 
 /// The projects folded in the sidebar last time.
 fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
-    std::fs::read(sidebar_file(paths))
+    crate::host::read(&sidebar_file(paths))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("collapsed").cloned())
@@ -1757,7 +1975,7 @@ fn load_collapsed(paths: &Paths) -> std::collections::HashSet<ProjectId> {
 }
 
 fn load_list<T: serde::de::DeserializeOwned>(paths: &Paths, key: &str) -> Vec<T> {
-    std::fs::read(sidebar_file(paths))
+    crate::host::read(&sidebar_file(paths))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get(key).cloned())
@@ -1766,7 +1984,7 @@ fn load_list<T: serde::de::DeserializeOwned>(paths: &Paths, key: &str) -> Vec<T>
 }
 
 fn load_folded_threads(paths: &Paths) -> std::collections::HashSet<ThreadId> {
-    std::fs::read(sidebar_file(paths))
+    crate::host::read(&sidebar_file(paths))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("folded_threads").cloned())
@@ -2010,21 +2228,16 @@ impl ThreadState {
                 rows.push(Row::Work {
                     turn_ix,
                     open,
-                    steps: work.len(),
+                    // What you said along the way isn't one of its steps.
+                    steps: work.iter().filter(|&&i| !is_said(&items[i])).count(),
                 });
                 if open {
                     push_runs(&mut rows, items, &work);
                 } else {
-                    // Folded, but agents still at work stay in view.
-                    let live: Vec<usize> = work
-                        .iter()
-                        .copied()
-                        .filter(|&i| {
-                            is_agent(&items[i])
-                                && agent_running(model, &items[i], &self.live_spawned)
-                        })
-                        .collect();
-                    push_runs(&mut rows, items, &live);
+                    let shown = shown_when_folded(items, &work, |i| {
+                        is_agent(&items[i]) && agent_running(model, &items[i], &self.live_spawned)
+                    });
+                    push_runs(&mut rows, items, &shown);
                 }
             }
             if !done {

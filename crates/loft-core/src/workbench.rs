@@ -167,20 +167,42 @@ impl Core {
     }
 
     pub(crate) fn read_file(&self, root: &FsRoot, rel: &str) -> CoreResult<FileContent> {
-        use std::io::Read as _;
         let (_, path) = self.resolve(root, rel)?;
-        let meta = std::fs::metadata(&path).map_err(|e| bad(format!("{rel}: {e}")))?;
+        self.read_file_at(&path, rel)
+    }
+
+    /// A project's icon: the image chosen for it, else the one found in
+    /// its folder (`Request::ProjectIcon`).
+    pub(crate) fn project_icon(&self, id: &ProjectId) -> CoreResult<FileContent> {
+        let project = self
+            .with_store(|s| s.project(id))?
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+        let icon = project
+            .icon
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|p| loft_config::icons::drawable(p))
+            .or_else(|| loft_config::icons::find(Path::new(&project.root_path)))
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "no icon"))?;
+        let name = icon.to_string_lossy().into_owned();
+        self.read_file_at(&icon, &name)
+    }
+
+    /// Read `path` (already checked by the caller), reported under `name`.
+    pub(crate) fn read_file_at(&self, path: &Path, name: &str) -> CoreResult<FileContent> {
+        use std::io::Read as _;
+        let meta = std::fs::metadata(path).map_err(|e| bad(format!("{name}: {e}")))?;
         if meta.is_dir() {
-            return Err(bad(format!("{rel} is a directory")));
+            return Err(bad(format!("{name} is a directory")));
         }
-        let file = std::fs::File::open(&path).map_err(|e| bad(format!("{rel}: {e}")))?;
+        let file = std::fs::File::open(path).map_err(|e| bad(format!("{name}: {e}")))?;
         let mut bytes = Vec::with_capacity(meta.len().min(MAX_READ) as usize);
         file.take(MAX_READ)
             .read_to_end(&mut bytes)
             .map_err(internal)?;
         let sniff = &bytes[..bytes.len().min(8192)];
         Ok(FileContent {
-            rel_path: rel.to_owned(),
+            rel_path: name.to_owned(),
             abs_path: path.to_string_lossy().into_owned(),
             size: meta.len(),
             binary: sniff.contains(&0),

@@ -403,42 +403,52 @@ impl Render for DetailsCard {
 
         // Where it runs.
         let folder = cwd.clone();
-        list = list.child(
-            row("details-computer", &p)
-                .h(px(TALL_ROW))
-                .child(icon(IconName::Laptop, &p))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
+        list =
+            list.child(
+                row("details-computer", &p)
+                    .h(px(TALL_ROW))
+                    .child(icon(IconName::Laptop, &p))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(self.computer.clone().unwrap_or_else(
+                                || {
+                                    // In a browser the folder is on the
+                                    // computer Agentloft runs on, not this one.
+                                    if crate::host::IS_WEB {
+                                        "Agentloft's computer".into()
+                                    } else {
+                                        "This Mac".into()
+                                    }
+                                },
+                            )))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(p.faint_foreground)
+                                    .child(crate::workspace::tilde_path_str(&cwd)),
+                            ),
+                    )
+                    // Showing the folder in Finder is this computer's to do.
+                    .when(!crate::host::IS_WEB, |d| {
+                        d.child(
                             div()
-                                .truncate()
-                                .child(self.computer.clone().unwrap_or_else(|| "This Mac".into())),
+                                .id("details-reveal")
+                                .p(px(4.))
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .text_color(p.muted_foreground)
+                                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                .child(Icon::new(IconName::FolderOpen).small())
+                                .on_click(move |_, window, cx| {
+                                    cx.open_with_system(std::path::Path::new(&folder));
+                                    Self::dismiss(floating, window);
+                                }),
                         )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_xs()
-                                .text_color(p.faint_foreground)
-                                .child(crate::workspace::tilde_path_str(&cwd)),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("details-reveal")
-                        .p(px(4.))
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .text_color(p.muted_foreground)
-                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                        .child(Icon::new(IconName::FolderOpen).small())
-                        .on_click(move |_, window, cx| {
-                            cx.open_with_system(std::path::Path::new(&folder));
-                            Self::dismiss(floating, window);
-                        }),
-                ),
-        );
+                    }),
+            );
 
         // Open in an editor.
         let editor = self.editor();

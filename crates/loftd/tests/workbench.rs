@@ -56,6 +56,7 @@ async fn setup() -> Env {
         harnesses,
         capture_login_env: false,
         mcp_bridge: None,
+        web_bundle: None,
     })
     .await
     .unwrap();

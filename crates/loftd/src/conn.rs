@@ -1,19 +1,51 @@
 //! One client connection: handshake, requests, subscriptions.
+//!
+//! The same loop serves both transports: the Unix socket (length-prefixed
+//! frames, a local client that may do everything) and the web listener's
+//! WebSocket (one frame per message, a remote session held to
+//! `loft_core::RemotePolicy`).
 
 use bytes::Bytes;
 use futures::stream::SplitSink;
-use futures::{SinkExt as _, StreamExt as _};
+use futures::{SinkExt as _, Stream, StreamExt as _};
 use loft_config::Paths;
-use loft_core::{BusMsg, Core};
+use loft_core::{BusMsg, Core, RemotePolicy};
 use loft_protocol::{
-    ClientMsg, ErrorBody, ErrorCode, MAX_FRAME_LEN, PROTOCOL_VERSION, Request, Response, ServerMsg,
-    Snapshot, Topic, Welcome,
+    ClientMsg, ErrorBody, ErrorCode, MAX_FRAME_LEN, PROTOCOL_VERSION, RemoteAccess, Request,
+    Response, ServerMsg, Snapshot, Topic, Welcome,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+/// What every connection needs from the daemon.
+#[derive(Clone)]
+pub(crate) struct Hub {
+    pub core: Arc<Core>,
+    pub shutdown: watch::Sender<bool>,
+    /// Web access, for the local clients that manage it.
+    pub web: Option<Arc<crate::web::Web>>,
+}
+
+/// Who is on the other end.
+#[derive(Debug, Clone)]
+pub(crate) enum Peer {
+    /// The Unix socket: the user who owns the data home.
+    Local,
+    /// A browser signed in to web access.
+    Remote {
+        session: String,
+        policy: RemotePolicy,
+    },
+}
+
+/// Requests one remote session may have running at once.
+const MAX_REMOTE_IN_FLIGHT: usize = 64;
+/// Subscriptions one remote session may hold.
+const MAX_REMOTE_SUBSCRIPTIONS: usize = 256;
 
 pub(crate) fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
@@ -41,8 +73,9 @@ pub(crate) fn peer_allowed(stream: &UnixStream, paths: &Paths) -> bool {
     }
 }
 
-pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::Sender<bool>) {
-    let (mut sink, mut source): (SplitSink<_, Bytes>, _) = Framed::new(stream, codec()).split();
+/// Serve a local client on the Unix socket.
+pub(crate) async fn serve_unix(stream: UnixStream, hub: Hub) {
+    let (mut sink, source): (SplitSink<_, Bytes>, _) = Framed::new(stream, codec()).split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
 
     let writer = tokio::spawn(async move {
@@ -55,25 +88,116 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
             }
         }
     });
+    // A read error (oversized frame, reset) ends the connection.
+    let frames = source
+        .take_while(|frame| futures::future::ready(frame.is_ok()))
+        .filter_map(|frame| futures::future::ready(frame.ok().map(|f| f.freeze())));
+    run(frames, out_tx, hub, Peer::Local).await;
+    let _ = writer.await;
+    tracing::debug!("client disconnected");
+}
+
+/// The `op` of a request frame, without decoding the rest (audit log).
+fn peek_op(frame: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Frame<'a> {
+        #[serde(borrow)]
+        body: Option<Body<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Body<'a> {
+        op: Option<&'a str>,
+    }
+    serde_json::from_slice::<Frame<'_>>(frame)
+        .ok()?
+        .body?
+        .op
+        .map(str::to_owned)
+}
+
+/// Requests too frequent or too plain to be worth a log line each.
+fn quiet_op(op: &str) -> bool {
+    matches!(
+        op,
+        "ping"
+            | "set_draft"
+            | "find_files"
+            | "list_dir"
+            | "read_file"
+            | "read_path"
+            | "get_diff"
+            | "get_settings"
+            | "list_models"
+            | "list_commands"
+            | "list_branches"
+            | "probe_harness"
+            | "search_threads"
+            | "git_hub_login"
+            | "agent_info"
+    )
+}
+
+/// Undoes a connection's registrations however its task ends.
+struct Registered {
+    core: Arc<Core>,
+    conn_id: u64,
+    subs: HashMap<u64, tokio::task::AbortHandle>,
+    /// For subscriptions to a page: the last picture its viewer has shown.
+    page_acks: HashMap<u64, watch::Sender<u64>>,
+    relay: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        for (_, task) in self.subs.drain() {
+            task.abort();
+        }
+        self.core.clients().unregister(self.conn_id);
+        if let Some(relay) = self.relay.take() {
+            relay.abort();
+        }
+    }
+}
+
+/// Run one connection: `frames` are the client's messages (ending when it
+/// goes away), `out_tx` takes ours. Returns when the client is gone.
+pub(crate) async fn run<S>(
+    mut frames: S,
+    out_tx: mpsc::UnboundedSender<ServerMsg>,
+    hub: Hub,
+    peer: Peer,
+) where
+    S: Stream<Item = Bytes> + Unpin,
+{
+    let core = hub.core.clone();
+    let remote = match &peer {
+        Peer::Local => None,
+        Peer::Remote { session, policy } => Some((session.clone(), *policy)),
+    };
 
     // Handshake.
     let browser_host;
-    let hello = match source.next().await {
-        Some(Ok(frame)) => serde_json::from_slice::<ClientMsg>(&frame).ok(),
-        _ => None,
+    let hello = match frames.next().await {
+        Some(frame) => serde_json::from_slice::<ClientMsg>(&frame).ok(),
+        None => None,
     };
     match hello {
         Some(ClientMsg::Hello(h))
             if h.protocol_version == PROTOCOL_VERSION
                 || h.protocol_version + 1 == PROTOCOL_VERSION =>
         {
-            tracing::debug!(kind = ?h.client_kind, build = %h.client_build, "client connected");
-            browser_host = h.capabilities.iter().any(|c| c == "browser");
+            tracing::debug!(kind = ?h.client_kind, build = %h.client_build, remote = remote.is_some(), "client connected");
+            // Only a local window hosts the browser panel agents drive.
+            browser_host = remote.is_none() && h.capabilities.iter().any(|c| c == "browser");
             let _ = out_tx.send(ServerMsg::Welcome(Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 daemon_build: crate::BUILD.into(),
                 daemon_pid: std::process::id(),
                 daemon_exe_mtime_ms: *crate::EXE_MTIME,
+                remote: remote.as_ref().map(|(_, policy)| RemoteAccess {
+                    terminal: policy.allow_terminal,
+                    browser: policy.allow_browser,
+                }),
             }));
         }
         Some(ClientMsg::Hello(h)) => {
@@ -84,8 +208,6 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                     h.protocol_version
                 ),
             )));
-            drop(out_tx);
-            let _ = writer.await;
             return;
         }
         _ => {
@@ -93,15 +215,13 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
                 ErrorCode::BadRequest,
                 "expected hello",
             )));
-            drop(out_tx);
-            let _ = writer.await;
             return;
         }
     }
 
     static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let conn_id = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let call_relay = browser_host.then(|| {
+    let relay = browser_host.then(|| {
         let mut calls = core.clients().register_browser_host(conn_id);
         let out = out_tx.clone();
         tokio::spawn(async move {
@@ -118,10 +238,16 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
             }
         })
     });
+    let mut registered = Registered {
+        core: core.clone(),
+        conn_id,
+        subs: HashMap::new(),
+        page_acks: HashMap::new(),
+        relay,
+    };
+    let in_flight = Arc::new(Semaphore::new(MAX_REMOTE_IN_FLIGHT));
 
-    let mut subs: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
-    while let Some(frame) = source.next().await {
-        let Ok(frame) = frame else { break };
+    while let Some(frame) = frames.next().await {
         let msg = match serde_json::from_slice::<ClientMsg>(&frame) {
             Ok(m) => m,
             Err(err) => {
@@ -150,63 +276,171 @@ pub(crate) async fn serve(stream: UnixStream, core: Arc<Core>, shutdown: watch::
         match msg {
             ClientMsg::Hello(_) => {}
             ClientMsg::Request { id, body } => {
+                if let Some((session, policy)) = &remote {
+                    // What remote sessions asked for, by name only.
+                    if let Some(op) = peek_op(&frame)
+                        && !quiet_op(&op)
+                    {
+                        tracing::info!(target: "agentloft::web::audit", session = %session, op = %op, "remote request");
+                    }
+                    if let Some(result) = core.handle_inline_remote(&body, policy) {
+                        let _ = out_tx.send(ServerMsg::Response { id, result });
+                        continue;
+                    }
+                    let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                        let _ = out_tx.send(ServerMsg::Response {
+                            id,
+                            result: Err(ErrorBody::new(
+                                ErrorCode::Conflict,
+                                "too many requests at once",
+                            )),
+                        });
+                        continue;
+                    };
+                    let (core, out, policy) = (core.clone(), out_tx.clone(), *policy);
+                    tokio::spawn(async move {
+                        let result = core.handle_remote(body, &policy).await;
+                        let _ = out.send(ServerMsg::Response { id, result });
+                        drop(permit);
+                    });
+                    continue;
+                }
                 if let Some(result) = core.handle_inline(&body) {
                     let _ = out_tx.send(ServerMsg::Response { id, result });
                     continue;
                 }
-                let core = core.clone();
+                let hub = hub.clone();
                 let out = out_tx.clone();
-                let shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    let result = match body {
-                        // An upgrade waits for running turns; a user quit doesn't.
-                        Request::Shutdown {
-                            reason: loft_protocol::ShutdownReason::Upgrade,
-                        } if core.is_busy() => Err(ErrorBody::new(
-                            ErrorCode::Conflict,
-                            "agents are running; the update applies once they're done",
-                        )),
-                        Request::Shutdown { reason } => {
-                            tracing::info!(?reason, "shutdown requested by client");
-                            let _ = shutdown.send(true);
-                            Ok(Response::Ok)
-                        }
-                        other => core.handle(other).await,
-                    };
+                    let result = handle_local(&hub, body).await;
                     let _ = out.send(ServerMsg::Response { id, result });
                 });
             }
             ClientMsg::Subscribe { sub_id, topic } => {
-                if let Some(old) = subs.remove(&sub_id) {
+                if let Some((_, policy)) = &remote {
+                    let allowed = core.check_remote_topic(&topic, policy).and_then(|()| {
+                        if registered.subs.len() >= MAX_REMOTE_SUBSCRIPTIONS
+                            && !registered.subs.contains_key(&sub_id)
+                        {
+                            Err(ErrorBody::new(
+                                ErrorCode::Conflict,
+                                "too many subscriptions",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(err) = allowed {
+                        let _ = out_tx.send(ServerMsg::Fatal(err));
+                        continue;
+                    }
+                }
+                if let Some(old) = registered.subs.remove(&sub_id) {
                     old.abort();
                 }
+                registered.page_acks.remove(&sub_id);
                 if let Topic::Thread(thread) = &topic {
                     core.clients().watch(conn_id, sub_id, thread.clone());
                 }
-                let task = tokio::spawn(forward(core.clone(), sub_id, topic, out_tx.clone()));
-                subs.insert(sub_id, task.abort_handle());
+                let task = match topic {
+                    Topic::Page(page) => {
+                        let (acked, acks) = watch::channel(0);
+                        registered.page_acks.insert(sub_id, acked);
+                        tokio::spawn(forward_page(
+                            core.clone(),
+                            sub_id,
+                            page,
+                            out_tx.clone(),
+                            acks,
+                        ))
+                    }
+                    topic => tokio::spawn(forward(core.clone(), sub_id, topic, out_tx.clone())),
+                };
+                registered.subs.insert(sub_id, task.abort_handle());
             }
             ClientMsg::Unsubscribe { sub_id } => {
                 core.clients().unwatch(conn_id, sub_id);
-                if let Some(task) = subs.remove(&sub_id) {
+                registered.page_acks.remove(&sub_id);
+                if let Some(task) = registered.subs.remove(&sub_id) {
                     task.abort();
                 }
             }
+            ClientMsg::PageFrameAck { sub_id, seq } => {
+                if let Some(acked) = registered.page_acks.get(&sub_id) {
+                    acked.send_if_modified(|last| {
+                        let newer = seq > *last;
+                        *last = (*last).max(seq);
+                        newer
+                    });
+                }
+            }
             ClientMsg::ClientCallResult { call_id, result } => {
-                core.clients().complete(call_id, result);
+                // Only a browser host is ever asked; a remote session isn't one.
+                if remote.is_none() {
+                    core.clients().complete(call_id, result);
+                }
             }
         }
     }
-    for (_, task) in subs {
-        task.abort();
+}
+
+/// A local client's request: the daemon's own (shutdown, web access), else
+/// the core's.
+async fn handle_local(hub: &Hub, body: Request) -> Result<Response, ErrorBody> {
+    let web = || {
+        hub.web
+            .clone()
+            .ok_or_else(|| ErrorBody::new(ErrorCode::Unsupported, "web access isn't available"))
+    };
+    match body {
+        // An upgrade waits for running turns; a user quit doesn't.
+        Request::Shutdown {
+            reason: loft_protocol::ShutdownReason::Upgrade,
+        } if hub.core.is_busy() => Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            "agents are running; the update applies once they're done",
+        )),
+        Request::Shutdown { reason } => {
+            tracing::info!(?reason, "shutdown requested by client");
+            let _ = hub.shutdown.send(true);
+            Ok(Response::Ok)
+        }
+        Request::WebStatus => Ok(Response::WebStatus {
+            status: web()?.status(),
+        }),
+        Request::WebRotateToken => {
+            let web = web()?;
+            web.rotate_token()
+                .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
+            Ok(Response::WebStatus {
+                status: web.status(),
+            })
+        }
+        Request::WebRevokeSession { id } => {
+            let web = web()?;
+            web.revoke_session(&id);
+            Ok(Response::WebStatus {
+                status: web.status(),
+            })
+        }
+        Request::WebRevokeAllSessions => {
+            let web = web()?;
+            web.revoke_all_sessions();
+            Ok(Response::WebStatus {
+                status: web.status(),
+            })
+        }
+        // The listener follows the config; answer once it has caught up, so
+        // a status asked right after is true.
+        Request::ReloadConfig => {
+            let result = hub.core.handle(Request::ReloadConfig).await;
+            if let Some(web) = &hub.web {
+                web.apply(&hub.core.config().web).await;
+            }
+            result
+        }
+        other => hub.core.handle(other).await,
     }
-    core.clients().unregister(conn_id);
-    if let Some(relay) = call_relay {
-        relay.abort();
-    }
-    drop(out_tx);
-    let _ = writer.await;
-    tracing::debug!("client disconnected");
 }
 
 /// Send a snapshot, then every later event/delta for the topic.
@@ -229,7 +463,8 @@ async fn forward(
         let mut seq = match &snapshot {
             Snapshot::Workspace { seq, .. }
             | Snapshot::Thread { seq, .. }
-            | Snapshot::Terminal { seq, .. } => *seq,
+            | Snapshot::Terminal { seq, .. }
+            | Snapshot::Page { seq, .. } => *seq,
         };
         if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
             return;
@@ -286,6 +521,10 @@ async fn forward(
                         return;
                     }
                 }
+                // Pages have a forwarder of their own (`forward_page`).
+                Ok(
+                    BusMsg::PageFrame { .. } | BusMsg::PageState { .. } | BusMsg::PageClosed { .. },
+                ) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(n, sub_id, "subscriber lagged; resending snapshot");
                     break;
@@ -296,10 +535,136 @@ async fn forward(
     }
 }
 
+/// How long a viewer may sit on a picture before the next is sent anyway.
+const PAGE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Counts one viewer of a page for as long as it lives.
+struct Watching {
+    core: Arc<Core>,
+    page: loft_protocol::PageId,
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let (core, page) = (self.core.clone(), self.page.clone());
+        tokio::spawn(async move { core.page_watching(&page, false).await });
+    }
+}
+
+/// One viewer of a page of the daemon's browser: its state as it changes,
+/// and its pictures. One picture is in flight at a time; the next (always
+/// the newest) goes out when the viewer says it has shown the last, so a
+/// slow link gets fewer pictures instead of a queue of stale ones.
+async fn forward_page(
+    core: Arc<Core>,
+    sub_id: u64,
+    page: loft_protocol::PageId,
+    out: mpsc::UnboundedSender<ServerMsg>,
+    mut acks: watch::Receiver<u64>,
+) {
+    // Subscribe before snapshotting so nothing falls in between.
+    let mut bus = core.subscribe();
+    let snapshot = match core.snapshot(&Topic::Page(page.clone())) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = out.send(ServerMsg::PageClosed {
+                sub_id,
+                id: page,
+                reason: err.message,
+            });
+            return;
+        }
+    };
+    let mut sent = match &snapshot {
+        Snapshot::Page {
+            seq,
+            frame: Some(_),
+            ..
+        } => *seq,
+        _ => 0,
+    };
+    let mut in_flight = (sent > 0).then(|| (sent, tokio::time::Instant::now()));
+    if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
+        return;
+    }
+    core.page_watching(&page, true).await;
+    let _watching = Watching {
+        core: core.clone(),
+        page: page.clone(),
+    };
+    let mut newer = false;
+    loop {
+        let ready = in_flight
+            .is_none_or(|(seq, at)| *acks.borrow() >= seq || at.elapsed() >= PAGE_ACK_TIMEOUT);
+        if newer && ready {
+            newer = false;
+            if let Some(frame) = core.page_frame_after(&page, sent) {
+                sent = frame.seq;
+                in_flight = Some((sent, tokio::time::Instant::now()));
+                let frame = ServerMsg::PageFrame {
+                    sub_id,
+                    id: page.clone(),
+                    frame,
+                };
+                if out.send(frame).is_err() {
+                    return;
+                }
+            }
+        }
+        let waiting = newer
+            .then(|| in_flight.map(|(_, at)| at + PAGE_ACK_TIMEOUT))
+            .flatten();
+        tokio::select! {
+            msg = bus.recv() => match msg {
+                Ok(BusMsg::PageFrame { id, seq }) if id == page && seq > sent => newer = true,
+                Ok(BusMsg::PageState { id }) if id == page => {
+                    if let Some(info) = core.page_info(&page)
+                        && out.send(ServerMsg::PageState { sub_id, page: info }).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(BusMsg::PageClosed { id, reason }) if id == page => {
+                    let _ = out.send(ServerMsg::PageClosed { sub_id, id, reason });
+                    return;
+                }
+                Ok(_) => {}
+                // Missed some: the newest picture and the current state
+                // are all that matter.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    newer = true;
+                    match core.page_info(&page) {
+                        Some(info) => {
+                            if out.send(ServerMsg::PageState { sub_id, page: info }).is_err() {
+                                return;
+                            }
+                        }
+                        None => {
+                            let _ = out.send(ServerMsg::PageClosed {
+                                sub_id,
+                                id: page,
+                                reason: "The tab was closed.".into(),
+                            });
+                            return;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            changed = acks.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = async { tokio::time::sleep_until(waiting.unwrap_or_else(tokio::time::Instant::now)).await }, if waiting.is_some() => {}
+        }
+    }
+}
+
 fn matches_topic(topic: &Topic, event: &loft_protocol::Event) -> bool {
     match topic {
         Topic::Workspace => event.is_workspace_event(),
         Topic::Thread(id) => event.thread_id() == Some(id),
-        Topic::Terminal(_) => false,
+        Topic::Terminal(_) | Topic::Page(_) => false,
     }
 }

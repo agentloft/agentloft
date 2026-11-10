@@ -3,6 +3,8 @@
 Local, checked-in tracker for [PLAN §7](PLAN.md#7-milestones). Update it in the same PR as the work.
 Legend: `[x]` done and verified · `[~]` partial · `[ ]` not started.
 
+**Latest:** Agentloft in a browser: see [Web](#web-agentloft-in-a-browser-adr-0016) for what works, how to try it and what to review.
+
 ## M0: Walking skeleton (in progress, branch `m0/scaffold`)
 
 | # | Acceptance criterion | Status | Evidence |
@@ -107,6 +109,87 @@ Built ahead of the PLAN's milestone order, by request.
 | Settings window (M5) | [x] | ⌘, opens a native window with sections: Appearance (theme, accent swatches, text/code size, density, width, fonts; applied live), Agents (binary, default model and permissions per harness), Worktrees (mode, prefix) and About. Writes `config.toml` with toml_edit, keeping comments. The daemon applies changes via `ReloadConfig`. Agents also show whether each CLI is installed (path and version), and the welcome screen lists ready agents or how to install them. **Not yet done:** auth status. **Themes:** Appearance has mode cards (System/Light/Dark) painted in the current theme, a gallery of 10 built-in themes (each with light and dark sides), your own themes in `~/.agentloft/themes/*.toml` (only background/foreground/accent required; the rest derived), a theme editor (hex fields per side, applied live), "New theme"/copy-to-edit, delete, **Design with Claude** (`AskOnce`: a one-shot tool-less `claude -p --effort low`, ~5 s; verified live: "Embers & Espresso"), accent override, and contrast (soft/normal/high). Accent text colour follows the accent's brightness. **Agents page:** a list of agents (logo, version, status, on/off) and, per agent, defaults for new threads (model from its catalog, reasoning effort, permissions as an icon strip), runtime (binary, launch arguments, environment variables merged into its processes) and which models the pickers show. Off hides an agent from pickers; hidden models drop out of the model picker unless in use |
 | Daemon updates | [x] | The daemon reports its executable's mtime. When the binary on disk has changed (rebuild or app update), the app asks an idle daemon to shut down and starts the new one. A busy daemon keeps running until its agents finish. Unknown requests from a newer app get a clear error instead of hanging |
 | App icon, bundle, About, menus | [x] | `cargo xtask bundle` |
+
+## Web: Agentloft in a browser ([ADR-0016](adr/0016-web-client.md))
+
+**Summary (2026-11-10).** The same `loft-ui` now runs in a browser as WebAssembly, served by `agentloftd` over a secured HTTP + WebSocket listener. Off by default, this computer only by default.
+
+**What works** (each checked in headless Chrome 158 over WebGPU, against a dev daemon with the scripted `fake` agent):
+- Pairing with the link from Settings ▸ Web access; the token leaves the address bar and becomes an HttpOnly session cookie.
+- Sidebar and thread list, project icons, opening threads.
+- Thread view: Markdown, highlighted code, tables, CJK and emoji; scrolling a long thread holds 60 fps (median and p95 frame 16.7 ms).
+- Composer: type, send, queue while a turn runs, steer with ⌘↩ / Ctrl+Enter; IME composition (underlined preedit, then commit).
+- Approvals: by click and by ⌘↩.
+- Settings, inside the window: appearance and themes (a change lands in `config.toml` on the daemon's machine and applies), agents' defaults and models, projects, worktrees, shortcuts, sign out.
+- Side panel: Changes (diffs) and Files with the file viewer; menus draw in-window.
+- A browser tab in the side panel ([ADR-0017](adr/0017-streamed-browser.md)): the daemon runs the Chrome installed on its machine, headless, and streams the page; the web client shows it and sends mouse and keys back. Tried: address bar (addresses and searches), clicking, typing and editing, links, back and reload, a new-window link opening in place, wheel scrolling, a two-line paste, resizing with the panel, the tab's title, turning it off and on for a connected browser. The web client holds 60 fps while the page scrolls (median and p99 frame 16.7 / 16.8 ms).
+- Settings ▸ Browser, in the app and in the browser: the search engine the address bar uses (seven by name, or an address of your own with `%s`), the home page new tabs open, and (desktop only) which browser app the daemon runs for the web client. Tried: picking Google and a home page in the web client, a new tab opening it, a search going to Google, and the same values showing in the desktop app's Settings.
+- Terminals, in the dock under the conversation and as side-panel tabs: the same widget and emulator as the desktop app (libghostty-vt built for wasm), on the daemon's PTYs. Tried: zsh with colours, CJK and emoji, vim, Ctrl+C, scrollback, a two-line paste (bracketed), select all and copy, two shells at once, the shell surviving a reconnect.
+- Images in replies that point at files in the project: fetched through the daemon. A path outside the project stays empty.
+- Light and dark themes; a 2× (HiDPI) screen; the tab title follows the thread; reconnecting after the daemon restarts.
+- Desktop app: Settings ▸ Web access (on/off, pairing link, signed-in browsers, sign out, address, port, TLS, warnings).
+
+**How to try it**
+
+```sh
+cargo xtask web --release     # the web client → target/web (about a minute; 24 MB wasm, 9.0 MB gzipped)
+cargo xtask dev               # the app, on ./.dev-home
+```
+
+Then in the app: Settings ▸ Web access ▸ turn on "Use Agentloft in a browser" ▸ **Open in browser**.
+
+Without the app, on any home:
+
+```sh
+printf '[web]\nenabled = true\n' >> "$AGENTLOFT_HOME/config.toml"
+target/debug/agentloftd --home "$AGENTLOFT_HOME" &
+target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing link
+```
+
+**What's left**
+- Sending images from the browser (paste, drop, pick), and the image preview's Copy / Save.
+- Images in replies that point at other websites: the page's Content-Security-Policy allows no third-party requests, so they stay empty in the browser.
+- In the streamed browser tab: agents can't drive it yet (they drive the desktop app's panel), and the desktop app doesn't show the same tabs; script dialogs are answered for the page, downloads and file choosers are refused; one tab per thread; the pointer keeps its arrow shape; text an input method is composing shows only once committed; needs Chrome, Chromium, Edge or Brave on the daemon's machine.
+- In the browser's terminal: keys the browser keeps for itself (⌘W / Ctrl+W, ⌘T, ⌘N) never reach the shell; prompt glyphs from icon fonts are missing (the client ships JetBrains Mono); a paste has to be the browser's own (⌘V, Ctrl+Shift+V or its menu).
+- Adding a project by browsing folders (the browser can make a new project or clone one, only where projects are kept).
+- Phone-sized layout: it is the desktop layout.
+- Not yet tried: Safari, Firefox, a real agent (Claude, Codex) through the browser, a non-loopback address (tests cover the refusal and TLS on loopback only, so no test opens a network port), `cargo xtask bundle` with the web client in it (the code is there; not run).
+- Dialogs show a few stray pixels at their bottom corners in the browser.
+- A QR code for the pairing link.
+- ADR-0014's device keys and Tailscale modes (the listener is ready for them).
+
+**Decisions to review** (details in [ADR-0016](adr/0016-web-client.md))
+1. `RUSTC_BOOTSTRAP=wasm_thread` for the wasm build: one unstable feature gate, one crate, on the pinned compiler.
+2. Default port 4780.
+3. A long-lived pairing link (as asked) rather than one-time codes; "New link" also signs everyone out.
+4. What a browser session may not do: no agent binary / arguments / environment, projects only where projects are kept, files by path only inside projects and thread folders. Note that it can still ask an agent to run commands: a session is as powerful as a shell.
+5. Browser shortcuts where the browser keeps the usual keys: new thread Ctrl+Alt+N, new pane Ctrl+Alt+T, settings Ctrl+Alt+,.
+6. Fonts shipped with the web client: Inter, JetBrains Mono, IBM Plex Sans.
+7. A fix that also touches the desktop app: an open Settings window read the store while the store was updating whenever `config.toml` changed (a panic). It now refreshes after the update.
+8. Terminals in the browser: on while only this computer can reach Agentloft (a loopback address, no proxy names), off until you turn them on once other devices can. Settings ▸ Web access ▸ Terminals, or `[web] allow_terminal`.
+9. `vendor/ghostty-vt-sys`: a copy of the published bindings crate with a wasm32 build added, patched in for every target. It goes away when the published crate can do the same.
+10. The web client's browser is a Chrome the daemon runs (the installed one, with a profile of its own), while the desktop app keeps its native panel: two browsers until the desktop shows the daemon's pages too. It follows the terminal's rule for who gets it (`[web] allow_browser`).
+
+| # | Item | Status | Evidence |
+|---|---|---|---|
+| 0 | Spike: a gpui-kit view as wasm in a real browser | [x] | Rendered, clicked, typed, IME; `gpui-pre-web` 0.3.11 is viable |
+| 1 | HTTP + WebSocket listener, off by default, loopback by default | [x] | `loftd/src/web/`; `loftd/tests/web.rs` (32 tests) |
+| 1 | Non-loopback refused without TLS or `allow_insecure_remote` | [x] | `loft-config` tests; `a_remote_address_without_tls_is_refused` |
+| 1 | Token (256-bit, 0600, constant-time, rotatable), fragment pairing, HttpOnly SameSite=Strict cookie, expiry, revocation | [x] | `web/auth.rs` (15 tests); pairing, cookie, revocation and rotation tests |
+| 1 | Rate limiting of wrong tokens | [x] | `wrong_tokens_are_rate_limited`, limiter unit tests |
+| 1 | Host check (DNS rebinding), Origin check (cross-site WebSocket), CSP, no CORS | [x] | `an_unknown_host_is_refused`, `the_websocket_refuses_other_origins`, `responses_are_hardened_and_never_cors` |
+| 1 | Frame, request and connection limits | [x] | `oversized_requests_are_cut_off`, `an_oversized_websocket_message_ends_the_connection`, `connections_are_capped` |
+| 1 | Least privilege for browser sessions; path confinement | [x] | `loft-core/src/remote.rs` (10 tests) |
+| 1 | TLS | [x] | `tls_serves_https_with_secure_cookies` (self-signed, loopback) |
+| 2 | Transport abstraction in `loft-client` | [x] | `native.rs` (Unix socket), `web.rs` (WebSocket) |
+| 2 | `loft-ui` compiles for wasm32; CI job | [x] | `cargo xtask web`; CI `web` job (build and clippy) |
+| 2 | Disk access through the daemon in the browser | [x] | `loft-ui/src/host.rs`; `UiFiles`, `PutUiState`, `DeleteTheme`, `ProjectIcon`, `ReadPath` |
+| 2 | Native-only pieces get a placeholder, not a crash | [~] | Folder browser, file dialogs, Finder, editors: left out. Docs viewer (Word, Excel…) and image attachments: untested in the browser |
+| 2 | A browser tab in the browser | [x] | The daemon's own Chrome, streamed (`loft-core/src/pages`, `loft-ui/src/panel/page.rs`); `pages::tests::live_a_page_is_pictured_and_takes_input` (needs Chrome, run with `--ignored`), `the_daemons_browser_follows_who_can_reach_the_listener`, `the_daemons_browser_is_refused_unless_allowed` |
+| 2 | The terminal in the browser | [x] | `loft-terminal` unchanged on libghostty-vt for wasm32 (`vendor/ghostty-vt-sys`); allowed per session by `[web] allow_terminal` (`web_terminals_follow_who_can_reach_the_listener`, `terminals_follow_who_can_reach_the_listener`, `loft-core/src/remote.rs` tests) |
+| 3 | Sidebar, thread view, composer, approvals, settings, diff panel in a browser | [x] | Screenshots during development (not checked in: they show local paths) |
+| 3 | IME, shortcuts, scrolling, light/dark | [x] | See the summary |
+| 4 | Settings ▸ Web access in the desktop app | [~] | Everything but the QR code |
 
 ## M1 → M9
 

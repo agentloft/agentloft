@@ -19,15 +19,26 @@ use loft_protocol::Request;
 
 mod agents;
 mod appearance;
+mod browser;
 mod projects;
 mod shortcuts;
+mod web;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
 impl Global for SettingsWindow {}
 
+/// Settings drawn inside the main window: where there is only one window
+/// (Agentloft in a browser tab).
+struct SettingsOverlay(Entity<SettingsView>);
+impl Global for SettingsOverlay {}
+
 /// Open the settings window (optionally at a section), or bring the open
 /// one to the front.
 pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
+    if crate::host::IS_WEB {
+        open_in_window(store, section, cx);
+        return;
+    }
     if let Some(SettingsWindow(handle, view)) = cx
         .try_global::<SettingsWindow>()
         .map(|w| SettingsWindow(w.0, w.1.clone()))
@@ -72,12 +83,68 @@ pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
     }
 }
 
+/// Settings over the main window's content (see [`overlay`]).
+fn open_in_window(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
+    if let Some(view) = cx.try_global::<SettingsOverlay>().map(|o| o.0.clone()) {
+        if let Some(section) = section {
+            view.update(cx, |v, cx| {
+                v.section = section;
+                cx.notify();
+            });
+        }
+        return;
+    }
+    let Some(handle) = cx.active_window().or_else(|| cx.windows().first().copied()) else {
+        return;
+    };
+    // Deferred: this is usually called from inside that window's own event
+    // handling, where it can't be borrowed again.
+    cx.defer(move |cx| {
+        let _ = handle.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = SettingsView::new(store.clone(), window, cx);
+                if let Some(section) = section {
+                    view.section = section;
+                }
+                view
+            });
+            window.focus(&view.read(cx).focus.clone(), cx);
+            cx.set_global(SettingsWindow(handle, view.downgrade()));
+            cx.set_global(SettingsOverlay(view));
+            window.refresh();
+        });
+    });
+}
+
+/// Close in-window settings.
+pub fn close(cx: &mut App) {
+    if cx.try_global::<SettingsOverlay>().is_some() {
+        cx.remove_global::<SettingsOverlay>();
+        cx.refresh_windows();
+    }
+}
+
+/// In-window settings, for the main window's root view to draw over
+/// everything else (`None` when closed, and always on the desktop, where
+/// settings have a window of their own).
+pub fn overlay(cx: &App) -> Option<AnyElement> {
+    let view = cx.try_global::<SettingsOverlay>()?.0.clone();
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .child(view)
+            .into_any_element(),
+    )
+}
+
 /// Re-read `config.toml` into an open settings window (changed elsewhere).
 pub fn refresh(cx: &mut App) {
     if let Some(view) = cx.try_global::<SettingsWindow>().map(|w| w.1.clone()) {
         let _ = view.update(cx, |v, cx| {
             let paths = v.store.read(cx).paths().clone();
-            if let Ok(c) = Config::load(&paths) {
+            if let Ok(c) = crate::host::load_config(&paths) {
                 v.config = c;
                 v.studio.themes = crate::themes::all(&paths.home);
             }
@@ -212,6 +279,21 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Worktrees,
     },
     Findable {
+        label: "Search engine",
+        keywords: "browser search engine google duckduckgo bing brave kagi ecosia startpage address bar default",
+        section: Section::Browser,
+    },
+    Findable {
+        label: "Home page",
+        keywords: "browser home page new tab start address",
+        section: Section::Browser,
+    },
+    Findable {
+        label: "Browser app",
+        keywords: "browser chrome chromium edge brave executable path web client",
+        section: Section::Browser,
+    },
+    Findable {
         label: "Keyboard shortcuts",
         keywords: "shortcuts hotkeys keys keybindings keymap rebind steer",
         section: Section::Shortcuts,
@@ -239,25 +321,54 @@ pub enum Section {
     Agents,
     Projects,
     Worktrees,
+    /// The browser panel: search engine, home page, which browser.
+    Browser,
     Shortcuts,
+    /// Agentloft in a browser (desktop only: a browser session may not
+    /// manage its own access).
+    Web,
     About,
 }
 
 impl Section {
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL
+        Self::all()
             .into_iter()
-            .find(|sec| sec.label().eq_ignore_ascii_case(s))
+            .find(|sec| sec.label().eq_ignore_ascii_case(s) || sec.slug() == s)
     }
 
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 8] = [
         Section::Appearance,
         Section::Agents,
         Section::Projects,
         Section::Worktrees,
+        Section::Browser,
         Section::Shortcuts,
+        Section::Web,
         Section::About,
     ];
+
+    /// The sections this build has.
+    fn all() -> Vec<Section> {
+        Self::ALL
+            .into_iter()
+            .filter(|section| !(crate::host::IS_WEB && *section == Section::Web))
+            .collect()
+    }
+
+    /// One word, for links and the dev hook (`settings:web`).
+    fn slug(self) -> &'static str {
+        match self {
+            Section::Appearance => "appearance",
+            Section::Agents => "agents",
+            Section::Projects => "projects",
+            Section::Worktrees => "worktrees",
+            Section::Browser => "browser",
+            Section::Shortcuts => "shortcuts",
+            Section::Web => "web",
+            Section::About => "about",
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -265,7 +376,9 @@ impl Section {
             Section::Agents => "Agents",
             Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
+            Section::Browser => "Browser",
             Section::Shortcuts => "Shortcuts",
+            Section::Web => "Web access",
             Section::About => "About",
         }
     }
@@ -276,7 +389,9 @@ impl Section {
             Section::Agents => IconName::Bot,
             Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
+            Section::Browser => IconName::Globe,
             Section::Shortcuts => IconName::Keyboard,
+            Section::Web => IconName::GlobeLock,
             Section::About => IconName::Sparkles,
         }
     }
@@ -290,6 +405,15 @@ pub(super) enum Field {
     BranchPrefix,
     ProjectsDir,
     NewProjectsDir,
+    WebBind,
+    WebPort,
+    WebCert,
+    WebKey,
+    WebHosts,
+    /// A search address of the user's own (`browser.search`).
+    BrowserSearch,
+    BrowserHome,
+    BrowserApp,
 }
 
 impl Field {
@@ -300,6 +424,14 @@ impl Field {
             Field::BranchPrefix => &["worktrees", "branch_prefix"],
             Field::ProjectsDir => &["projects", "base_dir"],
             Field::NewProjectsDir => &["projects", "new_dir"],
+            Field::WebBind => &["web", "bind"],
+            Field::WebPort => &["web", "port"],
+            Field::WebCert => &["web", "tls_cert"],
+            Field::WebKey => &["web", "tls_key"],
+            Field::WebHosts => &["web", "allowed_hosts"],
+            Field::BrowserSearch => &["browser", "search"],
+            Field::BrowserHome => &["browser", "home"],
+            Field::BrowserApp => &["browser", "executable"],
         }
     }
 
@@ -310,6 +442,19 @@ impl Field {
             Field::BranchPrefix => c.worktrees.branch_prefix.clone(),
             Field::ProjectsDir => c.projects.base_dir.clone().unwrap_or_default(),
             Field::NewProjectsDir => c.projects.new_dir.clone().unwrap_or_default(),
+            Field::WebBind => c.web.bind.clone(),
+            Field::WebPort => c.web.port.to_string(),
+            Field::WebCert => c.web.tls_cert.clone().unwrap_or_default(),
+            Field::WebKey => c.web.tls_key.clone().unwrap_or_default(),
+            Field::WebHosts => c.web.allowed_hosts.join(", "),
+            // Only an address of one's own is typed; an engine picked by
+            // name leaves the field empty.
+            Field::BrowserSearch => match c.browser.search_engine() {
+                Some(_) => String::new(),
+                None => c.browser.search.clone().unwrap_or_default(),
+            },
+            Field::BrowserHome => c.browser.home.clone().unwrap_or_default(),
+            Field::BrowserApp => c.browser.executable.clone().unwrap_or_default(),
         }
     }
 
@@ -320,6 +465,24 @@ impl Field {
             Field::BranchPrefix => "agentloft",
             Field::ProjectsDir => "~/",
             Field::NewProjectsDir => "~/.agentloft/projects",
+            Field::WebBind => "127.0.0.1",
+            Field::WebPort => "4780",
+            Field::WebCert => "None",
+            Field::WebKey => "None",
+            Field::WebHosts => "None",
+            Field::BrowserSearch => "https://example.com/search?q=%s",
+            Field::BrowserHome => "A blank tab",
+            Field::BrowserApp => "Chrome, Chromium, Edge or Brave",
+        }
+    }
+
+    /// What the field holds when nothing was set (shown as its placeholder
+    /// rather than typed in).
+    fn default_text(self) -> &'static str {
+        match self {
+            Field::WebBind => "127.0.0.1",
+            Field::WebPort => "4780",
+            _ => "",
         }
     }
 
@@ -332,6 +495,30 @@ impl Field {
                 true,
             ) => SettingValue::Unset,
             (Field::BranchPrefix, true) => SettingValue::Str("agentloft".into()),
+            (Field::WebBind | Field::WebPort | Field::WebCert | Field::WebKey, true) => {
+                SettingValue::Unset
+            }
+            (Field::BrowserSearch | Field::BrowserHome | Field::BrowserApp, true) => {
+                SettingValue::Unset
+            }
+            // Not a port: left as it was (the field shows the old value again).
+            (Field::WebPort, false) => match text.parse::<u16>() {
+                Ok(port) => SettingValue::Int(i64::from(port)),
+                Err(_) => SettingValue::Unset,
+            },
+            (Field::WebHosts, _) => {
+                let names: Vec<String> = text
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if names.is_empty() {
+                    SettingValue::Unset
+                } else {
+                    SettingValue::List(names)
+                }
+            }
             _ => SettingValue::Str(text.to_owned()),
         }
     }
@@ -340,12 +527,18 @@ impl Field {
     fn is_daemon(self) -> bool {
         !matches!(
             self,
-            Field::UiFont | Field::MonoFont | Field::ProjectsDir | Field::NewProjectsDir
+            Field::UiFont
+                | Field::MonoFont
+                | Field::ProjectsDir
+                | Field::NewProjectsDir
+                | Field::BrowserSearch
+                | Field::BrowserHome
         )
     }
 }
 
 pub struct SettingsView {
+    focus: gpui_kit::FocusHandle,
     store: Entity<AppStore>,
     section: Section,
     config: Config,
@@ -355,6 +548,8 @@ pub struct SettingsView {
     agents: agents::AgentsPage,
     projects: projects::ProjectsPage,
     shortcuts: shortcuts::ShortcutsPage,
+    web: web::WebPage,
+    browser: browser::BrowserPage,
     _subs: Vec<Subscription>,
 }
 
@@ -372,7 +567,7 @@ const ACCENTS: [(&str, Option<&str>); 8] = [
 impl SettingsView {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = store.read(cx).paths().clone();
-        let (config, error) = match Config::load(&paths) {
+        let (config, error) = match crate::host::load_config(&paths) {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(format!("{e:#}"))),
         };
@@ -384,12 +579,20 @@ impl SettingsView {
             Field::BranchPrefix,
             Field::ProjectsDir,
             Field::NewProjectsDir,
+            Field::WebBind,
+            Field::WebPort,
+            Field::WebCert,
+            Field::WebKey,
+            Field::WebHosts,
+            Field::BrowserSearch,
+            Field::BrowserHome,
+            Field::BrowserApp,
         ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
                 let mut s = InputState::new(window, cx).placeholder(field.placeholder());
-                // `auto` reads better as the placeholder.
-                if current != "auto" {
+                // Defaults read better as the placeholder.
+                if current != "auto" && current != field.default_text() {
                     s.set_value(current, window, cx);
                 }
                 s
@@ -406,6 +609,7 @@ impl SettingsView {
         }
         let studio = appearance::Studio::new(&paths.home);
         Self {
+            focus: cx.focus_handle(),
             store,
             section: Section::Appearance,
             config,
@@ -415,6 +619,8 @@ impl SettingsView {
             agents: agents::AgentsPage::new(),
             projects: projects::ProjectsPage::default(),
             shortcuts: shortcuts::ShortcutsPage::default(),
+            web: web::WebPage::default(),
+            browser: browser::BrowserPage::default(),
             _subs: subs,
         }
     }
@@ -428,10 +634,27 @@ impl SettingsView {
     }
 
     fn save_field(&mut self, field: Field, text: &str, cx: &mut Context<Self>) {
+        // A search address has to have a place for the words; one that
+        // doesn't is said so, not saved.
+        if field == Field::BrowserSearch
+            && !text.trim().is_empty()
+            && loft_config::custom_search_template(text).is_none()
+        {
+            self.error = Some(
+                "A search address starts with https:// and has %s where the words go, like https://example.com/search?q=%s"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let value = field.value(text);
         let unchanged = match &value {
             SettingValue::Str(s) => *s == field.current(&self.config),
-            SettingValue::Unset => field.current(&self.config).is_empty(),
+            SettingValue::Int(n) => n.to_string() == field.current(&self.config),
+            SettingValue::Unset => {
+                let current = field.current(&self.config);
+                current.is_empty() || current == field.default_text()
+            }
             _ => false,
         };
         if !unchanged {
@@ -442,12 +665,12 @@ impl SettingsView {
     /// Write one setting, reload, and apply it.
     fn write(&mut self, key: &[&str], value: SettingValue, daemon: bool, cx: &mut Context<Self>) {
         let paths = self.store.read(cx).paths().clone();
-        if let Err(err) = loft_config::write_setting(&paths, key, value) {
+        if let Err(err) = crate::host::write_setting(&paths, key, value) {
             self.error = Some(format!("Couldn't save: {err:#}"));
             cx.notify();
             return;
         }
-        match Config::load(&paths) {
+        match crate::host::load_config(&paths) {
             Ok(c) => {
                 self.config = c;
                 self.error = None;
@@ -466,6 +689,10 @@ impl SettingsView {
                         Err(err) => this.error = Some(err.message),
                         // A new binary path: re-check what's installed.
                         Ok(_) => store.update(cx, |s, cx| s.probe_harnesses(cx)),
+                    }
+                    // The daemon has applied `[web]` by now.
+                    if this.section == Section::Web {
+                        this.refresh_web(cx);
                     }
                     cx.notify();
                 });
@@ -622,7 +849,7 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         let mut nav = v_flex().gap_0p5().px_2();
-        for section in Section::ALL {
+        for section in Section::all() {
             let active = section == self.section;
             nav = nav.child(
                 h_flex()
@@ -652,13 +879,26 @@ impl Render for SettingsView {
             Section::Agents => self.agents_page(&p, window, cx),
             Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
+            Section::Browser => self.browser_page(&p, cx),
             Section::Shortcuts => self.shortcuts_page(&p, cx),
+            Section::Web => self.web_page(&p, cx),
             Section::About => self.about(&p, cx),
         };
+        // In a window of its own the title bar closes it; drawn inside the
+        // main window (the browser) it brings its own way out.
+        let in_window = crate::host::IS_WEB;
         h_flex()
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
+            .track_focus(&self.focus)
+            .when(in_window, |d| {
+                d.on_key_down(|event: &gpui_kit::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        close(cx);
+                    }
+                })
+            })
             .child(
                 v_flex()
                     .w(px(200.))
@@ -667,8 +907,53 @@ impl Render for SettingsView {
                     .bg(p.sidebar)
                     .border_r_1()
                     .border_color(p.border)
-                    .pt(px(52.))
-                    .child(nav),
+                    .when(!in_window, |d| d.pt(px(52.)))
+                    .when(in_window, |d| {
+                        d.child(
+                            h_flex()
+                                .h(px(52.))
+                                .flex_shrink_0()
+                                .px_2()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .id("settings-close")
+                                        .gap_1p5()
+                                        .items_center()
+                                        .px_2()
+                                        .py(px(5.))
+                                        .rounded(px(7.))
+                                        .text_sm()
+                                        .text_color(p.muted_foreground)
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                        .child(Icon::new(IconName::ArrowLeft).small())
+                                        .child("Back")
+                                        .on_click(|_, _, cx| close(cx)),
+                                ),
+                        )
+                    })
+                    .child(nav)
+                    .when(in_window, |d| {
+                        d.child(div().flex_1()).child(
+                            div().p_2().child(
+                                h_flex()
+                                    .id("settings-sign-out")
+                                    .gap_2()
+                                    .items_center()
+                                    .px_2()
+                                    .py(px(6.))
+                                    .rounded(px(7.))
+                                    .text_sm()
+                                    .text_color(p.muted_foreground)
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                    .child(Icon::new(IconName::LogOut).small())
+                                    .child("Sign out of this browser")
+                                    .on_click(|_, _, _| crate::host::sign_out()),
+                            ),
+                        )
+                    }),
             )
             .child(
                 v_flex()
@@ -756,11 +1041,7 @@ pub(super) fn path_link(
     p: &Palette,
     cx: &mut Context<SettingsView>,
 ) -> AnyElement {
-    let shown =
-        match std::env::home_dir().and_then(|h| path.strip_prefix(h).ok().map(|r| r.to_owned())) {
-            Some(rest) => format!("~/{}", rest.display()),
-            None => path.display().to_string(),
-        };
+    let shown = crate::workspace::tilde_path(&path);
     h_flex()
         .id(id)
         .gap_1p5()

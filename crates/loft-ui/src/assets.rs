@@ -116,8 +116,142 @@ gpui_kit::assets::icon_assets!(
         Table,
         Trash,
         X,
+        LogOut,
+        GlobeLock,
+        QrCode,
+        KeyRound,
+        MonitorSmartphone,
     ]
 );
+
+// gpui-kit's own components draw these (its default bundle). Natively that
+// bundle is embedded by gpui-kit; in the browser it would be downloaded icon
+// by icon, so the web build embeds the same set here instead. The list is
+// gpui-kit-assets 0.9.0's `default-icons.txt`: refresh it when bumping
+// gpui-kit.
+#[cfg(target_arch = "wasm32")]
+gpui_kit::assets::icon_assets!(
+    KitIcons,
+    [
+        ALargeSmall,
+        ArrowDown,
+        ArrowLeft,
+        ArrowRight,
+        ArrowUp,
+        Asterisk,
+        Ban,
+        BatteryCharging,
+        BatteryFull,
+        BatteryLow,
+        BatteryMedium,
+        BatteryWarning,
+        Battery,
+        Bell,
+        BookOpen,
+        Bot,
+        Building2,
+        Calendar,
+        CaseSensitive,
+        ChartPie,
+        Check,
+        ChevronDown,
+        ChevronLeft,
+        ChevronRight,
+        ChevronUp,
+        ChevronsUpDown,
+        CircleAlert,
+        CircleCheck,
+        CircleUser,
+        CircleX,
+        Close,
+        Copy,
+        Cpu,
+        Dash,
+        Delete,
+        EllipsisVertical,
+        Ellipsis,
+        ExternalLink,
+        EyeOff,
+        Eye,
+        FileText,
+        File,
+        FolderClosed,
+        FolderOpen,
+        Folder,
+        Frame,
+        GalleryVerticalEnd,
+        Github,
+        Globe,
+        HardDrive,
+        HeartOff,
+        Heart,
+        Inbox,
+        Info,
+        Inspector,
+        LayoutDashboard,
+        LoaderCircle,
+        Loader,
+        Map,
+        Maximize,
+        MemoryStick,
+        Menu,
+        Mic,
+        Minimize,
+        Minus,
+        Moon,
+        Network,
+        Palette,
+        PanelBottomOpen,
+        PanelBottom,
+        PanelLeftClose,
+        PanelLeftOpen,
+        PanelLeft,
+        PanelRightClose,
+        PanelRightOpen,
+        PanelRight,
+        Pause,
+        Play,
+        Plus,
+        Redo2,
+        Redo,
+        RefreshCw,
+        Replace,
+        ResizeCorner,
+        RotateCw,
+        Search,
+        Settings2,
+        Settings,
+        SortAscending,
+        SortDescending,
+        SquareTerminal,
+        Square,
+        StarFill,
+        StarOff,
+        Star,
+        Sun,
+        ThumbsDown,
+        ThumbsUp,
+        TriangleAlert,
+        Undo2,
+        Undo,
+        User,
+        WindowClose,
+        WindowMaximize,
+        WindowMinimize,
+        WindowRestore
+    ]
+);
+
+/// gpui-kit's default icons.
+#[cfg(not(target_arch = "wasm32"))]
+fn kit_icons() -> impl AssetSource {
+    gpui_kit::assets::Assets
+}
+
+#[cfg(target_arch = "wasm32")]
+fn kit_icons() -> impl AssetSource {
+    KitIcons
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Assets;
@@ -129,13 +263,13 @@ impl AssetSource for Assets {
         }
         match AppIcons.load(path)? {
             Some(bytes) => Ok(Some(bytes)),
-            None => gpui_kit::assets::Assets.load(path),
+            None => kit_icons().load(path),
         }
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut out = AppIcons.list(path)?;
-        out.extend(gpui_kit::assets::Assets.list(path)?);
+        out.extend(kit_icons().list(path)?);
         Ok(out)
     }
 }

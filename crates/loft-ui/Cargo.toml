@@ -11,19 +11,34 @@ publish.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Image dimensions from file headers (reply images keep their proportions).
 imagesize = "0.14"
+# Pictures of the daemon's browser pages (JPEG), decoded for GPUI.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 loft-protocol.workspace = true
 loft-client.workspace = true
 loft-config.workspace = true
-gpui-kit.workspace = true
 loft-docs = { path = "../loft-docs" }
 loft-browser = { path = "../loft-browser" }
 loft-terminal.workspace = true
-tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 toml.workspace = true
+# `Instant`/`SystemTime` that also work in the browser (std's panic there);
+# the std types themselves on native targets.
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+gpui-kit = { workspace = true, features = ["tree-sitter-languages"] }
+tokio.workspace = true
+
+# The browser build (crates/loft-web, ADR-0016): only tokio's channels.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gpui-kit = { workspace = true, features = ["syntect"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
+# The window layout lives in the browser's localStorage.
+web-sys = { version = "0.3", features = ["Event", "Storage", "Window"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
