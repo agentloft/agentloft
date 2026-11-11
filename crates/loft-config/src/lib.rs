@@ -167,6 +167,16 @@ pub struct Config {
     pub web: WebConfig,
     pub browser: BrowserConfig,
     pub titles: TitlesConfig,
+    pub threads: ThreadsConfig,
+}
+
+/// `[threads]` in config.toml: housekeeping for threads.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ThreadsConfig {
+    /// Delete an archived thread (its conversation, worktree, checkpoints
+    /// and attachments) this many days after it was archived; 0 = never.
+    pub delete_archived_after_days: u32,
 }
 
 /// `[titles]` in config.toml: how a new thread gets its name.

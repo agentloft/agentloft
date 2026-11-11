@@ -438,6 +438,8 @@ pub(super) enum Field {
     BrowserApp,
     TitleModel,
     TitleInstructions,
+    /// Custom days before archived threads are deleted.
+    ArchiveDays,
 }
 
 impl Field {
@@ -458,6 +460,7 @@ impl Field {
             Field::BrowserApp => &["browser", "executable"],
             Field::TitleModel => &["titles", "model"],
             Field::TitleInstructions => &["titles", "instructions"],
+            Field::ArchiveDays => &["threads", "delete_archived_after_days"],
         }
     }
 
@@ -483,6 +486,7 @@ impl Field {
             Field::BrowserApp => c.browser.executable.clone().unwrap_or_default(),
             Field::TitleModel => c.titles.model.clone(),
             Field::TitleInstructions => c.titles.instructions.clone(),
+            Field::ArchiveDays => c.threads.delete_archived_after_days.to_string(),
         }
     }
 
@@ -503,6 +507,7 @@ impl Field {
             Field::BrowserApp => "Chrome, Chromium, Edge or Brave",
             Field::TitleModel => "Automatic",
             Field::TitleInstructions => "None",
+            Field::ArchiveDays => "Days",
         }
     }
 
@@ -513,6 +518,7 @@ impl Field {
             Field::WebBind => "127.0.0.1",
             Field::WebPort => "4780",
             Field::TitleModel => "auto",
+            Field::ArchiveDays => "0",
             _ => "",
         }
     }
@@ -533,6 +539,11 @@ impl Field {
                 SettingValue::Unset
             }
             (Field::TitleModel | Field::TitleInstructions, true) => SettingValue::Unset,
+            // Empty or 0: never. Not a number: checked in `save_field`.
+            (Field::ArchiveDays, _) => match text.parse::<u32>() {
+                Ok(days) if days > 0 => SettingValue::Int(i64::from(days)),
+                _ => SettingValue::Unset,
+            },
             // Not a port: left as it was (the field shows the old value again).
             (Field::WebPort, false) => match text.parse::<u16>() {
                 Ok(port) => SettingValue::Int(i64::from(port)),
@@ -582,6 +593,9 @@ pub struct SettingsView {
     shortcuts: shortcuts::ShortcutsPage,
     web: web::WebPage,
     browser: browser::BrowserPage,
+    /// "Custom" is picked for deleting archived threads (its days field
+    /// shows even while the value is a preset or never).
+    archive_custom: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -621,6 +635,7 @@ impl SettingsView {
             Field::BrowserApp,
             Field::TitleModel,
             Field::TitleInstructions,
+            Field::ArchiveDays,
         ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
@@ -655,6 +670,7 @@ impl SettingsView {
             shortcuts: shortcuts::ShortcutsPage::default(),
             web: web::WebPage::default(),
             browser: browser::BrowserPage::default(),
+            archive_custom: false,
             _subs: subs,
         }
     }
@@ -678,6 +694,14 @@ impl SettingsView {
                 "A search address starts with https:// and has %s where the words go, like https://example.com/search?q=%s"
                     .into(),
             );
+            cx.notify();
+            return;
+        }
+        if field == Field::ArchiveDays
+            && !text.trim().is_empty()
+            && !text.trim().parse::<u32>().is_ok_and(|days| days <= 3650)
+        {
+            self.error = Some("Days is a whole number from 0 to 3650, like 14.".into());
             cx.notify();
             return;
         }

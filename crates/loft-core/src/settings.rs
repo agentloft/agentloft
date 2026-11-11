@@ -35,6 +35,8 @@ enum Kind {
     /// `#rrggbb`.
     Color,
     Number(f64, f64),
+    /// A whole number in this range.
+    Int(i64, i64),
     Bool,
     TextList,
     /// A table of strings (environment variables).
@@ -147,6 +149,11 @@ const KEYS: &[Key] = &[
         key: "titles.instructions",
         kind: Kind::Text,
         about: "Extra instructions for thread titles (style, language…); null = none",
+    },
+    Key {
+        key: "threads.delete_archived_after_days",
+        kind: Kind::Int(0, 3650),
+        about: "Delete archived threads (conversation, worktree, checkpoints, attachments) this many days after archiving; 0 = never",
     },
     Key {
         key: "projects.new_dir",
@@ -269,6 +276,10 @@ fn to_setting(key: &Key, value: &Value) -> CoreResult<SettingValue> {
             Some(n) if (lo..=hi).contains(&n) => SettingValue::Float(n),
             _ => return Err(bad(format!("{name} is a number from {lo} to {hi}"))),
         },
+        Kind::Int(lo, hi) => match value.as_i64() {
+            Some(n) if (lo..=hi).contains(&n) => SettingValue::Int(n),
+            _ => return Err(bad(format!("{name} is a whole number from {lo} to {hi}"))),
+        },
         Kind::Bool => match value.as_bool() {
             Some(b) => SettingValue::Bool(b),
             None => return Err(bad(format!("{name} is true or false"))),
@@ -299,6 +310,7 @@ fn kind_text(kind: Kind) -> String {
         Kind::Text => "text".into(),
         Kind::Color => "#rrggbb".into(),
         Kind::Number(lo, hi) => format!("number {lo}–{hi}"),
+        Kind::Int(lo, hi) => format!("whole number {lo}–{hi}"),
         Kind::Bool => "true | false".into(),
         Kind::TextList => "list of text".into(),
         Kind::TextMap => "table of text".into(),

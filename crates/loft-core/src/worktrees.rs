@@ -93,7 +93,7 @@ impl Core {
         })
     }
 
-    fn load_thread(&self, id: &ThreadId) -> CoreResult<Thread> {
+    pub(crate) fn load_thread(&self, id: &ThreadId) -> CoreResult<Thread> {
         self.with_store(|s| s.thread(id))?.ok_or_else(not_found)
     }
 
@@ -447,11 +447,83 @@ impl Core {
             })
             .await;
         }
+        // Its uploaded images, and a chat's own folder.
+        let attachments = self.opts().attachments_dir.join(id.as_str());
+        let chats = self.opts().chats_dir.clone();
+        let cwd = PathBuf::from(&thread.cwd);
+        let own_chat_dir = cwd.file_name().is_some_and(|n| n == id.as_str())
+            && cwd.parent().is_some_and(|parent| same_dir(parent, &chats));
+        let _ = blocking(move || {
+            let _ = std::fs::remove_dir_all(&attachments);
+            if own_chat_dir {
+                let _ = std::fs::remove_dir_all(&cwd);
+            }
+            Ok(())
+        })
+        .await;
         self.commit(vec![Event::ThreadDeleted {
             thread_id: id.clone(),
         }])?;
         Ok(Response::Ok)
     }
+
+    /// Delete the archived threads that have been archived for longer than
+    /// `threads.delete_archived_after_days` (0 = keep them). Returns how
+    /// many went.
+    pub async fn delete_expired_archived(self: &Arc<Self>) -> usize {
+        let days = self.config().threads.delete_archived_after_days;
+        if days == 0 {
+            return 0;
+        }
+        let cutoff = now_ms() - i64::from(days) * 24 * 60 * 60 * 1000;
+        let expired: Vec<ThreadId> = match self.with_store(|s| s.threads()) {
+            Ok(threads) => threads
+                .into_iter()
+                // Archiving stamps `updated_at_ms`.
+                .filter(|t| t.status == ThreadStatus::Archived && t.updated_at_ms < cutoff)
+                .map(|t| t.id)
+                .collect(),
+            Err(_) => return 0,
+        };
+        let mut deleted = 0;
+        for id in expired {
+            match self.delete_thread(&id).await {
+                Ok(_) => deleted += 1,
+                Err(err) => {
+                    tracing::warn!(thread = %id.as_str(), err = %err.message, "couldn't delete expired archived thread")
+                }
+            }
+        }
+        if deleted > 0 {
+            tracing::info!(deleted, days, "deleted expired archived threads");
+        }
+        deleted
+    }
+
+    /// Run [`Self::delete_expired_archived`] now, every hour, and whenever
+    /// the config is reloaded. Ends when the core is dropped (or abort it).
+    pub fn spawn_archive_cleanup(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let core = Arc::downgrade(self);
+        let mut changes = self.config_changes();
+        tokio::spawn(async move {
+            loop {
+                let Some(c) = core.upgrade() else { return };
+                c.delete_expired_archived().await;
+                drop(c);
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60 * 60)) => {}
+                    changed = changes.changed() => if changed.is_err() { return },
+                }
+            }
+        })
+    }
+}
+
+/// Whether two paths name the same folder (following symlinks when they
+/// exist, e.g. /tmp vs /private/tmp).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
 }
 
 /// `gh pr create`; an already-open PR for the branch is returned instead.

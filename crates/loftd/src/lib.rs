@@ -43,6 +43,8 @@ pub struct Daemon {
     shutdown_tx: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     web_task: tokio::task::JoinHandle<()>,
+    /// Deletes archived threads past `threads.delete_archived_after_days`.
+    cleanup_task: tokio::task::JoinHandle<()>,
     _lock: File,
 }
 
@@ -108,12 +110,14 @@ impl Daemon {
             web: Some(web.clone()),
         };
         let task = tokio::spawn(accept_loop(listener, hub, shutdown_rx, paths.clone()));
+        let cleanup_task = core.spawn_archive_cleanup();
         Ok(Self {
             core,
             web,
             shutdown_tx,
             task,
             web_task,
+            cleanup_task,
             _lock: lock,
         })
     }
@@ -126,6 +130,7 @@ impl Daemon {
 
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
+        self.cleanup_task.abort();
         let _ = self.web_task.await;
         self.core.shutdown().await;
         let _ = self.task.await;

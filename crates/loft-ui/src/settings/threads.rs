@@ -1,8 +1,9 @@
 //! Settings ▸ Threads: how a new thread gets its title (`[titles]`). After
 //! the first message an agent writes a short one; until then, or with this
-//! off, the message's first line is the title.
+//! off, the message's first line is the title. And when archived threads
+//! are deleted for good (`[threads] delete_archived_after_days`).
 
-use super::{Field, SettingsView, agents::AGENTS, row, text_input};
+use super::{Field, SettingsView, agents::AGENTS, row, text_input, web::heading};
 use crate::theme::Palette;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -13,6 +14,21 @@ use loft_config::SettingValue;
 
 /// `titles.agent` for "the thread's own agent".
 const SAME_AGENT: &str = "thread";
+
+/// Picks for deleting archived threads: days (0 = never) and their label.
+const ARCHIVE_PRESETS: [(u32, &str); 4] = [
+    (0, "Never"),
+    (1, "After a day"),
+    (7, "After a week"),
+    (30, "After a month"),
+];
+
+fn archive_label(days: u32) -> String {
+    match ARCHIVE_PRESETS.iter().find(|(d, _)| *d == days) {
+        Some((_, label)) => (*label).to_owned(),
+        None => format!("After {days} days"),
+    }
+}
 
 impl SettingsView {
     pub(super) fn threads_page(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -97,6 +113,91 @@ impl SettingsView {
                     p,
                 ));
         }
+        page = page.child(heading(
+            "Archive",
+            "Archived threads leave the sidebar and wait under Archived, where you can bring them back.",
+            p,
+        ));
+        page = page.child(row(
+            "Delete archived threads",
+            "Deletes a thread for good this long after it was archived: its conversation, worktree, checkpoints and attachments. Its branch is kept.",
+            self.archive_picker(cx),
+            p,
+        ));
+        let days = self.config.threads.delete_archived_after_days;
+        let preset = ARCHIVE_PRESETS.iter().any(|(d, _)| *d == days);
+        if self.archive_custom || !preset {
+            page = page.child(row(
+                "Days",
+                "How many days after archiving, up to 3650. Press Enter to save; empty or 0 is never.",
+                text_input(&self.input(Field::ArchiveDays)),
+                p,
+            ));
+        }
         page.into_any_element()
+    }
+
+    fn archive_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let days = self.config.threads.delete_archived_after_days;
+        let custom = self.archive_custom || !ARCHIVE_PRESETS.iter().any(|(d, _)| *d == days);
+        let label = if custom && days == 0 {
+            "Custom".to_owned()
+        } else {
+            archive_label(days)
+        };
+        let view = cx.entity();
+        Button::new("archive-delete-after")
+            .cursor_pointer()
+            .outline()
+            .small()
+            .label(label)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (preset, name) in ARCHIVE_PRESETS {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(name)
+                            .checked(!custom && preset == days)
+                            .on_click(move |_, _, cx| {
+                                let value = if preset == 0 {
+                                    SettingValue::Unset
+                                } else {
+                                    SettingValue::Int(i64::from(preset))
+                                };
+                                view.update(cx, |this, cx| {
+                                    this.archive_custom = false;
+                                    this.write(
+                                        &["threads", "delete_archived_after_days"],
+                                        value,
+                                        true,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    );
+                }
+                let view = view.clone();
+                menu.separator()
+                    .item(PopupMenuItem::new("Custom…").checked(custom).on_click(
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.archive_custom = true;
+                                let input = this.input(Field::ArchiveDays);
+                                input.update(cx, |s, cx| {
+                                    // Coming from a preset: start empty, so
+                                    // typing doesn't add to its number.
+                                    let text = if custom && days > 0 {
+                                        days.to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    s.set_value(text, window, cx);
+                                    s.focus(window, cx);
+                                });
+                                cx.notify();
+                            });
+                        },
+                    ))
+            })
+            .into_any_element()
     }
 }

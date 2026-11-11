@@ -1581,3 +1581,67 @@ accent = "#d9480f"
     assert_eq!(value["current"]["ui"]["theme"], "dark");
     assert_eq!(value["themes"]["custom"][0]["id"], "custom:ember");
 }
+
+#[tokio::test]
+async fn expired_archived_threads_are_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = loft_config::Config::default();
+    config.threads.delete_archived_after_days = 7;
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            attachments_dir: dir.path().join("attachments"),
+            config,
+            ..Default::default()
+        },
+    );
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let old = new_thread(&core, &project_dir).await;
+    let recent = new_thread(&core, &project_dir).await;
+    let active = new_thread(&core, &project_dir).await;
+    let images = dir.path().join("attachments").join(old.id.as_str());
+    std::fs::create_dir_all(&images).unwrap();
+    std::fs::write(images.join("a.png"), b"png").unwrap();
+    for t in [&old, &recent] {
+        core.handle(Request::ArchiveThread {
+            thread_id: t.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap();
+    }
+    // `old` was archived eight days ago; `active` was last touched then.
+    let eight_days = 8 * 24 * 60 * 60 * 1000;
+    for id in [&old.id, &active.id] {
+        let mut t = core.load_thread(id).unwrap();
+        t.updated_at_ms -= eight_days;
+        core.commit(vec![Event::ThreadUpdated { thread: t }])
+            .unwrap();
+    }
+
+    assert_eq!(core.delete_expired_archived().await, 1);
+    let left: Vec<ThreadId> = core
+        .with_store(|s| s.threads())
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(!left.contains(&old.id));
+    assert!(left.contains(&recent.id) && left.contains(&active.id));
+    assert!(!images.exists(), "its attachments went too");
+
+    // 0 = never.
+    let mut t = core.load_thread(&recent.id).unwrap();
+    t.updated_at_ms -= eight_days;
+    core.commit(vec![Event::ThreadUpdated { thread: t }])
+        .unwrap();
+    core.config
+        .write()
+        .unwrap()
+        .threads
+        .delete_archived_after_days = 0;
+    assert_eq!(core.delete_expired_archived().await, 0);
+}
