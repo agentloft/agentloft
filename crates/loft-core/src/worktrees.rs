@@ -336,7 +336,7 @@ impl Core {
         );
         blocking(move || {
             let dir = Path::new(&path);
-            wt::commit_and_push(dir, &branch, &base, &message, &env)?;
+            wt::commit_and_push(dir, &branch, &base, &message, &env, Some(&gh))?;
             gh_pr_create(&gh, dir, &branch, &base, &title, &body, &env)
         })
         .await

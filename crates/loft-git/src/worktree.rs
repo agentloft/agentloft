@@ -293,6 +293,9 @@ fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<(String, Vec<Stri
 /// Commit pending work on the worktree's branch (if any), then push it to
 /// the base branch's remote (default `origin`) with upstream tracking.
 /// `env` is the user's login environment (credential helpers, SSH agent).
+/// With `gh`, HTTPS pushes sign in through the GitHub CLI, as `gh pr create`
+/// does, instead of a credential helper that may have nothing stored.
+/// Fails before pushing when the branch changes no files beyond `base`.
 /// Returns the remote name.
 pub fn commit_and_push(
     worktree: &Path,
@@ -300,10 +303,19 @@ pub fn commit_and_push(
     base: &str,
     message: &str,
     env: &std::collections::HashMap<String, String>,
+    gh: Option<&Path>,
 ) -> Result<String> {
     if is_dirty(worktree)? {
         run(git(worktree).args(["add", "-A"]))?;
         run(git(worktree).args(["commit", "-q", "--no-verify", "-m", message]))?;
+    }
+    let fork_point = run(git(worktree).args(["merge-base", base, branch]))?;
+    if git(worktree)
+        .args(["diff", "--quiet", fork_point.trim(), branch])
+        .status()?
+        .success()
+    {
+        bail!("nothing to open a pull request for: `{branch}` changes no files on `{base}`");
     }
     let remotes = run(git(worktree).arg("remote"))?;
     let configured = run(git(worktree).args(["config", &format!("branch.{base}.remote")]))
@@ -317,8 +329,14 @@ pub fn commit_and_push(
     let mut cmd = git(worktree);
     cmd.envs(env)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .args(["push", "-q", "-u", &remote, &format!("{branch}:{branch}")]);
+        .env("LC_ALL", "C");
+    if let Some(gh) = gh {
+        let quoted = gh.to_string_lossy().replace('\'', "'\\''");
+        cmd.args(["-c", "credential.helper="])
+            .arg("-c")
+            .arg(format!("credential.helper=!'{quoted}' auth git-credential"));
+    }
+    cmd.args(["push", "-q", "-u", &remote, &format!("{branch}:{branch}")]);
     run(&mut cmd)?;
     Ok(remote)
 }
@@ -465,13 +483,41 @@ mod tests {
         std::fs::write(wt.join("new.txt"), "x\n").unwrap();
         let env = std::env::vars().collect();
         assert_eq!(
-            commit_and_push(&wt, "agentloft/pr", "main", "Add new", &env).unwrap(),
+            commit_and_push(&wt, "agentloft/pr", "main", "Add new", &env, None).unwrap(),
             "origin"
         );
         let log =
             run(git(remote.path()).args(["log", "--format=%s", "agentloft/pr", "-1"])).unwrap();
         assert_eq!(log.trim(), "Add new");
         assert!(!is_dirty(&wt).unwrap());
+
+        // A branch with only empty commits is refused before anything is pushed.
+        add(
+            root,
+            &wt_parent.path().join("wt2"),
+            "agentloft/empty",
+            "main",
+        )
+        .unwrap();
+        let wt2 = wt_parent.path().join("wt2");
+        run(git(&wt2).args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "checkpoint",
+        ]))
+        .unwrap();
+        let err = commit_and_push(&wt2, "agentloft/empty", "main", "x", &env, None).unwrap_err();
+        assert!(err.to_string().contains("changes no files"), "{err}");
+        assert!(
+            run(git(remote.path()).args(["rev-parse", "--verify", "-q", "agentloft/empty"]))
+                .is_err()
+        );
     }
 
     #[test]
