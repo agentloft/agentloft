@@ -2839,6 +2839,13 @@ impl ThreadState {
         self.views.get(id).map(|(page, _)| page.clone())
     }
 
+    /// Where one of the thread's views is drawn right now (dev hooks).
+    pub(crate) fn a_view_bounds(&self, cx: &App) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        self.views
+            .values()
+            .find_map(|(page, _)| page.read(cx).bounds())
+    }
+
     /// Keep a view's page, and measure its row again whenever the page
     /// changes height.
     pub(crate) fn adopt_view(

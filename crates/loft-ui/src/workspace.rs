@@ -505,6 +505,68 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            Some(("viewclick", spec)) => {
+                // `x,y[,times[,gap_ms[,after_ms]]]`: click in one of the
+                // thread's views, x and y from its top left. Goes through
+                // the window's own event handling, so it tests what a real
+                // click does without the system's leave to post one.
+                let n: Vec<f32> = spec
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+                let (x, y, times) = (at(0, 10.), at(1, 10.), at(2, 1.) as usize);
+                let gap = std::time::Duration::from_millis(at(3, 150.) as u64);
+                let after = std::time::Duration::from_millis(at(4, 3000.) as u64);
+                let thread = thread.clone();
+                cx.spawn_in(window, async move |_, cx| {
+                    use gpui_kit::{
+                        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+                        PlatformInput, point,
+                    };
+                    cx.background_executor().timer(after).await;
+                    for i in 0..times {
+                        let Ok(Some(bounds)) = cx.update(|_, cx| thread.read(cx).a_view_bounds(cx))
+                        else {
+                            tracing::info!("dev: no view to click in");
+                            return;
+                        };
+                        let position = bounds.origin + point(px(x), px(y));
+                        let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+                        let steps = [
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position,
+                                pressed_button: None,
+                                modifiers,
+                            }),
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                button,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                            }),
+                        ];
+                        for step in steps {
+                            let _ = cx.update(|window, cx| {
+                                window.dispatch_event(step, cx);
+                            });
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(40))
+                                .await;
+                        }
+                        tracing::info!(click = i + 1, "dev: clicked in a view");
+                        cx.background_executor().timer(gap).await;
+                    }
+                })
+                .detach();
+            }
             Some(("addproject", text)) => {
                 let text = text.to_owned();
                 cx.defer_in(window, move |this, window, cx| {

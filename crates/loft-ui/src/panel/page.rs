@@ -96,6 +96,12 @@ impl Seen {
     }
 }
 
+/// Whether a request failed because the connection to the daemon ended,
+/// rather than because of what was asked.
+fn lost_connection(err: &loft_protocol::ErrorBody) -> bool {
+    err.code == loft_protocol::ErrorCode::Internal && err.message.ends_with("agentloftd")
+}
+
 fn init(cx: &mut App) {
     if cx.has_global::<Initialized>() {
         return;
@@ -163,6 +169,9 @@ pub struct PageView {
     seen: Rc<Cell<Option<Seen>>>,
     /// The newest picture not drawn yet, and when it arrived (for the log).
     arrived: Rc<Cell<Option<(u64, Instant)>>>,
+    /// The page couldn't be opened because there was no daemon to ask (it
+    /// was restarting): it is opened as soon as there is one again.
+    offline: bool,
     /// Lets go of a view's page once it has gone unseen.
     resting: Option<Task<()>>,
     /// Whether a view's page is the top of its card (no title over it),
@@ -199,6 +208,14 @@ impl PageView {
         };
         let subs = vec![
             cx.subscribe_in(&address, window, Self::on_address_event),
+            // Back in touch with the daemon: a page that was waiting for
+            // that opens now, with nobody having to touch it.
+            cx.observe(&store, |this, store, cx| {
+                if this.offline && store.read(cx).client().is_some() {
+                    this.offline = false;
+                    cx.notify();
+                }
+            }),
             // The view going away (its thread's panel closed) closes the
             // page: nothing else would.
             cx.on_release(|this, cx| {
@@ -246,6 +263,7 @@ impl PageView {
             last_height: None,
             seen: Rc::default(),
             arrived: Rc::default(),
+            offline: false,
             resting: None,
             flush_top: Rc::default(),
             _subs: subs,
@@ -268,6 +286,11 @@ impl PageView {
 
     /// Whether a view's page is the top of its card. Whoever draws the
     /// card says so each time it draws.
+    /// Where the page is drawn in its window, once it has been.
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.bounds.get()
+    }
+
     pub fn flush_top(&self) -> Rc<Cell<bool>> {
         self.flush_top.clone()
     }
@@ -416,6 +439,13 @@ impl PageView {
                     }
                 }
                 Ok(other) => this.note = Some(format!("unexpected response: {other:?}")),
+                // The daemon is away (restarting, being replaced by a newer
+                // build): that is not the page failing, and nothing for the
+                // viewer to retry. It opens when the daemon is back.
+                Err(_) if this.store.read(cx).client().is_none() => this.offline = true,
+                // Asked on a connection that ended meanwhile: the redraw
+                // below asks again on the one there is now.
+                Err(err) if lost_connection(&err) => {}
                 Err(err) => this.note = Some(err.message),
             }
             cx.notify();
@@ -430,7 +460,7 @@ impl PageView {
             return;
         };
         if self.info.is_none() {
-            if !self.opening && self.note.is_none() {
+            if !self.opening && !self.offline && self.note.is_none() {
                 self.open(size, cx);
             }
             return;
@@ -637,6 +667,7 @@ impl PageView {
         self.info = None;
         self.asked = None;
         self.note = None;
+        self.offline = false;
         cx.notify();
     }
 
@@ -715,6 +746,9 @@ impl PageView {
     ) {
         window.focus(&self.focus, cx);
         let Some((x, y)) = self.page_point(event.position) else {
+            // No page behind the picture (it was let go, or the daemon
+            // restarted): a click is as good a moment as any to get one.
+            cx.notify();
             return;
         };
         self.last_point = event.position;
