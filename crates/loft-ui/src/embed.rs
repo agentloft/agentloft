@@ -8,7 +8,7 @@
 //! of it, which menus can cover and which scrolls in step with the thread;
 //! the page itself waits out of sight, still running.
 
-use crate::panel::page::{PageResized, Seen, act};
+use crate::panel::page::{PageResized, Seen, act, pointer_for};
 use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use futures::StreamExt as _;
@@ -17,9 +17,9 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Bounds, Context, DispatchPhase, Entity, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Render,
-    RenderImage, ScrollEvent, Styled as _, Task, Window, canvas, div, img, px,
+    Bounds, Context, DispatchPhase, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
+    Pixels, Render, RenderImage, ScrollEvent, Styled as _, Task, Window, canvas, div, img, px,
 };
 use loft_browser::{Corners, HostEvent, HostPicture, ViewHost};
 use loft_protocol::{ItemId, PageAction, Request, Response, ThreadId, ViewTheme};
@@ -39,7 +39,11 @@ const RADIUS: f32 = 11.;
 const SETTLE: Duration = Duration::from_millis(120);
 /// While a page that isn't live keeps changing by itself (it animates), its
 /// picture is taken again this often.
-const MOVING_EVERY: Duration = Duration::from_millis(300);
+const MOVING_EVERY: Duration = Duration::from_millis(70);
+/// The band at the bottom of the thread where the list draws its fade and
+/// its jump button, in rems: the page is not shown there (its picture is),
+/// so both stay on top of it.
+const BAND: f32 = 3.;
 /// After the thread scrolls, the pointer has to move again (or press) for
 /// the page under it to come in: a scroll is a run of events, and a page
 /// that came and went with each would flicker.
@@ -92,6 +96,16 @@ pub struct EmbedView {
     typing: bool,
     /// A press was handed to the page: its release is too.
     handed: bool,
+    /// The pointer the page wants where the mouse is, as CSS names it. The
+    /// web view sets it itself, but the app sets its own again whenever it
+    /// redraws (an arrow, for a row it knows nothing about): so the app is
+    /// told to want the same.
+    cursor: String,
+    /// The app's own focus while the page has the keyboard. Without it the
+    /// composer would still be what the app thinks is focused, and would
+    /// take Cmd+A, Cmd+C and Cmd+V meant for the page.
+    focus: FocusHandle,
+    _blur: gpui_kit::Subscription,
     /// The page as last pictured: what the row shows while it isn't live.
     still: Option<Arc<RenderImage>>,
     /// That picture's pixels, hashed: a page whose pictures differ is moving.
@@ -105,6 +119,10 @@ pub struct EmbedView {
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     visible: Rc<Cell<Option<Bounds<Pixels>>>>,
     seen: Rc<Cell<Option<Seen>>>,
+    /// The view reaches into the band at the bottom of the list, where its
+    /// picture shows even while the page is live: so the picture is kept
+    /// up with the page there.
+    banded: Rc<Cell<bool>>,
     /// Whether the page is the top of its card (no title over it).
     flush_top: Rc<Cell<bool>>,
     events: Option<Task<()>>,
@@ -121,9 +139,18 @@ impl EmbedView {
         item: ItemId,
         host: ViewHost,
         events: UnboundedReceiver<HostEvent>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let events = Some(Self::listen(events, 0, cx));
+        let events = Some(Self::listen(events, 0, window, cx));
+        let focus = cx.focus_handle();
+        // The app's focus went elsewhere (a click in the composer, a
+        // shortcut): the keyboard goes with it.
+        let _blur = cx.on_blur(&focus, window, |this, _, _| {
+            if let Some(host) = &this.host {
+                host.release_focus();
+            }
+        });
         // Out of sight for a while: the page goes, its picture stays.
         let _resting = cx.spawn(async move |this, cx| {
             let mut gone: Option<Instant> = None;
@@ -181,6 +208,9 @@ impl EmbedView {
             scrolled: Rc::default(),
             typing: false,
             handed: false,
+            cursor: String::new(),
+            focus,
+            _blur,
             still: None,
             print: 0,
             picturing: false,
@@ -190,6 +220,7 @@ impl EmbedView {
             bounds: Rc::default(),
             visible: Rc::default(),
             seen: Rc::default(),
+            banded: Rc::default(),
             flush_top: Rc::default(),
             events,
             _resting,
@@ -200,13 +231,14 @@ impl EmbedView {
     fn listen(
         mut events: UnboundedReceiver<HostEvent>,
         epoch: u64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<()> {
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
-                let heard = this.update(cx, |this, cx| {
+                let heard = this.update_in(cx, |this, window, cx| {
                     if this.epoch == epoch {
-                        this.on_host(event, cx);
+                        this.on_host(event, window, cx);
                     }
                 });
                 if heard.is_err() {
@@ -244,7 +276,7 @@ impl EmbedView {
         match ViewHost::new(window, &origin, loft_view::ALLOWED_HOSTS, events) {
             Ok(host) => {
                 self.host = Some(host);
-                self.events = Some(Self::listen(heard, self.epoch, cx));
+                self.events = Some(Self::listen(heard, self.epoch, window, cx));
             }
             Err(err) => tracing::debug!(err = %format!("{err:#}"), "no page for a view"),
         }
@@ -372,7 +404,7 @@ impl EmbedView {
         .detach();
     }
 
-    fn on_host(&mut self, event: HostEvent, cx: &mut Context<Self>) {
+    fn on_host(&mut self, event: HostEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             HostEvent::Ready => {
                 // An empty document (the first, or the page loaded anew):
@@ -394,20 +426,22 @@ impl EmbedView {
                             return;
                         };
                         let wanted = wanted.min(u64::from(u32::MAX)) as u32;
-                        // More than the tallest a view gets: it scrolls
-                        // inside, once clicked into.
-                        if let Some(host) = &self.host {
-                            host.set_scrolls(wanted > loft_view::MAX_HEIGHT);
-                        }
+                        // (More than the tallest a view gets scrolls inside.)
                         let height = wanted.clamp(loft_view::MIN_HEIGHT, loft_view::MAX_HEIGHT);
                         if height != self.height {
                             self.height = height;
                             cx.emit(PageResized);
                             cx.notify();
+                            if self.live {
+                                self.settle_sticky();
+                            }
                         }
                         self.picture_soon(cx);
                     }
                     Some("state") => {
+                        if self.live && self.banded.get() {
+                            self.picture_soon(cx);
+                        }
                         let state = call["value"].clone();
                         if state.to_string().len() > loft_view::MAX_STATE {
                             return;
@@ -425,6 +459,42 @@ impl EmbedView {
                         );
                     }
                     Some("typing") => self.typing = call["value"].as_bool().unwrap_or(false),
+                    // The page took the keyboard (it was clicked into): the
+                    // app's focus follows, out of wherever it was.
+                    Some("focused") => {
+                        if call["value"].as_bool().unwrap_or(false)
+                            && !self.focus.is_focused(window)
+                        {
+                            window.focus(&self.focus, cx);
+                        }
+                    }
+                    Some("reach") => {
+                        let way = |i: usize| call["value"][i].as_bool().unwrap_or(false);
+                        if let Some(host) = &self.host {
+                            host.set_reach([way(0), way(1), way(2), way(3)]);
+                        }
+                    }
+                    // Something of the page moved or changed under the
+                    // pointer: the part of it that is a picture follows.
+                    Some(kind @ ("scrolled" | "cursor")) => {
+                        if kind == "cursor" {
+                            let wanted = match call["value"].as_str() {
+                                Some("default" | "auto") | None => "",
+                                Some(name) => name,
+                            };
+                            if self.cursor != wanted {
+                                tracing::debug!(
+                                    cursor = wanted,
+                                    "a view's page wants another pointer"
+                                );
+                                self.cursor = wanted.to_owned();
+                                cx.notify();
+                            }
+                        }
+                        if self.live && self.banded.get() {
+                            self.picture(cx);
+                        }
+                    }
                     Some("send") => self.act(PageAction::Send { text: text() }, cx),
                     Some("copy") => self.act(PageAction::Copy { text: text() }, cx),
                     Some("open") => self.act(PageAction::Open { target: text() }, cx),
@@ -495,7 +565,7 @@ impl EmbedView {
                 cx.notify();
                 if std::mem::take(&mut this.picture_again) {
                     this.picture(cx);
-                } else if moving && !this.live && this.in_sight() {
+                } else if moving && (!this.live || this.banded.get()) && this.in_sight() {
                     // It changes by itself: keep its picture roughly current.
                     this.settle = Some(cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(MOVING_EVERY).await;
@@ -526,7 +596,20 @@ impl EmbedView {
         if !self.live && self.opened {
             tracing::debug!("a view's page comes in under the pointer");
             self.live = true;
+            self.settle_sticky();
             cx.notify();
+        }
+    }
+
+    /// The page was out of sight and is about to be shown (or changed size
+    /// while it is): have WebKit place its sticky and fixed parts anew. It
+    /// keeps where it last put them, and that was worked out for a page
+    /// somewhere else, of another size; a scroll to where it already is
+    /// makes it work them out again. (A picture of the page never shows
+    /// this: it is drawn afresh.)
+    fn settle_sticky(&self) {
+        if let Some(host) = &self.host {
+            drop(host.run("window.scrollBy(0, 1); window.scrollBy(0, -1);"));
         }
     }
 
@@ -575,7 +658,7 @@ impl EmbedView {
     /// A press on the picture: the page comes in under it and gets the
     /// press, as if it had been there.
     fn on_press(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.live || !self.opened {
+        if !self.opened {
             return;
         }
         let (Some(bounds), Some(visible), Some(host)) =
@@ -583,15 +666,20 @@ impl EmbedView {
         else {
             return;
         };
-        self.live = true;
+        // (A press can reach us with the page shown, too: in the band at
+        // the bottom of the list, where only its picture is.)
+        if !self.live {
+            self.live = true;
+            self.settle_sticky();
+            host.show_now(
+                bounds,
+                visible,
+                window.scale_factor(),
+                px(RADIUS),
+                self.corners(),
+            );
+        }
         self.leaving = false;
-        host.show_now(
-            bounds,
-            visible,
-            window.scale_factor(),
-            px(RADIUS),
-            self.corners(),
-        );
         host.take_press();
         self.handed = true;
         cx.stop_propagation();
@@ -635,8 +723,10 @@ impl EmbedView {
 async fn render(picture: HostPicture) -> Option<(Arc<RenderImage>, u64)> {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    picture.bgra.hash(&mut hasher);
-    let pixels = image::RgbaImage::from_raw(picture.width, picture.height, picture.bgra)?;
+    let (width, height) = (picture.width, picture.height);
+    let bgra = picture.into_bgra();
+    bgra.hash(&mut hasher);
+    let pixels = image::RgbaImage::from_raw(width, height, bgra)?;
     Some((
         Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])),
         hasher.finish(),
@@ -671,24 +761,26 @@ impl Render for EmbedView {
         let (bounds, visible, seen) =
             (self.bounds.clone(), self.visible.clone(), self.seen.clone());
         let (live, host, entity) = (self.live, self.host.clone(), cx.entity().downgrade());
+        let banded = self.banded.clone();
         let scrolled = self.scrolled.clone();
+        let band = window.rem_size() * BAND;
         div()
             .id(("view-embed", cx.entity_id()))
             .relative()
             .w_full()
             .h(px(self.height as f32))
             .overflow_hidden()
+            .cursor(pointer_for(&self.cursor))
+            .track_focus(&self.focus)
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.come_alive(cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_press))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_release))
             .child(body)
             .children(self.host.as_ref().map(|host| {
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .child(host.surface(live, px(RADIUS), self.corners()))
+                div().absolute().top_0().left_0().size_full().child(
+                    host.surface(live, px(RADIUS), self.corners())
+                        .keep_clear_below(band),
+                )
             }))
             .child(
                 canvas(
@@ -698,7 +790,13 @@ impl Render for EmbedView {
                         area
                     },
                     move |_, area, window, _| {
-                        visible.set(Some(area.intersect(&window.content_mask().bounds)));
+                        let mask = window.content_mask().bounds;
+                        banded.set(
+                            area.bottom() > mask.bottom() - band && area.top() < mask.bottom(),
+                        );
+                        visible.set(Some(
+                            area.intersect(&loft_browser::without_band(mask, band)),
+                        ));
                         // The thread scrolls (the wheel over anything but a
                         // shown page comes here first).
                         window.on_mouse_event(move |_: &ScrollEvent, phase, _, _| {
@@ -736,9 +834,15 @@ impl Render for EmbedView {
                                 let _ = scrolled.update(cx, |this, cx| this.rest(cx));
                             }
                         });
-                        let typed = entity.clone();
+                        // (Not a key the page itself is getting: with the
+                        // keyboard in the page, what reaches the app is a
+                        // shortcut on its way to the Edit menu and back to
+                        // the page: Cmd+A, Cmd+C, Cmd+V.)
+                        let (typed, keyed) = (entity.clone(), host.clone());
                         window.on_key_event(move |_: &KeyDownEvent, phase, _, cx| {
-                            if phase == DispatchPhase::Capture {
+                            if phase == DispatchPhase::Capture
+                                && !keyed.as_ref().is_some_and(ViewHost::is_focused)
+                            {
                                 let _ = typed.update(cx, |this, cx| this.rest(cx));
                             }
                         });

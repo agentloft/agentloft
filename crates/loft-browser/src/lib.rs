@@ -73,7 +73,7 @@ mod view;
 
 pub use address::{DEFAULT_SEARCH_TEMPLATE, normalize_address, search_url};
 pub use command::{BrowserCommand, BrowserError, EVAL_TIMEOUT, NAVIGATION_TIMEOUT, SCRIPT_TIMEOUT};
-pub use host::{Corners, HostEvent, HostPicture, HostSurface, ViewHost};
+pub use host::{Corners, HostEvent, HostPicture, HostSurface, ViewHost, without_band};
 pub use snapshot::{
     Block, BlockKind, ElementInfo, FormattedSnapshot, MAX_SNAPSHOT_CHARS, PageSnapshot, Part,
     Viewport, format_snapshot,

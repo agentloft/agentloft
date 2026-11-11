@@ -33,7 +33,7 @@ impl NativeHost {
 
     pub fn set_size(&self, _width: f64, _height: f64) {}
 
-    pub fn set_scrolls(&self, _scrolls: bool) {}
+    pub fn set_reach(&self, _reach: [bool; 4]) {}
 
     pub fn park(&self) {}
 
@@ -60,4 +60,6 @@ impl NativeHost {
     pub fn wheel_at(&self, _x: f64, _y: f64, _lines: i32) {}
 
     pub fn click_in_window(&self, _x: f64, _y: f64) {}
+
+    pub fn type_keys(&self, _keys: &str, _command: bool) {}
 }

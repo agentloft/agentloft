@@ -580,6 +580,71 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            Some(("viewkeys", spec)) => {
+                // `x,y,after_ms`: click a field of the thread's view, type
+                // "abc", press Cmd+A, type "z" (so the field holds "z" if
+                // the shortcut reached the page), all as the system sends
+                // them.
+                let n: Vec<f32> = spec
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+                let (x, y) = (at(0, 10.), at(1, 10.));
+                let after = std::time::Duration::from_millis(at(2, 3000.) as u64);
+                let thread = thread.clone();
+                self.panel_open = false;
+                cx.spawn_in(window, async move |_, cx| {
+                    use gpui_kit::{Modifiers, MouseMoveEvent, PlatformInput, point};
+                    let executor = cx.background_executor().clone();
+                    let pause = |ms: u64| executor.timer(std::time::Duration::from_millis(ms));
+                    pause(1500).await;
+                    let _ = cx.update(|_, cx| {
+                        thread.update(cx, |state, cx| {
+                            if let Some(item) = state.last_view_item() {
+                                state.reveal(item, cx);
+                            }
+                        })
+                    });
+                    executor.timer(after).await;
+                    let Ok(Some((embed, bounds))) = cx.update(|_, cx| {
+                        let state = thread.read(cx);
+                        state.a_view_embed().zip(state.a_view_bounds(cx))
+                    }) else {
+                        tracing::info!("dev: no native view to type in");
+                        return;
+                    };
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: bounds.origin + point(px(x), px(y)),
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                    });
+                    pause(500).await;
+                    let host =
+                        |cx: &mut gpui_kit::AsyncWindowContext,
+                         act: &dyn Fn(&loft_browser::ViewHost)| {
+                            let _ = cx.update(|_, cx| {
+                                if let Some(host) = embed.read(cx).host() {
+                                    act(host);
+                                }
+                            });
+                        };
+                    host(cx, &|h| h.click_at(x, y));
+                    pause(500).await;
+                    host(cx, &|h| h.type_keys("abc", false));
+                    pause(500).await;
+                    host(cx, &|h| h.type_keys("a", true));
+                    pause(500).await;
+                    host(cx, &|h| h.type_keys("z", false));
+                    tracing::info!("dev: typed abc, Cmd+A, z in a native view");
+                })
+                .detach();
+            }
             Some(("viewnative", spec)) => {
                 // `x,y[,times[,gap_ms[,after_ms]]]`: real clicks in a view
                 // that is a page of the app's own, through the window as

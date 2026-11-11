@@ -32,8 +32,10 @@ A view runs in two kinds of place, written from the same HTML with the same head
 **In the desktop app (macOS): the real page.** The app hosts it in a web view of its own (WKWebView), so a click, a hover, the pointer, selection and typing are the web view's, with nothing in between.
 
 - **Live under the pointer, a picture otherwise.** A native view draws above everything the app draws: menus, popups and tooltips would be under it, and it can't follow a scroll as smoothly as the rest. So the row shows the page itself only while the pointer is on it (or the keyboard is in one of its fields). The rest of the time it shows a picture the app took of that same page, which waits out of sight, still running. Going from one to the other shows nothing: the picture is taken as the pointer leaves, and the page comes in over the same pixels. A press on the picture brings the page in under it and is handed to it.
-- **The thread scrolls through it.** The wheel over a shown page turns the thread, as over any row (the page takes it only if it has more than it shows and was clicked into), and the page gives way to its picture while that lasts.
-- **Cut where the list cuts it**, with the card's round corners.
+- **The thread scrolls through it.** The wheel over a shown page turns the thread, as over any row, and the page gives way to its picture while that lasts. The page says where it has something of its own for the wheel to turn (a list inside it, or itself when it is taller than a view gets): there the wheel is the page's, sideways always, up and down once the page was clicked into, so that scrolling past a view never catches.
+- **The pointer is the page's.** The web view sets it itself; the app, which sets its own pointer again whenever it redraws, is told to want the same one there (as with the streamed page).
+- **The keyboard is the page's once it is clicked into.** The app's own focus moves to the view with it, so Cmd+A, Cmd+C, Cmd+V and the rest go to the page through the Edit menu and not to the composer. A page with the keyboard in one of its fields stays live wherever the pointer goes; one that is out of sight keeps the keyboard, so what is selected in it can still be copied.
+- **Cut where the list cuts it**, with the card's round corners, and kept out of the band at the bottom of the list where the app draws its fade and its jump button: there the picture shows, kept up with the page.
 - **The same walls.** Its own address and storage (nothing of the user's browser), no navigation, and nothing loads but scripts, styles and fonts from the same hosts (WebKit content rules, in place before the page is). The bridge runs in a script world of its own, the only one that can post to the app, and still asks the browser whether the user really clicked.
 - **A process each, while in sight.** A view out of sight for half a minute gives up its page; its picture stays, and the page comes back with what it remembered when it is drawn again.
 - **The agent's check is unchanged**: the daemon still loads the page once in its own browser to say what went wrong in it.
@@ -91,7 +93,7 @@ A view runs in two kinds of place, written from the same HTML with the same head
 ## Consequences
 
 - An agent can answer with anything a web page can be, and ask a question whose answer is a click.
-- In the desktop app a view is the page: native speed, the page's own pointer, selection and typing. A view that moves by itself is shown at about three pictures a second while the pointer isn't on it. In a browser client it is pictures of the page: no native text selection or screen reader inside it, and about 20 pictures a second.
+- In the desktop app a view is the page: native speed, the page's own pointer, selection and typing. A view that moves by itself is shown at about a dozen pictures a second while the pointer isn't on it. In a browser client it is pictures of the page: no native text selection or screen reader inside it, and about 20 pictures a second.
 - Each view in sight is a web view process in the app (or a tab in the daemon's browser, twenty at once at most, for browser clients).
 - The description costs every session about 500 tokens of tool definitions.
 - `read_thread` shows a view as its HTML, not as a picture.
@@ -101,7 +103,6 @@ A view runs in two kinds of place, written from the same HTML with the same head
 
 - Images a view may load: none from the web today, and none from the thread's folder.
 - The real page on other systems than macOS, and in the web client (an `<iframe>`).
-- A scrolling area inside a view that fits its row doesn't get the wheel (the thread does).
 - A view shown in a second window of the app keeps its page in the first.
 - Letting the agent read what a view remembered, rather than hearing it in a `send`.
 

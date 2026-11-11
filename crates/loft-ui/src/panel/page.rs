@@ -98,7 +98,7 @@ impl Seen {
 
 /// The pointer for what CSS calls `cursor` (what a page asked for where the
 /// mouse is); the arrow for anything unknown.
-fn pointer_for(cursor: &str) -> gpui_kit::CursorStyle {
+pub(crate) fn pointer_for(cursor: &str) -> gpui_kit::CursorStyle {
     use gpui_kit::CursorStyle as C;
     match cursor {
         "pointer" => C::PointingHand,

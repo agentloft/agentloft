@@ -70,13 +70,30 @@ impl Corners {
     }
 }
 
-/// A picture of a hosted page: its pixels as GPUI draws them (BGRA, rows
-/// top to bottom), at the display's density.
+/// A picture of a hosted page: its pixels, four bytes each, rows top to
+/// bottom, at the display's density.
 #[derive(Debug, Clone)]
 pub struct HostPicture {
-    pub bgra: Vec<u8>,
+    pub pixels: Vec<u8>,
+    /// Where blue, green, red and alpha sit in each pixel. GPUI draws
+    /// `[0, 1, 2, 3]`; see [`HostPicture::into_bgra`].
+    pub order: [u8; 4],
     pub width: u32,
     pub height: u32,
+}
+
+impl HostPicture {
+    /// The pixels as GPUI draws them (BGRA). Worth doing off the main
+    /// thread: it walks every pixel unless they are in that order already.
+    pub fn into_bgra(mut self) -> Vec<u8> {
+        if self.order != [0, 1, 2, 3] {
+            let [b, g, r, a] = self.order.map(usize::from);
+            for pixel in self.pixels.as_chunks_mut::<4>().0 {
+                *pixel = [pixel[b], pixel[g], pixel[r], pixel[a]];
+            }
+        }
+        self.pixels
+    }
 }
 
 /// A page the app hosts natively. Cheap to clone (one page behind it).
@@ -130,6 +147,7 @@ impl ViewHost {
             shown,
             radius,
             corners,
+            clear_below: Pixels::ZERO,
         }
     }
 
@@ -157,10 +175,12 @@ impl ViewHost {
         self.native.park();
     }
 
-    /// Whether the wheel is the page's own once it is clicked into (it has
-    /// more than it shows), rather than the thread's.
-    pub fn set_scrolls(&self, scrolls: bool) {
-        self.native.set_scrolls(scrolls);
+    /// Which ways the wheel has something to turn in the page where the
+    /// pointer is (`[left, right, up, down]`, as its bridge says). The
+    /// wheel is the page's there: sideways always, up and down once it was
+    /// clicked into. Everywhere else it is the thread's.
+    pub fn set_reach(&self, reach: [bool; 4]) {
+        self.native.set_reach(reach);
     }
 
     /// The press GPUI is handling right now belongs to the page: it was
@@ -203,6 +223,12 @@ impl ViewHost {
             .click_in_window(f64::from(f32::from(at.x)), f64::from(f32::from(at.y)));
     }
 
+    /// Keys as the system would send them: each of `keys` pressed and
+    /// released, with Command held if `command` (dev hooks).
+    pub fn type_keys(&self, keys: &str, command: bool) {
+        self.native.type_keys(keys, command);
+    }
+
     /// A turn of the wheel over `(x, y)`, `lines` down (dev hooks).
     pub fn wheel_at(&self, x: f32, y: f32, lines: i32) {
         self.native.wheel_at(f64::from(x), f64::from(y), lines);
@@ -217,6 +243,23 @@ pub struct HostSurface {
     shown: bool,
     radius: Pixels,
     corners: Corners,
+    clear_below: Pixels,
+}
+
+impl HostSurface {
+    /// Leave this much at the bottom of whatever clips the element to what
+    /// the app draws there (a fade, a button floating over the list): the
+    /// page isn't shown in that band, and its picture is.
+    pub fn keep_clear_below(mut self, band: Pixels) -> Self {
+        self.clear_below = band;
+        self
+    }
+}
+
+/// `clip` without a band of `below` at its bottom.
+pub fn without_band(mut clip: Bounds<Pixels>, below: Pixels) -> Bounds<Pixels> {
+    clip.size.height = (clip.size.height - below).max(Pixels::ZERO);
+    clip
 }
 
 /// Parks the page when dropped, unless a newer paint superseded it.
@@ -306,7 +349,8 @@ impl Element for HostSurface {
                 ((), guard.unwrap_or_else(|| PaintGuard::new(native)))
             });
         }
-        let visible = bounds.intersect(&window.content_mask().bounds);
+        let clip = without_band(window.content_mask().bounds, self.clear_below);
+        let visible = bounds.intersect(&clip);
         if self.shown {
             place(
                 &self.native,

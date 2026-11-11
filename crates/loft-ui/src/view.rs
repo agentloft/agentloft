@@ -186,7 +186,15 @@ fn make(
         match loft_browser::ViewHost::new(window, &origin, loft_view::ALLOWED_HOSTS, events) {
             Ok(host) => {
                 return Shown::Embed(cx.new(|cx| {
-                    EmbedView::new(store.clone(), thread.clone(), item.clone(), host, heard, cx)
+                    EmbedView::new(
+                        store.clone(),
+                        thread.clone(),
+                        item.clone(),
+                        host,
+                        heard,
+                        window,
+                        cx,
+                    )
                 }));
             }
             Err(err) => tracing::warn!(err = %format!("{err:#}"), "no native page for a view"),

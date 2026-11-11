@@ -27,6 +27,10 @@
     document.removeEventListener("mouseout", previous.onMove, true);
     document.removeEventListener("focusin", previous.onFocus, true);
     document.removeEventListener("focusout", previous.onFocus, true);
+    document.removeEventListener("scroll", previous.onScroll, true);
+    document.removeEventListener("mousedown", previous.onDown, true);
+    window.removeEventListener("focus", previous.onKeys, false);
+    window.removeEventListener("blur", previous.onKeys, false);
     clearInterval(previous.timer);
     if (previous.sizes) previous.sizes.disconnect();
   }
@@ -101,17 +105,70 @@
     }
     return "default";
   };
+  // Which ways the wheel has something to turn where the pointer is:
+  // [left, right, up, down]. A host that scrolls the thread around the page
+  // gives the page the wheel only where it can use it.
+  const reachAt = (x, y) => {
+    const can = [false, false, false, false];
+    const root = document.scrollingElement || document.documentElement;
+    for (let el = document.elementFromPoint(x, y); el; el = el.parentElement) {
+      const style = getComputedStyle(el);
+      const scrolls = (overflow) => el === root || overflow === "auto" || overflow === "scroll";
+      if (scrolls(style.overflowY) && el.scrollHeight > el.clientHeight + 1) {
+        if (el.scrollTop > 0) can[2] = true;
+        if (el.scrollTop + el.clientHeight < el.scrollHeight - 1) can[3] = true;
+      }
+      if (scrolls(style.overflowX) && el.scrollWidth > el.clientWidth + 1) {
+        if (el.scrollLeft > 0) can[0] = true;
+        if (el.scrollLeft + el.clientWidth < el.scrollWidth - 1) can[1] = true;
+      }
+    }
+    return can;
+  };
+  let reach = "";
+  let at = null;
+  const tellReach = () => {
+    const now = at ? reachAt(at[0], at[1]) : [false, false, false, false];
+    if (now.join() !== reach) {
+      reach = now.join();
+      post({ kind: "reach", value: now });
+    }
+  };
+  // What scrolled may have reached its end (or left it); and a host that
+  // shows a picture of part of the page wants a new one.
+  let scrolled = 0;
+  const onScroll = () => {
+    tellReach();
+    const now = performance.now();
+    if (now - scrolled > 60) {
+      scrolled = now;
+      post({ kind: "scrolled" });
+    }
+  };
+
   let pointer = "";
   const onMove = (event) => {
     // Leaving the page altogether arrives as a `mouseout` to nowhere.
     const left = event.type === "mouseout";
     if (left && event.relatedTarget) return;
+    at = left ? null : [event.clientX, event.clientY];
+    tellReach();
     const wanted = left ? "default" : cursorAt(event.clientX, event.clientY);
     if (wanted !== pointer) {
       pointer = wanted;
       post({ kind: "cursor", value: wanted });
     }
   };
+
+  // A press says where the pointer is as well as a move does (and a
+  // pointer that was already there when the page came in never moved).
+  const onDown = (event) => {
+    at = [event.clientX, event.clientY];
+    tellReach();
+  };
+
+  // Whether the page has the keyboard at all (it was clicked into).
+  const onKeys = (event) => post({ kind: "focused", value: event.type === "focus" });
 
   // Whether the keyboard is in a field of the page. A host that shows the
   // page only while the pointer is on it keeps it there while this is so.
@@ -167,7 +224,11 @@
   document.addEventListener("mouseout", onMove, true);
   document.addEventListener("focusin", onFocus, true);
   document.addEventListener("focusout", onFocus, true);
+  document.addEventListener("scroll", onScroll, true);
+  document.addEventListener("mousedown", onDown, true);
+  window.addEventListener("focus", onKeys, false);
+  window.addEventListener("blur", onKeys, false);
   const timer = setInterval(measure, 250);
-  world.__agentloftBridge = { onCall, onClick, onSubmit, onMove, onFocus, measure, timer, sizes };
+  world.__agentloftBridge = { onCall, onClick, onSubmit, onMove, onDown, onFocus, onScroll, onKeys, measure, timer, sizes };
   measure();
 })();

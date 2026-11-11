@@ -104,9 +104,9 @@ pub(crate) struct NativeHost {
     size: Cell<(f64, f64)>,
     /// What was last applied, to skip frames that change nothing.
     placed: Cell<Option<[f64; 10]>>,
-    /// Whether the wheel is the page's own (it has more than it shows and
-    /// was clicked into) rather than the thread's around it.
-    scrolls: Cell<bool>,
+    /// Which ways the wheel has something to turn in the page where the
+    /// pointer is: `[left, right, up, down]`, as the bridge says.
+    reach: Cell<[bool; 4]>,
     shared: Rc<Shared>,
     /// Paint generation for the surface element's drop guard.
     pub(crate) paint_token: Cell<u64>,
@@ -225,7 +225,7 @@ impl NativeHost {
             _handler: handler,
             size: Cell::new(size),
             placed: Cell::new(None),
-            scrolls: Cell::new(false),
+            reach: Cell::new([false; 4]),
             shared,
             paint_token: Cell::new(0),
         });
@@ -335,7 +335,7 @@ impl NativeHost {
             let outcome = unsafe {
                 match (image.as_ref(), error.as_ref()) {
                     (_, Some(error)) => Err(error.localizedDescription().to_string()),
-                    (Some(image), None) => pixels_of(image),
+                    (Some(image), None) => pixels_of(image).or_else(|_| pixels_by_tiff(image)),
                     (None, None) => Err("WebKit returned no image".to_owned()),
                 }
             };
@@ -371,9 +371,10 @@ impl NativeHost {
         }
     }
 
-    /// Whether the wheel belongs to the page once it is clicked into.
-    pub fn set_scrolls(&self, scrolls: bool) {
-        self.scrolls.set(scrolls);
+    /// Which ways the wheel has something to turn in the page where the
+    /// pointer is: `[left, right, up, down]`.
+    pub fn set_reach(&self, reach: [bool; 4]) {
+        self.reach.set(reach);
     }
 
     fn apply_away(&self) {
@@ -386,10 +387,11 @@ impl NativeHost {
             .setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)));
     }
 
-    /// Take the page out of sight (it keeps running).
+    /// Take the page out of sight. It keeps running, and keeps the
+    /// keyboard if it had it: what is selected in it can still be copied,
+    /// and what is typed still goes to its field.
     pub fn park(&self) {
         if self.placed.take().is_some() {
-            self.release_focus();
             self.apply_away();
         }
     }
@@ -605,6 +607,44 @@ impl NativeHost {
         }
     }
 
+    /// Keys as the system would send them, queued for the app: each of
+    /// `keys` pressed and released, with Command held if `command` (dev
+    /// hooks; letters and digits only).
+    pub fn type_keys(&self, keys: &str, command: bool) {
+        let (Some(window), Some(mtm)) = (self.wk.window(), MainThreadMarker::new()) else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let flags = if command {
+            NSEventModifierFlags::Command
+        } else {
+            NSEventModifierFlags::empty()
+        };
+        for key in keys.chars() {
+            let Some(code) = key_code(key) else {
+                continue;
+            };
+            let text = NSString::from_str(&key.to_string());
+            for kind in [NSEventType::KeyDown, NSEventType::KeyUp] {
+                let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                    kind,
+                    NSPoint::new(0.0, 0.0),
+                    flags,
+                    objc2_foundation::NSProcessInfo::processInfo().systemUptime(),
+                    window.windowNumber(),
+                    None,
+                    &text,
+                    &text,
+                    false,
+                    code,
+                );
+                if let Some(event) = event {
+                    app.postEvent_atStart(&event, false);
+                }
+            }
+        }
+    }
+
     /// A turn of the wheel over `(x, y)` from the page's top left, queued
     /// for the app as the system queues one (dev hooks).
     pub fn wheel_at(&self, x: f64, y: f64, lines: i32) {
@@ -674,6 +714,20 @@ impl Drop for NativeHost {
                 );
             self.container.removeFromSuperview();
         }
+    }
+}
+
+/// The virtual key code of a letter or digit on an ANSI keyboard.
+fn key_code(key: char) -> Option<u16> {
+    const LETTERS: [u16; 26] = [
+        0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16,
+        6,
+    ];
+    const DIGITS: [u16; 10] = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25];
+    match key.to_ascii_lowercase() {
+        c @ 'a'..='z' => Some(LETTERS[c as usize - 'a' as usize]),
+        c @ '0'..='9' => Some(DIGITS[c as usize - '0' as usize]),
+        _ => None,
     }
 }
 
@@ -749,8 +803,25 @@ fn watch_the_wheel() {
         let Some(host) = hit else {
             return event.as_ptr();
         };
-        if host.scrolls.get() && host.is_focused() {
-            return event.as_ptr();
+        // The page's own, where it has something to turn that way:
+        // sideways always (the thread only goes up and down), up and down
+        // once it was clicked into (or passing a view would catch the wheel).
+        let (dx, dy) = (event_ref.scrollingDeltaX(), event_ref.scrollingDeltaY());
+        let [left, right, up, down] = host.reach.get();
+        let for_the_page = if dx.abs() > dy.abs() {
+            (dx > 0.0 && left) || (dx < 0.0 && right)
+        } else {
+            host.is_focused() && ((dy > 0.0 && up) || (dy < 0.0 && down))
+        };
+        if for_the_page {
+            // The system takes it there itself, unless the event names no
+            // window (one made by a dev hook), which nobody would get.
+            if event_ref.window(mtm).is_some() {
+                return event.as_ptr();
+            }
+            tracing::trace!("the wheel over a view's page goes to the page");
+            host.wk.scrollWheel(event_ref);
+            return std::ptr::null_mut();
         }
         // SAFETY: main-thread view hierarchy read.
         if let Some(parent) = unsafe { host.container.superview() } {
@@ -768,8 +839,101 @@ fn watch_the_wheel() {
     std::mem::forget(monitor);
 }
 
-/// The picture's pixels as GPUI wants them (BGRA, rows top to bottom).
+/// A Quartz image, as far as we need to know it.
+#[repr(C)]
+struct CGImage {
+    _opaque: [u8; 0],
+}
+
+// SAFETY: the encoding of `CGImageRef`'s pointee, as AppKit declares it.
+unsafe impl objc2::encode::RefEncode for CGImage {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("CGImage", &[]));
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGImageGetWidth(image: *mut CGImage) -> usize;
+    fn CGImageGetHeight(image: *mut CGImage) -> usize;
+    fn CGImageGetBytesPerRow(image: *mut CGImage) -> usize;
+    fn CGImageGetBitsPerPixel(image: *mut CGImage) -> usize;
+    fn CGImageGetBitmapInfo(image: *mut CGImage) -> u32;
+    fn CGImageGetDataProvider(image: *mut CGImage) -> *mut std::ffi::c_void;
+    fn CGDataProviderCopyData(provider: *mut std::ffi::c_void) -> *const std::ffi::c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDataGetBytePtr(data: *const std::ffi::c_void) -> *const u8;
+    fn CFDataGetLength(data: *const std::ffi::c_void) -> isize;
+}
+
+/// The picture's pixels straight from its backing image: one copy, no
+/// encoding. Where blue, green, red and alpha sit in each pixel goes with
+/// them, for whoever puts them in order (off the main thread).
 fn pixels_of(image: &NSImage) -> Result<HostPicture, String> {
+    // SAFETY: an `NSImage` method with nil arguments ("as it is"); the
+    // image it returns belongs to `image`, which outlives this read; the
+    // data copied from it is released below.
+    unsafe {
+        let cg: *mut CGImage = msg_send![
+            image,
+            CGImageForProposedRect: std::ptr::null_mut::<NSRect>(),
+            context: Option::<&objc2_app_kit::NSGraphicsContext>::None,
+            hints: Option::<&objc2_foundation::NSDictionary>::None,
+        ];
+        if cg.is_null() || CGImageGetBitsPerPixel(cg) != 32 {
+            return Err("the picture has no 32-bit image behind it".into());
+        }
+        let (width, height, row) = (
+            CGImageGetWidth(cg),
+            CGImageGetHeight(cg),
+            CGImageGetBytesPerRow(cg),
+        );
+        let info = CGImageGetBitmapInfo(cg);
+        // `kCGBitmapByteOrder32Little`, and alpha (or padding) first.
+        let (little, alpha_first) = (info & 0x7000 == 0x2000, matches!(info & 0x1f, 2 | 4 | 6));
+        let order: [u8; 4] = match (little, alpha_first) {
+            (true, true) => [0, 1, 2, 3],   // B G R A
+            (false, false) => [2, 1, 0, 3], // R G B A
+            (false, true) => [3, 2, 1, 0],  // A R G B
+            (true, false) => [1, 2, 3, 0],  // A B G R
+        };
+        let provider = CGImageGetDataProvider(cg);
+        if provider.is_null() || width == 0 || height == 0 || row < width * 4 {
+            return Err("the picture's image can't be read".into());
+        }
+        let data = CGDataProviderCopyData(provider);
+        if data.is_null() {
+            return Err("the picture's image gave no data".into());
+        }
+        let bytes = std::slice::from_raw_parts(
+            CFDataGetBytePtr(data),
+            CFDataGetLength(data).max(0) as usize,
+        );
+        let pixels = if bytes.len() < row * (height - 1) + width * 4 {
+            None
+        } else if row == width * 4 {
+            Some(bytes[..row * height].to_vec())
+        } else {
+            let mut packed = Vec::with_capacity(width * height * 4);
+            for line in bytes.chunks(row).take(height) {
+                packed.extend_from_slice(&line[..width * 4]);
+            }
+            Some(packed)
+        };
+        CFRelease(data);
+        Ok(HostPicture {
+            pixels: pixels.ok_or("the picture's image is shorter than it says")?,
+            order,
+            width: width as u32,
+            height: height as u32,
+        })
+    }
+}
+
+/// The slower way to the same pixels, for an image the fast way can't read.
+fn pixels_by_tiff(image: &NSImage) -> Result<HostPicture, String> {
     let tiff = image
         .TIFFRepresentation()
         .ok_or("could not read the picture")?;
@@ -807,7 +971,8 @@ fn pixels_of(image: &NSImage) -> Result<HostPicture, String> {
         }
     }
     Ok(HostPicture {
-        bgra,
+        pixels: bgra,
+        order: [0, 1, 2, 3],
         width: width as u32,
         height: height as u32,
     })
