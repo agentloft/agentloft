@@ -237,7 +237,8 @@ impl Core {
         }
         enum Plan {
             WorkingTree,
-            Between(String, String),
+            /// A turn's own changes (without what a pull brought in).
+            Turn(String, String),
             ToWorkingTree(String),
         }
         let plan = match &scope {
@@ -251,7 +252,7 @@ impl Core {
                     return Ok(empty("No turns with checkpoints yet."));
                 };
                 match turn.and_then(|t| t.checkpoint_after.clone()) {
-                    Some(after) => Plan::Between(before, after),
+                    Some(after) => Plan::Turn(before, after),
                     None => Plan::ToWorkingTree(before),
                 }
             }
@@ -264,7 +265,7 @@ impl Core {
         };
         let diff = tokio::task::spawn_blocking(move || match plan {
             Plan::WorkingTree => loft_git::diff_working_tree(&dir),
-            Plan::Between(a, b) => loft_git::diff(&dir, &a, &b),
+            Plan::Turn(a, b) => loft_git::turn_diff(&dir, &a, &b, true),
             Plan::ToWorkingTree(a) => loft_git::diff_to_working_tree(&dir, &a),
         })
         .await

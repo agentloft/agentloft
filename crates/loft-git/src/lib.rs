@@ -200,6 +200,111 @@ pub fn diff_stat(dir: &Path, from: &str, to: &str) -> Result<Vec<FileStat>> {
     Ok(parse_numstat(&numstat))
 }
 
+/// What a turn changed between its two checkpoints, leaving out files that
+/// only came in with commits it didn't make (a `git pull` or rebase while
+/// it ran). `with_patch: false` skips the patch text.
+pub fn turn_diff(dir: &Path, from: &str, to: &str, with_patch: bool) -> Result<Diff> {
+    let all = diff_stat(dir, from, to)?;
+    // If this can't be worked out, show everything rather than nothing.
+    let authored = authored_paths(dir, from, to).unwrap_or_else(|err| {
+        tracing::debug!(%err, "authored paths");
+        None
+    });
+    let Some(authored) = authored else {
+        let patch = if with_patch {
+            diff(dir, from, to)?.patch
+        } else {
+            String::new()
+        };
+        return Ok(Diff { patch, files: all });
+    };
+    let files: Vec<FileStat> = all
+        .into_iter()
+        .filter(|f| authored.contains(&f.path))
+        .collect();
+    let mut patch = String::new();
+    if with_patch {
+        // Only the kept files' patches, a batch of paths at a time.
+        for batch in files.chunks(200) {
+            let mut cmd = git(dir);
+            cmd.args(["diff", "--no-color", "--no-ext-diff", "-M", "--relative"])
+                .args([from, to, "--"])
+                .args(batch.iter().map(|f| format!(":(literal){}", f.path)));
+            patch.push_str(&run(&mut cmd)?);
+        }
+    }
+    Ok(Diff { patch, files })
+}
+
+/// The paths a turn could have written, when `HEAD` moved between its
+/// checkpoints (whose parent is the `HEAD` they were taken on); `None` when
+/// it didn't, as then every change is the turn's. They are the files
+/// uncommitted when it started or ended, those of commits made while it ran
+/// and those of commits it dropped; a merge counts only for what it changed
+/// beyond a clean merge (conflict fixes).
+pub fn authored_paths(
+    dir: &Path,
+    from: &str,
+    to: &str,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let heads = run(git(dir).args([
+        "log",
+        "--no-walk=unsorted",
+        "--format=%P %ct",
+        &format!("{from}^{{commit}}"),
+        &format!("{to}^{{commit}}"),
+    ]))?;
+    let mut lines = heads.lines();
+    let (Some(first), Some(last)) = (lines.next(), lines.next()) else {
+        return Ok(None);
+    };
+    let mut first = first.split(' ');
+    let (start_head, started) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+    let end_head = last.split(' ').next().unwrap_or("");
+    if start_head.is_empty() || end_head.is_empty() || start_head == end_head {
+        return Ok(None);
+    }
+    let list = |args: &[&str]| -> Result<Vec<String>> {
+        let out = run(git(dir)
+            .args(["-c", "log.showSignature=false"])
+            .args(args)
+            .args([
+                "--relative",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+            ]))?;
+        Ok(out
+            .split(['\0', '\n'])
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect())
+    };
+    let since = format!("--since=@{started}");
+    let mut paths = std::collections::HashSet::new();
+    for args in [
+        vec!["diff", start_head, from],
+        vec!["diff", end_head, to],
+        vec![
+            "log",
+            "--format=",
+            "--diff-merges=remerge",
+            &format!("{end_head}..{start_head}"),
+        ],
+        vec![
+            "log",
+            "--format=",
+            "--diff-merges=remerge",
+            &since,
+            &format!("{start_head}..{end_head}"),
+        ],
+    ] {
+        paths.extend(list(&args)?);
+    }
+    Ok(Some(paths))
+}
+
 /// Uncommitted work-tree changes (including untracked files) vs `HEAD`.
 pub fn diff_working_tree(dir: &Path) -> Result<Diff> {
     let tree = snapshot_tree(dir)?;
@@ -266,6 +371,72 @@ mod tests {
         ]))
         .unwrap();
         dir
+    }
+
+    fn commit_all(d: &Path, message: &str, date: Option<&str>) {
+        run(git(d).args(["add", "-A"])).unwrap();
+        let mut cmd = git(d);
+        cmd.args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            message,
+        ]);
+        if let Some(date) = date {
+            cmd.env("GIT_COMMITTER_DATE", date)
+                .env("GIT_AUTHOR_DATE", date);
+        }
+        run(&mut cmd).unwrap();
+    }
+
+    #[test]
+    fn a_pull_during_a_turn_is_not_the_turns_work() {
+        let dir = repo();
+        let d = dir.path();
+        // Upstream work made before the turn, on another branch.
+        run(git(d).args(["checkout", "-qb", "upstream"])).unwrap();
+        std::fs::write(d.join("pulled.txt"), "from upstream\n").unwrap();
+        commit_all(d, "upstream", Some("2020-01-01T00:00:00Z"));
+        run(git(d).args(["checkout", "-q", "-"])).unwrap();
+
+        let before = checkpoint(d, "refs/agentloft/checkpoints/t/1-before", "before").unwrap();
+        // The agent edits a file, commits another, and pulls.
+        std::fs::write(d.join("committed.txt"), "agent\n").unwrap();
+        commit_all(d, "agent", None);
+        run(git(d).args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "merge",
+            "-q",
+            "--no-edit",
+            "upstream",
+        ]))
+        .unwrap();
+        std::fs::write(d.join("a.txt"), "edited\n").unwrap();
+        let after = checkpoint(d, "refs/agentloft/checkpoints/t/1-after", "after").unwrap();
+
+        let all: Vec<_> = diff_stat(d, &before, &after)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(all, vec!["a.txt", "committed.txt", "pulled.txt"]);
+        let turn = turn_diff(d, &before, &after, true).unwrap();
+        let kept: Vec<_> = turn.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(kept, vec!["a.txt", "committed.txt"]);
+        assert!(turn.patch.contains("+edited") && !turn.patch.contains("pulled"));
+
+        // HEAD didn't move: everything is the turn's.
+        let later = checkpoint(d, "refs/agentloft/checkpoints/t/2-before", "before").unwrap();
+        std::fs::write(d.join("pulled.txt"), "changed by the agent\n").unwrap();
+        let end = checkpoint(d, "refs/agentloft/checkpoints/t/2-after", "after").unwrap();
+        assert_eq!(authored_paths(d, &later, &end).unwrap(), None);
+        assert_eq!(turn_diff(d, &later, &end, false).unwrap().files.len(), 1);
     }
 
     #[test]

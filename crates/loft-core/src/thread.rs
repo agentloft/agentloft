@@ -654,10 +654,10 @@ impl ThreadActor {
                 };
                 // What the turn changed, for its "changed files" card.
                 let changes = start.and_then(|start| {
-                    loft_git::diff_stat(&dir, &start, &sha)
+                    loft_git::turn_diff(&dir, &start, &sha, false)
                         .inspect_err(|err| tracing::warn!(%err, "turn diff stat failed"))
                         .ok()
-                        .map(|files| files.into_iter().map(file_stat).collect())
+                        .map(|d| d.files.into_iter().map(file_stat).collect())
                 });
                 Some((Some(sha), changes))
             })
