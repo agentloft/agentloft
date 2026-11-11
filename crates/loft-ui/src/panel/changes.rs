@@ -32,7 +32,7 @@ impl ChangesView {
         let mut this = Self {
             store,
             thread_id,
-            scope: DiffScope::Thread,
+            scope: DiffScope::Origin,
             loading: false,
             result: None,
             error: None,
@@ -138,7 +138,15 @@ impl ChangesView {
 impl Render for ChangesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        // Name the branch once the daemon has said which one it is.
+        let origin = self
+            .result
+            .as_ref()
+            .filter(|r| r.scope == DiffScope::Origin)
+            .and_then(|r| r.base.as_ref())
+            .map_or_else(|| "vs origin".to_owned(), |b| format!("vs {b}"));
         let mut scopes = vec![
+            (DiffScope::Origin, origin),
             (DiffScope::Thread, "This thread".to_owned()),
             (DiffScope::LastTurn, "Last turn".to_owned()),
             (DiffScope::WorkingTree, "Uncommitted".to_owned()),

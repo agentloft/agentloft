@@ -71,6 +71,9 @@ pub enum DiffScope {
     Thread,
     /// What one turn changed (from its checkpoints).
     Turn(TurnId),
+    /// Everything not on the remote yet: from where the branch left its
+    /// upstream (else origin's default branch) to the working tree.
+    Origin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +84,9 @@ pub struct DiffResult {
     pub files: Vec<DiffFileStat>,
     /// Why there is no diff (not a git repo, no checkpoints yet, …).
     pub note: Option<String>,
+    /// What it was compared with, when that is a branch (`origin/main`).
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

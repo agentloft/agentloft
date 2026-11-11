@@ -223,6 +223,7 @@ impl Core {
             patch: String::new(),
             files: vec![],
             note: Some(note.to_owned()),
+            base: None,
         };
         let repo = {
             let dir = dir.clone();
@@ -240,9 +241,12 @@ impl Core {
             /// A turn's own changes (without what a pull brought in).
             Turn(String, String),
             ToWorkingTree(String),
+            /// From where the branch left the remote.
+            Origin,
         }
         let plan = match &scope {
             DiffScope::WorkingTree => Plan::WorkingTree,
+            DiffScope::Origin => Plan::Origin,
             DiffScope::LastTurn | DiffScope::Turn(_) => {
                 let turn = match &scope {
                     DiffScope::Turn(id) => turns.iter().find(|t| &t.id == id),
@@ -263,14 +267,25 @@ impl Core {
                 Plan::ToWorkingTree(first)
             }
         };
-        let diff = tokio::task::spawn_blocking(move || match plan {
-            Plan::WorkingTree => loft_git::diff_working_tree(&dir),
-            Plan::Turn(a, b) => loft_git::turn_diff(&dir, &a, &b, true),
-            Plan::ToWorkingTree(a) => loft_git::diff_to_working_tree(&dir, &a),
+        let found = tokio::task::spawn_blocking(move || match plan {
+            Plan::WorkingTree => loft_git::diff_working_tree(&dir).map(|d| Some((d, None))),
+            Plan::Turn(a, b) => loft_git::turn_diff(&dir, &a, &b, true).map(|d| Some((d, None))),
+            Plan::ToWorkingTree(a) => {
+                loft_git::diff_to_working_tree(&dir, &a).map(|d| Some((d, None)))
+            }
+            Plan::Origin => match loft_git::origin_base(&dir) {
+                Some((base, name)) => {
+                    loft_git::diff_to_working_tree(&dir, &base).map(|d| Some((d, Some(name))))
+                }
+                None => Ok(None),
+            },
         })
         .await
         .map_err(internal)?
         .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
+        let Some((diff, base)) = found else {
+            return Ok(empty("This branch has no remote branch to compare with."));
+        };
         let files: Vec<DiffFileStat> = diff
             .files
             .into_iter()
@@ -292,6 +307,7 @@ impl Core {
             note: files.is_empty().then(|| "No changes.".to_owned()),
             patch: diff.patch,
             files,
+            base,
         })
     }
 

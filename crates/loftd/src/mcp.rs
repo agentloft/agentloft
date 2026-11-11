@@ -321,10 +321,10 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "get_thread_diff",
-            "Get the code changes of a thread as a unified diff (defaults to this thread). scope: last_turn | thread | working_tree.",
+            "Get the code changes of a thread as a unified diff (defaults to this thread). scope: last_turn | thread | working_tree | origin (everything not pushed: vs the upstream branch).",
             json!({
                 "thread_id": { "type": "string" },
-                "scope": { "type": "string", "enum": ["last_turn", "thread", "working_tree"] }
+                "scope": { "type": "string", "enum": ["last_turn", "thread", "working_tree", "origin"] }
             }),
             &[],
         ),
@@ -407,6 +407,7 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
             scope: match args.get("scope").and_then(Value::as_str) {
                 Some("thread") => DiffScope::Thread,
                 Some("working_tree") => DiffScope::WorkingTree,
+                Some("origin") => DiffScope::Origin,
                 _ => DiffScope::LastTurn,
             },
         },

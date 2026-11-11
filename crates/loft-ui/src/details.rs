@@ -330,6 +330,8 @@ pub struct DetailsCard {
     local_branch: Option<String>,
     /// Files, lines added, lines removed in this thread.
     changes: Option<(usize, u32, u32)>,
+    /// The remote branch they are counted against (`origin/main`).
+    changes_base: Option<String>,
     editors: Vec<usize>,
     /// Where the editor ⌄ is (its menu opens under it).
     editor_anchor: std::rc::Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -431,6 +433,7 @@ impl DetailsCard {
             computer: None,
             local_branch: None,
             changes: None,
+            changes_base: None,
             editors: installed_editors(),
             editor_anchor: Default::default(),
             copied: false,
@@ -445,7 +448,7 @@ impl DetailsCard {
         };
         let body = Request::GetDiff {
             thread_id: self.thread_id.clone(),
-            scope: DiffScope::Thread,
+            scope: DiffScope::Origin,
         };
         cx.spawn(async move |this, cx| {
             if let Ok(Response::Diff { diff }) = client.request(body).await {
@@ -453,6 +456,7 @@ impl DetailsCard {
                 let removed = diff.files.iter().map(|f| f.removed).sum();
                 let _ = this.update(cx, |this, cx| {
                     this.changes = Some((diff.files.len(), added, removed));
+                    this.changes_base = diff.base;
                     cx.notify();
                 });
             }
@@ -746,7 +750,7 @@ impl Render for DetailsCard {
                 })),
         );
 
-        // Changes in this thread.
+        // Changes not on the remote yet.
         let changes = match self.changes {
             None => div()
                 .text_color(p.faint_foreground)
@@ -774,7 +778,23 @@ impl Render for DetailsCard {
                 .cursor_pointer()
                 .hover(|d| d.bg(p.hover))
                 .child(icon(IconName::FileDiff, &p))
-                .child(div().flex_1().child("Changes"))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child("Changes")
+                        .when_some(self.changes_base.clone(), |d, base| {
+                            d.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(p.faint_foreground)
+                                    .child(format!("vs {base}")),
+                            )
+                        }),
+                )
                 .child(changes)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.in_main(window, cx, |w, window, cx| {

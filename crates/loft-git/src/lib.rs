@@ -326,6 +326,36 @@ pub fn diff_to_working_tree(dir: &Path, from: &str) -> Result<Diff> {
     diff(dir, from, &tree)
 }
 
+/// Where the checkout left the remote: the merge base of `HEAD` with its
+/// upstream (else `origin/<default branch>`), and that branch's name.
+/// Uses the remote-tracking refs as last fetched.
+pub fn origin_base(dir: &Path) -> Option<(String, String)> {
+    let trimmed = |s: String| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
+    let upstream = run(git(dir).args([
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ]))
+    .ok()
+    .and_then(trimmed)
+    .or_else(|| {
+        let name = format!("origin/{}", worktree::default_branch(dir)?);
+        run(git(dir).args([
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/remotes/{name}"),
+        ]))
+        .ok()?;
+        Some(name)
+    })?;
+    let base = run(git(dir).args(["merge-base", "HEAD", &upstream]))
+        .ok()
+        .and_then(trimmed)?;
+    Some((base, upstream))
+}
+
 fn parse_numstat(text: &str) -> Vec<FileStat> {
     text.lines()
         .filter_map(|line| {
@@ -379,6 +409,50 @@ mod tests {
         ]))
         .unwrap();
         dir
+    }
+
+    #[test]
+    fn origin_base_counts_what_is_not_pushed() {
+        let dir = repo();
+        let d = dir.path();
+        assert_eq!(origin_base(d), None, "no remote yet");
+        let branch = head_branch(d);
+        let pushed = head(d).unwrap();
+        // As if fetched: origin has the first commit, with no upstream set.
+        run(git(d).args([
+            "update-ref",
+            &format!("refs/remotes/origin/{branch}"),
+            &pushed,
+        ]))
+        .unwrap();
+        std::fs::write(d.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        commit_all(d, "local", None);
+        std::fs::write(d.join("b.txt"), "new\n").unwrap();
+        let (base, name) = origin_base(d).unwrap();
+        assert_eq!(
+            (base.as_str(), name.clone()),
+            (pushed.as_str(), format!("origin/{branch}"))
+        );
+        let diff = diff_to_working_tree(d, &base).unwrap();
+        let mut paths: Vec<_> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["a.txt", "b.txt"],
+            "the unpushed commit and the uncommitted file"
+        );
+        // An upstream wins over origin's default branch.
+        run(git(d).args(["update-ref", "refs/remotes/origin/feature", &pushed])).unwrap();
+        run(git(d).args(["remote", "add", "origin", "/nonexistent"])).unwrap();
+        run(git(d).args(["branch", "-u", "origin/feature"])).unwrap();
+        assert_eq!(origin_base(d).unwrap().1, "origin/feature");
+    }
+
+    fn head_branch(d: &Path) -> String {
+        run(git(d).args(["branch", "--show-current"]))
+            .unwrap()
+            .trim()
+            .to_owned()
     }
 
     fn commit_all(d: &Path, message: &str, date: Option<&str>) {
