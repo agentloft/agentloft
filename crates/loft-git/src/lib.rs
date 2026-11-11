@@ -60,46 +60,175 @@ fn head(dir: &Path) -> Option<String> {
 /// Write the current work tree (tracked + untracked, honoring .gitignore)
 /// as a tree object via a temporary index. Returns the tree id.
 pub fn snapshot_tree(dir: &Path) -> Result<String> {
-    let tmp = tempfile_path(dir)?;
-    let index = tmp.to_string_lossy().into_owned();
-    let result = (|| {
-        // Seed the temp index from HEAD so unchanged files are cheap.
-        if head(dir).is_some() {
-            run(git(dir)
-                .env("GIT_INDEX_FILE", &index)
-                .args(["read-tree", "HEAD"]))?;
-        }
-        run(git(dir)
-            .env("GIT_INDEX_FILE", &index)
-            .args(["add", "-A", "--", "."]))?;
-        let tree = run(git(dir).env("GIT_INDEX_FILE", &index).args(["write-tree"]))?;
-        Ok(tree.trim().to_owned())
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+    Ok(snapshot(dir)?.0)
 }
 
-fn tempfile_path(dir: &Path) -> Result<PathBuf> {
-    let git_dir = run(git(dir).args(["rev-parse", "--absolute-git-dir"]))?;
-    let n = std::time::SystemTime::now()
+/// Our own index from the last snapshot, in the git directory (each work
+/// tree has its own). Only ever a way to read fewer files: deleting it
+/// costs one slower snapshot.
+const KEPT_INDEX: &str = "agentloft-index";
+
+/// The tree of [`snapshot_tree`], and the `HEAD` it was made on.
+///
+/// The tree is always `HEAD`'s with everything under `dir` added to it.
+/// What that takes is the difference: an index made from `HEAD` alone knows
+/// nothing about the files on disk, so git has to read and hash every
+/// tracked file to find the ones that changed (seconds in a large
+/// repository, before and after every turn and for every look at the
+/// changes). An index that has seen the files before only needs their sizes
+/// and times. So the index of the last snapshot is kept, and the first one
+/// starts from the checkout's own.
+fn snapshot(dir: &Path) -> Result<(String, Option<String>)> {
+    let git_dir = PathBuf::from(run(git(dir).args(["rev-parse", "--absolute-git-dir"]))?.trim());
+    // Snapshots run side by side (a checkpoint, a look at the changes), and
+    // the clock alone doesn't tell two of them apart.
+    static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(PathBuf::from(git_dir.trim()).join(format!("agentloft-index-{}-{n}", std::process::id())))
+    let tmp = git_dir.join(format!("agentloft-index-{}-{at}-{n}", std::process::id()));
+    let kept = git_dir.join(KEPT_INDEX);
+    let head = head(dir);
+    // Taken before any file is looked at: see `keep_index`.
+    let started = clock_of(&tmp);
+
+    // An index that knows the files: ours from last time (taken, not
+    // copied, so two snapshots at once never share one), else the
+    // checkout's. Not without commits: there is no tree to start from.
+    let known = head.is_some()
+        && started.is_some()
+        && (std::fs::rename(&kept, &tmp).is_ok() || copy_checkout_index(dir, &git_dir, &tmp));
+    let mut tree = if known {
+        index_tree(dir, &tmp, Seed::Known)
+    } else {
+        Err(anyhow::anyhow!("no index to start from"))
+    };
+    if tree.is_err() {
+        // The first time, without commits, or whatever was wrong with the
+        // index we had: from `HEAD` alone, as slow as it is sure.
+        let _ = std::fs::remove_file(&tmp);
+        let seed = if head.is_some() {
+            Seed::Head
+        } else {
+            Seed::Empty
+        };
+        tree = index_tree(dir, &tmp, seed);
+    }
+    match (&tree, started) {
+        (Ok(_), Some(started)) if head.is_some() => keep_index(&tmp, &kept, started),
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok((tree?, head))
+}
+
+/// What the temporary index holds before the work tree is added to it.
+enum Seed {
+    /// An index that has seen the work tree: made into `HEAD`'s tree, but
+    /// keeping what it knows of the files `HEAD` has unchanged.
+    Known,
+    /// `HEAD`'s tree, knowing nothing of the files.
+    Head,
+    /// Nothing (a repository without commits).
+    Empty,
+}
+
+fn index_tree(dir: &Path, index: &Path, seed: Seed) -> Result<String> {
+    let git = || {
+        let mut cmd = git(dir);
+        cmd.env("GIT_INDEX_FILE", index);
+        cmd
+    };
+    match seed {
+        // `-m` with one tree: the index becomes that tree, and an entry
+        // that already had the tree's content keeps what it knows of the
+        // file. `-i`: the index is not the work tree's, don't compare.
+        Seed::Known => run(git().args(["read-tree", "-i", "-m", "HEAD"]))?,
+        Seed::Head => run(git().args(["read-tree", "HEAD"]))?,
+        Seed::Empty => String::new(),
+    };
+    run(git().args(["add", "-A", "--", "."]))?;
+    Ok(run(git().arg("write-tree"))?.trim().to_owned())
+}
+
+/// Start `tmp` as a copy of the checkout's own index, if every entry in it
+/// is an ordinary one. Files the user told git to assume unchanged or to
+/// skip, and conflicts, are left to the slow way: `git add` would pass the
+/// first two by.
+fn copy_checkout_index(dir: &Path, git_dir: &Path, tmp: &Path) -> bool {
+    let index = git_dir.join("index");
+    // Git decides which entries to double-check from the index file's own
+    // time (see `keep_index`): the copy has to carry the original's.
+    let copied = (|| -> std::io::Result<()> {
+        let written = std::fs::metadata(&index)?.modified()?;
+        std::fs::copy(&index, tmp)?;
+        std::fs::File::options()
+            .write(true)
+            .open(tmp)?
+            .set_modified(written)
+    })();
+    let ordinary = copied.is_ok()
+        && run(git(dir).env("GIT_INDEX_FILE", tmp).args(["ls-files", "-v"]))
+            .is_ok_and(|entries| entries.lines().all(|entry| entry.starts_with("H ")));
+    if !ordinary {
+        let _ = std::fs::remove_file(tmp);
+    }
+    ordinary
+}
+
+/// The time by the clock that stamps files where `near` is (on a network
+/// volume, not necessarily ours).
+fn clock_of(near: &Path) -> Option<std::time::SystemTime> {
+    let mut probe = near.as_os_str().to_owned();
+    probe.push(".clock");
+    let probe = PathBuf::from(probe);
+    let time = std::fs::File::create(&probe)
+        .and_then(|f| f.metadata())
+        .and_then(|m| m.modified());
+    let _ = std::fs::remove_file(&probe);
+    time.ok()
+}
+
+/// Keep `tmp` as the index the next snapshot starts from.
+///
+/// Git believes an index about a file whose size and times are as the index
+/// recorded them, unless the file's time is not before the index's own: such
+/// a file may have changed after it was read, within the same tick of the
+/// clock, and git reads it again. The index is written when the snapshot
+/// ends, so a file changed while the snapshot ran (an agent is at work)
+/// would slip through. Dated to before the snapshot began (with room for
+/// coarse file times), every file touched since is read again next time.
+fn keep_index(tmp: &Path, kept: &Path, started: std::time::SystemTime) {
+    let dated = (|| -> std::io::Result<()> {
+        let before = started
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or(started);
+        std::fs::File::options()
+            .write(true)
+            .open(tmp)?
+            .set_modified(before)?;
+        std::fs::rename(tmp, kept)
+    })();
+    if dated.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
 }
 
 /// Capture a checkpoint commit of the work tree under `ref_name`
 /// (e.g. `refs/agentloft/checkpoints/<thread>/<n>`). Returns the commit id.
 pub fn checkpoint(dir: &Path, ref_name: &str, message: &str) -> Result<String> {
-    let tree = snapshot_tree(dir)?;
+    let (tree, head) = snapshot(dir)?;
     let mut cmd = git(dir);
     cmd.args(["commit-tree", &tree, "-m", message])
         .env("GIT_AUTHOR_NAME", "Agentloft")
         .env("GIT_AUTHOR_EMAIL", "checkpoints@agentloft.local")
         .env("GIT_COMMITTER_NAME", "Agentloft")
         .env("GIT_COMMITTER_EMAIL", "checkpoints@agentloft.local");
-    if let Some(parent) = head(dir) {
-        cmd.args(["-p", &parent]);
+    if let Some(parent) = &head {
+        cmd.args(["-p", parent]);
     }
     let commit = run(&mut cmd)?.trim().to_owned();
     run(git(dir).args(["update-ref", ref_name, &commit]))?;
@@ -181,15 +310,21 @@ pub struct Diff {
 /// Diff between two tree-ish ids (commits or trees).
 pub fn diff(dir: &Path, from: &str, to: &str) -> Result<Diff> {
     let common = ["--no-color", "--no-ext-diff", "-M", "--relative"];
-    let patch = run(git(dir).arg("diff").args(common).args([from, to]))?;
-    let numstat = run(git(dir)
-        .arg("diff")
-        .args(common)
-        .arg("--numstat")
-        .args([from, to]))?;
+    // Side by side: each compares the two trees from scratch.
+    let (patch, numstat) = std::thread::scope(|scope| {
+        let patch = scope.spawn(|| run(git(dir).arg("diff").args(common).args([from, to])));
+        let numstat = run(git(dir)
+            .arg("diff")
+            .args(common)
+            .arg("--numstat")
+            .args([from, to]));
+        (patch.join(), numstat)
+    });
+    let patch =
+        patch.map_err(|_| anyhow::anyhow!("git diff: the thread running it panicked"))??;
     Ok(Diff {
         patch,
-        files: parse_numstat(&numstat),
+        files: parse_numstat(&numstat?),
     })
 }
 
@@ -586,6 +721,176 @@ mod tests {
         delete_refs(d, "refs/agentloft/checkpoints/t").unwrap();
         let left = run(git(d).args(["for-each-ref", REF_PREFIX])).unwrap();
         assert!(left.trim().is_empty());
+    }
+
+    /// The tree a snapshot has to come to: from `HEAD` alone, with every
+    /// file read (how all snapshots were once made).
+    fn slow_tree(d: &Path) -> String {
+        let index = git_dir(d).join("slow-index");
+        let tree = index_tree(d, &index, Seed::Head).unwrap();
+        std::fs::remove_file(&index).unwrap();
+        tree
+    }
+
+    fn git_dir(d: &Path) -> PathBuf {
+        PathBuf::from(
+            run(git(d).args(["rev-parse", "--absolute-git-dir"]))
+                .unwrap()
+                .trim(),
+        )
+    }
+
+    #[test]
+    fn a_snapshot_from_a_kept_index_is_the_tree_of_one_that_reads_every_file() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(d.join("untracked.txt"), "new\n").unwrap();
+        std::fs::write(d.join("ignored.log"), "x\n").unwrap();
+
+        // The first starts from the checkout's index, the rest from ours.
+        let kept = git_dir(d).join(KEPT_INDEX);
+        assert!(!kept.exists());
+        assert_eq!(snapshot_tree(d).unwrap(), slow_tree(d));
+        assert!(kept.exists(), "kept for the next snapshot");
+        assert_eq!(snapshot_tree(d).unwrap(), slow_tree(d));
+
+        // An edit, a new file in a new folder, a deletion.
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::create_dir_all(d.join("src/deep")).unwrap();
+        std::fs::write(d.join("src/deep/mod.rs"), "x").unwrap();
+        std::fs::remove_file(d.join("untracked.txt")).unwrap();
+        let edited = snapshot_tree(d).unwrap();
+        assert_eq!(edited, slow_tree(d));
+
+        // `HEAD` moves (the kept index was made on the old one), with work
+        // on top of it.
+        commit_all(d, "more", None);
+        assert_eq!(snapshot_tree(d).unwrap(), edited, "committed, not changed");
+        std::fs::write(d.join("src/deep/mod.rs"), "y").unwrap();
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        assert_eq!(snapshot_tree(d).unwrap(), slow_tree(d));
+
+        // And back to an older commit, with what that leaves staged.
+        run(git(d).args(["checkout", "-q", "HEAD~1", "--", "."])).unwrap();
+        run(git(d).args(["reset", "-q", "--soft", "HEAD~1"])).unwrap();
+        let staged = || run(git(d).args(["diff", "--cached", "--raw"])).unwrap();
+        let staged_before = staged();
+        assert!(!staged_before.is_empty());
+        assert_eq!(snapshot_tree(d).unwrap(), slow_tree(d));
+        // The user's own index was read, never written.
+        assert_eq!(staged(), staged_before);
+        // Nothing of ours is left behind but the kept index.
+        let ours: Vec<String> = std::fs::read_dir(git_dir(d))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("agentloft-index"))
+            .collect();
+        assert_eq!(ours, [KEPT_INDEX]);
+    }
+
+    #[test]
+    fn a_kept_index_is_dated_before_its_snapshot_began() {
+        let dir = repo();
+        let d = dir.path();
+        let before = std::time::SystemTime::now();
+        snapshot_tree(d).unwrap();
+        let dated = std::fs::metadata(git_dir(d).join(KEPT_INDEX))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(dated < before, "{dated:?} is not before {before:?}");
+    }
+
+    /// What an index can't see by a file's size and times: a change that
+    /// leaves both as they were (in life: a second write within the same
+    /// tick of the clock as the one the index saw).
+    #[test]
+    fn a_change_that_keeps_size_and_time_is_still_seen() {
+        let dir = repo();
+        let d = dir.path();
+        // Without this git would notice by the inode's change time, which
+        // can't be put back.
+        run(git(d).args(["config", "core.trustctime", "false"])).unwrap();
+        let file = d.join("a.txt");
+        let set_time = |to: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(to)
+                .unwrap();
+        };
+        let touched = std::time::SystemTime::now();
+        set_time(touched);
+        let first = snapshot_tree(d).unwrap();
+        let second = snapshot_tree(d).unwrap();
+        assert_eq!(first, second);
+        if touched
+            .elapsed()
+            .is_ok_and(|waited| waited.as_millis() > 1500)
+        {
+            // The machine stalled: the file is no longer "just written" as
+            // the snapshots saw it, and the rest would test nothing.
+            return;
+        }
+        std::fs::write(&file, "ONE\ntwo\n").unwrap();
+        set_time(touched);
+        let third = snapshot_tree(d).unwrap();
+        assert_ne!(third, second, "the rewrite was missed");
+        assert_eq!(third, slow_tree(d));
+    }
+
+    #[test]
+    fn a_file_git_was_told_to_assume_unchanged_is_still_captured() {
+        let dir = repo();
+        let d = dir.path();
+        run(git(d).args(["update-index", "--assume-unchanged", "a.txt"])).unwrap();
+        std::fs::write(d.join("a.txt"), "changed all the same\n").unwrap();
+        // Twice: from the checkout's index (which says to pass the file
+        // by), then from what the first left.
+        for _ in 0..2 {
+            let wt = diff_working_tree(d).unwrap();
+            assert_eq!(wt.files.len(), 1, "{:?}", wt.files);
+            assert!(wt.patch.contains("+changed all the same"));
+        }
+    }
+
+    #[test]
+    fn snapshots_at_the_same_time_each_get_the_tree() {
+        let dir = repo();
+        let d = dir.path();
+        for i in 0..40 {
+            std::fs::write(d.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+        }
+        let expected = snapshot_tree(d).unwrap();
+        let trees: Vec<String> = std::thread::scope(|scope| {
+            let running: Vec<_> = (0..6)
+                .map(|_| scope.spawn(|| snapshot_tree(d).unwrap()))
+                .collect();
+            running.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert!(trees.iter().all(|t| *t == expected), "{trees:?}");
+    }
+
+    #[test]
+    fn a_linked_work_tree_keeps_an_index_of_its_own() {
+        let dir = repo();
+        let d = dir.path();
+        let linked = tempfile::tempdir().unwrap();
+        let w = linked.path().join("w");
+        run(git(d).args(["worktree", "add", "-q", "--detach"]).arg(&w)).unwrap();
+        std::fs::write(w.join("a.txt"), "theirs\n").unwrap();
+        std::fs::write(w.join("new.txt"), "n\n").unwrap();
+        let main = snapshot_tree(d).unwrap();
+        let theirs = snapshot_tree(&w).unwrap();
+        assert_ne!(main, theirs);
+        assert_eq!(theirs, slow_tree(&w));
+        std::fs::write(w.join("new.txt"), "m\n").unwrap();
+        assert_eq!(snapshot_tree(&w).unwrap(), slow_tree(&w));
+        assert!(git_dir(&w).join(KEPT_INDEX).exists());
+        assert_ne!(git_dir(&w), git_dir(d));
     }
 
     #[test]
