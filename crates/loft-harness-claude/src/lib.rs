@@ -265,6 +265,10 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
         "--replay-user-messages",
         "--permission-prompt-tool",
         "stdio",
+        // Full access can be picked mid-session (`set_permission_mode`
+        // to bypassPermissions is refused otherwise). It only makes the
+        // mode available; the session starts in `--permission-mode`.
+        "--allow-dangerously-skip-permissions",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -487,6 +491,9 @@ mod tests {
     #[test]
     fn default_args_omit_mode_and_model() {
         let args = build_args(&cfg());
+        // Full access stays available to switch to later.
+        assert!(args.contains(&"--allow-dangerously-skip-permissions".to_owned()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_owned()));
         assert!(args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--permission-mode".to_owned()));
         assert!(!args.contains(&"--model".to_owned()));
