@@ -158,6 +158,8 @@ pub enum HarnessEvent {
     RequestResolved {
         native_id: String,
     },
+    /// How full the agent's context is after its latest step.
+    ContextUsed(loft_protocol::ContextUse),
     /// The agent's marker for the turn so far (see `Turn::native_turn`).
     TurnMarker {
         native_turn: String,

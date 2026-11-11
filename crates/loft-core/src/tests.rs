@@ -1242,6 +1242,33 @@ async fn spawned_threads_inherit_settings_and_report_back() {
     assert_eq!(value["status"], "idle");
     assert_eq!(value["latest_reply"], "echo: count the files");
     assert_eq!(value["spawned_by"], parent.id.0.as_str());
+    // And how its last turn went: timing, tokens and how full its context is.
+    let last = &value["last_turn"];
+    assert_eq!(last["status"], "completed");
+    assert!(last["duration_s"].as_f64().is_some_and(|s| s >= 0.0));
+    assert!(
+        last["started_at"]
+            .as_str()
+            .is_some_and(|t| t.ends_with('Z'))
+    );
+    assert_eq!(last["tokens"]["input"], 10);
+    assert_eq!(last["context"]["tokens"], 1234);
+    assert_eq!(last["context"]["window"], 200_000);
+    assert_eq!(last["context"]["percent_full"], 0.6);
+    let Response::Text { text } = f
+        .core
+        .handle(Request::ReadThread {
+            thread_id: child.id.clone(),
+            detail: loft_protocol::ReadDetail::Full,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(text.contains("### Turn 1 · "), "{text}");
+    assert!(text.contains("context 1k of 200k"), "{text}");
+    assert!(text.contains("## User · "), "{text}");
 
     // Spawning nests only so deep.
     let mut from = child.id.clone();

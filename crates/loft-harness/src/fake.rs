@@ -362,6 +362,10 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
         });
     }
     let failed = script.contains("fail");
+    ends.emit(HarnessEvent::ContextUsed(loft_protocol::ContextUse {
+        tokens: 1_234,
+        window: Some(200_000),
+    }));
     ends.emit(HarnessEvent::TurnCompleted {
         status: if failed {
             TurnStatus::Failed

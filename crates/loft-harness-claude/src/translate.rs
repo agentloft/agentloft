@@ -5,8 +5,8 @@
 
 use loft_harness::{HarnessEvent, ToolResult};
 use loft_protocol::{
-    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, Question,
-    QuestionOption, RequestKind, RequestReply, ToolKind, TurnStatus, Usage,
+    ContextUse, DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode,
+    Question, QuestionOption, RequestKind, RequestReply, ToolKind, TurnStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +50,8 @@ const VIEW_STEP: usize = 240;
 
 #[derive(Debug, Default)]
 pub struct Translator {
+    /// How full the main conversation's context is, as last reported.
+    context: Option<ContextUse>,
     /// (api message id, block index) → (native item id, channel).
     open_blocks: HashMap<(String, u64), (String, DeltaChannel)>,
     /// Message ids whose text/thinking was streamed via `stream_event`.
@@ -344,8 +346,37 @@ impl Translator {
             self.interrupt_requested = false;
             out.push(Out::Event(HarnessEvent::TurnStarted));
         }
+        // Each step of the main conversation says what it sent: the whole
+        // context. Subagents have contexts of their own.
+        if str_at(v, "parent_tool_use_id").is_none() {
+            let usage = match str_at(v, "type") {
+                Some("stream_event") => v.pointer("/event/message/usage"),
+                Some("assistant") => v.pointer("/message/usage"),
+                _ => None,
+            };
+            if let Some(usage) = usage {
+                let tokens = u64_at(usage, "input_tokens")
+                    + u64_at(usage, "cache_read_input_tokens")
+                    + u64_at(usage, "cache_creation_input_tokens");
+                out.extend(self.context_now(Some(tokens), None));
+            }
+        }
         out.extend(self.dispatch(v));
         out
+    }
+
+    /// A `ContextUsed` when the context's size or window changed.
+    fn context_now(&mut self, tokens: Option<u64>, window: Option<u64>) -> Option<Out> {
+        let last = self.context.unwrap_or_default();
+        let now = ContextUse {
+            tokens: tokens.filter(|t| *t > 0).unwrap_or(last.tokens),
+            window: window.or(last.window),
+        };
+        if now.tokens == 0 || Some(now) == self.context {
+            return None;
+        }
+        self.context = Some(now);
+        Some(Out::Event(HarnessEvent::ContextUsed(now)))
     }
 
     fn dispatch(&mut self, v: &Value) -> Vec<Out> {
@@ -850,6 +881,17 @@ impl Translator {
 
     fn on_result(&mut self, v: &Value) -> Vec<Out> {
         let mut out = Vec::new();
+        // The model's context window, from its usage so far (the largest:
+        // a smaller model may have run a subagent).
+        let window = v
+            .get("modelUsage")
+            .and_then(Value::as_object)
+            .and_then(|m| {
+                m.values()
+                    .filter_map(|u| u.get("contextWindow")?.as_u64())
+                    .max()
+            });
+        out.extend(self.context_now(None, window));
         // A message sent mid-turn that Claude hasn't taken in yet: it goes
         // on with it straight away, so this turn goes on too.
         let goes_on =
@@ -1507,6 +1549,38 @@ mod tests {
             t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"y"}}"#);
         assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
         assert!(t.turn_active());
+    }
+
+    #[test]
+    fn each_step_says_how_full_the_context_is() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        let start = |parent: &str, cached: u64| {
+            format!(
+                r#"{{"type":"stream_event","parent_tool_use_id":{parent},"event":{{"type":"message_start","message":{{"usage":{{"input_tokens":2,"cache_read_input_tokens":{cached},"cache_creation_input_tokens":100}}}}}}}}"#
+            )
+        };
+        let used = |out: &[Out]| -> Vec<ContextUse> {
+            events(out)
+                .into_iter()
+                .filter_map(|e| match e {
+                    HarnessEvent::ContextUsed(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        };
+        let c = |tokens, window| ContextUse { tokens, window };
+        assert_eq!(used(&t.on_line(&start("null", 1000))), [c(1102, None)]);
+        // A subagent's context is its own.
+        assert!(used(&t.on_line(&start(r#""toolu_sub""#, 5))).is_empty());
+        // The whole message repeats the step's usage: nothing new.
+        let whole = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"m","content":[],"usage":{"input_tokens":2,"cache_read_input_tokens":1000,"cache_creation_input_tokens":100}}}"#;
+        assert!(used(&t.on_line(whole)).is_empty());
+        // The result names the window; the largest model's counts.
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"claude-fable-5-2":{"contextWindow":1000000},"claude-haiku-5-5":{"contextWindow":200000}}}"#;
+        let out = t.on_line(result);
+        assert_eq!(used(&out), [c(1102, Some(1_000_000))]);
+        assert!(completed(&out));
     }
 
     #[test]

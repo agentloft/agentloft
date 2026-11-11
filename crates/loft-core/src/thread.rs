@@ -445,6 +445,7 @@ impl ThreadActor {
             checkpoint_after: None,
             native_turn: None,
             changes: None,
+            context: None,
         };
         let user_item = self.new_item(
             Some(turn.id.clone()),
@@ -935,6 +936,18 @@ impl ThreadActor {
 
     fn apply_harness_event(&mut self, event: HarnessEvent) -> CoreResult<()> {
         match event {
+            HarnessEvent::ContextUsed(context) => {
+                if let Some(turn) = self.turn.as_mut()
+                    && turn.context != Some(context)
+                {
+                    // Keep a window the agent told us before if it doesn't
+                    // repeat it every step.
+                    let window = context.window.or(turn.context.and_then(|c| c.window));
+                    turn.context = Some(loft_protocol::ContextUse { window, ..context });
+                    let turn = turn.clone();
+                    self.core.commit(vec![Event::TurnUpdated { turn }])?;
+                }
+            }
             HarnessEvent::TurnMarker { native_turn } => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.native_turn = Some(native_turn);
@@ -1006,6 +1019,7 @@ impl ThreadActor {
                     checkpoint_after: None,
                     native_turn: None,
                     changes: None,
+                    context: None,
                 };
                 self.thread.status = ThreadStatus::Running;
                 self.thread.updated_at_ms = now;

@@ -8,8 +8,8 @@
 
 use loft_harness::{HarnessEvent, McpServer, ToolResult};
 use loft_protocol::{
-    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, RequestKind,
-    ToolKind, TurnStatus, Usage,
+    ContextUse, DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode,
+    RequestKind, ToolKind, TurnStatus, Usage,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -911,7 +911,13 @@ impl Translator {
                 if u.pointer("/cost/currency").and_then(Value::as_str) == Some("USD") {
                     self.cost_now = u.pointer("/cost/amount").and_then(Value::as_f64);
                 }
-                vec![]
+                match u.get("used").and_then(Value::as_u64).filter(|t| *t > 0) {
+                    Some(tokens) => vec![Out::Event(HarnessEvent::ContextUsed(ContextUse {
+                        tokens,
+                        window: u.get("size").and_then(Value::as_u64),
+                    }))],
+                    None => vec![],
+                }
             }
             Some("notice") => {
                 let level = match u.get("severity").and_then(Value::as_str) {
@@ -1726,6 +1732,22 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../fixtures/opencode-2.2.5-turn.jsonl");
+
+    #[test]
+    fn usage_updates_say_how_full_the_context_is() {
+        let mut t = ready();
+        let out = t.on_line(&update(json!({
+            "sessionUpdate": "usage_update", "used": 7195, "size": 262144,
+            "cost": {"amount": 0, "currency": "USD"}
+        })));
+        assert!(matches!(
+            events(&out)[..],
+            [HarnessEvent::ContextUsed(ContextUse {
+                tokens: 7195,
+                window: Some(262_144)
+            })]
+        ));
+    }
 
     fn events(out: &[Out]) -> Vec<&HarnessEvent> {
         out.iter()

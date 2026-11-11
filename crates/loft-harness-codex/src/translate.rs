@@ -4,8 +4,8 @@
 
 use loft_harness::{HarnessEvent, ToolResult};
 use loft_protocol::{
-    DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode, Question,
-    QuestionOption, RequestKind, RequestReply, ToolKind, TurnStatus, Usage,
+    ContextUse, DecisionKind, DeltaChannel, ItemBody, ItemStatus, NoticeLevel, PermissionMode,
+    Question, QuestionOption, RequestKind, RequestReply, ToolKind, TurnStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -1251,7 +1251,19 @@ impl Translator {
                         duration_ms: None,
                     });
                 }
-                vec![]
+                // The latest step's tokens are what the context holds now.
+                let n = |k: &str| p.pointer(k).and_then(Value::as_u64).unwrap_or(0);
+                let tokens =
+                    n("/tokenUsage/last/totalTokens").max(n("/tokenUsage/last/inputTokens"));
+                if tokens == 0 {
+                    return vec![];
+                }
+                vec![Out::Event(HarnessEvent::ContextUsed(ContextUse {
+                    tokens,
+                    window: p
+                        .pointer("/tokenUsage/modelContextWindow")
+                        .and_then(Value::as_u64),
+                }))]
             }
             "serverRequest/resolved" => {
                 let id = p.get("requestId").map(id_string).unwrap_or_default();
@@ -1931,6 +1943,36 @@ pub fn models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_usage_says_how_full_the_context_is() {
+        // codex-cli 0.167.0: the last step's tokens fill a 475k window.
+        let mut t = Translator::new("/tmp/probe".into(), None, None, None);
+        let mut out = t.start_turn("x");
+        for line in include_str!("../fixtures/0.167.0-turn-with-approvals.jsonl").lines() {
+            out.extend(t.on_line(line));
+        }
+        let used: Vec<ContextUse> = events(&out)
+            .into_iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ContextUsed(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            used,
+            [
+                ContextUse {
+                    tokens: 16_931,
+                    window: Some(475_000)
+                },
+                ContextUse {
+                    tokens: 17_043,
+                    window: Some(475_000)
+                },
+            ]
+        );
+    }
 
     #[test]
     fn recorded_subagents_replay_as_cards() {

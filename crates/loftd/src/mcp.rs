@@ -222,7 +222,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "thread_status",
-            "Where a thread stands: running / idle / waiting_for_approval / error, its settings and its latest reply.",
+            "Where a thread stands: running / idle / waiting_for_approval / error, its settings, its latest reply, and its last turn's timing, tokens, cost and how full its context is.",
             json!({ "thread_id": { "type": "string" } }),
             &["thread_id"],
         ),
@@ -341,7 +341,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "read_thread",
-            "Read another thread's transcript. detail=summary (default) gives requests and answers; full adds tool calls.",
+            "Read another thread's transcript, with each turn's time, tokens, cost and context size and when each message came. detail=summary (default) gives requests and answers; full adds tool calls with how long each took.",
             json!({
                 "thread_id": { "type": "string" },
                 "detail": { "type": "string", "enum": ["summary", "full"] }

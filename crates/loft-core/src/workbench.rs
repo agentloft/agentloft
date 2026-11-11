@@ -4,7 +4,7 @@
 use crate::{Core, CoreResult, internal};
 use loft_protocol::{
     DiffFileStat, DiffResult, DiffScope, DirEntry, ErrorBody, ErrorCode, FileContent, FsRoot,
-    ItemBody, ProjectId, ReadDetail, ThreadId,
+    ItemBody, ItemStatus, ProjectId, ReadDetail, ThreadId, Turn, TurnStatus,
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -429,6 +429,13 @@ impl Core {
             _ => "idle",
         };
         let last = turns.last();
+        let now = loft_store::now_ms();
+        let costs: Vec<f64> = turns
+            .iter()
+            .filter_map(|t| t.usage.as_ref()?.cost_usd)
+            .collect();
+        let total_cost = (!costs.is_empty()).then(|| round2(costs.iter().sum()));
+        let last_activity = items.iter().map(|i| i.updated_at_ms).max();
         Ok(serde_json::json!({
             "thread_id": thread.id,
             "title": thread.title,
@@ -440,10 +447,9 @@ impl Core {
             "permission_mode": thread.permission_mode,
             "cwd": thread.cwd,
             "turns": turns.len(),
-            "last_turn": last.map(|t| serde_json::json!({
-                "status": t.status,
-                "error": t.error,
-            })),
+            "last_turn": last.map(|t| turn_stats(t, now)),
+            "total_cost_usd": total_cost,
+            "last_activity_s_ago": last_activity.map(|at| secs(now - at)),
             "spawned_by": thread.parent.as_ref()
                 .filter(|p| p.kind == loft_protocol::ForkKind::Spawned)
                 .map(|p| p.thread_id.clone()),
@@ -457,15 +463,34 @@ impl Core {
         let (thread, items) = self.with_store(|s| Ok((s.thread(id)?, s.items(id)?)))?;
         let thread =
             thread.ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
+        let turns = self.with_store(|s| s.turns(id))?;
+        let now = loft_store::now_ms();
         let mut out = format!(
-            "# {}\nthread_id: {} · harness: {} · cwd: {}\n\n",
-            thread.title, thread.id, thread.harness, thread.cwd
+            "# {}\nthread_id: {} · harness: {} · cwd: {} · times are UTC, now {}\n\n",
+            thread.title,
+            thread.id,
+            thread.harness,
+            thread.cwd,
+            utc(now)
         );
+        let mut in_turn = None;
         for item in items.iter().filter(|i| i.parent_id.is_none()) {
+            if let Some(turn) = item
+                .turn_id
+                .as_ref()
+                .filter(|t| in_turn != Some(*t))
+                .and_then(|t| turns.iter().find(|turn| &turn.id == t))
+            {
+                in_turn = Some(&turn.id);
+                out.push_str(&turn_heading(turn, now));
+            }
+            let at = clock(item.started_at_ms.unwrap_or(item.updated_at_ms));
             match &item.body {
-                ItemBody::UserMessage { text, .. } => out.push_str(&format!("## User\n{text}\n\n")),
+                ItemBody::UserMessage { text, .. } => {
+                    out.push_str(&format!("## User · {at}\n{text}\n\n"))
+                }
                 ItemBody::AssistantMessage { text } if !text.trim().is_empty() => {
-                    out.push_str(&format!("## Assistant\n{text}\n\n"))
+                    out.push_str(&format!("## Assistant · {at}\n{text}\n\n"))
                 }
                 ItemBody::ToolCall {
                     tool,
@@ -473,7 +498,14 @@ impl Core {
                     output,
                     ..
                 } if detail == ReadDetail::Full => {
-                    out.push_str(&format!("- tool `{tool}`: {title}\n"));
+                    let took = match (item.status, item.started_at_ms) {
+                        (ItemStatus::InProgress, Some(start)) => {
+                            format!("running {}", span(now - start))
+                        }
+                        (_, Some(start)) => span(item.updated_at_ms - start),
+                        (_, None) => String::new(),
+                    };
+                    out.push_str(&format!("- tool `{tool}` · {at} · {took}: {title}\n"));
                     if let Some(o) = output.as_ref().filter(|o| !o.trim().is_empty()) {
                         let short: String = o.chars().take(600).collect();
                         out.push_str(&format!("  output: {}\n", short.replace('\n', "\n  ")));
@@ -604,5 +636,146 @@ mod search_tests {
         assert!(s.ends_with("is here and more"));
         let (s, a, b) = snippet("needle", 0, 6);
         assert_eq!((s.as_str(), a, b), ("needle", 0, 6));
+    }
+}
+
+/// A turn's timing, tokens, cost and context, for `thread_status`.
+fn turn_stats(t: &Turn, now: i64) -> serde_json::Value {
+    let end = t.ended_at_ms.unwrap_or(now);
+    let u = t.usage.as_ref();
+    serde_json::json!({
+        "status": t.status,
+        "error": t.error,
+        "started_at": utc(t.started_at_ms),
+        "ended_at": t.ended_at_ms.map(utc),
+        "duration_s": secs(end - t.started_at_ms),
+        "tokens": u.map(|u| serde_json::json!({
+            "input": u.input_tokens,
+            "output": u.output_tokens,
+            "cache_read": u.cache_read_tokens,
+            "cache_write": u.cache_write_tokens,
+        })),
+        "cost_usd": u.and_then(|u| u.cost_usd).map(round2),
+        "context": t.context.map(|c| serde_json::json!({
+            "tokens": c.tokens,
+            "window": c.window,
+            "percent_full": c.window.filter(|w| *w > 0)
+                .map(|w| (c.tokens as f64 * 1000.0 / w as f64).round() / 10.0),
+        })),
+    })
+}
+
+/// `### Turn 2 · 05:16:04 → 06:17:37 (61.5 min) · 95.3M tokens · $44.49 · context 962k of 1M`
+fn turn_heading(t: &Turn, now: i64) -> String {
+    let mut line = format!("### Turn {} · {}", t.ordinal, clock(t.started_at_ms));
+    match t.ended_at_ms {
+        Some(end) => line.push_str(&format!(
+            " → {} ({})",
+            clock(end),
+            span(end - t.started_at_ms)
+        )),
+        None => line.push_str(&format!(" · running for {}", span(now - t.started_at_ms))),
+    }
+    if t.status != TurnStatus::Running && t.status != TurnStatus::Completed {
+        line.push_str(&format!(" · {:?}", t.status).to_lowercase());
+    }
+    if let Some(u) = &t.usage {
+        let all = u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens;
+        if all > 0 {
+            line.push_str(&format!(" · {} tokens", count(all)));
+        }
+        if let Some(cost) = u.cost_usd {
+            line.push_str(&format!(" · ${cost:.2}"));
+        }
+    }
+    if let Some(c) = t.context {
+        line.push_str(&format!(" · context {}", count(c.tokens)));
+        if let Some(w) = c.window {
+            line.push_str(&format!(" of {}", count(w)));
+        }
+    }
+    line.push_str("\n\n");
+    line
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+fn secs(ms: i64) -> f64 {
+    (ms.max(0) as f64 / 100.0).round() / 10.0
+}
+
+/// `0.4s`, `12s`, `3.5 min`, `1.2 h`.
+fn span(ms: i64) -> String {
+    let s = ms.max(0) as f64 / 1000.0;
+    if s < 10.0 {
+        format!("{s:.1}s")
+    } else if s < 120.0 {
+        format!("{s:.0}s")
+    } else if s < 7200.0 {
+        format!("{:.1} min", s / 60.0)
+    } else {
+        format!("{:.1} h", s / 3600.0)
+    }
+}
+
+/// `950`, `28k`, `962k`, `1M`, `95.3M`.
+fn count(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..999_500 => format!("{}k", (n as f64 / 1e3).round()),
+        _ => {
+            let m = format!("{:.1}", n as f64 / 1e6);
+            format!("{}M", m.trim_end_matches(".0"))
+        }
+    }
+}
+
+/// `2026-11-11T06:17:37Z`
+fn utc(ms: i64) -> String {
+    let (days, secs) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000) / 1000);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
+/// `06:17:37` (UTC)
+fn clock(ms: i64) -> String {
+    utc(ms)[11..19].to_owned()
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn times_and_amounts_read_well() {
+        assert_eq!(utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc(1_794_377_857_653), "2026-11-11T06:17:37Z");
+        assert_eq!(utc(951_782_400_000), "2000-02-29T00:00:00Z");
+        assert_eq!(clock(1_794_377_857_653), "06:17:37");
+        assert_eq!(span(400), "0.4s");
+        assert_eq!(span(12_300), "12s");
+        assert_eq!(span(3_693_304), "61.6 min");
+        assert_eq!(count(950), "950");
+        assert_eq!(count(28_094), "28k");
+        assert_eq!(count(1_000_000), "1M");
+        assert_eq!(count(95_022_258), "95M");
+        assert_eq!(count(95_322_258), "95.3M");
+        assert_eq!(secs(3_693_304), 3693.3);
     }
 }

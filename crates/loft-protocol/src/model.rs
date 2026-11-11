@@ -319,6 +319,17 @@ pub struct Turn {
     /// once when it ends; older turns get it the first time it's asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<crate::DiffFileStat>>,
+    /// How full the agent's context was at its latest step in this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextUse>,
+}
+
+/// Tokens in the agent's context, and the most it holds when it says.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextUse {
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
