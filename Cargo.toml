@@ -103,9 +103,22 @@ opt-level = 1
 [profile.dev.build-override]
 debug = "line-tables-only"
 
+# What `cargo xtask bundle` builds, after every change that is to be seen in
+# the app: so a rebuild after an edit matters as much as the result.
+#
+# Dependencies are compiled as one unit each (as fast as each can be made;
+# slow to build, but built once and kept), our own crates as sixteen, and
+# nothing is optimized again across crates at link time. Against thin LTO
+# with four units throughout, measured on this app: a rebuild after an edit
+# to loft-ui 24.5 s -> 10.5 s (thin LTO took 14 s of every link, over every
+# crate each time); the app's CPU with a turn running the same to within
+# what two runs differ by (28.7% and 29.1% of a core); the binary 3%
+# smaller. A build from nothing takes 100 s instead of 70.
 [profile.release]
-lto = "thin"
-codegen-units = 4
+codegen-units = 16
+
+[profile.release.package."*"]
+codegen-units = 1
 
 # The browser client (`cargo xtask web --release`): size matters most, since
 # every byte is downloaded.
