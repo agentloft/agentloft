@@ -50,7 +50,7 @@ Two constraints shape everything:
 |---|---|
 | Embedded browser (WKWebView) | Replaced by a page of the daemon's own browser, streamed ([ADR-0017](0017-streamed-browser.md)). |
 | Folder browser, file dialogs, Finder, "Open in editor" | Left out. |
-| Menus and Settings in their own window | Drawn inside the one window. |
+| Menus, Settings and the thread details popover in their own window | Drawn inside the one window. |
 | Dock badge, notifications | None. |
 | Syntax highlighting | syntect instead of tree-sitter (its C grammars do not build for wasm32). |
 | System fonts | Not reachable: the client ships Inter, JetBrains Mono and IBM Plex Sans (all OFL-1.1). CJK and emoji use the browser's fonts through GPUI's canvas fallback. |

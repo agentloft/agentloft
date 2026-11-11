@@ -697,29 +697,27 @@ fn render_work_header(
     };
     let turn_id = turn.id.clone();
     let thread = thread.clone();
+    // The words (and the chevron) are the whole of it: what you click.
     h_flex()
-        .id(SharedString::from(format!("work-{}", turn.id.0)))
-        .gap_2()
-        .items_center()
         .pt_1()
         .text_sm()
         .text_color(p.muted_foreground)
         .child(
             h_flex()
+                .id(SharedString::from(format!("work-{}", turn.id.0)))
                 .flex_none()
                 .gap_1()
                 .items_center()
                 .child(label)
-                .when(!running && steps > 0, |d| d.child(chevron(open))),
+                .when(!running && steps > 0, |d| {
+                    d.child(chevron(open))
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(p.foreground))
+                        .on_click(move |_, _, cx| {
+                            thread.update(cx, |t, cx| t.toggle_work(&turn_id, cx));
+                        })
+                }),
         )
-        .child(div().flex_1().h_px().bg(p.border))
-        .when(!running && steps > 0, |d| {
-            d.cursor_pointer()
-                .hover(|d| d.text_color(p.foreground))
-                .on_click(move |_, _, cx| {
-                    thread.update(cx, |t, cx| t.toggle_work(&turn_id, cx));
-                })
-        })
         .into_any_element()
 }
 
@@ -1934,7 +1932,12 @@ fn render_turn_footer(
             parts.push(format!("{} tokens", compact_count(tokens)));
         }
         if let Some(cost) = u.cost_usd {
-            parts.push(format!("${cost:.3}"));
+            // A turn's own cost can be a fraction of a cent's tenth.
+            parts.push(if cost > 0. && cost < 0.0005 {
+                "<$0.001".to_owned()
+            } else {
+                format!("${cost:.3}")
+            });
         }
     }
     let idle = model.running_turn().is_none();

@@ -147,7 +147,9 @@ async fn run(
     let mut lines = BufReader::new(stdout).lines();
 
     let init = t.initialize();
-    if write_json(&mut stdin, &init).await.is_err() {
+    let cost = t.ask_cost_so_far();
+    if write_json(&mut stdin, &init).await.is_err() || write_json(&mut stdin, &cost).await.is_err()
+    {
         return RunEnd::Eof;
     }
 

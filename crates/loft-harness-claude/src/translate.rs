@@ -59,6 +59,19 @@ pub struct Translator {
     unechoed: std::collections::VecDeque<bool>,
     /// Whether Claude echoes our messages (older CLIs may not).
     echoes: bool,
+    /// Claude's running cost for the session as the current turn began. It
+    /// reports a total, one that a resumed session picks up where it left
+    /// off, so a turn's own cost is what the total grew by. `None` while
+    /// that isn't known.
+    cost_before: Option<f64>,
+    /// Our question for that total, asked as the session starts.
+    cost_query: Option<String>,
+    /// Whether Claude has produced anything in this process: a total that
+    /// arrives after that may already count some of the first turn.
+    replied: bool,
+    /// What the turn used before a message sent mid-turn made it go on.
+    /// Claude ends one part and starts the next, with a result for each.
+    carried: Option<Usage>,
 }
 
 impl Translator {
@@ -80,6 +93,14 @@ impl Translator {
     pub fn initialize(&mut self) -> Value {
         let id = self.next_request_id();
         json!({"type": "control_request", "request_id": id, "request": {"subtype": "initialize", "hooks": null}})
+    }
+
+    /// Ask what the session has cost so far. Sent once, before the first
+    /// prompt: Claude answers it before it runs anything.
+    pub fn ask_cost_so_far(&mut self) -> Value {
+        let id = self.next_request_id();
+        self.cost_query = Some(id.clone());
+        json!({"type": "control_request", "request_id": id, "request": {"subtype": "get_usage"}})
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {
@@ -294,8 +315,14 @@ impl Translator {
     pub fn on_value(&mut self, v: &Value) -> Vec<Out> {
         match str_at(v, "type") {
             Some("system") => self.on_system(v),
-            Some("stream_event") => self.on_stream_event(v),
-            Some("assistant") => self.on_assistant(v),
+            Some("stream_event") => {
+                self.replied = true;
+                self.on_stream_event(v)
+            }
+            Some("assistant") => {
+                self.replied = true;
+                self.on_assistant(v)
+            }
             Some("user") => self.on_user(v),
             Some("control_request") => self.on_control_request(v),
             Some("control_response") => self.on_control_response(v),
@@ -665,7 +692,19 @@ impl Translator {
     }
 
     fn on_control_response(&mut self, v: &Value) -> Vec<Out> {
-        if let Some(id) = v.pointer("/response/request_id").and_then(Value::as_str)
+        let id = v.pointer("/response/request_id").and_then(Value::as_str);
+        if id.is_some() && id == self.cost_query.as_deref() {
+            // Ours, and nobody is waiting for it: a CLI too old to answer
+            // just leaves the first turn without a cost.
+            self.cost_query = None;
+            if self.cost_before.is_none() && !self.replied {
+                self.cost_before = v
+                    .pointer("/response/response/session/total_cost_usd")
+                    .and_then(Value::as_f64);
+            }
+            return vec![];
+        }
+        if let Some(id) = id
             && self.queries.remove(id)
         {
             let result = if v.pointer("/response/subtype").and_then(Value::as_str) == Some("error")
@@ -761,18 +800,35 @@ impl Translator {
                 .unwrap_or(subtype)
                 .to_owned()
         });
+        // Tokens and time are this result's own; the cost is the session's.
         let usage = v.get("usage").map(|u| Usage {
             input_tokens: u64_at(u, "input_tokens"),
             output_tokens: u64_at(u, "output_tokens"),
             cache_read_tokens: u64_at(u, "cache_read_input_tokens"),
             cache_write_tokens: u64_at(u, "cache_creation_input_tokens"),
-            cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+            cost_usd: None,
             duration_ms: v.get("duration_ms").and_then(Value::as_u64),
         });
         self.streamed_messages.clear();
         self.denied_tools.clear();
+        let mut usage = add_usage(self.carried.take(), usage);
         if goes_on {
+            self.carried = usage;
             return out;
+        }
+        if let Some(total) = v.get("total_cost_usd").and_then(Value::as_f64) {
+            let cost = self.cost_before.map(|before| {
+                // A total below the last one is a count that started over.
+                if total >= before {
+                    total - before
+                } else {
+                    total
+                }
+            });
+            self.cost_before = Some(total);
+            if let Some(usage) = usage.as_mut() {
+                usage.cost_usd = cost;
+            }
         }
         self.turn_active = false;
         self.interrupt_requested = false;
@@ -825,6 +881,24 @@ pub fn questions(input: &Value) -> Vec<Question> {
             })
         })
         .collect()
+}
+
+/// Two parts of one turn, added up.
+fn add_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
+    let (Some(a), Some(b)) = (&a, &b) else {
+        return a.or(b);
+    };
+    Some(Usage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cache_read_tokens: a.cache_read_tokens + b.cache_read_tokens,
+        cache_write_tokens: a.cache_write_tokens + b.cache_write_tokens,
+        cost_usd: None,
+        duration_ms: match (a.duration_ms, b.duration_ms) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        },
+    })
 }
 
 pub fn permission_mode_arg(mode: PermissionMode) -> &'static str {
@@ -1030,7 +1104,10 @@ mod tests {
         match evs.last().unwrap() {
             HarnessEvent::TurnCompleted { status, usage, .. } => {
                 assert_eq!(*status, TurnStatus::Completed);
-                assert!(usage.as_ref().unwrap().cost_usd.is_some());
+                let usage = usage.as_ref().unwrap();
+                assert_eq!((usage.output_tokens, usage.duration_ms), (4, Some(1219)));
+                // Nothing said what the session had cost before this turn.
+                assert_eq!(usage.cost_usd, None);
             }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
@@ -1142,6 +1219,102 @@ mod tests {
         t.start_turn("x");
         t.steer_with("y", &[]);
         assert!(completed(&t.on_line(RESULT)));
+    }
+
+    /// A result: what it used itself, and the session's total so far.
+    fn result(tokens: u64, ms: u64, total: f64) -> String {
+        json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "ok",
+            "duration_ms": ms, "total_cost_usd": total,
+            "usage": {"input_tokens": tokens, "output_tokens": 1},
+        })
+        .to_string()
+    }
+
+    fn used(out: &[Out]) -> Usage {
+        events(out)
+            .iter()
+            .find_map(|e| match e {
+                HarnessEvent::TurnCompleted { usage, .. } => usage.clone(),
+                _ => None,
+            })
+            .expect("a finished turn with its usage")
+    }
+
+    /// The session's total, as Claude answers our question at the start.
+    fn cost_so_far(t: &mut Translator, total: f64) -> Vec<Out> {
+        let ask = t.ask_cost_so_far();
+        t.on_value(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ask["request_id"],
+            "response": {"session": {"total_cost_usd": total}},
+        }}))
+    }
+
+    fn cents(usage: &Usage) -> Option<i64> {
+        usage.cost_usd.map(|cost| (cost * 100.0).round() as i64)
+    }
+
+    #[test]
+    fn a_turn_costs_what_the_session_total_grew_by() {
+        let mut t = Translator::new();
+        // A resumed session: it had already cost half a dollar.
+        assert!(cost_so_far(&mut t, 0.50).is_empty());
+        t.start_turn("x");
+        assert_eq!(cents(&used(&t.on_line(&result(10, 900, 0.75)))), Some(25));
+        t.start_turn("y");
+        assert_eq!(cents(&used(&t.on_line(&result(10, 900, 0.85)))), Some(10));
+    }
+
+    #[test]
+    fn a_turn_has_no_cost_while_the_total_before_it_is_unknown() {
+        let mut t = Translator::new();
+        let ask = t.ask_cost_so_far();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"assistant","message":{"id":"m1","content":[]}}"#);
+        // Too late: this total may count some of the turn under way.
+        let late = t.on_value(&json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": ask["request_id"],
+            "response": {"session": {"total_cost_usd": 2.0}},
+        }}));
+        assert!(late.is_empty());
+        assert_eq!(used(&t.on_line(&result(10, 900, 2.25))).cost_usd, None);
+        // From here on the total is known.
+        t.start_turn("y");
+        assert_eq!(cents(&used(&t.on_line(&result(10, 900, 2.50)))), Some(25));
+    }
+
+    #[test]
+    fn a_claude_that_cannot_say_its_cost_is_not_a_warning() {
+        let mut t = Translator::new();
+        let ask = t.ask_cost_so_far();
+        let out = t.on_value(&json!({"type": "control_response", "response": {
+            "subtype": "error", "request_id": ask["request_id"], "error": "unknown request",
+        }}));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_turn_that_went_on_counts_all_of_its_parts() {
+        let mut t = Translator::new();
+        cost_so_far(&mut t, 1.0);
+        t.start_turn("work for a while");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"work for a while"}}"#);
+        t.steer_with("stop now", &[]);
+        // Claude ends its part, then takes the message in and answers it.
+        assert!(!completed(&t.on_line(&result(100, 12_900, 1.07))));
+        t.on_line(
+            r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"stop now"}}"#,
+        );
+        let usage = used(&t.on_line(&result(20, 1_300, 1.09)));
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.duration_ms, Some(14_200));
+        assert_eq!(cents(&usage), Some(9));
+        // The next turn starts from nothing carried over.
+        t.start_turn("again");
+        let usage = used(&t.on_line(&result(5, 400, 1.10)));
+        assert_eq!((usage.input_tokens, usage.duration_ms), (5, Some(400)));
+        assert_eq!(cents(&usage), Some(1));
     }
 
     #[test]
