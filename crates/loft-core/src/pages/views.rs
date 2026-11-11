@@ -309,6 +309,8 @@ impl Browser {
             .cdp
             .send(
                 "Target.createTarget",
+                // A window of its own: a tab behind another one in the
+                // same window is not drawn, and several views show at once.
                 json!({ "url": "about:blank", "browserContextId": context }),
                 None,
             )
@@ -348,6 +350,7 @@ impl Browser {
             target,
             session: session.clone(),
             input,
+            shaping: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 info: info.clone(),
                 frame: None,
@@ -1013,6 +1016,83 @@ mod tests {
             }
         );
         assert_eq!(lock(&kept).as_slice(), [json!({ "clicks": 5 })]);
+        pages.shutdown().await;
+    }
+
+    /// The height in pixels a JPEG says it has.
+    fn jpeg_height(jpeg: &[u8]) -> Option<u32> {
+        let mut at = 2;
+        while at + 9 < jpeg.len() {
+            if jpeg[at] != 0xff {
+                at += 1;
+                continue;
+            }
+            if matches!(jpeg[at + 1], 0xc0..=0xc2) {
+                return Some(u32::from(u16::from_be_bytes([jpeg[at + 5], jpeg[at + 6]])));
+            }
+            at += 2 + usize::from(u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]));
+        }
+        None
+    }
+
+    /// Views that are watched from the moment they open, on a dense screen,
+    /// and never hold still: each ends up pictured as tall as its content.
+    /// (Chrome puts a page back to the size it had when a screenshot began,
+    /// so a height set while one was being taken used to be lost, and the
+    /// view stayed a strip of its first 160 px.)
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a real browser"]
+    async fn live_views_watched_from_the_start_are_pictured_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let (bus, _heard) = tokio::sync::broadcast::channel(4096);
+        let pages = Pages::default();
+        let thread = ThreadId::new();
+        let keep: StateKeeper = Arc::new(|_, _, _| {});
+        let mut opened = Vec::new();
+        for tall in [420u32, 260, 610, 340] {
+            let html = format!(
+                "<div id=\"box\" style=\"height:{tall}px\"></div>\
+                 <script>setInterval(() => box.textContent = Date.now(), 20)</script>"
+            );
+            let request = ViewRequest {
+                thread: thread.clone(),
+                item: ItemId::new(),
+                html,
+                done: true,
+                width: 500,
+                scale: 2.0,
+                theme: Some(Theme::default()),
+                state: Value::Null,
+                keep: keep.clone(),
+            };
+            let page = pages
+                .open_view(request, None, &profile, bus.clone())
+                .await
+                .unwrap();
+            pages.watching(&page.id, true).await;
+            opened.push((page.id, tall));
+        }
+        for (id, tall) in opened {
+            let whole = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let (info, frame, _) = pages.snapshot(&id).unwrap();
+                    let pictured = frame.and_then(|frame| jpeg_height(&frame.jpeg.0));
+                    if info.height >= tall && pictured == Some(info.height * 2) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            let (info, frame, _) = pages.snapshot(&id).unwrap();
+            assert!(
+                whole.is_ok(),
+                "a view {} px tall is pictured {:?} px tall (at twice the scale)",
+                info.height,
+                frame.and_then(|frame| jpeg_height(&frame.jpeg.0)),
+            );
+        }
         pages.shutdown().await;
     }
 }

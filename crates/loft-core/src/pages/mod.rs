@@ -103,6 +103,12 @@ struct Page {
     /// Input in the order it arrived; one task replays it.
     input: mpsc::UnboundedSender<PageInput>,
     state: Mutex<State>,
+    /// Held while the page is given a size and while it is photographed,
+    /// one at a time: when a screenshot is done Chrome puts the page back
+    /// to the size it had when the screenshot began, so a size set in
+    /// between would be undone and every later picture would be the old
+    /// size.
+    shaping: tokio::sync::Mutex<()>,
     /// Set when the page draws a view an agent made rather than a site.
     view: Option<views::ViewPage>,
 }
@@ -132,20 +138,7 @@ impl Browser {
     /// changing: one screenshot at a time, always of the page as it is now.
     async fn picture_view(self: Arc<Self>, page: Arc<Page>) {
         loop {
-            let shot = self
-                .cdp
-                .send(
-                    "Page.captureScreenshot",
-                    json!({ "format": "jpeg", "quality": VIEW_QUALITY, "optimizeForSpeed": true }),
-                    Some(&page.session),
-                )
-                .await
-                .ok()
-                .and_then(|shot| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(shot["data"].as_str()?)
-                        .ok()
-                });
+            let shot = self.screenshot(&page, VIEW_QUALITY).await;
             let again = {
                 let mut state = lock(&page.state);
                 if let Some(jpeg) = shot {
@@ -164,6 +157,23 @@ impl Browser {
                 return;
             }
         }
+    }
+
+    /// A picture of the page at its real scale, as a JPEG.
+    async fn screenshot(&self, page: &Page, quality: u32) -> Option<Vec<u8>> {
+        let _shaping = page.shaping.lock().await;
+        let shot = self
+            .cdp
+            .send(
+                "Page.captureScreenshot",
+                json!({ "format": "jpeg", "quality": quality, "optimizeForSpeed": true }),
+                Some(&page.session),
+            )
+            .await
+            .ok()?;
+        base64::engine::general_purpose::STANDARD
+            .decode(shot["data"].as_str()?)
+            .ok()
     }
 }
 
@@ -555,6 +565,7 @@ impl Browser {
             target,
             session: session.clone(),
             input,
+            shaping: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 info: info.clone(),
                 frame: None,
@@ -652,23 +663,29 @@ impl Browser {
         height: u32,
         scale: f32,
     ) -> Result<(), ErrorBody> {
-        let (info, watched) = {
+        let watched = {
             let mut state = lock(&page.state);
             let info = &mut state.info;
             if (info.width, info.height) == (width, height) && info.scale == scale {
                 return Ok(());
             }
             (info.width, info.height, info.scale) = (width, height, scale);
-            (state.info.clone(), state.viewers > 0)
+            state.viewers > 0
         };
-        self.cdp
-            .send(
-                "Emulation.setDeviceMetricsOverride",
-                metrics(&info),
-                Some(&page.session),
-            )
-            .await
-            .map_err(internal)?;
+        {
+            // Not while a screenshot is being taken (see `Page::shaping`),
+            // and with the size as it is by then: the last one asked for.
+            let _shaping = page.shaping.lock().await;
+            let info = lock(&page.state).info.clone();
+            self.cdp
+                .send(
+                    "Emulation.setDeviceMetricsOverride",
+                    metrics(&info),
+                    Some(&page.session),
+                )
+                .await
+                .map_err(internal)?;
+        }
         if watched {
             // Pictures at the new size: a screencast keeps the limits it
             // was started with, so it is started over.
@@ -1073,21 +1090,7 @@ impl Browser {
                     return;
                 }
             }
-            let Ok(shot) = browser
-                .cdp
-                .send(
-                    "Page.captureScreenshot",
-                    json!({ "format": "jpeg", "quality": STILL_QUALITY, "optimizeForSpeed": true }),
-                    Some(&page.session),
-                )
-                .await
-            else {
-                return;
-            };
-            let Some(jpeg) = shot["data"]
-                .as_str()
-                .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-            else {
+            let Some(jpeg) = browser.screenshot(&page, STILL_QUALITY).await else {
                 return;
             };
             let seq = {
