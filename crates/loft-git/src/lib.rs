@@ -26,10 +26,18 @@ fn git(dir: &Path) -> Command {
 fn run(cmd: &mut Command) -> Result<String> {
     let out = cmd.output().context("run git")?;
     if !out.status.success() {
+        // Some failures (`commit` with nothing to commit) explain on stdout.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let why = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
         bail!(
             "git {:?} failed: {}",
             cmd.get_args().collect::<Vec<_>>(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            why
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())

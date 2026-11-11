@@ -261,18 +261,28 @@ pub fn prune(repo: &Path) -> Result<()> {
 /// Files that would conflict when merging `branch` into `base`
 /// (`git merge-tree --write-tree`, no work tree touched).
 pub fn merge_conflicts(repo: &Path, base: &str, branch: &str) -> Result<Vec<String>> {
+    Ok(merge_tree(repo, base, branch)?.1)
+}
+
+/// The tree a merge of `branch` into `base` would produce, and the files
+/// that would conflict.
+fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<(String, Vec<String>)> {
     let out = git(repo)
         .args(["merge-tree", "--write-tree", "--name-only", base, branch])
         .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let tree = lines.next().unwrap_or_default().to_owned();
     match out.status.code() {
-        Some(0) => Ok(Vec::new()),
+        Some(0) => Ok((tree, Vec::new())),
         // Conflicts: tree id, then conflicted paths, then a blank line.
-        Some(1) => Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .skip(1)
-            .take_while(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect()),
+        Some(1) => Ok((
+            tree,
+            lines
+                .take_while(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )),
         _ => bail!(
             "git merge-tree failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -341,12 +351,18 @@ pub fn squash_merge(
     if ahead.trim() == "0" {
         bail!("nothing to merge: `{branch}` has no changes beyond `{base}`");
     }
-    let conflicts = merge_conflicts(repo, base, branch)?;
+    let (tree, conflicts) = merge_tree(repo, base, branch)?;
     if !conflicts.is_empty() {
         bail!(
             "merging `{branch}` into `{base}` would conflict in: {}",
             conflicts.join(", ")
         );
+    }
+    // Commits ahead can still change nothing: an empty checkpoint, or work
+    // already on `base` by another route.
+    let base_tree = run(git(repo).args(["rev-parse", &format!("{base}^{{tree}}")]))?;
+    if tree == base_tree.trim() {
+        bail!("nothing to merge: `{branch}` changes no files on `{base}`");
     }
     run(git(repo).args(["merge", "--squash", "-q", branch]))?;
     if let Err(err) = run(git(repo).args(["commit", "-q", "-m", message])) {
@@ -524,6 +540,23 @@ mod tests {
         let log = run(git(root).args(["log", "--format=%s", "-1"])).unwrap();
         assert_eq!(log.trim(), "Greet");
         assert!(squash_merge(root, &wt, &branch, "main", "again").is_err());
+
+        // Commits that change nothing beyond `main` are refused by name.
+        run(git(&wt).args(["merge", "-q", "main"])).unwrap();
+        run(git(&wt).args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "checkpoint",
+        ]))
+        .unwrap();
+        let err = squash_merge(root, &wt, &branch, "main", "empty").unwrap_err();
+        assert!(err.to_string().contains("changes no files"), "{err}");
 
         // A conflicting change is refused without touching the checkout.
         std::fs::write(wt.join("a.txt"), "worktree\n").unwrap();
