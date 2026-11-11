@@ -420,7 +420,16 @@ pub fn render_row(
         Row::Queued(id) => render_queued(&state.id, store, *id, p, cx),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
-            render_turn_footer(store, model, *turn_ix, agents, p)
+            let changes = render_turn_changes(thread, store, state, model, *turn_ix, p);
+            let footer = render_turn_footer(store, model, *turn_ix, agents, p);
+            match changes {
+                Some(card) => v_flex()
+                    .gap(p.row_gap)
+                    .child(card)
+                    .child(footer)
+                    .into_any_element(),
+                None => footer,
+            }
         }
     };
     let footer = matches!(row, Row::TurnFooter { .. });
@@ -1941,6 +1950,151 @@ pub(crate) fn approval_card(
         })
         .child(buttons)
         .into_any_element()
+}
+
+/// The most files a "changed files" card lists before "N more".
+const CARD_FILES: usize = 12;
+
+/// "3 changed files +94 −80" under a finished turn, with the files it
+/// touched; a file (or "Open diff") shows the turn's diff in Changes.
+fn render_turn_changes(
+    thread: &Entity<ThreadState>,
+    store: &Entity<AppStore>,
+    state: &ThreadState,
+    model: &ThreadModel,
+    turn_ix: usize,
+    p: &Palette,
+) -> Option<AnyElement> {
+    let turn = model.turns.get(turn_ix)?;
+    let files = state.turn_diffs.get(&turn.id)?.files.as_ref()?;
+    if files.is_empty() {
+        return None;
+    }
+    let open = !state.folded_diffs.contains(&turn.id);
+    let added: u32 = files.iter().map(|f| f.added).sum();
+    let removed: u32 = files.iter().map(|f| f.removed).sum();
+    let stat = |added: u32, removed: u32, binary: bool| {
+        h_flex()
+            .gap_1p5()
+            .flex_shrink_0()
+            .font_family(p.mono.clone())
+            .text_xs()
+            .when(binary, |d| {
+                d.child(div().text_color(p.faint_foreground).child("binary"))
+            })
+            .when(!binary, |d| {
+                d.child(div().text_color(p.success).child(format!("+{added}")))
+                    .child(div().text_color(p.danger).child(format!("−{removed}")))
+            })
+    };
+    let open_diff = {
+        let (store, t, u) = (store.clone(), model.thread.id.clone(), turn.id.clone());
+        move |path: Option<String>| {
+            let (store, t, u) = (store.clone(), t.clone(), u.clone());
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                let (t, u, path) = (t.clone(), u.clone(), path.clone());
+                store.update(cx, |s, cx| s.open_turn_diff(t, u, path, cx));
+            }
+        }
+    };
+    let header = h_flex()
+        .id(SharedString::from(format!("turn-changes-{}", turn.id)))
+        .px_3()
+        .py_2()
+        .gap_2()
+        .items_center()
+        .cursor_pointer()
+        .text_sm()
+        .on_click({
+            let (thread, turn_id) = (thread.clone(), turn.id.clone());
+            move |_, _, cx| thread.update(cx, |t, cx| t.toggle_turn_diff(&turn_id, cx))
+        })
+        .child(div().text_color(p.faint_foreground).child(chevron(open)))
+        .child(
+            div()
+                .text_color(p.foreground)
+                .font_weight(FontWeight::MEDIUM)
+                .child(match files.len() {
+                    1 => "1 changed file".to_owned(),
+                    n => format!("{n} changed files"),
+                }),
+        )
+        .child(stat(added, removed, false))
+        .child(div().flex_1())
+        .child(
+            Button::new(SharedString::from(format!("turn-diff-{}", turn.id)))
+                .cursor_pointer()
+                .icon(IconName::FileDiff)
+                .label("Open diff")
+                .ghost()
+                .xsmall()
+                .on_click(open_diff(None)),
+        );
+    let rows = open.then(|| {
+        let mut list = v_flex().pb_1();
+        for (i, f) in files.iter().take(CARD_FILES).enumerate() {
+            let (dir, name) = match f.path.rsplit_once('/') {
+                Some((dir, name)) => (Some(format!("{dir}/")), name),
+                None => (None, f.path.as_str()),
+            };
+            list = list.child(
+                h_flex()
+                    .id(SharedString::from(format!("turn-file-{}-{i}", turn.id)))
+                    .px_3()
+                    .py(px(3.))
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.hover))
+                    .on_click(open_diff(Some(f.path.clone())))
+                    .child(div().pl(px(18.)))
+                    .child(crate::file_icons::icon(name, false, false, px(14.)))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font_family(p.mono.clone())
+                            .text_size(p.mono_size)
+                            .when_some(dir, |d, dir| {
+                                d.child(div().text_color(p.faint_foreground).child(dir))
+                            })
+                            .child(div().text_color(p.foreground).child(name.to_owned())),
+                    )
+                    .child(stat(f.added, f.removed, f.binary)),
+            );
+        }
+        if files.len() > CARD_FILES {
+            list = list.child(
+                h_flex()
+                    .id(SharedString::from(format!("turn-files-more-{}", turn.id)))
+                    .px_3()
+                    .py(px(3.))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    .on_click(open_diff(None))
+                    .child(div().pl(px(18.)))
+                    .child(format!("{} more", files.len() - CARD_FILES)),
+            );
+        }
+        list
+    });
+    Some(
+        v_flex()
+            .w_full()
+            .mt(p.row_gap / 2.)
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.border)
+            .overflow_hidden()
+            .child(header)
+            .children(rows)
+            .into_any_element(),
+    )
 }
 
 fn render_turn_footer(

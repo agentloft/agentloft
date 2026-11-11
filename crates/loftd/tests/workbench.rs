@@ -205,6 +205,21 @@ async fn turns_are_checkpointed_and_diffable() {
     assert_eq!(paths, vec!["NEW.md", "src/main.rs"], "{diff:?}");
     assert!(diff.patch.contains("+fn main() { println!(\"hi\"); }"));
 
+    // The same turn asked for by id (its "changed files" card).
+    let turn_id = model.turns[0].id.clone();
+    let Response::Diff { diff: by_id } = env
+        .client
+        .request(Request::GetDiff {
+            thread_id: thread.id.clone(),
+            scope: DiffScope::Turn(turn_id),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(by_id.files, diff.files);
+
     // The user's git state is untouched.
     let status = Command::new("git")
         .current_dir(&env.repo)

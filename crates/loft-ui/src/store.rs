@@ -211,6 +211,12 @@ pub enum StoreEvent {
         thread_id: ThreadId,
         item_id: ItemId,
     },
+    /// Show what one turn changed in the Changes panel (at `path`, if set).
+    OpenTurnDiff {
+        thread_id: ThreadId,
+        turn_id: loft_protocol::TurnId,
+        path: Option<String>,
+    },
     /// An agent wants to drive the browser panel (answer via `respond_call`).
     BrowserCall {
         call_id: u64,
@@ -953,7 +959,8 @@ impl AppStore {
         if let Some(entity) = self.threads.get(id) {
             return entity.clone();
         }
-        let entity = cx.new(|cx| ThreadState::new(id.clone(), cx));
+        let store = cx.entity().downgrade();
+        let entity = cx.new(|cx| ThreadState::new(id.clone(), store, cx));
         let live = self.live_spawned(id);
         entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
         self.threads.insert(id.clone(), entity.clone());
@@ -1231,6 +1238,20 @@ impl AppStore {
 
     pub fn open_agent(&mut self, thread_id: ThreadId, item_id: ItemId, cx: &mut Context<Self>) {
         cx.emit(StoreEvent::OpenAgent { thread_id, item_id });
+    }
+
+    pub fn open_turn_diff(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: loft_protocol::TurnId,
+        path: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(StoreEvent::OpenTurnDiff {
+            thread_id,
+            turn_id,
+            path,
+        });
     }
 
     pub fn selected_thread(&self) -> Option<Entity<ThreadState>> {
@@ -2173,12 +2194,30 @@ pub struct ThreadState {
     pub drawn_messages:
         std::rc::Rc<std::cell::RefCell<HashMap<usize, gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     pub visible_messages: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    /// What each finished turn changed (its "changed files" card), keyed by
+    /// turn and the checkpoint it was read at.
+    pub turn_diffs: HashMap<loft_protocol::TurnId, TurnDiff>,
+    /// Turns whose "changed files" card is folded.
+    pub folded_diffs: HashSet<loft_protocol::TurnId>,
+    store: WeakEntity<AppStore>,
+}
+
+/// One turn's changes, as fetched for its "changed files" card.
+pub struct TurnDiff {
+    /// The turn's `checkpoint_after` when it was read (it's fetched again
+    /// if that changes).
+    pub at: Option<String>,
+    /// `None` while loading.
+    pub files: Option<Vec<loft_protocol::DiffFileStat>>,
 }
 
 impl ThreadState {
-    fn new(id: ThreadId, cx: &mut Context<Self>) -> Self {
+    fn new(id: ThreadId, store: WeakEntity<AppStore>, cx: &mut Context<Self>) -> Self {
         Self {
             id,
+            turn_diffs: HashMap::new(),
+            folded_diffs: HashSet::new(),
+            store,
             model: None,
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
@@ -2561,10 +2600,95 @@ impl ThreadState {
         }));
     }
 
+    /// Read what each finished turn changed, for its "changed files" card
+    /// (once per turn and checkpoint).
+    fn fetch_turn_diffs(&mut self, cx: &mut Context<Self>) {
+        let Some(model) = self.model.as_ref() else {
+            return;
+        };
+        let wanted: Vec<_> = model
+            .turns
+            .iter()
+            .filter(|t| t.status.is_terminal() && t.checkpoint_before.is_some())
+            .filter(|t| {
+                self.turn_diffs
+                    .get(&t.id)
+                    .is_none_or(|d| d.at != t.checkpoint_after)
+            })
+            .map(|t| (t.id.clone(), t.checkpoint_after.clone()))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        for (turn_id, at) in &wanted {
+            self.turn_diffs.insert(
+                turn_id.clone(),
+                TurnDiff {
+                    at: at.clone(),
+                    files: None,
+                },
+            );
+        }
+        // This runs inside the store's own updates (snapshots, events), so
+        // the requests go out once that update is over.
+        let (this, store) = (cx.entity().downgrade(), self.store.clone());
+        cx.defer(move |cx| {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                for (turn_id, at) in wanted {
+                    let body = Request::GetDiff {
+                        thread_id: this.id.clone(),
+                        scope: loft_protocol::DiffScope::Turn(turn_id.clone()),
+                    };
+                    request_in(&store, body, cx, move |this, result, cx| {
+                        let files = match result {
+                            Ok(Response::Diff { diff }) => diff.files,
+                            _ => Vec::new(),
+                        };
+                        match this.turn_diffs.get_mut(&turn_id) {
+                            Some(d) if d.at == at => d.files = Some(files),
+                            _ => return,
+                        }
+                        this.remeasure_turn_footer(&turn_id, cx);
+                    });
+                }
+            });
+        });
+    }
+
+    /// The card under a turn changed height.
+    fn remeasure_turn_footer(&mut self, turn_id: &loft_protocol::TurnId, cx: &mut Context<Self>) {
+        let Some(model) = self.model.as_ref() else {
+            return;
+        };
+        let Some(turn_ix) = model.turns.iter().position(|t| &t.id == turn_id) else {
+            return;
+        };
+        if let Some(row) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::TurnFooter { turn_ix: ix } if *ix == turn_ix))
+        {
+            self.scroller
+                .update(cx, |s, cx| s.remeasure_items(row..row + 1, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_turn_diff(&mut self, turn_id: &loft_protocol::TurnId, cx: &mut Context<Self>) {
+        if !self.folded_diffs.remove(turn_id) {
+            self.folded_diffs.insert(turn_id.clone());
+        }
+        self.remeasure_turn_footer(turn_id, cx);
+    }
+
     /// Rebuild rows and tell the virtual list what changed.
     fn sync_rows(&mut self, changed_item: Option<&ItemId>, cx: &mut Context<Self>) {
         let old = self.rebuild_rows();
         self.ensure_ticker(cx);
+        self.fetch_turn_diffs(cx);
         let new_len = self.rows.len();
         let common = old
             .iter()
@@ -2599,6 +2723,7 @@ impl ThreadState {
         self.model = Some(model);
         self.rebuild_rows();
         self.ensure_ticker(cx);
+        self.fetch_turn_diffs(cx);
         let count = self.rows.len();
         let reveal = self.reveal.take().and_then(|id| self.row_of_item(&id));
         self.scroller.update(cx, |s, cx| {

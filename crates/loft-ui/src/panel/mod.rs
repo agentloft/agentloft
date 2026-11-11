@@ -635,6 +635,24 @@ impl WorkbenchPanel {
         cx.notify();
     }
 
+    /// Show what one turn changed in the Changes tab (at `path`, if set).
+    pub fn open_turn_diff(
+        &mut self,
+        thread_id: &ThreadId,
+        turn_id: loft_protocol::TurnId,
+        path: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.ensure_id(thread_id, window, cx) else {
+            return;
+        };
+        panel
+            .changes
+            .update(cx, |c, cx| c.show_turn(turn_id, path, cx));
+        self.add(thread_id, Tab::Changes, window, cx);
+    }
+
     pub fn open_file(
         &mut self,
         thread_id: &ThreadId,

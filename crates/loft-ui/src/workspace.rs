@@ -365,6 +365,17 @@ impl WorkspaceView {
                 self.panel
                     .update(cx, |panel, cx| panel.open_file(&t, r, window, cx));
             }
+            StoreEvent::OpenTurnDiff {
+                thread_id,
+                turn_id,
+                path,
+            } => {
+                self.panel_open = true;
+                let (t, u, path) = (thread_id.clone(), turn_id.clone(), path.clone());
+                self.panel.update(cx, |panel, cx| {
+                    panel.open_turn_diff(&t, u, path, window, cx)
+                });
+            }
             StoreEvent::OpenAgent { thread_id, item_id } => {
                 self.panel_open = true;
                 let (t, i) = (thread_id.clone(), item_id.clone());

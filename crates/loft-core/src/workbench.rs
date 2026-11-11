@@ -4,7 +4,7 @@
 use crate::{Core, CoreResult, internal};
 use loft_protocol::{
     DiffFileStat, DiffResult, DiffScope, DirEntry, ErrorBody, ErrorCode, FileContent, FsRoot,
-    ItemBody, ProjectId, ReadDetail, ThreadId, TurnStatus,
+    ItemBody, ProjectId, ReadDetail, ThreadId,
 };
 use std::path::{Component, Path, PathBuf};
 
@@ -219,7 +219,7 @@ impl Core {
         let dir = self.root_dir(&FsRoot::Thread(thread_id.clone()))?;
         let turns = self.with_store(|s| s.turns(thread_id))?;
         let empty = |note: &str| DiffResult {
-            scope,
+            scope: scope.clone(),
             patch: String::new(),
             files: vec![],
             note: Some(note.to_owned()),
@@ -240,17 +240,19 @@ impl Core {
             Between(String, String),
             ToWorkingTree(String),
         }
-        let plan = match scope {
+        let plan = match &scope {
             DiffScope::WorkingTree => Plan::WorkingTree,
-            DiffScope::LastTurn => {
-                let Some(turn) = turns.iter().rev().find(|t| t.checkpoint_before.is_some()) else {
+            DiffScope::LastTurn | DiffScope::Turn(_) => {
+                let turn = match &scope {
+                    DiffScope::Turn(id) => turns.iter().find(|t| &t.id == id),
+                    _ => turns.iter().rev().find(|t| t.checkpoint_before.is_some()),
+                };
+                let Some(before) = turn.and_then(|t| t.checkpoint_before.clone()) else {
                     return Ok(empty("No turns with checkpoints yet."));
                 };
-                let before = turn.checkpoint_before.clone().unwrap_or_default();
-                match (&turn.checkpoint_after, turn.status) {
-                    (Some(after), _) => Plan::Between(before, after.clone()),
-                    (None, TurnStatus::Running) => Plan::ToWorkingTree(before),
-                    (None, _) => Plan::ToWorkingTree(before),
+                match turn.and_then(|t| t.checkpoint_after.clone()) {
+                    Some(after) => Plan::Between(before, after),
+                    None => Plan::ToWorkingTree(before),
                 }
             }
             DiffScope::Thread => {

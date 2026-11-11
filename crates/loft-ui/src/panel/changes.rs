@@ -23,6 +23,8 @@ pub struct ChangesView {
     error: Option<String>,
     diff: Option<Entity<DiffState>>,
     split: bool,
+    /// A file to scroll to once the diff has loaded.
+    reveal: Option<String>,
 }
 
 impl ChangesView {
@@ -36,6 +38,7 @@ impl ChangesView {
             error: None,
             diff: None,
             split: false,
+            reveal: None,
         };
         this.refresh(cx);
         this
@@ -46,7 +49,7 @@ impl ChangesView {
         cx.notify();
         let body = Request::GetDiff {
             thread_id: self.thread_id.clone(),
-            scope: self.scope,
+            scope: self.scope.clone(),
         };
         request_in(&self.store, body, cx, |this, result, cx| {
             this.loading = false;
@@ -59,7 +62,11 @@ impl ChangesView {
                     } else {
                         DiffMode::Unified
                     };
-                    this.diff = Some(cx.new(|cx| DiffState::new(files, cx).with_mode(mode)));
+                    let diff_state = cx.new(|cx| DiffState::new(files, cx).with_mode(mode));
+                    if let Some(path) = this.reveal.take() {
+                        diff_state.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+                    }
+                    this.diff = Some(diff_state);
                     this.result = Some(diff);
                 }
                 Ok(other) => this.error = Some(format!("unexpected response: {other:?}")),
@@ -67,6 +74,44 @@ impl ChangesView {
             }
             cx.notify();
         });
+    }
+
+    /// Show what one turn changed, scrolled to `path` if set.
+    pub fn show_turn(
+        &mut self,
+        turn_id: loft_protocol::TurnId,
+        path: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let scope = DiffScope::Turn(turn_id);
+        if self.scope == scope {
+            if self.loading {
+                self.reveal = path;
+            } else if let (Some(path), Some(diff)) = (&path, &self.diff) {
+                diff.update(cx, |d, cx| d.scroll_to_file(path, cx));
+            }
+            return;
+        }
+        self.reveal = path;
+        self.scope = scope;
+        self.refresh(cx);
+    }
+
+    /// "Turn 3" for the turn the view is scoped to.
+    fn turn_label(&self, cx: &Context<Self>) -> Option<String> {
+        let DiffScope::Turn(id) = &self.scope else {
+            return None;
+        };
+        let store = self.store.read(cx);
+        let ix = store
+            .threads
+            .get(&self.thread_id)
+            .and_then(|t| t.read(cx).model.as_ref())
+            .and_then(|m| m.turns.iter().position(|t| &t.id == id));
+        Some(match ix {
+            Some(ix) => format!("Turn {}", ix + 1),
+            None => "Turn".to_owned(),
+        })
     }
 
     fn set_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
@@ -93,11 +138,15 @@ impl ChangesView {
 impl Render for ChangesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
-        let scopes = [
-            (DiffScope::Thread, "This thread"),
-            (DiffScope::LastTurn, "Last turn"),
-            (DiffScope::WorkingTree, "Uncommitted"),
+        let mut scopes = vec![
+            (DiffScope::Thread, "This thread".to_owned()),
+            (DiffScope::LastTurn, "Last turn".to_owned()),
+            (DiffScope::WorkingTree, "Uncommitted".to_owned()),
         ];
+        // Opened from a turn's "changed files" card.
+        if let Some(label) = self.turn_label(cx) {
+            scopes.push((self.scope.clone(), label));
+        }
         let mut segmented = h_flex().p(px(2.)).gap(px(2.)).rounded(px(8.)).bg(p.muted);
         for (scope, label) in scopes {
             let active = self.scope == scope;
@@ -116,7 +165,7 @@ impl Render for ChangesView {
                     })
                     .when(!active, |d| d.text_color(p.muted_foreground))
                     .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_scope(scope, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_scope(scope.clone(), cx))),
             );
         }
         let stats = self.result.as_ref().map(|r| {

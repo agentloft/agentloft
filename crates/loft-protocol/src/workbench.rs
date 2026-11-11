@@ -1,6 +1,6 @@
 //! Workbench wire types: file system, diffs, terminals and client calls.
 
-use crate::ids::{ProjectId, TerminalId, ThreadId};
+use crate::ids::{ProjectId, TerminalId, ThreadId, TurnId};
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -60,7 +60,7 @@ pub struct FileContent {
     pub bytes: Bytes,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "turn", rename_all = "snake_case")]
 pub enum DiffScope {
     /// Uncommitted changes in the thread's working tree vs `HEAD`.
@@ -69,6 +69,8 @@ pub enum DiffScope {
     LastTurn,
     /// Everything since the thread's first turn started.
     Thread,
+    /// What one turn changed (from its checkpoints).
+    Turn(TurnId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,6 +143,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DiffScope::LastTurn).unwrap(),
             r#"{"kind":"last_turn"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&DiffScope::Turn(TurnId("t1".into()))).unwrap(),
+            r#"{"kind":"turn","turn":"t1"}"#
         );
     }
 }
