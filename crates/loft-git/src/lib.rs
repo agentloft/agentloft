@@ -185,6 +185,21 @@ pub fn diff(dir: &Path, from: &str, to: &str) -> Result<Diff> {
     })
 }
 
+/// Per-file line counts between two tree-ish ids (no patch text).
+pub fn diff_stat(dir: &Path, from: &str, to: &str) -> Result<Vec<FileStat>> {
+    let numstat = run(git(dir)
+        .arg("diff")
+        .args([
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            "--relative",
+            "--numstat",
+        ])
+        .args([from, to]))?;
+    Ok(parse_numstat(&numstat))
+}
+
 /// Uncommitted work-tree changes (including untracked files) vs `HEAD`.
 pub fn diff_working_tree(dir: &Path) -> Result<Diff> {
     let tree = snapshot_tree(dir)?;

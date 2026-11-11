@@ -219,6 +219,8 @@ async fn turns_are_checkpointed_and_diffable() {
         panic!()
     };
     assert_eq!(by_id.files, diff.files);
+    // …and the turn already carries them, worked out when it ended.
+    assert_eq!(model.turns[0].changes.as_ref(), Some(&diff.files));
 
     // The user's git state is untouched.
     let status = Command::new("git")

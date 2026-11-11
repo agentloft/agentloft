@@ -1966,7 +1966,7 @@ fn render_turn_changes(
     p: &Palette,
 ) -> Option<AnyElement> {
     let turn = model.turns.get(turn_ix)?;
-    let files = state.turn_diffs.get(&turn.id)?.files.as_ref()?;
+    let files = turn.changes.as_ref()?;
     if files.is_empty() {
         return None;
     }

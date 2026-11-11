@@ -270,20 +270,27 @@ impl Core {
         .await
         .map_err(internal)?
         .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
+        let files: Vec<DiffFileStat> = diff
+            .files
+            .into_iter()
+            .map(crate::thread::file_stat)
+            .collect();
+        // A turn from before turns kept their changes: keep them now, so
+        // its "changed files" card doesn't have to ask again.
+        if let DiffScope::Turn(id) = &scope
+            && let Some(mut turn) = turns.into_iter().find(|t| &t.id == id)
+            && turn.status.is_terminal()
+            && turn.checkpoint_after.is_some()
+            && turn.changes.is_none()
+        {
+            turn.changes = Some(files.clone());
+            let _ = self.commit(vec![loft_protocol::Event::TurnUpdated { turn }]);
+        }
         Ok(DiffResult {
             scope,
-            note: diff.files.is_empty().then(|| "No changes.".to_owned()),
+            note: files.is_empty().then(|| "No changes.".to_owned()),
             patch: diff.patch,
-            files: diff
-                .files
-                .into_iter()
-                .map(|f| DiffFileStat {
-                    path: f.path,
-                    added: f.added,
-                    removed: f.removed,
-                    binary: f.binary,
-                })
-                .collect(),
+            files,
         })
     }
 

@@ -532,6 +532,7 @@ mod tests {
             checkpoint_before: None,
             checkpoint_after: None,
             native_turn: None,
+            changes: None,
         };
         store
             .commit(vec![

@@ -93,6 +93,8 @@ pub(crate) enum ThreadCmd {
         turn_id: TurnId,
         before: bool,
         sha: Option<String>,
+        /// After a turn: the files it changed.
+        changes: Option<Vec<loft_protocol::DiffFileStat>>,
     },
 }
 
@@ -206,7 +208,8 @@ impl ThreadActor {
                 turn_id,
                 before,
                 sha,
-            } => self.on_checkpoint(turn_id, before, sha),
+                changes,
+            } => self.on_checkpoint(turn_id, before, sha, changes),
             ThreadCmd::SetDraft { draft, reply } => {
                 // Not a change worth re-sorting the sidebar for.
                 let res = if self.thread.draft == draft {
@@ -423,6 +426,7 @@ impl ThreadActor {
             checkpoint_before: None,
             checkpoint_after: None,
             native_turn: None,
+            changes: None,
         };
         let user_item = self.new_item(
             Some(turn.id.clone()),
@@ -637,31 +641,48 @@ impl ThreadActor {
         );
         let tx = self.self_tx.clone();
         let turn_id = turn.id.clone();
+        let start = turn.checkpoint_before.clone().filter(|_| !before);
         tokio::spawn(async move {
-            let sha = tokio::task::spawn_blocking(move || {
+            let (sha, changes) = tokio::task::spawn_blocking(move || {
                 loft_git::repo_root(&dir)?;
-                match loft_git::checkpoint(&dir, &ref_name, &message) {
-                    Ok(sha) => Some(sha),
+                let sha = match loft_git::checkpoint(&dir, &ref_name, &message) {
+                    Ok(sha) => sha,
                     Err(err) => {
                         tracing::warn!(%err, "checkpoint failed");
-                        None
+                        return None;
                     }
-                }
+                };
+                // What the turn changed, for its "changed files" card.
+                let changes = start.and_then(|start| {
+                    loft_git::diff_stat(&dir, &start, &sha)
+                        .inspect_err(|err| tracing::warn!(%err, "turn diff stat failed"))
+                        .ok()
+                        .map(|files| files.into_iter().map(file_stat).collect())
+                });
+                Some((Some(sha), changes))
             })
             .await
             .ok()
-            .flatten();
+            .flatten()
+            .unwrap_or((None, None));
             if let Some(tx) = tx.upgrade() {
                 let _ = tx.send(ThreadCmd::Checkpoint {
                     turn_id,
                     before,
                     sha,
+                    changes,
                 });
             }
         });
     }
 
-    fn on_checkpoint(&mut self, turn_id: TurnId, before: bool, sha: Option<String>) {
+    fn on_checkpoint(
+        &mut self,
+        turn_id: TurnId,
+        before: bool,
+        sha: Option<String>,
+        changes: Option<Vec<loft_protocol::DiffFileStat>>,
+    ) {
         if before {
             let Some(turn) = self.turn.as_mut().filter(|t| t.id == turn_id) else {
                 return;
@@ -709,6 +730,7 @@ impl ThreadActor {
                 .and_then(|turns| turns.into_iter().find(|t| t.id == turn_id));
             if let Some(mut turn) = turn {
                 turn.checkpoint_after = Some(sha);
+                turn.changes = changes;
                 let _ = self.core.commit(vec![Event::TurnUpdated { turn }]);
             }
         }
@@ -965,6 +987,7 @@ impl ThreadActor {
                     checkpoint_before: None,
                     checkpoint_after: None,
                     native_turn: None,
+                    changes: None,
                 };
                 self.thread.status = ThreadStatus::Running;
                 self.thread.updated_at_ms = now;
@@ -1397,4 +1420,13 @@ fn title_from(text: &str) -> String {
         title.push('…');
     }
     title
+}
+
+pub(crate) fn file_stat(f: loft_git::FileStat) -> loft_protocol::DiffFileStat {
+    loft_protocol::DiffFileStat {
+        path: f.path,
+        added: f.added,
+        removed: f.removed,
+        binary: f.binary,
+    }
 }

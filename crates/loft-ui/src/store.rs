@@ -2194,28 +2194,19 @@ pub struct ThreadState {
     pub drawn_messages:
         std::rc::Rc<std::cell::RefCell<HashMap<usize, gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     pub visible_messages: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
-    /// What each finished turn changed (its "changed files" card), keyed by
-    /// turn and the checkpoint it was read at.
-    pub turn_diffs: HashMap<loft_protocol::TurnId, TurnDiff>,
+    /// Turns from before turns kept their changes, asked for once (the
+    /// daemon then keeps them on the turn).
+    asked_changes: HashSet<loft_protocol::TurnId>,
     /// Turns whose "changed files" card is folded.
     pub folded_diffs: HashSet<loft_protocol::TurnId>,
     store: WeakEntity<AppStore>,
-}
-
-/// One turn's changes, as fetched for its "changed files" card.
-pub struct TurnDiff {
-    /// The turn's `checkpoint_after` when it was read (it's fetched again
-    /// if that changes).
-    pub at: Option<String>,
-    /// `None` while loading.
-    pub files: Option<Vec<loft_protocol::DiffFileStat>>,
 }
 
 impl ThreadState {
     fn new(id: ThreadId, store: WeakEntity<AppStore>, cx: &mut Context<Self>) -> Self {
         Self {
             id,
-            turn_diffs: HashMap::new(),
+            asked_changes: HashSet::new(),
             folded_diffs: HashSet::new(),
             store,
             model: None,
@@ -2600,8 +2591,8 @@ impl ThreadState {
         }));
     }
 
-    /// Read what each finished turn changed, for its "changed files" card
-    /// (once per turn and checkpoint).
+    /// Turns that ended before turns kept their changes: ask the daemon
+    /// once, and it keeps them on the turn (the card shows on its update).
     fn fetch_turn_diffs(&mut self, cx: &mut Context<Self>) {
         let Some(model) = self.model.as_ref() else {
             return;
@@ -2609,26 +2600,15 @@ impl ThreadState {
         let wanted: Vec<_> = model
             .turns
             .iter()
-            .filter(|t| t.status.is_terminal() && t.checkpoint_before.is_some())
-            .filter(|t| {
-                self.turn_diffs
-                    .get(&t.id)
-                    .is_none_or(|d| d.at != t.checkpoint_after)
-            })
-            .map(|t| (t.id.clone(), t.checkpoint_after.clone()))
+            .filter(|t| t.status.is_terminal() && t.changes.is_none())
+            .filter(|t| t.checkpoint_before.is_some() && t.checkpoint_after.is_some())
+            .filter(|t| !self.asked_changes.contains(&t.id))
+            .map(|t| t.id.clone())
             .collect();
         if wanted.is_empty() {
             return;
         }
-        for (turn_id, at) in &wanted {
-            self.turn_diffs.insert(
-                turn_id.clone(),
-                TurnDiff {
-                    at: at.clone(),
-                    files: None,
-                },
-            );
-        }
+        self.asked_changes.extend(wanted.iter().cloned());
         // This runs inside the store's own updates (snapshots, events), so
         // the requests go out once that update is over.
         let (this, store) = (cx.entity().downgrade(), self.store.clone());
@@ -2637,22 +2617,12 @@ impl ThreadState {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                for (turn_id, at) in wanted {
+                for turn_id in wanted {
                     let body = Request::GetDiff {
                         thread_id: this.id.clone(),
-                        scope: loft_protocol::DiffScope::Turn(turn_id.clone()),
+                        scope: loft_protocol::DiffScope::Turn(turn_id),
                     };
-                    request_in(&store, body, cx, move |this, result, cx| {
-                        let files = match result {
-                            Ok(Response::Diff { diff }) => diff.files,
-                            _ => Vec::new(),
-                        };
-                        match this.turn_diffs.get_mut(&turn_id) {
-                            Some(d) if d.at == at => d.files = Some(files),
-                            _ => return,
-                        }
-                        this.remeasure_turn_footer(&turn_id, cx);
-                    });
+                    request_in(&store, body, cx, |_, _, _| {});
                 }
             });
         });
@@ -2758,6 +2728,10 @@ impl ThreadState {
             _ => None,
         };
         self.sync_rows(changed.as_ref(), cx);
+        // A turn's changes came in: its card appears under it.
+        if let Event::TurnUpdated { turn } = &env.event {
+            self.remeasure_turn_footer(&turn.id, cx);
+        }
         cx.notify();
     }
 

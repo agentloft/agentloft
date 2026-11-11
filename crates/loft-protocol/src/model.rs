@@ -315,6 +315,10 @@ pub struct Turn {
     /// assistant message uuid, Codex's turn id), to fork from it natively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_turn: Option<String>,
+    /// The files the turn changed (between its checkpoints), worked out
+    /// once when it ends; older turns get it the first time it's asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<crate::DiffFileStat>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
