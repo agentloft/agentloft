@@ -2,13 +2,13 @@
 //! toggle), images, office documents, and an external-open fallback.
 
 use crate::panel::docs::{DocPreview, doc_kind};
+use crate::spinner::Spinner;
 use crate::store::AppStore;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::input::Rope;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -46,6 +46,8 @@ pub struct FileViewer {
     show_source: bool,
     /// Highlighting the file that's about to be shown, off the main thread.
     pending: Option<Task<()>>,
+    /// What `content` was made from: the length and a hash of the bytes.
+    shown: Option<(usize, u64)>,
 }
 
 impl FileViewer {
@@ -66,6 +68,7 @@ impl FileViewer {
             content: Content::Loading,
             show_source: false,
             pending: None,
+            shown: None,
         };
         this.reload(window, cx);
         this
@@ -74,6 +77,7 @@ impl FileViewer {
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.store.read(cx).client() else {
             self.content = Content::Error("Not connected to agentloftd.".into());
+            self.shown = None;
             cx.notify();
             return;
         };
@@ -89,10 +93,12 @@ impl FileViewer {
                     Ok(Response::File { file }) => this.show(file, window, cx),
                     Ok(other) => {
                         this.content = Content::Error(format!("unexpected response: {other:?}"));
+                        this.shown = None;
                         cx.notify();
                     }
                     Err(err) => {
                         this.content = Content::Error(err.message);
+                        this.shown = None;
                         cx.notify();
                     }
                 });
@@ -107,6 +113,19 @@ impl FileViewer {
         self.truncated = file.truncated;
         let ext = extension(&self.rel_path);
         let bytes = file.bytes.0;
+        // Open tabs are read again after every turn, whether the turn
+        // touched them or not. The same bytes are what is showing already:
+        // making it all again would only lose the place it is scrolled to.
+        let read = (bytes.len(), {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = std::hash::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        });
+        if self.shown == Some(read) {
+            return;
+        }
+        self.shown = Some(read);
         self.content = if let Some(format) = image_format(&ext) {
             Content::Image(Arc::new(Image::from_bytes(format, bytes)))
         } else if let Some(kind) = doc_kind(&self.rel_path) {
@@ -216,8 +235,12 @@ fn code_editor(
             .language(language)
             .line_number(true)
             .soft_wrap(false);
-        preparse::install(&mut state, parsed, cx);
+        // In this order: setting the text makes the editor drop whatever
+        // highlighter it has, and the parsed one handed over before that was
+        // used for a moment and thrown away, the file then parsed again on
+        // the main thread at the first paint.
         state.set_value(text, window, cx);
+        preparse::install(&mut state, parsed, cx);
         state
     })
 }

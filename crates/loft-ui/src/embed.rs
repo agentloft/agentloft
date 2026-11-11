@@ -14,11 +14,11 @@
 //! release) that landed on the picture a moment before the page came in.
 
 use crate::panel::page::{PageResized, Seen, act};
+use crate::spinner::Spinner;
 use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Sizable as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{

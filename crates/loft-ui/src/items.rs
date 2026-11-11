@@ -1,11 +1,11 @@
 //! Timeline rows: user bubbles, assistant prose, collapsible reasoning,
 //! grouped tool activity with first-class approval prompts, turn footers.
 
+use crate::spinner::Spinner;
 use crate::store::{AppStore, Row, ThreadState};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -802,7 +802,8 @@ fn render_doing(icon: IconName, what: String, p: &Palette) -> AnyElement {
             "pending-pulse",
             Animation::new(std::time::Duration::from_millis(1400))
                 .repeat()
-                .with_easing(pulsating_between(0.45, 1.0)),
+                .with_easing(pulsating_between(0.45, 1.0))
+                .with_max_fps(crate::spinner::FADING_FPS),
             |d, delta| d.opacity(delta),
         )
         .into_any_element()
@@ -1027,7 +1028,8 @@ fn render_waiting(tasks: &[String], p: &Palette) -> AnyElement {
             "waiting-pulse",
             Animation::new(std::time::Duration::from_millis(1800))
                 .repeat()
-                .with_easing(pulsating_between(0.5, 1.0)),
+                .with_easing(pulsating_between(0.5, 1.0))
+                .with_max_fps(crate::spinner::FADING_FPS),
             |d, delta| d.opacity(delta),
         )
         .into_any_element()
@@ -1133,7 +1135,7 @@ fn agents_group(
     let looks: Vec<(String, bool, bool)> = items
         .iter()
         .map(|item| {
-            let running = crate::store::agent_running(model, item, &live);
+            let running = crate::store::agent_running(item, &live);
             let spawned = match &item.body {
                 ItemBody::ToolCall { tool, output, .. }
                     if tool.ends_with("agentloft__spawn_thread") =>
@@ -1581,7 +1583,8 @@ pub(crate) fn agent_avatar(
                 SharedString::from(format!("{id}-halo")),
                 Animation::new(std::time::Duration::from_millis(1400))
                     .repeat()
-                    .with_easing(ease_in_out),
+                    .with_easing(ease_in_out)
+                    .with_max_fps(crate::spinner::FADING_FPS),
                 move |d, t| {
                     let grow = dot_size * 0.9 * t;
                     d.right(px(-ring - grow / 2.))
@@ -1611,6 +1614,14 @@ pub(crate) fn in_background(item: &Item) -> bool {
         if out.trim_start().starts_with("Async agent launched"))
 }
 
+/// Whether a subagent is still at work. Its call stays open until the
+/// agent has finished, in the background too (the daemon closes it when the
+/// agent says so). Going by whether one of its steps happens to be running
+/// made it read as done between every two steps.
+pub(crate) fn subagent_running(item: &Item) -> bool {
+    item.status == ItemStatus::InProgress
+}
+
 pub(crate) fn subagent_status(model: &ThreadModel, item: &Item) -> SubagentStatus {
     let children: Vec<&Item> = model
         .items
@@ -1619,11 +1630,7 @@ pub(crate) fn subagent_status(model: &ThreadModel, item: &Item) -> SubagentStatu
         .collect();
     let background = in_background(item);
     let stopped = item.status == ItemStatus::Declined;
-    // Its call stays open until the agent has finished, in the background
-    // too (the daemon closes it when the agent says so). Going by whether
-    // one of its steps happens to be running made it read as done between
-    // every two steps.
-    let running = item.status == ItemStatus::InProgress;
+    let running = subagent_running(item);
     let failed = matches!(item.status, ItemStatus::Failed | ItemStatus::Declined)
         || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. });
     // Under the title: what it is doing now, else what it answered.

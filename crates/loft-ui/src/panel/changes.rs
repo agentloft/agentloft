@@ -1,11 +1,11 @@
 //! Changes view: the diff of the last turn, the whole thread, or uncommitted
 //! work, from git checkpoints (ADR-0008), rendered with gpui-kit's Diff.
 
+use crate::spinner::Spinner;
 use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
@@ -56,13 +56,25 @@ impl ChangesView {
             match result {
                 Ok(Response::Diff { diff }) => {
                     this.error = None;
-                    let files = DiffFile::parse(&diff.patch).unwrap_or_default();
-                    let mode = if this.split {
-                        DiffMode::Split
-                    } else {
-                        DiffMode::Unified
+                    // Asked again after every turn, and most turns leave the
+                    // diff as it was: the one showing stays then, with where
+                    // it is scrolled to and what is folded in it.
+                    let same = this
+                        .result
+                        .as_ref()
+                        .is_some_and(|shown| shown.patch == diff.patch);
+                    let diff_state = match this.diff.clone().filter(|_| same) {
+                        Some(showing) => showing,
+                        None => {
+                            let files = DiffFile::parse(&diff.patch).unwrap_or_default();
+                            let mode = if this.split {
+                                DiffMode::Split
+                            } else {
+                                DiffMode::Unified
+                            };
+                            cx.new(|cx| DiffState::new(files, cx).with_mode(mode))
+                        }
                     };
-                    let diff_state = cx.new(|cx| DiffState::new(files, cx).with_mode(mode));
                     if let Some(path) = this.reveal.take() {
                         diff_state.update(cx, |d, cx| d.scroll_to_file(&path, cx));
                     }

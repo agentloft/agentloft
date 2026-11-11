@@ -2,8 +2,8 @@
 //! images, spreadsheets as a virtualized grid with sheet tabs, slide decks as
 //! slide cards with speaker notes.
 
+use crate::spinner::Spinner;
 use crate::theme::Palette;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{

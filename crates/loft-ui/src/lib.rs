@@ -27,6 +27,7 @@ pub mod panel;
 mod project_icon;
 pub mod settings;
 mod shell_highlight;
+mod spinner;
 pub mod store;
 pub mod theme;
 pub mod themes;

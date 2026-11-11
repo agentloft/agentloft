@@ -1,10 +1,10 @@
 //! File explorer: a lazily loaded tree of the thread's working directory,
 //! rendered as a virtualized flat list.
 
+use crate::spinner::Spinner;
 use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     Context, ElementId, Entity, EventEmitter, InteractiveElement as _, IntoElement,

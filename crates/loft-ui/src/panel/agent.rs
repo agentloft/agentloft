@@ -2,11 +2,11 @@
 //! tools it ran, its messages, and the report it returned.
 
 use crate::items::{render_item, render_tool_group};
+use crate::spinner::Spinner;
 use crate::store::AppStore;
 use crate::store::Row;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{

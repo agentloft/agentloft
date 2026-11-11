@@ -4,6 +4,7 @@
 
 use crate::items::render_row;
 use crate::panel::{Tab, WorkbenchPanel};
+use crate::spinner::Spinner;
 use crate::store::{AppStore, ConnState, StoreEvent, ThreadState};
 use crate::theme::{self, Palette, relative_time};
 use gpui_kit::assets::IconName;
@@ -11,7 +12,6 @@ use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, Textar
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::message_scroller::MessageScroller;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, ElementId, Entity, FontWeight, InteractiveElement as _,
@@ -1750,45 +1750,20 @@ impl WorkspaceView {
         let model = state.model.as_ref()?;
         let tid = state.id.clone();
         let items = &model.items;
-        let mut marks: Vec<(usize, String, String)> = Vec::new();
-        for (row_ix, row) in state.rows.iter().enumerate() {
-            let crate::store::Row::Item(i) = row else {
-                continue;
-            };
-            let loft_protocol::ItemBody::UserMessage { text, attachments } = &items[*i].body else {
-                continue;
-            };
-            let title = text
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(|l| l.chars().take(90).collect::<String>())
-                .unwrap_or_else(|| match attachments.len() {
-                    0 => "Message".into(),
-                    1 => "Image".into(),
-                    n => format!("{n} images"),
-                });
-            let turn = &items[*i].turn_id;
-            let reply = items
-                .iter()
-                .rev()
-                .filter(|it| it.parent_id.is_none() && &it.turn_id == turn)
-                .find_map(|it| match &it.body {
-                    loft_protocol::ItemBody::AssistantMessage { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .map(|t| {
-                    // Plain text: no Markdown emphasis, code ticks or headings.
-                    let plain: String = t
-                        .chars()
-                        .filter(|c| !matches!(c, '*' | '`' | '#'))
-                        .collect();
-                    let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
-                    flat.chars().take(220).collect::<String>()
-                })
-                .unwrap_or_default();
-            marks.push((row_ix, title, reply));
-        }
+        // A tick per message you sent: its row, and its item.
+        let marks: Vec<(usize, usize)> = state
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row_ix, row)| match row {
+                crate::store::Row::Item(i)
+                    if matches!(items[*i].body, loft_protocol::ItemBody::UserMessage { .. }) =>
+                {
+                    Some((row_ix, *i))
+                }
+                _ => None,
+            })
+            .collect();
         if marks.len() < 2 {
             return None;
         }
@@ -1829,11 +1804,21 @@ impl WorkspaceView {
         let mut rail = v_flex()
             .w(px(if compact { 22. } else { 34. }))
             .items_start();
-        for (ix, (row, title, reply)) in marks.into_iter().enumerate() {
-            let hovered = self.peek.as_ref() == Some(&(tid.clone(), ix));
+        // The card's words are made for the tick under the pointer alone:
+        // they take a walk through the thread's items, and this runs for
+        // every tick on every paint.
+        let peeked = self
+            .peek
+            .as_ref()
+            .filter(|(thread, _)| *thread == tid)
+            .and_then(|(_, ix)| Some((*ix, turn_peek(items, marks.get(*ix)?.1))));
+        for (ix, (row, _)) in marks.into_iter().enumerate() {
+            let peek = peeked.as_ref().filter(|(peeked, _)| *peeked == ix);
+            let hovered = peek.is_some();
             let is_current = lit.contains(&ix);
             let scroller = scroller.clone();
-            let card = hovered.then(|| {
+            let card = peek.map(|(_, (title, reply))| {
+                let (title, reply) = (title.clone(), reply.clone());
                 v_flex()
                     .absolute()
                     .left(px(if compact { 26. } else { 38. }))
@@ -7537,6 +7522,54 @@ fn context_color(fraction: Option<f32>, p: &Palette) -> gpui_kit::Hsla {
 }
 
 /// "230K", "1.2M".
+/// What a turn-map tick's card says: the first line of the message at
+/// `message`, and the start of its turn's reply as plain text.
+fn turn_peek(items: &[loft_protocol::Item], message: usize) -> (String, String) {
+    let item = &items[message];
+    let loft_protocol::ItemBody::UserMessage { text, attachments } = &item.body else {
+        return Default::default();
+    };
+    let title = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(90).collect::<String>())
+        .unwrap_or_else(|| match attachments.len() {
+            0 => "Message".into(),
+            1 => "Image".into(),
+            n => format!("{n} images"),
+        });
+    let reply = items
+        .iter()
+        .rev()
+        .filter(|it| it.parent_id.is_none() && it.turn_id == item.turn_id)
+        .find_map(|it| match &it.body {
+            loft_protocol::ItemBody::AssistantMessage { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .map(|t| {
+            // Plain text: no Markdown emphasis, code ticks or headings.
+            // Only as much of the reply as can fill the card is looked at.
+            let mut flat = String::new();
+            for word in t
+                .split_whitespace()
+                .map(|w| w.replace(['*', '`', '#'], ""))
+                .filter(|w| !w.is_empty())
+            {
+                if !flat.is_empty() {
+                    flat.push(' ');
+                }
+                flat.push_str(&word);
+                if flat.chars().count() >= 220 {
+                    break;
+                }
+            }
+            flat.chars().take(220).collect::<String>()
+        })
+        .unwrap_or_default();
+    (title, reply)
+}
+
 fn short_tokens(n: u64) -> String {
     match n {
         n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),

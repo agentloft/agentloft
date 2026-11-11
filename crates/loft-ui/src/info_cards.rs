@@ -2,10 +2,10 @@
 //! Claude (`get_context_usage`, `get_usage`), `/status` from Codex
 //! (account, limits, usage history and the thread's tokens).
 
+use crate::spinner::Spinner;
 use crate::store::{AppStore, CardState, InfoCard, ThreadState};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, App, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,

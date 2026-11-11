@@ -2508,7 +2508,7 @@ impl ThreadState {
                     push_runs(&mut rows, items, &work);
                 } else {
                     let shown = shown_when_folded(items, &work, |i| {
-                        is_agent(&items[i]) && agent_running(model, &items[i], &self.live_spawned)
+                        is_agent(&items[i]) && agent_running(&items[i], &self.live_spawned)
                     });
                     push_runs(&mut rows, items, &shown);
                 }
@@ -3010,15 +3010,18 @@ pub(crate) fn spawned_thread_id(output: &str) -> Option<ThreadId> {
 
 /// Whether an agent card's agent is still at work.
 pub(crate) fn agent_running(
-    model: &ThreadModel,
     item: &loft_protocol::Item,
     live_spawned: &std::collections::HashSet<ThreadId>,
 ) -> bool {
     match &item.body {
+        // Not `subagent_status(..).running`: that also works out what the
+        // card says (a walk through the thread's items and several copies
+        // of the agent's report), and this is asked of every agent of every
+        // folded turn each time the rows are rebuilt.
         ItemBody::ToolCall {
             tool_kind: loft_protocol::ToolKind::Subagent,
             ..
-        } => crate::items::subagent_status(model, item).running,
+        } => crate::items::subagent_running(item),
         ItemBody::ToolCall { output, .. } => {
             item.status == ItemStatus::InProgress
                 || output

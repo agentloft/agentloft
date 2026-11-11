@@ -4,6 +4,7 @@
 //! through the most recent thread on it, as `/usage` and `/status` do).
 
 use super::{SettingsView, web::heading};
+use crate::spinner::Spinner;
 use crate::theme::Palette;
 use chrono::Datelike as _;
 use gpui_kit::assets::IconName;
@@ -11,7 +12,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::date_picker::{
     DatePicker, DatePickerEvent, DatePickerState, DateRangePreset, DateTime,
 };
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _,

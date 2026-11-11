@@ -3,11 +3,11 @@
 //! controls (accent, contrast, sizes, fonts).
 
 use super::{ACCENTS, Field, SettingsView, row, segmented, text_input};
+use crate::spinner::Spinner;
 use crate::theme::{self, Palette};
 use crate::themes::{self, Swatch, Theme, ThemeFile};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,

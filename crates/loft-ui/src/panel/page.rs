@@ -3,12 +3,12 @@
 //! This is the browser tab of the web client, where there is no native web
 //! view to embed; nothing in it is specific to the web.
 
+use crate::spinner::Spinner;
 use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{

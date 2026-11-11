@@ -17,6 +17,29 @@ const FRESH: Duration = Duration::from_secs(30);
 
 thread_local! {
     static FOUND: RefCell<HashMap<PathBuf, (Instant, Option<PathBuf>)>> = RefCell::new(HashMap::new());
+    /// Chosen icons, and whether each can be drawn.
+    static CHOSEN: RefCell<HashMap<PathBuf, (Instant, bool)>> = RefCell::new(HashMap::new());
+}
+
+/// Whether a chosen icon can be drawn. Asked for every project row on every
+/// paint, and the answer is on the disk: it is trusted as long as a favicon
+/// lookup is.
+fn chosen_drawable(path: &Path) -> bool {
+    let cached = CHOSEN.with(|c| {
+        c.borrow()
+            .get(path)
+            .filter(|(at, _)| at.elapsed() < FRESH)
+            .map(|(_, drawable)| *drawable)
+    });
+    if let Some(drawable) = cached {
+        return drawable;
+    }
+    let drawable = loft_config::icons::drawable(path);
+    CHOSEN.with(|c| {
+        c.borrow_mut()
+            .insert(path.to_path_buf(), (Instant::now(), drawable))
+    });
+    drawable
 }
 
 /// The favicon in a project folder, if it has one.
@@ -46,7 +69,7 @@ pub fn image(project: &loft_protocol::Project) -> Option<PathBuf> {
         .icon
         .as_ref()
         .map(PathBuf::from)
-        .filter(|p| loft_config::icons::drawable(p))
+        .filter(|p| chosen_drawable(p))
         .or_else(|| favicon(Path::new(&project.root_path)))
 }
 
@@ -117,6 +140,7 @@ pub fn initials_badge(name: &str, size: f32, _p: &Palette) -> AnyElement {
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn forget() {
     FOUND.with(|f| f.borrow_mut().clear());
+    CHOSEN.with(|c| c.borrow_mut().clear());
 }
 
 #[cfg(test)]
