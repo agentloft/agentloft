@@ -106,11 +106,12 @@ struct Page {
     /// Input in the order it arrived; one task replays it.
     input: mpsc::UnboundedSender<PageInput>,
     state: Mutex<State>,
-    /// Held while the page is given a size and while it is photographed,
-    /// one at a time: when a screenshot is done Chrome puts the page back
-    /// to the size it had when the screenshot began, so a size set in
-    /// between would be undone and every later picture would be the old
-    /// size.
+    /// Held while the page is given a size, while it is photographed and
+    /// while it is given input, one at a time. A screenshot is not a quiet
+    /// thing in Chrome: for its length the page is drawn scaled to the
+    /// viewer's pixel density (so input lands at scaled coordinates), and
+    /// when it is done the page is put back to the size it had when the
+    /// screenshot began (so a size set in between is undone).
     shaping: tokio::sync::Mutex<()>,
     /// Set when the page draws a view an agent made rather than a site.
     view: Option<views::ViewPage>,
@@ -812,7 +813,16 @@ impl Browser {
                     }
                 );
             let (method, params) = input_command(input);
-            if let Err(err) = self.cdp.send(method, params, Some(&page.session)).await {
+            let sent = {
+                // Never while the page is being photographed. For the
+                // length of a screenshot Chrome draws the page scaled to
+                // the viewer's pixel density, and a click that lands
+                // meanwhile lands at its coordinates divided by that: on a
+                // dense screen, halfway to where it was aimed.
+                let _shaping = page.shaping.lock().await;
+                self.cdp.send(method, params, Some(&page.session)).await
+            };
+            if let Err(err) = sent {
                 tracing::debug!(%err, "page input");
             }
             if acts {

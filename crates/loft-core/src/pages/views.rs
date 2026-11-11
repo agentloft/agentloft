@@ -1186,4 +1186,79 @@ mod tests {
         }
         pages.shutdown().await;
     }
+
+    /// A click lands where it was aimed while the view is being pictured.
+    /// (For the length of a screenshot Chrome draws a page scaled to the
+    /// viewer's pixel density. Input that landed meanwhile landed at its
+    /// coordinates divided by that: on a dense screen, a click on a button
+    /// in a view that was changing selected text halfway to it instead.)
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a real browser"]
+    async fn live_a_click_lands_where_it_was_aimed_while_the_view_is_pictured() {
+        use loft_protocol::{PageButton, PageInput, PageMouse};
+
+        // Something always moves, so pictures are always being taken; every
+        // press is remembered with where it arrived.
+        const HTML: &str = "<div id=\"spin\" style=\"position:absolute;right:10px;top:10px;\
+            width:30px;height:30px;background:#2a78d6\"></div><div style=\"height:400px\"></div>\
+            <script>const log = []; let turn = 0;\
+            setInterval(() => { spin.style.transform = 'rotate(' + (turn += 7) + 'deg)'; }, 30);\
+            document.addEventListener('mousedown', (e) => {\
+              log.push([Math.round(e.clientX), Math.round(e.clientY)]);\
+              agentloft.setState({ log }); });</script>";
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let (bus, _heard) = tokio::sync::broadcast::channel(4096);
+        let pages = Pages::default();
+        let kept: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let keep: StateKeeper = {
+            let kept = kept.clone();
+            Arc::new(move |_, _, state| lock(&kept).push(state.clone()))
+        };
+        let request = ViewRequest {
+            thread: ThreadId::new(),
+            item: ItemId::new(),
+            html: HTML.to_owned(),
+            done: true,
+            width: 600,
+            scale: 2.0,
+            theme: Some(Theme::default()),
+            state: Value::Null,
+            keep,
+        };
+        let page = pages
+            .open_view(request, None, &profile, bus.clone())
+            .await
+            .unwrap();
+        pages.watching(&page.id, true).await;
+        let rest = |ms: u64| tokio::time::sleep(Duration::from_millis(ms));
+        rest(1_000).await;
+
+        let mut aimed = Vec::new();
+        for n in 0..25u32 {
+            let (x, y) = (150 + n * 37 % 400, 120 + n * 53 % 250);
+            for action in [PageMouse::Down, PageMouse::Up] {
+                pages
+                    .input(
+                        &page.id,
+                        PageInput::Mouse {
+                            action,
+                            x: x as f32,
+                            y: y as f32,
+                            button: PageButton::Left,
+                            click_count: 1,
+                            modifiers: 0,
+                        },
+                    )
+                    .unwrap();
+                rest(40).await;
+            }
+            aimed.push(json!([x, y]));
+            rest(60).await;
+        }
+        rest(800).await;
+        let landed = lock(&kept).last().cloned().unwrap_or_default();
+        assert_eq!(landed["log"], Value::Array(aimed));
+        pages.shutdown().await;
+    }
 }

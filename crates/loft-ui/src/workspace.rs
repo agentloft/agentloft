@@ -519,11 +519,24 @@ impl WorkspaceView {
                 let gap = std::time::Duration::from_millis(at(3, 150.) as u64);
                 let after = std::time::Duration::from_millis(at(4, 3000.) as u64);
                 let thread = thread.clone();
+                // As the user has it: no side panel taking room from the chat.
+                self.panel_open = false;
                 cx.spawn_in(window, async move |_, cx| {
                     use gpui_kit::{
                         Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
                         PlatformInput, point,
                     };
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1500))
+                        .await;
+                    // The thread's last view, scrolled into sight.
+                    let _ = cx.update(|_, cx| {
+                        thread.update(cx, |state, cx| {
+                            if let Some(item) = state.last_view_item() {
+                                state.reveal(item, cx);
+                            }
+                        })
+                    });
                     cx.background_executor().timer(after).await;
                     for i in 0..times {
                         let Ok(Some(bounds)) = cx.update(|_, cx| thread.read(cx).a_view_bounds(cx))

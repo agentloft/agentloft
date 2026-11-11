@@ -2839,6 +2839,17 @@ impl ThreadState {
         self.views.get(id).map(|(page, _)| page.clone())
     }
 
+    /// The thread's last view, if it has one (dev hooks).
+    pub(crate) fn last_view_item(&self) -> Option<ItemId> {
+        let model = self.model.as_ref()?;
+        model
+            .items
+            .iter()
+            .rev()
+            .find(|item| crate::view::is_view(item))
+            .map(|item| item.id.clone())
+    }
+
     /// Where one of the thread's views is drawn right now (dev hooks).
     pub(crate) fn a_view_bounds(&self, cx: &App) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
         self.views

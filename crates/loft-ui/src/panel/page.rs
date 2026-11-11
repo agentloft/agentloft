@@ -748,11 +748,26 @@ impl PageView {
         let Some((x, y)) = self.page_point(event.position) else {
             // No page behind the picture (it was let go, or the daemon
             // restarted): a click is as good a moment as any to get one.
+            tracing::debug!(
+                opening = self.opening,
+                offline = self.offline,
+                "a press with no page to go to"
+            );
             cx.notify();
             return;
         };
         self.last_point = event.position;
         self.held = button(event.button);
+        tracing::debug!(
+            x,
+            y,
+            at = ?event.position,
+            bounds = ?self.bounds.get(),
+            page = ?self.info.as_ref().map(|i| (i.width, i.height)),
+            count = event.click_count,
+            first = event.first_mouse,
+            "a press goes to the page"
+        );
         self.input(
             PageInput::Mouse {
                 action: PageMouse::Down,
@@ -769,8 +784,16 @@ impl PageView {
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some((x, y)) = self.page_point(event.position) else {
+            tracing::debug!("a release with no page to go to");
             return;
         };
+        tracing::debug!(
+            x,
+            y,
+            held = ?self.held,
+            count = event.click_count,
+            "a release goes to the page"
+        );
         self.held = PageButton::None;
         self.input(
             PageInput::Mouse {
