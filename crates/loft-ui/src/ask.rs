@@ -620,8 +620,11 @@ impl AskForm {
             .max_h(if expanded { tall } else { px(300.) })
             .overflow_y_scroll()
             .child(
-                TextView::markdown(SharedString::from(format!("plan-md-{id}")), plan)
-                    .selectable(true),
+                crate::items::code_blocks(TextView::markdown(
+                    SharedString::from(format!("plan-md-{id}")),
+                    plan,
+                ))
+                .selectable(true),
             );
 
         let feedback = !self.feedback.read(cx).value().trim().is_empty();
@@ -827,10 +830,10 @@ pub(crate) fn render_record(
             })
             .when(unfolded, |d| {
                 d.child(
-                    TextView::markdown(
+                    crate::items::code_blocks(TextView::markdown(
                         SharedString::from(format!("plan-rec-md-{}", item.id)),
                         plan,
-                    )
+                    ))
                     .selectable(true),
                 )
             })

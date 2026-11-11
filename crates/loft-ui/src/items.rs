@@ -125,7 +125,8 @@ pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
     use gpui_kit::component::menu::ContextMenuExt as _;
     use gpui_kit::component::text::MarkdownNode;
     let render_cwd = cwd.clone();
-    view.image_source(local_images(cwd))
+    code_blocks(view)
+        .image_source(local_images(cwd))
         .markdown_block_parser(|node, _| {
             let image = reply_image_block(node)?;
             let markdown = format!("![{}]({})", image.alt, image.src);
@@ -187,6 +188,43 @@ pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
                         .into_any_element()
                 }
             }
+        })
+}
+
+/// Tallest a code block grows before it scrolls inside itself.
+const CODE_BLOCK_MAX_HEIGHT: f32 = 420.;
+
+/// Code blocks get their language and a copy button in the top-right
+/// corner. Long blocks scroll inside themselves, so the corner (and the
+/// button) stays in view however long the code is.
+pub(crate) fn code_blocks(view: TextView) -> TextView {
+    use gpui_kit::component::text::TextViewStyle;
+    let mut block = gpui_kit::StyleRefinement::default()
+        .max_h(px(CODE_BLOCK_MAX_HEIGHT))
+        .rounded(px(8.));
+    block.overflow.y = Some(gpui_kit::Overflow::Scroll);
+    view.style(TextViewStyle::default().code_block(block))
+        .code_block_actions(|block, _, cx| {
+            let p = Palette::of(cx);
+            let code = block.code().to_string();
+            // Same code, same id: its ✓ shows wherever it was copied from.
+            let id = {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                code.hash(&mut h);
+                format!("code-{:x}", h.finish())
+            };
+            h_flex()
+                .gap_1()
+                .items_center()
+                .pl_2()
+                .children(
+                    block
+                        .lang()
+                        .filter(|l| !l.is_empty())
+                        .map(|lang| div().text_xs().text_color(p.muted_foreground).child(lang)),
+                )
+                .child(copy_button(id, code, "Copy code", &p))
         })
 }
 
