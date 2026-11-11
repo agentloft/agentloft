@@ -68,6 +68,7 @@
 - **A fixed library of native components** (the first version). Fast, exact and safe, but an agent can only say what the library has words for. Dropped at the product owner's request.
 - **A web view in the timeline** (WKWebView on the desktop, an `<iframe>` over the canvas in the web client). Live at the display's frame rate with native text selection, but a native view draws above everything GPUI draws: every menu, tooltip and dialog over the conversation would be under it, and it would not clip to the scrolling list. Two implementations, and the desktop one is macOS-only today. **To review:** the desktop app could put a real web view over a view's picture while the pointer is in it.
 - **Letting pages reach the network.** Agents like to pull charts' libraries from a CDN, so a few script hosts are let through. More than that would make a view a way around the user's approvals: a page could send out whatever the agent put in it.
+- **MCP Apps** (pages that MCP servers ship with their tools, as T3 Code shows them). Looked into and set aside at the product owner's request on 2026-11-11, before any of it was built: `show_ui` is the way an agent draws here. Should it come back, the same view pages can show them: Claude Code hands a host what it needs with `CLAUDE_CODE_MCP_APPS_HOST=1` and the `mcp_status`, `mcp_read_resource` and `mcp_call` control requests; Codex marks a call with `mcpAppUi` and has `mcpServer/resource/read`; ACP has nothing.
 - **A new item kind.** The tool call's item already holds everything; a second kind would be a protocol change that buys nothing now that the daemon can add the item itself.
 
 ## Consequences
@@ -81,7 +82,6 @@
 
 ## What's left
 
-- MCP Apps: pages that MCP servers ship with their tools, shown the same way.
 - Images a view may load: none from the web today, and none from the thread's folder.
 - A real web view over the picture on the desktop (see above).
 - Letting the agent read what a view remembered, rather than hearing it in a `send`.
