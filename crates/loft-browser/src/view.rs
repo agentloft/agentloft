@@ -536,7 +536,16 @@ impl BrowserView {
             }
             (Freeze::Live, _) => {}
             (_, false) => {
-                self.freeze = Freeze::Live;
+                // The picture is done with. GPUI keeps what it decoded and
+                // the texture it drew until told to let go: a full-size
+                // screenshot for every dialog opened over a page (the
+                // command palette is one), for as long as the app ran.
+                if let Freeze::Still(picture) = std::mem::replace(&mut self.freeze, Freeze::Live) {
+                    if let Some(drawn) = picture.clone().get_render_image(window, cx) {
+                        cx.drop_image(drawn, Some(window));
+                    }
+                    picture.remove_asset(cx);
+                }
                 cx.notify();
             }
             _ => {}

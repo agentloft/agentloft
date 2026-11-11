@@ -11,13 +11,13 @@ pub mod page;
 pub mod terminal;
 pub mod viewer;
 
+use crate::spinner::Spinner;
 use crate::store::{AppStore, ThreadState};
 use crate::theme::Palette;
 use agent::AgentView;
 use changes::ChangesView;
 use files::{FileTree, FileTreeEvent};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Bounds, Context, Entity, FontWeight, InteractiveElement as _,
@@ -173,7 +173,11 @@ impl gpui_kit::EventEmitter<PanelEvent> for WorkbenchPanel {}
 
 impl WorkbenchPanel {
     pub fn new(store: Entity<AppStore>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        cx.observe(&store, |this, _, cx| {
+            this.forget_gone_threads(cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             store,
             threads: HashMap::new(),
@@ -183,6 +187,41 @@ impl WorkbenchPanel {
             maximized: false,
             cramped: false,
             search: String::new(),
+        }
+    }
+
+    /// Let go of what was kept for threads that are gone for good (deleted:
+    /// the store has dropped them). Each kept its file tree, its changes,
+    /// its open files, its shells with their scrollback and its web pages
+    /// (a WebKit process apiece, still polled) for as long as the app ran.
+    fn forget_gone_threads(&mut self, cx: &mut Context<Self>) {
+        let gone: Vec<ThreadId> = {
+            let store = self.store.read(cx);
+            self.threads
+                .keys()
+                .filter(|id| !store.threads.contains_key(*id))
+                .cloned()
+                .collect()
+        };
+        for id in gone {
+            let Some(panel) = self.threads.remove(&id) else {
+                continue;
+            };
+            // As closing each tab by hand would: the daemon ends the shells
+            // and the pages.
+            for tab in &panel.tabs {
+                match tab {
+                    Open::Terminal { pane, .. } => pane.update(cx, |p, cx| p.close(cx)),
+                    Open::Page { view } => view.update(cx, |v, cx| v.close(cx)),
+                    _ => {}
+                }
+            }
+            for (_, pane) in &panel.dock {
+                pane.update(cx, |p, cx| p.close(cx));
+            }
+            if self.shown.as_ref().is_some_and(|(shown, _)| *shown == id) {
+                self.shown = None;
+            }
         }
     }
 
