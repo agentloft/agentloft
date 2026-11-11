@@ -95,6 +95,16 @@ pub struct Translator {
     /// Claude finished its part and the turn is held open only for a
     /// message it hasn't echoed yet. Stopping then gets no result back.
     awaiting_echo: bool,
+    /// The "Compacting…" line while Claude summarizes the conversation
+    /// (its native item id): open until Claude says how it went.
+    compacting: Option<String>,
+    /// Our question after a compaction, for how full the context is now,
+    /// and how full Claude said it was before.
+    compact_query: Option<(String, Option<u64>)>,
+    /// A turn's result that arrived ahead of that answer (Claude ends a
+    /// `/compact` turn first): kept until the answer, so the turn ends
+    /// knowing how full the context is.
+    held_result: Option<Value>,
 }
 
 impl Translator {
@@ -104,6 +114,21 @@ impl Translator {
 
     pub fn turn_active(&self) -> bool {
         self.turn_active
+    }
+
+    /// Whether a turn's result is waiting for an answer from Claude
+    /// (see `held_result`).
+    pub fn holding_result(&self) -> bool {
+        self.held_result.is_some()
+    }
+
+    /// The answer didn't come: end the turn without it.
+    pub fn release_result(&mut self) -> Vec<Out> {
+        self.compact_query = None;
+        match self.held_result.take() {
+            Some(result) => self.on_result(&result),
+            None => vec![],
+        }
     }
 
     fn next_request_id(&mut self) -> String {
@@ -463,8 +488,61 @@ impl Translator {
                 level: NoticeLevel::Warning,
                 text: "Claude API error — retrying…".into(),
             })],
+            // Claude is summarizing the conversation (`/compact`, or by
+            // itself as the context fills up): say so while it does.
+            Some("status") => match str_at(v, "status") {
+                Some("compacting") if self.compacting.is_none() => {
+                    let native_id = format!("compact:{}", str_at(v, "uuid").unwrap_or_default());
+                    self.compacting = Some(native_id.clone());
+                    vec![Out::Event(HarnessEvent::ItemStarted {
+                        native_id,
+                        body: ItemBody::Notice {
+                            level: NoticeLevel::Info,
+                            text: "Compacting the conversation…".into(),
+                        },
+                        parent: None,
+                    })]
+                }
+                None if str_at(v, "compact_result") == Some("failed") => {
+                    let text = match str_at(v, "compact_error") {
+                        Some(why) => format!("Compacting failed: {why}"),
+                        None => "Compacting failed.".into(),
+                    };
+                    self.compacted(NoticeLevel::Warning, text, ItemStatus::Failed)
+                }
+                // Done: the numbers follow (`compact_boundary`).
+                _ => vec![],
+            },
+            // Compacted. The size Claude gives here for what is left counts
+            // only the messages, not the prompt and tools that are always
+            // there, so ask it how full the context really is now.
+            Some("compact_boundary") => {
+                let before = v
+                    .pointer("/compact_metadata/pre_tokens")
+                    .and_then(Value::as_u64);
+                let id = self.next_request_id();
+                self.compact_query = Some((id.clone(), before));
+                vec![Out::Send(json!({
+                    "type": "control_request", "request_id": id,
+                    "request": {"subtype": "get_context_usage"}
+                }))]
+            }
             _ => vec![],
         }
+    }
+
+    /// How a compaction went: in place of its "Compacting…" line when
+    /// there is one, a notice of its own otherwise.
+    fn compacted(&mut self, level: NoticeLevel, text: String, status: ItemStatus) -> Vec<Out> {
+        vec![Out::Event(match self.compacting.take() {
+            Some(native_id) => HarnessEvent::ItemCompleted {
+                native_id,
+                body: Some(ItemBody::Notice { level, text }),
+                tool_result: None,
+                status,
+            },
+            None => HarnessEvent::Notice { level, text },
+        })]
     }
 
     fn background_tasks(&self) -> Vec<Out> {
@@ -865,6 +943,32 @@ impl Translator {
             }
             return vec![];
         }
+        if let Some((_, before)) = self
+            .compact_query
+            .take_if(|(ours, _)| Some(ours.as_str()) == id)
+        {
+            // A CLI too old to answer leaves the numbers out.
+            let answer = v.pointer("/response/response");
+            let tokens = |key: &str| answer?.get(key)?.as_u64().filter(|n| *n > 0);
+            let after = tokens("totalTokens");
+            let mut out = Vec::new();
+            if self.compacting.is_some() {
+                let text = match (before, after) {
+                    (Some(before), Some(after)) => format!(
+                        "Conversation compacted: {} → {} tokens",
+                        short_tokens(before),
+                        short_tokens(after)
+                    ),
+                    _ => "Conversation compacted.".into(),
+                };
+                out.extend(self.compacted(NoticeLevel::Info, text, ItemStatus::Completed));
+            }
+            out.extend(self.context_now(after, tokens("maxTokens")));
+            if let Some(result) = self.held_result.take() {
+                out.extend(self.on_result(&result));
+            }
+            return out;
+        }
         if let Some(id) = id
             && self.queries.remove(id)
         {
@@ -932,6 +1036,10 @@ impl Translator {
     }
 
     fn on_result(&mut self, v: &Value) -> Vec<Out> {
+        if self.compact_query.is_some() && self.held_result.is_none() {
+            self.held_result = Some(v.clone());
+            return vec![];
+        }
         let mut out = Vec::new();
         // The model's context window, from its usage so far (the largest:
         // a smaller model may have run a subagent).
@@ -953,6 +1061,13 @@ impl Translator {
             self.unechoed.clear();
         }
         // Anything still open is finished now.
+        if self.compacting.is_some() {
+            let text = match self.interrupt_requested {
+                true => "Compacting stopped.",
+                false => "Conversation compacted.",
+            };
+            out.extend(self.compacted(NoticeLevel::Info, text.into(), ItemStatus::Completed));
+        }
         for ((_, _), (native_id, _)) in self.open_blocks.drain() {
             out.push(Out::Event(HarnessEvent::ItemCompleted {
                 native_id,
@@ -1162,6 +1277,16 @@ fn tool_result_text(content: Option<&Value>) -> String {
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+/// "152K", "6.7K", "1.2M".
+fn short_tokens(n: u64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 10_000 => format!("{}K", n / 1_000),
+        n if n >= 1_000 => format!("{:.1}K", n as f64 / 1e3),
+        n => n.to_string(),
+    }
 }
 
 fn u64_at(v: &Value, key: &str) -> u64 {
@@ -1771,6 +1896,72 @@ mod tests {
         };
         assert_eq!(v["request"]["subtype"], "stop_task");
         assert_eq!(v["request"]["task_id"], "t9");
+    }
+
+    #[test]
+    fn compacting_shows_while_it_runs_and_says_what_it_saved() {
+        let mut t = Translator::new();
+        let out =
+            t.on_line(r#"{"type":"system","subtype":"status","status":"compacting","uuid":"u1"}"#);
+        let [
+            HarnessEvent::ItemStarted {
+                native_id, body, ..
+            },
+        ] = events(&out).as_slice()
+        else {
+            panic!("expected a line for it: {out:?}");
+        };
+        assert_eq!(native_id, "compact:u1");
+        assert!(matches!(body, ItemBody::Notice { text, .. } if text.starts_with("Compacting")));
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}"#,
+        );
+        assert!(events(&out).is_empty());
+        // What Claude says is left counts the messages alone: ask it for
+        // the whole context instead.
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":152340,"post_tokens":6684}}"#,
+        );
+        assert!(events(&out).is_empty());
+        let asked = sent(&out);
+        assert_eq!(asked["request"]["subtype"], "get_context_usage");
+        // The turn's end waits for the answer.
+        assert!(events(&t.on_line(RESULT)).is_empty());
+        assert!(t.holding_result());
+        let out = t.on_line(&format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":{},"response":{{"totalTokens":31250,"maxTokens":200000}}}}}}"#,
+            asked["request_id"]
+        ));
+        let [
+            HarnessEvent::ItemCompleted {
+                native_id,
+                body: Some(ItemBody::Notice { text, .. }),
+                status: ItemStatus::Completed,
+                ..
+            },
+            HarnessEvent::ContextUsed(context),
+            HarnessEvent::TurnCompleted { .. },
+        ] = events(&out).as_slice()
+        else {
+            panic!("expected the line to finish and the context to shrink: {out:?}");
+        };
+        assert!(!t.holding_result());
+        assert_eq!(native_id, "compact:u1");
+        assert_eq!(text, "Conversation compacted: 152K → 31K tokens");
+        assert_eq!((context.tokens, context.window), (31250, Some(200000)));
+
+        // One that fails says why, in the same line.
+        t.on_line(r#"{"type":"system","subtype":"status","status":"compacting","uuid":"u2"}"#);
+        let out = t.on_line(
+            r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Not enough messages to compact."}"#,
+        );
+        assert!(
+            matches!(events(&out).as_slice(), [HarnessEvent::ItemCompleted {
+            body: Some(ItemBody::Notice { level: NoticeLevel::Warning, text }),
+            status: ItemStatus::Failed,
+            ..
+        }] if text == "Compacting failed: Not enough messages to compact.")
+        );
     }
 
     #[test]

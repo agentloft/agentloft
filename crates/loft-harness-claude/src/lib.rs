@@ -198,6 +198,12 @@ async fn run(
                     return RunEnd::Eof;
                 }
             }
+            // A turn's end is waiting for an answer Claude never gave.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)), if t.holding_result() => {
+                if dispatch(&events, &mut stdin, &mut waiting, t.release_result()).await.is_err() {
+                    return RunEnd::Eof;
+                }
+            }
         }
     }
 }

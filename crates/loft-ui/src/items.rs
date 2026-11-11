@@ -679,6 +679,11 @@ pub(crate) fn render_item(
                 .into_any_element()
         }
 
+        // Something under way (a compaction): said the way "Thinking…" is.
+        ItemBody::Notice { text, .. } if item.status == ItemStatus::InProgress => {
+            render_doing(IconName::FoldVertical, text.clone(), p)
+        }
+
         ItemBody::Notice { level, text } => h_flex()
             .justify_center()
             .text_xs()
@@ -780,14 +785,19 @@ fn render_work_header(
 
 /// The agent hasn't said anything yet (or is between steps).
 fn render_pending(p: &Palette) -> AnyElement {
+    render_doing(IconName::Brain, "Thinking…".into(), p)
+}
+
+/// What is going on right now, pulsing while it does.
+fn render_doing(icon: IconName, what: String, p: &Palette) -> AnyElement {
     use gpui_kit::{Animation, AnimationExt as _, pulsating_between};
     h_flex()
         .gap_1p5()
         .items_center()
         .text_sm()
         .text_color(p.muted_foreground)
-        .child(Icon::new(IconName::Brain).small())
-        .child("Thinking…")
+        .child(Icon::new(icon).small())
+        .child(what)
         .with_animation(
             "pending-pulse",
             Animation::new(std::time::Duration::from_millis(1400))

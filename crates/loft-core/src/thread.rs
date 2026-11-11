@@ -430,8 +430,12 @@ impl ThreadActor {
                 "a turn is already running in this thread",
             ));
         }
-        // Worked out before this turn joins the thread's turns.
-        let compact_first = self.idle_compaction(now_ms());
+        // Worked out before this turn joins the thread's turns. Not for a
+        // message that compacts or clears the conversation itself.
+        let command = text.split_whitespace().next().unwrap_or_default();
+        let compact_first = (!matches!(command, "/compact" | "/clear"))
+            .then(|| self.idle_compaction(now_ms()))
+            .flatten();
         self.ensure_session()?;
         if self.thread.started_at_ms.is_none() || self.thread.draft.is_some() {
             self.thread.started_at_ms.get_or_insert_with(now_ms);

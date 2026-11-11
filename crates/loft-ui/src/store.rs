@@ -2467,10 +2467,17 @@ impl ThreadState {
                 .count();
             push_runs(&mut rows, items, &run[..lead]);
             let rest = &run[lead..];
+            // A turn that ends on a notice and no reply (a compaction: what
+            // it saved) has that for its answer.
+            let closing_notice = rest
+                .last()
+                .is_some_and(|&i| matches!(items[i].body, ItemBody::Notice { .. }))
+                .then(|| rest.len() - 1);
             let answer_at = done
                 .then(|| {
                     rest.iter()
                         .rposition(|&i| matches!(items[i].body, ItemBody::AssistantMessage { .. }))
+                        .or(closing_notice)
                 })
                 .flatten()
                 .unwrap_or(rest.len());

@@ -120,6 +120,8 @@ pub struct Translator {
     approvals: HashMap<String, OpenApproval>,
     usage: Option<Usage>,
     interrupted: bool,
+    /// The compaction under way (its item id), shown as "Compacting…".
+    compacting: Option<String>,
     /// MCP servers whose tool calls are approved automatically.
     pub auto_allow_mcp: Vec<String>,
     /// Open the session as a native fork of this Codex thread.
@@ -1216,15 +1218,34 @@ impl Translator {
                     vec![Out::Event(HarnessEvent::TurnStarted)]
                 }
             }
-            "item/started" => item_started(p.get("item").unwrap_or(&Value::Null), &self.cwd)
-                .map(|e| vec![Out::Event(e)])
-                .unwrap_or_default(),
+            "item/started" => {
+                let item = p.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
+                    self.compacting = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                }
+                item_started(item, &self.cwd)
+                    .map(|e| vec![Out::Event(e)])
+                    .unwrap_or_default()
+            }
             "item/completed"
                 if p.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction") =>
             {
-                vec![Out::Event(HarnessEvent::Notice {
-                    level: NoticeLevel::Info,
-                    text: "Conversation compacted: earlier turns are summarized for Codex.".into(),
+                let (level, text) = (
+                    NoticeLevel::Info,
+                    "Conversation compacted: earlier turns are summarized for Codex.".to_owned(),
+                );
+                // In place of its "Compacting…" line when there was one.
+                let id = p.pointer("/item/id").and_then(Value::as_str);
+                vec![Out::Event(match self.compacting.take() {
+                    Some(native_id) if Some(native_id.as_str()) == id => {
+                        HarnessEvent::ItemCompleted {
+                            native_id,
+                            body: Some(ItemBody::Notice { level, text }),
+                            tool_result: None,
+                            status: ItemStatus::Completed,
+                        }
+                    }
+                    _ => HarnessEvent::Notice { level, text },
                 })]
             }
             "item/completed" => item_completed(p.get("item").unwrap_or(&Value::Null), &self.cwd)
@@ -1682,7 +1703,7 @@ fn item_started(item: &Value, cwd: &str) -> Option<HarnessEvent> {
         },
         "contextCompaction" => ItemBody::Notice {
             level: NoticeLevel::Info,
-            text: "Context compacted".into(),
+            text: "Compacting the conversation…".into(),
         },
         _ => tool_body(item, cwd)?,
     };

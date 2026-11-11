@@ -1834,4 +1834,21 @@ async fn a_message_after_idle_compacts_first() {
             .any(|i| i.turn_id.as_ref() == Some(&turns[0].id)
                 && matches!(&i.body, ItemBody::Notice { .. }))
     );
+    // Asking for a compaction yourself doesn't get one ahead of it.
+    core.handle(send("/compact")).await.unwrap();
+    wait_for(&core, &thread.id, |_, turns| {
+        turns.len() == 3 && turns[2].status.is_terminal()
+    })
+    .await;
+    let (_, turns, items, _) = thread_snapshot(&core, &thread.id);
+    let replies: Vec<&str> = items
+        .iter()
+        .filter(|i| i.turn_id.as_ref() == Some(&turns[2].id))
+        .filter_map(|i| match &i.body {
+            ItemBody::AssistantMessage { text } => Some(text.as_str()),
+            ItemBody::Notice { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replies, ["echo: /compact"]);
 }
