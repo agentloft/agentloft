@@ -14,6 +14,7 @@ gpui_kit::assets::icon_assets!(
         Bug,
         ChartPie,
         Gauge,
+        FoldVertical,
         Hourglass,
         Keyboard,
         RotateCcw,

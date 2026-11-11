@@ -3,6 +3,7 @@
 
 mod conn;
 pub mod mcp;
+mod prices;
 mod reaper;
 pub mod web;
 
@@ -45,6 +46,8 @@ pub struct Daemon {
     web_task: tokio::task::JoinHandle<()>,
     /// Deletes archived threads past `threads.delete_archived_after_days`.
     cleanup_task: tokio::task::JoinHandle<()>,
+    /// Keeps the model prices for cost estimates a day fresh at most.
+    prices_task: tokio::task::JoinHandle<()>,
     _lock: File,
 }
 
@@ -111,6 +114,7 @@ impl Daemon {
         };
         let task = tokio::spawn(accept_loop(listener, hub, shutdown_rx, paths.clone()));
         let cleanup_task = core.spawn_archive_cleanup();
+        let prices_task = prices::spawn(core.clone(), paths.clone());
         Ok(Self {
             core,
             web,
@@ -118,6 +122,7 @@ impl Daemon {
             task,
             web_task,
             cleanup_task,
+            prices_task,
             _lock: lock,
         })
     }
@@ -131,6 +136,7 @@ impl Daemon {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         self.cleanup_task.abort();
+        self.prices_task.abort();
         let _ = self.web_task.await;
         self.core.shutdown().await;
         let _ = self.task.await;

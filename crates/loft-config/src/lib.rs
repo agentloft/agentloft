@@ -2,6 +2,7 @@
 //! environment used to spawn agent CLIs (PLAN §1.7, §4.1, §4.5).
 
 pub mod icons;
+pub mod pricing;
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -168,15 +169,65 @@ pub struct Config {
     pub browser: BrowserConfig,
     pub titles: TitlesConfig,
     pub threads: ThreadsConfig,
+    /// `[pricing."<model>"]`: API prices to estimate cost with, in USD per
+    /// million tokens, over the built-in ones (a model id or its prefix).
+    pub pricing: std::collections::BTreeMap<String, ModelPrice>,
+    pub usage: UsageConfig,
+}
+
+/// `[usage]` in config.toml: the Usage page's cost estimates.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UsageConfig {
+    /// Where the daemon gets model prices each day (models.dev's format);
+    /// empty: only the built-in prices and `[pricing]`.
+    pub price_catalog: String,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            price_catalog: "https://models.dev/api.json".into(),
+        }
+    }
+}
+
+/// A model's API price, USD per million tokens. Unset cache prices follow
+/// the usual ratios (reads 10% of input, writes 125%).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
 }
 
 /// `[threads]` in config.toml: housekeeping for threads.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ThreadsConfig {
     /// Delete an archived thread (its conversation, worktree, checkpoints
     /// and attachments) this many days after it was archived; 0 = never.
     pub delete_archived_after_days: u32,
+    /// A message to a thread that has sat idle for `compact_idle_minutes`
+    /// with at least `compact_min_tokens` in its context compacts the
+    /// conversation first: the agent's prompt cache has expired by then, so
+    /// the whole context would otherwise be read again at full price.
+    pub compact_when_idle: bool,
+    pub compact_idle_minutes: u32,
+    pub compact_min_tokens: u64,
+}
+
+impl Default for ThreadsConfig {
+    fn default() -> Self {
+        Self {
+            delete_archived_after_days: 0,
+            compact_when_idle: true,
+            compact_idle_minutes: 60,
+            compact_min_tokens: 100_000,
+        }
+    }
 }
 
 /// `[titles]` in config.toml: how a new thread gets its name.

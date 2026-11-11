@@ -331,6 +331,12 @@ pub struct AppStore {
     /// `[browser]` in the settings (search engine, home page), kept
     /// current as the settings change.
     pub browser: loft_config::BrowserConfig,
+    /// `[threads]` in the settings (compacting idle threads), kept current.
+    pub threads_config: loft_config::ThreadsConfig,
+    /// `[pricing]` in the settings: API prices over the built-in ones.
+    pub pricing: std::collections::BTreeMap<String, loft_config::ModelPrice>,
+    /// The model prices the daemon fetched (models.dev), as it last saved them.
+    pub price_catalog: Option<std::sync::Arc<loft_config::pricing::Catalog>>,
     /// Models left out of the pickers, per agent.
     pub hidden_models: HashMap<String, Vec<String>>,
     /// Terminal panes fed by `Topic::Terminal` subscriptions.
@@ -382,6 +388,9 @@ impl AppStore {
             branches_loading: Default::default(),
             disabled_agents: Default::default(),
             browser: Default::default(),
+            threads_config: Default::default(),
+            pricing: Default::default(),
+            price_catalog: None,
             hidden_models: HashMap::new(),
             terminals: HashMap::new(),
             terminal_subs: HashMap::new(),
@@ -566,6 +575,17 @@ impl AppStore {
             return;
         };
         self.browser = config.browser.clone();
+        self.threads_config = config.threads.clone();
+        self.pricing = config.pricing.clone();
+        let file = loft_config::pricing::catalog_file(&self.paths);
+        let fetched = self.price_catalog.as_ref().map(|c| c.fetched_at_ms);
+        if let Some(catalog) = crate::host::read_to_string(&file)
+            .ok()
+            .and_then(|text| serde_json::from_str::<loft_config::pricing::Catalog>(&text).ok())
+            .filter(|c| Some(c.fetched_at_ms) != fetched)
+        {
+            self.price_catalog = Some(std::sync::Arc::new(catalog));
+        }
         self.disabled_agents.clear();
         self.hidden_models.clear();
         for (id, h) in [
@@ -2047,6 +2067,26 @@ impl AppStore {
             cx,
             |_, _, _| {},
         );
+    }
+
+    /// Compact idle threads before a message (`threads.compact_when_idle`,
+    /// for every thread); the daemon reads it at the next message.
+    pub fn set_compact_when_idle(&mut self, on: bool, cx: &mut Context<Self>) {
+        // On is the default.
+        let value = if on {
+            loft_config::SettingValue::Unset
+        } else {
+            loft_config::SettingValue::Bool(false)
+        };
+        if let Err(err) =
+            crate::host::write_setting(&self.paths, &["threads", "compact_when_idle"], value)
+        {
+            self.fail(format!("Couldn't save: {err:#}"), cx);
+            return;
+        }
+        self.threads_config.compact_when_idle = on;
+        self.request(Request::ReloadConfig, cx, |_, _, _| {});
+        cx.notify();
     }
 
     pub fn set_model(

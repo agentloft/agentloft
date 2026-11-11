@@ -37,6 +37,7 @@ impl Harness for FakeHarness {
             live_model_switch: true,
             live_mode_switch: true,
             steer: true,
+            compact: true,
             ..Default::default()
         }
     }

@@ -1778,3 +1778,60 @@ async fn a_view_the_harness_never_reported_gets_an_item() {
         .unwrap_err();
     assert_eq!(not_a_view.code, loft_protocol::ErrorCode::NotFound);
 }
+
+#[tokio::test]
+async fn a_message_after_idle_compacts_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = loft_config::Config::default();
+    // Any pause counts as idle; the fake agent reports 1,234 tokens.
+    config.threads.compact_idle_minutes = 0;
+    config.threads.compact_min_tokens = 1_000;
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            config,
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, dir.path()).await;
+    let send = |text: &str| Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: text.into(),
+        attachments: vec![],
+    };
+    // A first message: nothing to compact yet.
+    core.handle(send("first")).await.unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    core.handle(send("second")).await.unwrap();
+    wait_for(&core, &thread.id, |_, turns| {
+        turns.len() == 2 && turns[1].status.is_terminal()
+    })
+    .await;
+    let (_, turns, items, _) = thread_snapshot(&core, &thread.id);
+    assert_eq!(turns[1].status, TurnStatus::Completed);
+    let said: Vec<String> = items
+        .iter()
+        .filter(|i| i.turn_id.as_ref() == Some(&turns[1].id))
+        .filter_map(|i| match &i.body {
+            ItemBody::UserMessage { text, .. } => Some(format!("user: {text}")),
+            ItemBody::Notice { text, .. } => Some(format!("notice: {text}")),
+            ItemBody::AssistantMessage { text } => Some(format!("agent: {text}")),
+            _ => None,
+        })
+        .collect();
+    // The agent compacted, then got the message, all in one turn.
+    assert_eq!(said.len(), 4, "{said:?}");
+    assert_eq!(said[0], "user: second");
+    assert!(said[1].starts_with("notice: Compacting first: idle for 0 min, 1K tokens"));
+    assert_eq!(said[2], "agent: echo: /compact");
+    assert_eq!(said[3], "agent: echo: second");
+    // The first turn had nothing before it to compact.
+    assert!(
+        !items
+            .iter()
+            .any(|i| i.turn_id.as_ref() == Some(&turns[0].id)
+                && matches!(&i.body, ItemBody::Notice { .. }))
+    );
+}

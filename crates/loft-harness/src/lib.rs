@@ -230,6 +230,8 @@ pub struct Capabilities {
     /// the session (resuming it) before the next turn.
     pub live_effort_switch: bool,
     pub native_fork: bool,
+    /// A `/compact` prompt compacts the conversation (a turn of its own).
+    pub compact: bool,
 }
 
 pub trait Harness: Send + Sync + 'static {

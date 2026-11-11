@@ -242,6 +242,15 @@ impl Store {
         )
     }
 
+    /// Every turn that reported what it used, oldest first.
+    pub fn turns_with_usage(&self) -> Result<Vec<Turn>> {
+        self.query_data(
+            "SELECT data FROM turns WHERE json_extract(data, '$.usage') IS NOT NULL \
+             ORDER BY json_extract(data, '$.started_at_ms')",
+            [],
+        )
+    }
+
     pub fn threads(&self) -> Result<Vec<Thread>> {
         self.query_data("SELECT data FROM threads ORDER BY updated_at_ms DESC", [])
     }
@@ -579,6 +588,7 @@ mod tests {
             native_turn: None,
             changes: None,
             context: None,
+            model: None,
         };
         store
             .commit(vec![

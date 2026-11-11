@@ -156,6 +156,26 @@ const KEYS: &[Key] = &[
         about: "Delete archived threads (conversation, worktree, checkpoints, attachments) this many days after archiving; 0 = never",
     },
     Key {
+        key: "threads.compact_when_idle",
+        kind: Kind::Bool,
+        about: "Compact a thread's conversation before a message sent after it sat idle (its prompt cache gone); off = never",
+    },
+    Key {
+        key: "threads.compact_idle_minutes",
+        kind: Kind::Int(1, 10080),
+        about: "How long a thread sits idle before a new message compacts it first (default 60)",
+    },
+    Key {
+        key: "threads.compact_min_tokens",
+        kind: Kind::Int(0, 10_000_000),
+        about: "Compact when idle only when the context holds at least this many tokens (default 100000)",
+    },
+    Key {
+        key: "usage.price_catalog",
+        kind: Kind::Text,
+        about: "Where model prices for cost estimates come from each day (models.dev's format); empty = only the built-in prices and [pricing]",
+    },
+    Key {
         key: "projects.new_dir",
         kind: Kind::Text,
         about: "Where new projects go; null = ~/.agentloft/projects",

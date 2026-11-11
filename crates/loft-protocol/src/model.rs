@@ -322,6 +322,10 @@ pub struct Turn {
     /// How full the agent's context was at its latest step in this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextUse>,
+    /// The model that ran the turn, as the agent named it (older turns
+    /// don't have it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Tokens in the agent's context, and the most it holds when it says.

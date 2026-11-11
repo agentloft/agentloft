@@ -4308,6 +4308,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "toml_edit 0.25.19+spec-1.1.0",
@@ -4546,6 +4547,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -8939,6 +8941,7 @@ checksum = "e7be76686bdf7198002062423ca0d8cf9b75a27c8e1de804513b97e97b555d9d"
 dependencies = [
  "base64 0.23.1",
  "der",
+ "flate2",
  "log",
  "native-tls",
  "percent-encoding",

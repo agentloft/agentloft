@@ -1399,6 +1399,61 @@ pub(crate) fn render(
         .into_any_element()
 }
 
+/// An agent's plan and its limits, from its `/usage` report (Claude Code)
+/// or its `/status` report (Codex): the plan's name, then a row per limit.
+pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<AnyElement>) {
+    let capital = |s: &str| s[..1].to_uppercase() + &s[1..];
+    let mut rows = Vec::new();
+    // Claude Code.
+    let claude = arr(info, "/rate_limits/limits");
+    for limit in &claude {
+        rows.push(limit_row(
+            limit_label(limit),
+            text(limit, "resets_at").and_then(reset_time),
+            num(limit, "percent") as f32,
+            text(limit, "severity") != Some("normal"),
+            p,
+        ));
+    }
+    // Codex.
+    let limits = info
+        .pointer("/rateLimits/rateLimits")
+        .unwrap_or(&Value::Null);
+    for w in ["primary", "secondary"]
+        .iter()
+        .filter_map(|k| limits.get(*k).filter(|w| !w.is_null()))
+    {
+        rows.push(limit_row(
+            window_label(num(w, "windowDurationMins")),
+            w.get("resetsAt")
+                .and_then(Value::as_i64)
+                .and_then(reset_unix),
+            num(w, "usedPercent") as f32,
+            num(w, "usedPercent") >= 80.,
+            p,
+        ));
+    }
+    if let Some(c) = limits.get("credits").filter(|c| {
+        c.get("hasCredits").and_then(Value::as_bool) == Some(true)
+            || c.get("unlimited").and_then(Value::as_bool) == Some(true)
+    }) {
+        let v = if c.get("unlimited").and_then(Value::as_bool) == Some(true) {
+            "Unlimited".to_owned()
+        } else {
+            text(c, "balance").unwrap_or("0").to_owned()
+        };
+        rows.push(stat_row("Credits".into(), v, None, p));
+    }
+    let plan = text(info, "subscription_type")
+        .or_else(|| {
+            info.pointer("/account/account/planType")
+                .and_then(Value::as_str)
+        })
+        .filter(|s| !s.is_empty())
+        .map(capital);
+    (plan, rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

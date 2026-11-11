@@ -237,6 +237,7 @@ impl Core {
             | Request::ArchiveThread { .. }
             | Request::DeleteThread { .. }
             | Request::SearchThreads { .. }
+            | Request::UsageReport { .. }
             // Projects that already exist.
             | Request::RenameProject { .. }
             | Request::SetProjectDefaults { .. }

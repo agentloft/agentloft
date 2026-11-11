@@ -166,6 +166,7 @@ impl Harness for AcpHarness {
             // posts a notice otherwise, but the UI can't rely on them.
             live_model_switch: false,
             live_mode_switch: false,
+            compact: false,
         }
     }
 

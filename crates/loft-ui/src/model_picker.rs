@@ -691,7 +691,80 @@ impl Render for ModelPicker {
                     .child(self.render_efforts(&snap, &p, cx)),
             )
             .child(self.render_permissions(&snap, &p, cx))
+            .when(can_compact(&snap.harness), |d| {
+                d.child(compaction_row(&self.store, "picker-compact", &p, cx))
+            })
     }
+}
+
+/// Whether the agent can compact its conversation (`/compact`).
+pub fn can_compact(harness: &HarnessId) -> bool {
+    matches!(harness.as_str(), HarnessId::CLAUDE | HarnessId::CODEX)
+}
+
+/// When an idle thread compacts first, in a few words.
+pub fn compaction_rule(c: &loft_config::ThreadsConfig) -> String {
+    let idle = match c.compact_idle_minutes {
+        m if m >= 60 && m % 60 == 0 => format!("{} h", m / 60),
+        m => format!("{m} min"),
+    };
+    let tokens = match c.compact_min_tokens {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{}K", n / 1_000),
+        n => n.to_string(),
+    };
+    format!("Idle {idle}+ with {tokens}+ tokens: compacts before your message")
+}
+
+/// "Compact when idle" with its switch: one setting for every thread.
+pub fn compaction_row<V: 'static>(
+    store: &Entity<AppStore>,
+    id: &'static str,
+    p: &Palette,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    use gpui_kit::component::switch::Switch;
+    let config = store.read(cx).threads_config.clone();
+    let on = config.compact_when_idle;
+    let store = store.clone();
+    h_flex()
+        .gap_2()
+        .items_center()
+        .px_3()
+        .py_1p5()
+        .border_t_1()
+        .border_color(p.border)
+        .bg(p.muted)
+        .text_xs()
+        .child(
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .items_center()
+                .text_color(p.muted_foreground)
+                .font_weight(FontWeight::MEDIUM)
+                .child(Icon::new(IconName::FoldVertical).xsmall())
+                .child("Compact when idle"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_right()
+                .text_color(p.faint_foreground)
+                .child(compaction_rule(&config)),
+        )
+        .child(
+            Switch::new(id)
+                .checked(on)
+                .xsmall()
+                .on_click(move |on: &bool, _, cx| {
+                    let on = *on;
+                    store.update(cx, |s, cx| s.set_compact_when_idle(on, cx));
+                }),
+        )
+        .into_any_element()
 }
 
 /// Whether `model` is what the thread runs (`None` = the default model).

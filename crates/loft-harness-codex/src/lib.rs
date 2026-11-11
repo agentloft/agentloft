@@ -33,6 +33,7 @@ impl Harness for CodexHarness {
             live_mode_switch: true,
             live_effort_switch: true,
             native_fork: true,
+            compact: true,
         }
     }
 

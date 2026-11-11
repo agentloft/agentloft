@@ -115,6 +115,8 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
     let actor = ThreadActor {
         self_tx: tx.downgrade(),
         pending_start: None,
+        after_compact: None,
+        session_model: None,
         pending_note: None,
         core,
         thread,
@@ -135,6 +137,11 @@ struct ThreadActor {
     self_tx: mpsc::WeakUnboundedSender<ThreadCmd>,
     /// Prompt waiting for the "before" checkpoint before it is sent.
     pending_start: Option<(String, Vec<AttachmentRef>)>,
+    /// The user's message, held while the conversation is compacted first
+    /// (it had sat idle): it goes out, in the same turn, once that's done.
+    after_compact: Option<(String, Vec<AttachmentRef>)>,
+    /// The model the running session said it uses (recorded on each turn).
+    session_model: Option<String>,
     /// Said to the agent ahead of the next prompt (e.g. after a revert).
     pending_note: Option<String>,
     core: Arc<Core>,
@@ -350,6 +357,8 @@ impl ThreadActor {
                 let _ = reply.send(res);
             }
             ThreadCmd::SetModel { model, reply } => {
+                // What the session said it ran no longer holds.
+                self.session_model = None;
                 self.thread.model = model.clone();
                 if let Some(s) = &self.session {
                     let _ = s.commands.send(SessionCommand::SetModel(model));
@@ -421,6 +430,8 @@ impl ThreadActor {
                 "a turn is already running in this thread",
             ));
         }
+        // Worked out before this turn joins the thread's turns.
+        let compact_first = self.idle_compaction(now_ms());
         self.ensure_session()?;
         if self.thread.started_at_ms.is_none() || self.thread.draft.is_some() {
             self.thread.started_at_ms.get_or_insert_with(now_ms);
@@ -446,6 +457,7 @@ impl ThreadActor {
             native_turn: None,
             changes: None,
             context: None,
+            model: None,
         };
         let user_item = self.new_item(
             Some(turn.id.clone()),
@@ -470,9 +482,28 @@ impl ThreadActor {
         ])?;
         self.turn = Some(turn.clone());
 
+        // Compact a conversation that sat idle first; the message follows
+        // once that's done.
+        let prompt = match compact_first {
+            Some(why) => {
+                let notice = self.new_item(
+                    Some(turn.id.clone()),
+                    ItemBody::Notice {
+                        level: loft_protocol::NoticeLevel::Info,
+                        text: why,
+                    },
+                    ItemStatus::Completed,
+                )?;
+                self.core
+                    .commit(vec![Event::ItemUpserted { item: notice }])?;
+                self.after_compact = Some((text, attachments));
+                ("/compact".to_owned(), Vec::new())
+            }
+            None => (text, attachments),
+        };
         // Snapshot the work tree first; the prompt goes out once that's done
         // so the turn's diff covers exactly the agent's changes.
-        self.pending_start = Some((text, attachments));
+        self.pending_start = Some(prompt);
         // A new worktree's setup runs first, so the turn's checkpoint (and
         // diff) start after it.
         match self.core.take_pending_setup(&self.thread.id) {
@@ -493,8 +524,9 @@ impl ThreadActor {
             .core
             .harness(&self.thread.harness)
             .is_some_and(|h| h.capabilities().steer);
-        // Not sent yet (the checkpoint is being taken): it joins the prompt.
-        let joins_prompt = self.pending_start.is_some();
+        // Not sent yet (the checkpoint is being taken, or the conversation
+        // is being compacted first): it joins the prompt.
+        let joins_prompt = self.pending_start.is_some() || self.after_compact.is_some();
         if !can_steer && !joins_prompt {
             return Err(ErrorBody::new(
                 ErrorCode::Conflict,
@@ -516,7 +548,8 @@ impl ThreadActor {
                 thread: self.thread.clone(),
             },
         ])?;
-        if let Some((prompt, images)) = self.pending_start.as_mut() {
+        if let Some((prompt, images)) = self.after_compact.as_mut().or(self.pending_start.as_mut())
+        {
             prompt.push_str("\n\n");
             prompt.push_str(&text);
             images.extend(attachments);
@@ -714,33 +747,13 @@ impl ThreadActor {
             let Some((text, attachments)) = self.pending_start.take() else {
                 return;
             };
-            let text = match self.pending_note.take() {
-                Some(note) => format!("{note}\n\n{text}"),
-                None => text,
+            // A note waits for the user's message, not `/compact`.
+            let note = if self.after_compact.is_some() {
+                None
+            } else {
+                self.pending_note.take()
             };
-            let images = attachments
-                .into_iter()
-                .map(|a| loft_harness::ImageInput {
-                    path: a.path.into(),
-                    mime: a.mime,
-                })
-                .collect();
-            let sent = self
-                .session
-                .as_ref()
-                .map(|s| {
-                    s.commands
-                        .send(SessionCommand::StartTurn(TurnInput { text, images }))
-                        .is_ok()
-                })
-                .unwrap_or(false);
-            if !sent {
-                let _ = self.finish_turn(
-                    TurnStatus::Failed,
-                    None,
-                    Some("The agent session closed before the turn started.".into()),
-                );
-            }
+            self.start_prompt(text, attachments, note);
         } else if let Some(sha) = sha {
             let turn = self
                 .core
@@ -753,6 +766,92 @@ impl ThreadActor {
                 let _ = self.core.commit(vec![Event::TurnUpdated { turn }]);
             }
         }
+    }
+
+    /// Send `text` to the agent as the running turn's prompt (after `note`).
+    fn start_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<AttachmentRef>,
+        note: Option<String>,
+    ) {
+        let text = match note {
+            Some(note) => format!("{note}\n\n{text}"),
+            None => text,
+        };
+        let images = attachments
+            .into_iter()
+            .map(|a| loft_harness::ImageInput {
+                path: a.path.into(),
+                mime: a.mime,
+            })
+            .collect();
+        let sent = self.session.as_ref().is_some_and(|s| {
+            s.commands
+                .send(SessionCommand::StartTurn(TurnInput { text, images }))
+                .is_ok()
+        });
+        if !sent {
+            let _ = self.finish_turn(
+                TurnStatus::Failed,
+                None,
+                Some("The agent session closed before the turn started.".into()),
+            );
+        }
+    }
+
+    /// Why a message now should compact the conversation first, if it
+    /// should: on (`threads.compact_when_idle`), an agent that can, idle
+    /// past the prompt cache, and a context worth shrinking.
+    fn idle_compaction(&self, now: i64) -> Option<String> {
+        let cfg = self.core.config().threads;
+        if !cfg.compact_when_idle
+            || !self
+                .core
+                .harness(&self.thread.harness)
+                .is_some_and(|h| h.capabilities().compact)
+        {
+            return None;
+        }
+        let turns = self.core.with_store(|s| s.turns(&self.thread.id)).ok()?;
+        let idle_ms = now - turns.last()?.ended_at_ms?;
+        if idle_ms < i64::from(cfg.compact_idle_minutes) * 60_000 {
+            return None;
+        }
+        let tokens = turns.iter().rev().find_map(|t| t.context)?.tokens;
+        if tokens < cfg.compact_min_tokens.max(1) {
+            return None;
+        }
+        Some(format!(
+            "Compacting first: idle for {}, {} tokens in context",
+            idle_for(idle_ms),
+            short_tokens(tokens)
+        ))
+    }
+
+    /// The compaction before a held message ended: send the message.
+    fn after_compaction(
+        &mut self,
+        status: TurnStatus,
+        error: Option<String>,
+        text: String,
+        attachments: Vec<AttachmentRef>,
+    ) -> CoreResult<()> {
+        if status != TurnStatus::Completed {
+            let why = error.unwrap_or_else(|| "the agent didn't say why".into());
+            let item = self.new_item(
+                self.turn_id(),
+                ItemBody::Notice {
+                    level: loft_protocol::NoticeLevel::Warning,
+                    text: format!("Couldn't compact ({why}); sending the message as it is"),
+                },
+                ItemStatus::Completed,
+            )?;
+            self.core.commit(vec![Event::ItemUpserted { item }])?;
+        }
+        let note = self.pending_note.take();
+        self.start_prompt(text, attachments, note);
+        Ok(())
     }
 
     fn respond(
@@ -973,6 +1072,9 @@ impl ThreadActor {
                     self.thread.native_session_id = Some(native_session_id);
                     changed = true;
                 }
+                if model.is_some() {
+                    self.session_model.clone_from(&model);
+                }
                 if self.thread.model.is_none() && model.is_some() {
                     self.thread.model = model;
                     changed = true;
@@ -1020,6 +1122,7 @@ impl ThreadActor {
                     native_turn: None,
                     changes: None,
                     context: None,
+                    model: None,
                 };
                 self.thread.status = ThreadStatus::Running;
                 self.thread.updated_at_ms = now;
@@ -1164,6 +1267,13 @@ impl ThreadActor {
             HarnessEvent::RequestResolved { native_id } => {
                 self.resolve_request(&native_id, None)?;
             }
+            // The compaction ahead of a held message is done: on with it.
+            HarnessEvent::TurnCompleted { status, error, .. }
+                if status != TurnStatus::Interrupted && self.after_compact.is_some() =>
+            {
+                let (text, attachments) = self.after_compact.take().unwrap_or_default();
+                self.after_compaction(status, error, text, attachments)?;
+            }
             HarnessEvent::TurnCompleted {
                 status,
                 usage,
@@ -1296,11 +1406,16 @@ impl ThreadActor {
             events.push(Event::ItemUpserted { item });
         }
         self.pending_start = None;
+        self.after_compact = None;
         let mut finished = None;
         if let Some(mut turn) = self.turn.take() {
             turn.status = status;
             turn.usage = usage;
             turn.error = error;
+            turn.model = self
+                .session_model
+                .clone()
+                .or_else(|| self.thread.model.clone());
             turn.ended_at_ms = Some(now_ms());
             finished = Some(turn.clone());
             events.push(Event::TurnUpdated { turn });
@@ -1519,6 +1634,26 @@ impl ThreadActor {
                 let _ = handle.send(ThreadCmd::GeneratedTitle { placeholder, title });
             }
         });
+    }
+}
+
+/// "2 h 5 min", "45 min", "3 days".
+fn idle_for(ms: i64) -> String {
+    let mins = ms / 60_000;
+    match mins {
+        m if m >= 2 * 1440 => format!("{} days", m / 1440),
+        m if m >= 60 && m % 60 == 0 => format!("{} h", m / 60),
+        m if m >= 60 => format!("{} h {} min", m / 60, m % 60),
+        m => format!("{m} min"),
+    }
+}
+
+/// "230K", "1.2M".
+fn short_tokens(n: u64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{}K", n / 1_000),
+        n => n.to_string(),
     }
 }
 

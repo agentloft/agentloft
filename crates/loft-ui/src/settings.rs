@@ -23,6 +23,7 @@ mod browser;
 mod projects;
 mod shortcuts;
 mod threads;
+mod usage;
 mod web;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
@@ -342,6 +343,8 @@ pub enum Section {
     /// The browser panel: search engine, home page, which browser.
     Browser,
     Shortcuts,
+    /// Tokens and cost across threads, and the agents' plan limits.
+    Usage,
     /// Agentloft in a browser (desktop only: a browser session may not
     /// manage its own access).
     Web,
@@ -355,7 +358,7 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s) || sec.slug() == s)
     }
 
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 10] = [
         Section::Appearance,
         Section::Agents,
         Section::Threads,
@@ -363,6 +366,7 @@ impl Section {
         Section::Worktrees,
         Section::Browser,
         Section::Shortcuts,
+        Section::Usage,
         Section::Web,
         Section::About,
     ];
@@ -385,6 +389,7 @@ impl Section {
             Section::Worktrees => "worktrees",
             Section::Browser => "browser",
             Section::Shortcuts => "shortcuts",
+            Section::Usage => "usage",
             Section::Web => "web",
             Section::About => "about",
         }
@@ -399,6 +404,7 @@ impl Section {
             Section::Worktrees => "Worktrees",
             Section::Browser => "Browser",
             Section::Shortcuts => "Shortcuts",
+            Section::Usage => "Usage",
             Section::Web => "Web access",
             Section::About => "About",
         }
@@ -413,6 +419,7 @@ impl Section {
             Section::Worktrees => IconName::GitBranch,
             Section::Browser => IconName::Globe,
             Section::Shortcuts => IconName::Keyboard,
+            Section::Usage => IconName::ChartPie,
             Section::Web => IconName::GlobeLock,
             Section::About => IconName::Sparkles,
         }
@@ -593,6 +600,7 @@ pub struct SettingsView {
     shortcuts: shortcuts::ShortcutsPage,
     web: web::WebPage,
     browser: browser::BrowserPage,
+    usage: usage::UsagePage,
     /// "Custom" is picked for deleting archived threads (its days field
     /// shows even while the value is a preset or never).
     archive_custom: bool,
@@ -670,6 +678,7 @@ impl SettingsView {
             shortcuts: shortcuts::ShortcutsPage::default(),
             web: web::WebPage::default(),
             browser: browser::BrowserPage::default(),
+            usage: usage::UsagePage::default(),
             archive_custom: false,
             _subs: subs,
         }
@@ -940,6 +949,7 @@ impl Render for SettingsView {
             Section::Worktrees => self.worktrees(&p, cx),
             Section::Browser => self.browser_page(&p, cx),
             Section::Shortcuts => self.shortcuts_page(&p, cx),
+            Section::Usage => self.usage_page(&p, window, cx),
             Section::Web => self.web_page(&p, cx),
             Section::About => self.about(&p, cx),
         };

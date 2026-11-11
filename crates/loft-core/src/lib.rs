@@ -11,6 +11,7 @@ mod settings;
 mod terminals;
 mod thread;
 mod titles;
+mod usage;
 mod workbench;
 mod worktrees;
 
@@ -152,6 +153,8 @@ pub struct Core {
     file_index: Mutex<HashMap<PathBuf, FileIndex>>,
     /// Bumped whenever the live config is replaced.
     config_rev: tokio::sync::watch::Sender<u64>,
+    /// Model prices fetched from models.dev (the daemon refreshes them).
+    price_catalog: std::sync::RwLock<Option<Arc<loft_config::pricing::Catalog>>>,
     opts: CoreOptions,
 }
 
@@ -184,6 +187,7 @@ impl Core {
             pending_setup: Mutex::new(HashMap::new()),
             file_index: Mutex::new(HashMap::new()),
             config_rev: tokio::sync::watch::channel(0).0,
+            price_catalog: std::sync::RwLock::new(None),
             opts,
         })
     }
@@ -233,6 +237,21 @@ impl Core {
         from: u64,
     ) -> CoreResult<Option<(Vec<u8>, u64)>> {
         self.terminals.read_since(id, from)
+    }
+
+    /// The model prices fetched last, if any.
+    pub fn price_catalog(&self) -> Option<Arc<loft_config::pricing::Catalog>> {
+        self.price_catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_price_catalog(&self, catalog: loft_config::pricing::Catalog) {
+        *self
+            .price_catalog
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(catalog));
     }
 
     /// The current config (reloaded by the settings window).
@@ -792,6 +811,11 @@ impl Core {
             }
             Request::RemoveProject { project_id } => self.remove_project(&project_id).await,
             Request::GetSettings => self.get_settings(),
+            Request::UsageReport {
+                utc_offset_min,
+                from_day,
+                to_day,
+            } => self.usage_report(utc_offset_min, from_day, to_day),
             Request::ChangeSetting { key, value } => self.change_setting(&key, &value),
             Request::SaveTheme { toml, select, id } => {
                 self.save_theme(&toml, select, id.as_deref())

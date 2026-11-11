@@ -41,6 +41,7 @@ impl Harness for ClaudeHarness {
             // `apply_flag_settings` can't express `max`; restart instead.
             live_effort_switch: false,
             native_fork: true,
+            compact: true,
         }
     }
 

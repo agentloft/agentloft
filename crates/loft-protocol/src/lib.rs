@@ -91,6 +91,19 @@ pub enum Request {
     /// Settings for agents: current values, settable keys, themes
     /// (`Response::Json`).
     GetSettings,
+    /// Tokens and cost over every thread's turns (`Response::Json`): totals,
+    /// and per day, agent, model, project and thread over the days
+    /// `from_day..=to_day` (unset: since the first turn / up to today).
+    /// Days are local to the asker (`utc_offset_min` east of UTC), counted
+    /// from 1970-01-01.
+    UsageReport {
+        #[serde(default)]
+        utc_offset_min: i32,
+        #[serde(default)]
+        from_day: Option<i64>,
+        #[serde(default)]
+        to_day: Option<i64>,
+    },
     /// Set one known setting (`ui.theme`, `harness.codex.default_model`…);
     /// `null` resets it (`Response::Text`).
     ChangeSetting {

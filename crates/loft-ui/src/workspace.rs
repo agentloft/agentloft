@@ -580,6 +580,10 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            Some(("click", spec)) => {
+                self.panel_open = false;
+                dev_click(spec.to_owned(), window, cx);
+            }
             Some(("viewkeys", spec)) => {
                 // `x,y,after_ms`: click a field of the thread's view, type
                 // "abc", press Cmd+A, type "z" (so the field holds "z" if
@@ -792,6 +796,10 @@ impl WorkspaceView {
             Some(("settings", section)) => {
                 let section = crate::settings::Section::parse(section);
                 crate::settings::open(self.store.clone(), section, cx);
+                // `AGENTLOFT_DEV_CLICK=x,y[,after_ms]`: then a click in it.
+                if let Ok(spec) = std::env::var("AGENTLOFT_DEV_CLICK") {
+                    dev_click(spec, window, cx);
+                }
             }
             Some(("attach", path)) => {
                 let paths = vec![std::path::PathBuf::from(path)];
@@ -4419,6 +4427,9 @@ impl WorkspaceView {
                                                         p,
                                                         window,
                                                         cx,
+                                                    ))
+                                                    .children(self.context_button(
+                                                        &thread_id, &harness, p, cx,
                                                     )),
                                             )
                                             .child(
@@ -4833,6 +4844,246 @@ impl WorkspaceView {
             .trigger(trigger)
             .content(move |_, _, _| picker.clone())
             .into_any_element()
+    }
+
+    /// A small ring by the model chip, filled as far as the agent's context
+    /// is; it opens the thread's numbers (context, tokens used, cost) and
+    /// the compact-when-idle switch. Nothing until a turn has reported any.
+    fn context_button(
+        &self,
+        thread_id: &ThreadId,
+        harness: &HarnessId,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use gpui_kit::component::Disableable as _;
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::popover::Popover;
+        let store = self.store.clone();
+        let id = thread_id.clone();
+        let stats = thread_stats(&store, &id, cx)?;
+        let fraction = stats.fraction();
+        let tip = match (fraction, stats.context) {
+            (Some(f), _) => format!("Context {}% full", (f * 100.).round() as i64),
+            (None, Some(c)) => format!("Context {} tokens", short_tokens(c.tokens)),
+            (None, None) => format!("{} tokens used", short_tokens(stats.total())),
+        };
+        let trigger = Button::new("context-ring")
+            .cursor_pointer()
+            .ghost()
+            .xsmall()
+            .compact()
+            .tooltip(tip)
+            .child(context_ring(
+                fraction.unwrap_or(0.),
+                context_color(fraction, p),
+                p.faint_foreground.opacity(0.45),
+            ));
+        let agent = harness_name(harness);
+        let compacts = crate::model_picker::can_compact(harness);
+        Some(
+            Popover::new("context-popover")
+                .anchor(gpui_kit::Anchor::BottomLeft)
+                .offset(px(8.))
+                .p_0()
+                .trigger(trigger)
+                .content(move |_, _, cx| {
+                    let p = Palette::of(cx);
+                    let stats = thread_stats(&store, &id, cx).unwrap_or_default();
+                    let fraction = stats.fraction();
+                    let color = context_color(fraction, &p);
+                    let numbers = match (stats.context, fraction) {
+                        (Some(c), Some(f)) => format!(
+                            "{}% · {} / {}",
+                            (f * 100.).round() as i64,
+                            short_tokens(c.tokens),
+                            short_tokens(c.window.unwrap_or_default())
+                        ),
+                        (Some(c), None) => format!("{} tokens", short_tokens(c.tokens)),
+                        (None, _) => "Not reported yet".into(),
+                    };
+                    let row = |label: &'static str, value: String, p: &Palette| {
+                        h_flex()
+                            .items_center()
+                            .text_xs()
+                            .child(div().flex_1().text_color(p.muted_foreground).child(label))
+                            .child(div().text_color(p.foreground).child(value))
+                    };
+                    let total = stats.total();
+                    let split = [
+                        (stats.input, "input"),
+                        (stats.cache_read, "cached"),
+                        (stats.cache_write, "cache write"),
+                        (stats.output, "output"),
+                    ]
+                    .iter()
+                    .filter(|(n, _)| *n > 0)
+                    .map(|(n, what)| format!("{} {what}", short_tokens(*n)))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                    v_flex()
+                        .w(px(300.))
+                        .rounded(px(12.))
+                        .overflow_hidden()
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .px_3()
+                                .py_2p5()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .text_sm()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child("Context window"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(p.muted_foreground)
+                                                .child(numbers),
+                                        ),
+                                )
+                                .when_some(fraction, |d, f| {
+                                    d.child(
+                                        div().h(px(6.)).w_full().rounded_full().bg(p.muted).child(
+                                            div()
+                                                .h_full()
+                                                .rounded_full()
+                                                .w(gpui_kit::relative(f.clamp(0., 1.)))
+                                                .bg(color),
+                                        ),
+                                    )
+                                })
+                                .when(compacts, |d| {
+                                    let busy = store
+                                        .read(cx)
+                                        .threads
+                                        .get(&id)
+                                        .and_then(|t| t.read(cx).model.as_ref())
+                                        .is_some_and(|m| {
+                                            m.thread.status != loft_protocol::ThreadStatus::Idle
+                                        });
+                                    let (store, id) = (store.clone(), id.clone());
+                                    let popover = cx.entity().downgrade();
+                                    d.child(
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_xs()
+                                                    .text_color(p.muted_foreground)
+                                                    .child(format!(
+                                                        "{agent} also compacts by itself when the context fills up."
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("context-compact-now")
+                                                    .cursor_pointer()
+                                                    .outline()
+                                                    .xsmall()
+                                                    .icon(IconName::FoldVertical)
+                                                    .label("Compact now")
+                                                    .disabled(busy)
+                                                    .tooltip(if busy {
+                                                        "Waits for the running turn to end"
+                                                    } else {
+                                                        "Summarize the conversation so far (/compact)"
+                                                    })
+                                                    .on_click(move |_, window, cx| {
+                                                        let id = id.clone();
+                                                        store.update(cx, |s, cx| {
+                                                            s.send_message(
+                                                                id,
+                                                                "/compact".into(),
+                                                                Vec::new(),
+                                                                cx,
+                                                            )
+                                                        });
+                                                        // Done here: close the popover.
+                                                        let _ = popover.update(cx, |s, cx| {
+                                                            s.dismiss(window, cx)
+                                                        });
+                                                    }),
+                                            ),
+                                    )
+                                }),
+                        )
+                        // What the thread has cost so far.
+                        .when(total > 0 || stats.cost.is_some(), |d| {
+                            d.child(
+                                v_flex()
+                                    .gap_1()
+                                    .px_3()
+                                    .py_2()
+                                    .border_t_1()
+                                    .border_color(p.border)
+                                    .when(total > 0, |d| {
+                                        d.child(row(
+                                            "Tokens used in this thread",
+                                            short_tokens(total),
+                                            &p,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(p.faint_foreground)
+                                                .child(split),
+                                        )
+                                    })
+                                    .when_some(stats.cost, |d, cost| {
+                                        d.child(row(
+                                            if stats.estimated {
+                                                "Cost (API estimate)"
+                                            } else {
+                                                "Cost"
+                                            },
+                                            format_cost(cost),
+                                            &p,
+                                        ))
+                                    })
+                                    .child({
+                                        let store = store.clone();
+                                        let popover = cx.entity().downgrade();
+                                        h_flex()
+                                            .id("context-usage-link")
+                                            .gap_1()
+                                            .items_center()
+                                            .pt_1()
+                                            .text_xs()
+                                            .text_color(p.accent)
+                                            .cursor_pointer()
+                                            .hover(|d| d.underline())
+                                            .child("All threads, by day, and plan limits")
+                                            .child(Icon::new(IconName::ChevronRight).xsmall())
+                                            .on_click(move |_, window, cx| {
+                                                let _ = popover
+                                                    .update(cx, |s, cx| s.dismiss(window, cx));
+                                                crate::settings::open(
+                                                    store.clone(),
+                                                    Some(crate::settings::Section::Usage),
+                                                    cx,
+                                                );
+                                            })
+                                    }),
+                            )
+                        })
+                        .when(compacts, |d| {
+                            d.child(crate::model_picker::compaction_row(
+                                &store,
+                                "context-compact",
+                                &p,
+                                cx,
+                            ))
+                        })
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_welcome(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -7189,6 +7440,196 @@ const SETTINGS_TEMPLATE: &str = r##"# Agentloft settings — changes apply live.
 # path = "auto"
 # default_permission_mode = "harness-default"
 "##;
+
+/// A thread's numbers over all its turns: how full the context is now,
+/// the tokens it has used, and what it has cost (when the agent says).
+#[derive(Default)]
+struct ThreadStats {
+    context: Option<loft_protocol::ContextUse>,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    cost: Option<f64>,
+    /// Some of the cost is an estimate at API prices.
+    estimated: bool,
+}
+
+impl ThreadStats {
+    fn total(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write + self.output
+    }
+
+    fn fraction(&self) -> Option<f32> {
+        let c = self.context?;
+        Some(c.tokens as f32 / c.window?.max(1) as f32)
+    }
+}
+
+fn thread_stats(
+    store: &Entity<AppStore>,
+    id: &ThreadId,
+    cx: &gpui_kit::App,
+) -> Option<ThreadStats> {
+    let prices = &store.read(cx).pricing;
+    let catalog = store.read(cx).price_catalog.clone();
+    let thread = store.read(cx).threads.get(id)?.read(cx);
+    let model = thread.model.as_ref()?;
+    let turns = &model.turns;
+    let mut stats = ThreadStats {
+        context: turns.iter().rev().find_map(|t| t.context),
+        ..Default::default()
+    };
+    // A window said once (Claude says it at a turn's end) still holds.
+    if let Some(c) = stats.context.as_mut()
+        && c.window.is_none()
+    {
+        c.window = turns.iter().rev().find_map(|t| t.context?.window);
+    }
+    for turn in turns {
+        let Some(u) = &turn.usage else { continue };
+        stats.input += u.input_tokens;
+        stats.cache_read += u.cache_read_tokens;
+        stats.cache_write += u.cache_write_tokens;
+        stats.output += u.output_tokens;
+        // The agent's own figure, else the tokens at the model's API price.
+        let estimate = || {
+            let name = turn.model.as_deref().or(model.thread.model.as_deref())?;
+            let context = turn.context.map(|c| c.tokens);
+            let p = loft_config::pricing::price(name, context, prices, catalog.as_deref())?;
+            stats.estimated = true;
+            Some(
+                (u.input_tokens as f64 * p.input
+                    + u.cache_read_tokens as f64 * p.cache_read
+                    + u.cache_write_tokens as f64 * p.cache_write
+                    + u.output_tokens as f64 * p.output)
+                    / 1e6,
+            )
+        };
+        if let Some(c) = u.cost_usd.or_else(estimate) {
+            *stats.cost.get_or_insert(0.) += c;
+        }
+    }
+    (stats.context.is_some() || stats.total() > 0 || stats.cost.is_some()).then_some(stats)
+}
+
+/// "$0.42", "$12.30", "<$0.01".
+fn format_cost(usd: f64) -> String {
+    if usd > 0. && usd < 0.01 {
+        "<$0.01".into()
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// The accent, amber past 75%, red past 90% (as when the agent is about
+/// to compact by itself).
+fn context_color(fraction: Option<f32>, p: &Palette) -> gpui_kit::Hsla {
+    match fraction {
+        Some(f) if f >= 0.9 => p.danger,
+        Some(f) if f >= 0.75 => p.warning,
+        _ => p.accent,
+    }
+}
+
+/// "230K", "1.2M".
+fn short_tokens(n: u64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 10_000 => format!("{}K", n / 1_000),
+        n if n >= 1_000 => format!("{:.1}K", n as f64 / 1e3),
+        n => n.to_string(),
+    }
+}
+
+/// A 14 px ring: the track, and an arc clockwise from the top to `fraction`.
+fn context_ring(fraction: f32, color: gpui_kit::Hsla, track: gpui_kit::Hsla) -> AnyElement {
+    use gpui_kit::{PathBuilder, point};
+    let fraction = fraction.clamp(0., 1.);
+    gpui_kit::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let r = (bounds.size.width.min(bounds.size.height) / 2.) - px(1.5);
+            let at = |turn: f32| {
+                let a = turn * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                point(center.x + r * a.cos(), center.y + r * a.sin())
+            };
+            let arc = |from: f32, to: f32| {
+                let steps = ((to - from) * 64.).ceil().max(1.) as usize;
+                let mut b = PathBuilder::stroke(px(2.));
+                b.move_to(at(from));
+                for i in 1..=steps {
+                    b.line_to(at(from + (to - from) * i as f32 / steps as f32));
+                }
+                b.build().ok()
+            };
+            if let Some(path) = arc(0., 1.) {
+                window.paint_path(path, track);
+            }
+            if fraction > 0.
+                && let Some(path) = arc(0., fraction.max(0.02))
+            {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size(px(14.))
+    .into_any_element()
+}
+
+/// Dev hook: one click at `x,y[,after_ms]` (logical pixels from the
+/// window's top left) in whichever window is active by then, through the
+/// window's own event handling: opens popovers and menus for a screenshot.
+fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>) {
+    let n: Vec<f32> = spec
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+    let position = gpui_kit::point(px(at(0, 10.)), px(at(1, 10.)));
+    let after = std::time::Duration::from_millis(at(2, 2500.) as u64);
+    cx.spawn_in(window, async move |_, cx| {
+        use gpui_kit::{
+            Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+        };
+        cx.background_executor().timer(after).await;
+        let Ok(Some(target)) = cx.update(|_, cx| cx.active_window()) else {
+            return;
+        };
+        let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+        for step in [
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers,
+            }),
+            PlatformInput::MouseDown(MouseDownEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }),
+            PlatformInput::MouseUp(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+            }),
+        ] {
+            let _ = cx.update(|_, cx| {
+                target.update(cx, |_, window, cx| {
+                    window.dispatch_event(step, cx);
+                })
+            });
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+        }
+    })
+    .detach();
+}
 
 #[cfg(test)]
 mod tests {
