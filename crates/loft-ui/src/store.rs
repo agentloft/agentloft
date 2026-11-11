@@ -227,6 +227,9 @@ pub enum StoreEvent {
     Browse { url: String },
     /// A transient message for the user (toast).
     Notify { message: String, error: bool },
+    /// Show (`Some`) or take down (`None`) the "working on it" toast of a
+    /// slow action, so its result doesn't sit beside a stale progress note.
+    Progress { message: Option<String> },
     /// Archiving needs confirmation (e.g. the worktree is dirty).
     ConfirmArchive { thread_id: ThreadId, reason: String },
     /// Put queued message `id` back in the composer to edit it.
@@ -1691,20 +1694,22 @@ impl AppStore {
     /// Push the worktree branch and open a PR with `gh`; opens it in the
     /// browser when done.
     pub fn create_pull_request(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        cx.emit(StoreEvent::Notify {
-            message: "Pushing and opening a pull request…".into(),
-            error: false,
+        cx.emit(StoreEvent::Progress {
+            message: Some("Pushing and opening a pull request…".into()),
         });
         self.request_result(
             Request::CreatePullRequest { thread_id },
             cx,
-            |store, result, cx| match result {
-                Ok(Response::Text { text: url }) => {
-                    cx.open_url(&url);
-                    store.notify_result(Ok(format!("Pull request: {url}")), cx);
+            |store, result, cx| {
+                cx.emit(StoreEvent::Progress { message: None });
+                match result {
+                    Ok(Response::Text { text: url }) => {
+                        cx.open_url(&url);
+                        store.notify_result(Ok(format!("Pull request: {url}")), cx);
+                    }
+                    Ok(_) => {}
+                    Err(err) => store.notify_result(Err(err), cx),
                 }
-                Ok(_) => {}
-                Err(err) => store.notify_result(Err(err), cx),
             },
         );
     }

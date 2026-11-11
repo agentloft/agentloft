@@ -404,6 +404,22 @@ impl WorkspaceView {
                 };
                 window.push_notification(note, cx);
             }
+            StoreEvent::Progress { message } => {
+                use gpui_kit::component::WindowExt as _;
+                use gpui_kit::component::notification::{Notification, NotificationType};
+                struct ProgressToast;
+                window.remove_notification::<ProgressToast>(cx);
+                if let Some(message) = message {
+                    window.push_notification(
+                        Notification::new()
+                            .message(message.clone())
+                            .id::<ProgressToast>()
+                            .with_type(NotificationType::Info)
+                            .autohide(false),
+                        cx,
+                    );
+                }
+            }
             StoreEvent::Browse { url } => {
                 self.panel_open = true;
                 self.panel
