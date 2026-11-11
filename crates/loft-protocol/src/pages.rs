@@ -29,6 +29,11 @@ pub struct PageInfo {
     /// A view with more content than its tallest size: it scrolls inside.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overflow: bool,
+    /// The pointer a view wants where the mouse is, as CSS names it
+    /// ("text", "pointer", "grab"…); empty for the ordinary arrow. The
+    /// viewer sees a picture, so its own pointer follows this.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cursor: String,
 }
 
 /// The app's look, as a view is told it (CSS variables and

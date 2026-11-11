@@ -607,6 +607,7 @@ impl Browser {
             scale,
             view: false,
             overflow: false,
+            cursor: String::new(),
         };
         let page = Arc::new(Page {
             id: info.id.clone(),

@@ -343,6 +343,7 @@ impl Browser {
             scale,
             view: true,
             overflow: false,
+            cursor: String::new(),
         };
         let now = Instant::now();
         let page = Arc::new(Page {
@@ -791,6 +792,22 @@ impl Browser {
                 }
                 lock(&view.inner).state = state.clone();
                 (view.keep)(&view.thread, &view.item, &state);
+                return;
+            }
+            Some("cursor") => {
+                // A CSS keyword, and nothing longer than one.
+                let wanted = match call["value"].as_str() {
+                    Some("default" | "auto") | None => "",
+                    Some(name) if name.len() <= 24 && name.is_ascii() => name,
+                    Some(_) => "",
+                };
+                let mut state = lock(&page.state);
+                if state.info.cursor != wanted {
+                    state.info.cursor = wanted.to_owned();
+                    let _ = self.bus.send(BusMsg::PageState {
+                        id: page.id.clone(),
+                    });
+                }
                 return;
             }
             Some("refused") => {
@@ -1259,6 +1276,74 @@ mod tests {
         rest(800).await;
         let landed = lock(&kept).last().cloned().unwrap_or_default();
         assert_eq!(landed["log"], Value::Array(aimed));
+        pages.shutdown().await;
+    }
+
+    /// A view says which pointer it wants where the mouse is: the viewer
+    /// has only a picture, and expects an I-beam over text all the same.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a real browser"]
+    async fn live_a_view_says_which_pointer_it_wants() {
+        use loft_protocol::{PageButton, PageInput, PageMouse};
+
+        const HTML: &str = "<p style=\"position:absolute;left:20px;top:20px;margin:0;\
+            font-size:30px\">Some words to select</p>\
+            <button style=\"position:absolute;left:20px;top:120px;width:200px;height:50px\">\
+            Press</button><div style=\"height:300px\"></div>";
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let (bus, _heard) = tokio::sync::broadcast::channel(4096);
+        let pages = Pages::default();
+        let request = ViewRequest {
+            thread: ThreadId::new(),
+            item: ItemId::new(),
+            html: HTML.to_owned(),
+            done: true,
+            width: 600,
+            scale: 1.0,
+            theme: Some(Theme::default()),
+            state: Value::Null,
+            keep: Arc::new(|_, _, _| {}),
+        };
+        let page = pages
+            .open_view(request, None, &profile, bus.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for (x, y, wanted) in [
+            (60.0, 38.0, "text"),
+            (120.0, 145.0, "pointer"),
+            (450.0, 250.0, ""),
+            (60.0, 38.0, "text"),
+        ] {
+            pages
+                .input(
+                    &page.id,
+                    PageInput::Mouse {
+                        action: PageMouse::Move,
+                        x,
+                        y,
+                        button: PageButton::None,
+                        click_count: 0,
+                        modifiers: 0,
+                    },
+                )
+                .unwrap();
+            let seen = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if pages.info(&page.id).unwrap().cursor == wanted {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                seen.is_ok(),
+                "at {x},{y} the view wants {:?}, not {wanted:?}",
+                pages.info(&page.id).unwrap().cursor
+            );
+        }
         pages.shutdown().await;
     }
 }

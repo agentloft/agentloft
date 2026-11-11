@@ -23,6 +23,8 @@
     document.removeEventListener("click", previous.onClick, false);
     document.removeEventListener("submit", previous.onSubmit, false);
     document.removeEventListener("load", previous.measure, true);
+    document.removeEventListener("mousemove", previous.onMove, true);
+    document.removeEventListener("mouseout", previous.onMove, true);
     clearInterval(previous.timer);
     if (previous.sizes) previous.sizes.disconnect();
   }
@@ -71,6 +73,44 @@
     if (!event.defaultPrevented) event.preventDefault();
   };
 
+  // The pointer the page wants where the mouse is. The viewer looks at a
+  // picture of the page, so their own pointer has to be told: an I-beam
+  // over text, a hand over a link, whatever the page's CSS asks for.
+  const cursorAt = (x, y) => {
+    const element = document.elementFromPoint(x, y);
+    if (!element) return "default";
+    const style = getComputedStyle(element);
+    // "url(hand.png) 4 4, pointer": the keyword at the end is the fallback.
+    const named = style.cursor.split(",").pop().trim();
+    if (named && named !== "auto") return named;
+    // `auto` is the browser's own choice: a hand on a link, an I-beam on
+    // text that can be selected, an arrow elsewhere.
+    if (element.closest("a[href]")) return "pointer";
+    if (element.isContentEditable) return "text";
+    if (style.userSelect === "none") return "default";
+    const caret = document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
+    const node = caret ? caret.startContainer : null;
+    if (node && node.nodeType === Node.TEXT_NODE) {
+      const run = document.createRange();
+      run.selectNodeContents(node);
+      for (const box of run.getClientRects()) {
+        if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) return "text";
+      }
+    }
+    return "default";
+  };
+  let pointer = "";
+  const onMove = (event) => {
+    // Leaving the page altogether arrives as a `mouseout` to nowhere.
+    const left = event.type === "mouseout";
+    if (left && event.relatedTarget) return;
+    const wanted = left ? "default" : cursorAt(event.clientX, event.clientY);
+    if (wanted !== pointer) {
+      pointer = wanted;
+      post({ kind: "cursor", value: wanted });
+    }
+  };
+
   let last = -1;
   let observed = null;
   let sizes = null;
@@ -103,7 +143,9 @@
   document.addEventListener("submit", onSubmit, false);
   // Images and fonts arriving change the height without a resize of ours.
   document.addEventListener("load", measure, true);
+  document.addEventListener("mousemove", onMove, true);
+  document.addEventListener("mouseout", onMove, true);
   const timer = setInterval(measure, 250);
-  world.__agentloftBridge = { onCall, onClick, onSubmit, measure, timer, sizes };
+  world.__agentloftBridge = { onCall, onClick, onSubmit, onMove, measure, timer, sizes };
   measure();
 })();

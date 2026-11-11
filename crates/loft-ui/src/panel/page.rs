@@ -96,6 +96,35 @@ impl Seen {
     }
 }
 
+/// The pointer for what CSS calls `cursor` (what a page asked for where the
+/// mouse is); the arrow for anything unknown.
+fn pointer_for(cursor: &str) -> gpui_kit::CursorStyle {
+    use gpui_kit::CursorStyle as C;
+    match cursor {
+        "pointer" => C::PointingHand,
+        "text" => C::IBeam,
+        "vertical-text" => C::IBeamCursorForVerticalLayout,
+        "crosshair" => C::Crosshair,
+        "grab" | "move" | "all-scroll" => C::OpenHand,
+        "grabbing" => C::ClosedHand,
+        "not-allowed" | "no-drop" => C::OperationNotAllowed,
+        "copy" => C::DragCopy,
+        "alias" => C::DragLink,
+        "context-menu" => C::ContextualMenu,
+        "col-resize" => C::ResizeColumn,
+        "row-resize" => C::ResizeRow,
+        "ew-resize" => C::ResizeLeftRight,
+        "ns-resize" => C::ResizeUpDown,
+        "e-resize" => C::ResizeRight,
+        "w-resize" => C::ResizeLeft,
+        "n-resize" => C::ResizeUp,
+        "s-resize" => C::ResizeDown,
+        "nwse-resize" | "nw-resize" | "se-resize" => C::ResizeUpLeftDownRight,
+        "nesw-resize" | "ne-resize" | "sw-resize" => C::ResizeUpRightDownLeft,
+        _ => C::Arrow,
+    }
+}
+
 /// Whether a request failed because the connection to the daemon ended,
 /// rather than because of what was asked.
 fn lost_connection(err: &loft_protocol::ErrorBody) -> bool {
@@ -502,6 +531,13 @@ impl PageView {
         if self.view.is_some() && self.last_height != Some(page.height) {
             self.last_height = Some(page.height);
             cx.emit(PageResized);
+        }
+        if self
+            .info
+            .as_ref()
+            .is_some_and(|old| old.cursor != page.cursor)
+        {
+            tracing::debug!(cursor = %page.cursor, "the page wants another pointer");
         }
         self.info = Some(page);
         self.note = None;
@@ -1257,6 +1293,10 @@ impl PageView {
             .w_full()
             .h(px(height as f32))
             .overflow_hidden()
+            // The pointer the page wants here: it is a picture to us.
+            .cursor(pointer_for(
+                self.info.as_ref().map_or("", |info| info.cursor.as_str()),
+            ))
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key_down))
@@ -1555,6 +1595,18 @@ mod tests {
         assert!(seen.in_sight());
         draw(7);
         assert!(!seen.in_sight());
+    }
+
+    #[test]
+    fn a_pages_cursor_becomes_the_viewers_pointer() {
+        use gpui_kit::CursorStyle as C;
+        assert_eq!(pointer_for("text"), C::IBeam);
+        assert_eq!(pointer_for("pointer"), C::PointingHand);
+        assert_eq!(pointer_for("grabbing"), C::ClosedHand);
+        assert_eq!(pointer_for("col-resize"), C::ResizeColumn);
+        // The ordinary arrow: nothing asked for, or nothing we know.
+        assert_eq!(pointer_for(""), C::Arrow);
+        assert_eq!(pointer_for("zoom-in"), C::Arrow);
     }
 
     #[test]
