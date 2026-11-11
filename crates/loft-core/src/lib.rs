@@ -151,6 +151,10 @@ pub struct Core {
     pending_setup: Mutex<HashMap<ThreadId, String>>,
     /// File lists per directory for `FindFiles`, briefly cached.
     file_index: Mutex<HashMap<PathBuf, FileIndex>>,
+    /// Held while a directory is walked for `file_index`, so that the key
+    /// presses that arrive meanwhile wait for that walk instead of each
+    /// starting another.
+    file_walk: tokio::sync::Mutex<()>,
     /// Bumped whenever the live config is replaced.
     config_rev: tokio::sync::watch::Sender<u64>,
     /// Model prices fetched from models.dev (the daemon refreshes them).
@@ -186,6 +190,7 @@ impl Core {
             commands: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
             file_index: Mutex::new(HashMap::new()),
+            file_walk: tokio::sync::Mutex::new(()),
             config_rev: tokio::sync::watch::channel(0).0,
             price_catalog: std::sync::RwLock::new(None),
             opts,
@@ -323,10 +328,20 @@ impl Core {
     /// Every file under `dir` (gitignore-aware, ≤100k), cached for 15 s so
     /// typing `@…` doesn't rewalk the tree on each keystroke.
     async fn file_index(&self, dir: PathBuf) -> CoreResult<Arc<Vec<String>>> {
-        if let Some((at, files)) = lock(&self.file_index).get(&dir)
-            && at.elapsed() < Duration::from_secs(15)
-        {
-            return Ok(files.clone());
+        const FRESH: Duration = Duration::from_secs(15);
+        let cached = |dir: &PathBuf| {
+            lock(&self.file_index)
+                .get(dir)
+                .filter(|(at, _)| at.elapsed() < FRESH)
+                .map(|(_, files)| files.clone())
+        };
+        if let Some(files) = cached(&dir) {
+            return Ok(files);
+        }
+        let _walking = self.file_walk.lock().await;
+        // Whoever held the lock may have walked this very directory.
+        if let Some(files) = cached(&dir) {
+            return Ok(files);
         }
         let d = dir.clone();
         let files = Arc::new(
@@ -334,7 +349,11 @@ impl Core {
                 .await
                 .map_err(internal)?,
         );
-        lock(&self.file_index).insert(dir, (std::time::Instant::now(), files.clone()));
+        let mut index = lock(&self.file_index);
+        // Lists nobody will be given again (every worktree is a directory of
+        // its own, and a list can be 100k paths) are let go.
+        index.retain(|_, (at, _)| at.elapsed() < FRESH);
+        index.insert(dir, (std::time::Instant::now(), files.clone()));
         Ok(files)
     }
 
@@ -670,10 +689,7 @@ impl Core {
         let live = self.live().get(item).cloned();
         let found = match live {
             Some(found) => Some(found),
-            None => self
-                .with_store(|s| s.items(thread))?
-                .into_iter()
-                .find(|i| &i.id == item),
+            None => self.with_store(|s| s.item(thread, item))?,
         };
         let not_a_view = || ErrorBody::new(ErrorCode::NotFound, "That isn't a view.");
         let found = found

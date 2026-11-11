@@ -353,7 +353,7 @@ impl Core {
             return Ok(Vec::new());
         }
         let (threads, items) =
-            self.with_store(|s| Ok((s.threads()?, s.items_mentioning(query)?)))?;
+            self.with_store(|s| Ok((s.threads()?, s.messages_mentioning(query)?)))?;
         let mut hits: std::collections::HashMap<ThreadId, loft_protocol::SearchHit> =
             Default::default();
         for item in items {
@@ -393,33 +393,39 @@ impl Core {
 
     /// Where a thread stands, for the agent orchestrating it.
     pub(crate) fn thread_outcome(&self, id: &ThreadId) -> CoreResult<serde_json::Value> {
-        let (thread, turns, items) =
-            self.with_store(|s| Ok((s.thread(id)?, s.turns(id)?, s.items(id)?)))?;
-        let thread =
-            thread.ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
-        // The latest answer: the last top-level agent message.
-        const MAX: usize = 20_000;
-        let reply = items
-            .iter()
-            .rev()
-            .filter(|i| i.parent_id.is_none())
-            .find_map(|i| match &i.body {
-                ItemBody::AssistantMessage { text } if !text.trim().is_empty() => {
-                    Some(text.clone())
+        // Asked once a second for every thread an agent is waiting on, so
+        // the items are not read whole: only back to the latest answer.
+        let (thread, turns, reply, last_activity) = self.with_store(|s| {
+            // The latest answer: the last top-level agent message.
+            let reply = s.find_item_newest_first(id, |i| match i.body {
+                ItemBody::AssistantMessage { text }
+                    if i.parent_id.is_none() && !text.trim().is_empty() =>
+                {
+                    Some(text)
                 }
                 _ => None,
-            })
-            .map(|t| {
-                if t.len() > MAX {
-                    let mut end = MAX;
-                    while !t.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}\n[truncated]", &t[..end])
-                } else {
-                    t
+            })?;
+            Ok((
+                s.thread(id)?,
+                s.turns(id)?,
+                reply,
+                s.last_item_update_ms(id)?,
+            ))
+        })?;
+        let thread =
+            thread.ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
+        const MAX: usize = 20_000;
+        let reply = reply.map(|t| {
+            if t.len() > MAX {
+                let mut end = MAX;
+                while !t.is_char_boundary(end) {
+                    end -= 1;
                 }
-            });
+                format!("{}\n[truncated]", &t[..end])
+            } else {
+                t
+            }
+        });
         let status = match thread.status {
             _ if thread.is_waiting() => "waiting_on_background_work",
             loft_protocol::ThreadStatus::Running => "running",
@@ -435,7 +441,6 @@ impl Core {
             .filter_map(|t| t.usage.as_ref()?.cost_usd)
             .collect();
         let total_cost = (!costs.is_empty()).then(|| round2(costs.iter().sum()));
-        let last_activity = items.iter().map(|i| i.updated_at_ms).max();
         Ok(serde_json::json!({
             "thread_id": thread.id,
             "title": thread.title,

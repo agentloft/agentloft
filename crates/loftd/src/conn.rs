@@ -134,6 +134,14 @@ fn quiet_op(op: &str) -> bool {
             | "search_threads"
             | "git_hub_login"
             | "agent_info"
+            // Every few seconds from each open tab, and once per key press,
+            // pointer move or window resize: opening the terminal or the
+            // page they go to is what gets the line.
+            | "ui_files"
+            | "terminal_input"
+            | "terminal_resize"
+            | "page_input"
+            | "page_resize"
     )
 }
 

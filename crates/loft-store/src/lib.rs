@@ -6,7 +6,7 @@
 
 use anyhow::{Context as _, Result};
 use loft_protocol::{
-    Event, EventEnvelope, Item, Project, ProjectId, RuntimeRequest, Thread, ThreadId, Turn,
+    Event, EventEnvelope, Item, ItemId, Project, ProjectId, RuntimeRequest, Thread, ThreadId, Turn,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -273,10 +273,51 @@ impl Store {
         )
     }
 
-    /// Items whose stored form mentions `text` (case-insensitive for
-    /// ASCII), in timeline order per thread. A coarse prefilter: callers
-    /// check the fields they care about.
-    pub fn items_mentioning(&self, text: &str) -> Result<Vec<Item>> {
+    /// One item of a thread, by id.
+    pub fn item(&self, thread: &ThreadId, id: &ItemId) -> Result<Option<Item>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT data FROM items WHERE id = ?1 AND thread_id = ?2")?;
+        let data: Option<String> = stmt
+            .query_row([id.as_str(), thread.as_str()], |r| r.get(0))
+            .optional()?;
+        data.map(|d| serde_json::from_str(&d).map_err(Into::into))
+            .transpose()
+    }
+
+    /// A thread's items from the newest back, one at a time, until `pick`
+    /// takes one: "the last …" without reading the whole thread.
+    pub fn find_item_newest_first<T>(
+        &self,
+        thread: &ThreadId,
+        mut pick: impl FnMut(Item) -> Option<T>,
+    ) -> Result<Option<T>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT data FROM items WHERE thread_id = ?1 ORDER BY ordinal DESC")?;
+        let mut rows = stmt.query([thread.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let item: Item = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+            if let Some(found) = pick(item) {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// When any of a thread's items last changed.
+    pub fn last_item_update_ms(&self, thread: &ThreadId) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT MAX(json_extract(data, '$.updated_at_ms')) FROM items WHERE thread_id = ?1",
+        )?;
+        Ok(stmt.query_row([thread.as_str()], |r| r.get(0))?)
+    }
+
+    /// Messages (yours and the agent's) whose stored form mentions `text`
+    /// (case-insensitive for ASCII), in timeline order per thread. A coarse
+    /// prefilter: callers check the text itself. Only messages are read out:
+    /// tool calls match most short searches and hold most of the bytes.
+    pub fn messages_mentioning(&self, text: &str) -> Result<Vec<Item>> {
         // Match the text as it appears inside the JSON (quotes, newlines
         // and backslashes are escaped there), as a literal LIKE pattern.
         let json = serde_json::to_string(text)?;
@@ -290,7 +331,9 @@ impl Store {
         }
         pattern.push('%');
         self.query_data(
-            "SELECT data FROM items WHERE data LIKE ?1 ESCAPE '|' ORDER BY thread_id, ordinal",
+            "SELECT data FROM items WHERE data LIKE ?1 ESCAPE '|'
+               AND json_extract(data, '$.body.kind') IN ('user_message', 'assistant_message')
+             ORDER BY thread_id, ordinal",
             [pattern],
         )
     }

@@ -186,7 +186,10 @@ impl ThreadActor {
                     Some(event) => self.on_harness_event(event),
                     None => self.on_session_lost(None, String::new()),
                 },
-                _ = flush.tick() => self.flush_dirty(),
+                // Only while there is live text to save: an idle thread's
+                // actor sleeps until a command or an event, instead of
+                // waking four times a second for as long as the daemon runs.
+                _ = flush.tick(), if !self.dirty.is_empty() => self.flush_dirty(),
             }
             if self.restart_session && self.turn.is_none() && self.pending_start.is_none() {
                 self.restart_session = false;
@@ -1578,11 +1581,7 @@ impl ThreadActor {
     }
 
     fn load_item(&self, id: &ItemId) -> CoreResult<Option<Item>> {
-        Ok(self
-            .core
-            .with_store(|s| s.items(&self.thread.id))?
-            .into_iter()
-            .find(|i| &i.id == id))
+        self.core.with_store(|s| s.item(&self.thread.id, id))
     }
 
     fn find_open_request(&self, native: &str) -> CoreResult<Option<RuntimeRequest>> {
