@@ -1039,7 +1039,7 @@ fn reasoning_summary(text: &str) -> Option<String> {
 
 // -- tool activity -----------------------------------------------------------
 
-fn render_tool_group(
+pub(crate) fn render_tool_group(
     thread: &Entity<ThreadState>,
     store: &Entity<AppStore>,
     state: &ThreadState,

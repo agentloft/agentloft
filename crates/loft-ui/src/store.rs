@@ -2377,17 +2377,8 @@ impl ThreadState {
         let mut rows = Vec::with_capacity(model.items.len());
         let items = &model.items;
         // Subagent activity lives in its own panel tab, not the main timeline.
-        // Claude's internal deferred-tool loading is noise in the timeline, and
-        // a finished thought with nothing to show is just a blank row.
-        let hidden = |i: usize| match &items[i].body {
-            ItemBody::ToolCall { tool, .. } => tool == "ToolSearch",
-            ItemBody::Reasoning { text } => {
-                text.trim().is_empty() && items[i].status != ItemStatus::InProgress
-            }
-            _ => false,
-        };
         let top: Vec<usize> = (0..items.len())
-            .filter(|&i| items[i].parent_id.is_none() && !hidden(i))
+            .filter(|&i| items[i].parent_id.is_none() && !is_noise(&items[i]))
             .collect();
         let mut k = 0;
         while k < top.len() {
@@ -2939,9 +2930,21 @@ pub(crate) fn agent_running(
     }
 }
 
+/// Left out of timelines: Claude's internal deferred-tool loading, and a
+/// finished thought with nothing to show (just a blank row).
+pub(crate) fn is_noise(item: &loft_protocol::Item) -> bool {
+    match &item.body {
+        ItemBody::ToolCall { tool, .. } => tool == "ToolSearch",
+        ItemBody::Reasoning { text } => {
+            text.trim().is_empty() && item.status != ItemStatus::InProgress
+        }
+        _ => false,
+    }
+}
+
 /// Rows for a list of top-level items: consecutive tool calls fold into
 /// one group row; consecutive agents share an agents card.
-fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
+pub(crate) fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
     let is_subagent = |i: usize| is_agent(&items[i]);
     // Questions, plans and views stand on their own, not in a tool group.
     let is_tool = |i: usize| {

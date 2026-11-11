@@ -1,8 +1,9 @@
 //! Subagent view: one Task/Agent tool call's own activity — its prompt, the
 //! tools it ran, its messages, and the report it returned.
 
-use crate::items::{render_item, tool_line};
+use crate::items::{render_item, render_tool_group};
 use crate::store::AppStore;
+use crate::store::Row;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::spinner::Spinner;
@@ -13,7 +14,7 @@ use gpui_kit::{
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use loft_protocol::{ItemBody, ItemId, ItemStatus, ThreadId};
+use loft_protocol::{Item, ItemBody, ItemId, ItemStatus, ThreadId};
 
 pub struct AgentView {
     store: Entity<AppStore>,
@@ -118,20 +119,36 @@ impl Render for AgentView {
         let state = thread.read(cx);
         let model = state.model.as_ref().expect("checked above");
         let cwd = model.thread.cwd.clone();
-        let mut activity = v_flex().gap_2();
+        // The agent's steps, grouped like the main timeline: runs of tool
+        // calls fold into one summary row. A thought with nothing to show
+        // isn't drawn, but still ends a run, so the steps read in order.
+        let mut rows = Vec::new();
+        let mut run = Vec::new();
         let mut count = 0;
-        for item in model
-            .items
-            .iter()
-            .filter(|i| i.parent_id.as_ref() == Some(&self.item_id))
-        {
-            count += 1;
-            activity = activity.child(match &item.body {
-                ItemBody::ToolCall { .. } => {
-                    tool_line(&thread, &self.store, state, model, item, &p, cx)
+        for (ix, item) in model.items.iter().enumerate() {
+            if item.parent_id.as_ref() != Some(&self.item_id) {
+                continue;
+            }
+            if crate::store::is_noise(item) {
+                crate::store::push_runs(&mut rows, &model.items, &run);
+                run.clear();
+            } else {
+                count += 1;
+                run.push(ix);
+            }
+        }
+        crate::store::push_runs(&mut rows, &model.items, &run);
+        let mut activity = v_flex().gap(p.row_gap);
+        for row in rows {
+            let el = match row {
+                Row::ToolGroup { members } => {
+                    let items: Vec<&Item> = members.iter().map(|i| &model.items[*i]).collect();
+                    render_tool_group(&thread, &self.store, state, model, &items, &p, cx)
                 }
-                _ => render_item(&thread, state, item, &p),
-            });
+                Row::Item(i) => render_item(&thread, state, &model.items[i], &p),
+                _ => continue,
+            };
+            activity = activity.child(el);
         }
 
         let header = h_flex()
@@ -239,8 +256,14 @@ impl Render for AgentView {
             .id("agent-scroll")
             .size_full()
             .overflow_y_scroll()
+            .flex()
+            .justify_center()
+            .items_start()
+            // The main thread's reading column, not the panel's full width.
             .child(
                 v_flex()
+                    .w_full()
+                    .max_w(p.content_width)
                     .p_4()
                     .pb_10()
                     .gap_3()
