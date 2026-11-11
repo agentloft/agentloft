@@ -70,10 +70,15 @@ fn main() {
     let submodule = repo_root.join("third_party").join("ghostty");
     // The gitlink file changes when the submodule moves to another commit.
     // Never watch the source files themselves: a checkout touches mtimes.
+    // Only watch it if it exists: Cargo counts a missing watched file as
+    // changed, which would rerun this script (and rebuild everything that
+    // links libghostty-vt) on every build in a checkout without the submodule.
     let gitlink = submodule.join(".git");
-    println!("cargo:rerun-if-changed={}", gitlink.display());
-    if let Some(head) = submodule_head(&gitlink) {
-        println!("cargo:rerun-if-changed={}", head.display());
+    if gitlink.exists() {
+        println!("cargo:rerun-if-changed={}", gitlink.display());
+        if let Some(head) = submodule_head(&gitlink) {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
     }
 
     let lock = Lock::read(&manifest_dir.join("GHOSTTY.lock"));
