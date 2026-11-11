@@ -1894,7 +1894,11 @@ async fn a_background_subagent_is_open_until_it_finishes() {
         );
     }
 
+    // The turn is over, but an update would take the agents down with the
+    // daemon: it waits for them.
+    assert!(f.core.is_busy());
     wait_for(&f.core, &thread.id, |t, _| t.waiting_on.is_empty()).await;
+    assert!(!f.core.is_busy());
     let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
     for agent in agents(&items) {
         assert_eq!(agent.status, ItemStatus::Completed);

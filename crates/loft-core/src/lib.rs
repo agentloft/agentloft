@@ -1585,10 +1585,15 @@ impl Core {
         }
     }
 
-    /// Whether any thread currently has a running turn (upgrade gating).
+    /// Whether any agent is at work (upgrade gating): a thread has a
+    /// running turn, or is waiting on work its agent left going in the
+    /// background (subagents, shells), which would die with the daemon.
     pub fn is_busy(&self) -> bool {
-        self.with_store(|s| Ok(!s.running_turns()?.is_empty()))
-            .unwrap_or(true)
+        self.with_store(|s| {
+            Ok(!s.running_turns()?.is_empty()
+                || s.threads()?.iter().any(|t| !t.waiting_on.is_empty()))
+        })
+        .unwrap_or(true)
     }
 
     pub(crate) fn record_process(&self, pid: u32, kind: &str, thread: &ThreadId) {
