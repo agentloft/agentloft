@@ -386,6 +386,9 @@ impl Pages {
                 before == 1 && state.viewers == 0,
             )
         };
+        if start || stop {
+            tracing::debug!(page = %id.0, watched = start, "a page's first watcher came or its last one left");
+        }
         if start {
             browser.start_pictures(&page).await;
         } else if stop {

@@ -4538,6 +4538,7 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::panel::page::frame_drawn(window);
         let p = Palette::of(cx);
         if std::mem::take(&mut self.pending_add_project) {
             cx.defer_in(window, |this, window, cx| {

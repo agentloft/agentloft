@@ -52,6 +52,50 @@ impl gpui_kit::EventEmitter<PageResized> for PageView {}
 struct Initialized;
 impl gpui_kit::Global for Initialized {}
 
+thread_local! {
+    /// How many frames each window has drawn, by window id.
+    static FRAMES: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        std::cell::RefCell::default();
+}
+
+/// A window is drawing a frame: its root view says so, once per frame.
+///
+/// A view's page is let go when it is out of sight, and "not painted for a
+/// while" doesn't say that: a window where nothing changes paints nothing,
+/// with the view in the middle of it. What says it is the window drawing
+/// frames the view is not in.
+pub fn frame_drawn(window: &Window) {
+    let id = window.window_handle().window_id().as_u64();
+    FRAMES.with(|frames| *frames.borrow_mut().entry(id).or_default() += 1);
+}
+
+/// The frame a view's page was last painted in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Seen {
+    window: u64,
+    frame: u64,
+}
+
+impl Seen {
+    fn now(window: &Window) -> Self {
+        let window = window.window_handle().window_id().as_u64();
+        Self {
+            window,
+            frame: Self::latest(window),
+        }
+    }
+
+    fn latest(window: u64) -> u64 {
+        FRAMES.with(|frames| frames.borrow().get(&window).copied().unwrap_or(0))
+    }
+
+    /// Whether that is still the last frame its window drew: the view is on
+    /// screen, however long ago that was.
+    fn in_sight(self) -> bool {
+        Self::latest(self.window) == self.frame
+    }
+}
+
 fn init(cx: &mut App) {
     if cx.has_global::<Initialized>() {
         return;
@@ -115,8 +159,8 @@ pub struct PageView {
     themed: Option<ViewTheme>,
     /// The height a view's page last had: what it keeps while reopening.
     last_height: Option<u32>,
-    /// When the page was last painted.
-    seen: Rc<Cell<Option<Instant>>>,
+    /// The frame of its window the page was last painted in.
+    seen: Rc<Cell<Option<Seen>>>,
     /// Lets go of a view's page once it has gone unseen.
     resting: Option<Task<()>>,
     /// Whether a view's page is the top of its card (no title over it),
@@ -487,13 +531,19 @@ impl PageView {
     /// and drawing it again opens the page again.
     fn rest_when_unseen(&mut self, cx: &mut Context<Self>) {
         self.resting = Some(cx.spawn(async move |this, cx| {
+            // Since when the window has been drawing without the view.
+            let mut gone: Option<Instant> = None;
             loop {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
                 let resting = this.update(cx, |this, cx| {
                     let Some(info) = &this.info else {
                         return true;
                     };
-                    if this.seen.get().is_some_and(|at| at.elapsed() < VIEW_UNSEEN) {
+                    if this.seen.get().is_some_and(Seen::in_sight) {
+                        gone = None;
+                        return false;
+                    }
+                    if gone.get_or_insert_with(Instant::now).elapsed() < VIEW_UNSEEN {
                         return false;
                     }
                     let id = info.id.clone();
@@ -1170,8 +1220,8 @@ impl PageView {
             .child(body)
             .child(
                 canvas(
-                    move |area, _, cx| {
-                        seen.set(Some(Instant::now()));
+                    move |area, window, cx| {
+                        seen.set(Some(Seen::now(window)));
                         // Its width is known from here on: open, or resize.
                         let before = bounds.replace(Some(area));
                         if before.is_none_or(|b| b.size.width != area.size.width) {
@@ -1412,6 +1462,23 @@ mod tests {
             d(stroke("é", Some("é"), plain)),
             ("é".into(), String::new())
         );
+    }
+
+    #[test]
+    fn a_view_is_out_of_sight_only_once_its_window_draws_without_it() {
+        let draw = |window: u64| FRAMES.with(|f| *f.borrow_mut().entry(window).or_default() += 1);
+        draw(7);
+        let seen = Seen {
+            window: 7,
+            frame: Seen::latest(7),
+        };
+        // Nothing drawn since: it is still on screen, however long that is.
+        assert!(seen.in_sight());
+        // Another window drawing says nothing about this one.
+        draw(8);
+        assert!(seen.in_sight());
+        draw(7);
+        assert!(!seen.in_sight());
     }
 
     #[test]
