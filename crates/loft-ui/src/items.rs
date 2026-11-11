@@ -1309,7 +1309,24 @@ pub(crate) fn tool_line(
         .flatten()
         .map(|f| relative_to(f, cwd))
         .filter(|f| !f.starts_with('/'));
-    let open = file.is_none() && output.is_some() && state.is_expanded(&item.id, false);
+    // A shell command: coloured, and shown whole when opened.
+    let command = (*tool_kind == ToolKind::Command)
+        .then(|| match input.get("command") {
+            Some(serde_json::Value::String(c)) => Some(c.clone()),
+            Some(serde_json::Value::Array(parts)) => Some(
+                parts
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .filter(|c| !c.trim().is_empty());
+    let open = file.is_none()
+        && (output.is_some() || command.is_some())
+        && state.is_expanded(&item.id, false);
     let mut detail = relative_to(
         title.strip_prefix(&format!("{tool} ")).unwrap_or(title),
         cwd,
@@ -1380,7 +1397,15 @@ pub(crate) fn tool_line(
             plain = true;
         }
     }
-    let clickable = file.is_some() || output.is_some();
+    let clickable = file.is_some() || output.is_some() || command.is_some();
+    let detail_text = if command.is_some() && !plain {
+        let highlights = crate::shell_highlight::highlights(&detail, cx);
+        gpui_kit::StyledText::new(detail)
+            .with_highlights(highlights)
+            .into_any_element()
+    } else {
+        detail.into_any_element()
+    };
 
     let row = h_flex()
         .id(SharedString::from(format!("tool-{}", item.id)))
@@ -1410,7 +1435,7 @@ pub(crate) fn tool_line(
                 } else {
                     p.muted_foreground
                 })
-                .child(detail),
+                .child(detail_text),
         )
         .when(declined, |d| {
             d.child(div().text_xs().text_color(p.warning).child("denied"))
@@ -1440,24 +1465,23 @@ pub(crate) fn tool_line(
     v_flex()
         .gap_1()
         .child(row)
-        .when_some(output.filter(|_| open), |d, out| {
-            let lines: Vec<&str> = out.lines().collect();
-            let shown = lines
-                .iter()
-                .take(OUTPUT_PREVIEW_LINES)
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n");
-            let more = lines.len().saturating_sub(OUTPUT_PREVIEW_LINES);
-            d.child(
+        .when(open, |d| {
+            let command = command.map(|c| {
+                let highlights = crate::shell_highlight::highlights(&c, cx);
+                div()
+                    .text_color(p.foreground)
+                    .child(gpui_kit::StyledText::new(c).with_highlights(highlights))
+            });
+            let output = output.map(|out| {
+                let lines: Vec<&str> = out.lines().collect();
+                let shown = lines
+                    .iter()
+                    .take(OUTPUT_PREVIEW_LINES)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let more = lines.len().saturating_sub(OUTPUT_PREVIEW_LINES);
                 v_flex()
-                    .ml(px(20.))
-                    .px_3()
-                    .py_2()
-                    .rounded(px(8.))
-                    .bg(p.muted)
-                    .font_family(p.mono.clone())
-                    .text_size(p.mono_size)
                     .text_color(if failed { p.danger } else { p.muted_foreground })
                     .child(shown)
                     .when(more > 0, |d| {
@@ -1467,7 +1491,20 @@ pub(crate) fn tool_line(
                                 .text_color(p.faint_foreground)
                                 .child(format!("… {more} more lines")),
                         )
-                    }),
+                    })
+            });
+            d.child(
+                v_flex()
+                    .ml(px(20.))
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .rounded(px(8.))
+                    .bg(p.muted)
+                    .font_family(p.mono.clone())
+                    .text_size(p.mono_size)
+                    .children(command)
+                    .children(output),
             )
         })
         .into_any_element()
