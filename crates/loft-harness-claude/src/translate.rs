@@ -331,6 +331,24 @@ impl Translator {
     }
 
     pub fn on_value(&mut self, v: &Value) -> Vec<Out> {
+        // Claude answering with no turn open has started one itself: a
+        // background task that finished as a turn ended comes back to it
+        // as a message of Claude's own. A background subagent's steps carry
+        // a parent and may come after the turn; they don't start one.
+        let mut out = Vec::new();
+        if !self.turn_active
+            && matches!(str_at(v, "type"), Some("stream_event" | "assistant"))
+            && str_at(v, "parent_tool_use_id").is_none()
+        {
+            self.turn_active = true;
+            self.interrupt_requested = false;
+            out.push(Out::Event(HarnessEvent::TurnStarted));
+        }
+        out.extend(self.dispatch(v));
+        out
+    }
+
+    fn dispatch(&mut self, v: &Value) -> Vec<Out> {
         match str_at(v, "type") {
             Some("system") => self.on_system(v),
             Some("stream_event") => {
@@ -1489,6 +1507,29 @@ mod tests {
             t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"y"}}"#);
         assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
         assert!(t.turn_active());
+    }
+
+    #[test]
+    fn claude_going_on_by_itself_after_a_turn_opens_a_new_one() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"x"}}"#);
+        assert!(completed(&t.on_line(RESULT)));
+        // A background subagent's step after the turn doesn't start one.
+        let sub = t.on_line(
+            r#"{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"message_start"}}"#,
+        );
+        assert!(events(&sub).is_empty());
+        assert!(!t.turn_active());
+        // A background command finished as the turn ended: Claude takes
+        // its notification in and answers it unprompted.
+        let out = t.on_line(
+            r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start"}}"#,
+        );
+        assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
+        assert!(t.turn_active());
+        assert!(completed(&t.on_line(RESULT)));
+        assert!(!t.turn_active());
     }
 
     #[test]
