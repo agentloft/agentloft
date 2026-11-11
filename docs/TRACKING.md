@@ -25,6 +25,8 @@ Infrastructure:
 - [x] `deny.toml` dependency policy (ADR-0009)
 - [x] CONTRIBUTING (DCO), PR and issue templates
 - [x] Branch protection on `main`: PR + 3 required checks, no force-push
+- [x] Build speed (2026-11-11): one build of each dependency whatever the cargo command (`crates/workspace-hack`, written by cargo-hakari; loft-terminal's view tests behind `--features test-support`; build scripts with line tables), and libghostty-vt built once per machine. In a new worktree with no compiler cache: build 88 → 56 s, `clippy --workspace --all-targets` 55 → 21 s, test compile 50 → 8 s, the first `clippy -p loft-ui` 42 → 1 s; target after all of it 14 → 7.5 GB. How to keep it: CONTRIBUTING, "Keeping builds fast"
+- [x] Running cost (2026-11-11, release build, 20 threads, app in front): a turn in progress took 38% of a CPU core for redrawing the window at every display refresh, now 24.5% (looping animations at 60 and 25 frames a second); background subagents 10.6 → 3.9%; idle 0%. A work-tree snapshot (before and after each turn) reads only changed files: 1.2 → 0.46 s in a 12,000-file repository. What remains: every frame is still the whole window, since nothing is drawn as a cached view
 
 ## M0.5: Design pass — "professional UI" (in progress, branch `m0.5/design`)
 
