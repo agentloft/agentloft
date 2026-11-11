@@ -157,6 +157,11 @@ pub struct WorkspaceView {
     /// The floating mini browser, shown when an agent drives the browser
     /// while the panel isn't showing it.
     browser_preview: bool,
+    /// Where the mini browser was dragged to, as its distance from the
+    /// conversation's right and bottom edges (`None`: its usual corner).
+    browser_preview_at: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+    /// The conversation's size as last laid out (the mini browser stays in it).
+    preview_room: std::rc::Rc<std::cell::Cell<gpui_kit::Size<gpui_kit::Pixels>>>,
     /// Whether we listen to the browser's events yet (annotations).
     /// The composer's model picker (for the selected thread) and whether
     /// it's open.
@@ -296,6 +301,8 @@ impl WorkspaceView {
             completion_seq: 0,
             pending_add_project: false,
             browser_preview: false,
+            browser_preview_at: None,
+            preview_room: Default::default(),
             model_picker: None,
             picker_open: false,
             branch_picker: None,
@@ -3713,6 +3720,23 @@ impl WorkspaceView {
             .relative()
             .flex_1()
             .min_h_0()
+            // Dragging the mini browser by its title bar moves it, kept
+            // inside the conversation.
+            .on_drag_move(cx.listener(
+                |this, e: &gpui_kit::DragMoveEvent<DraggedPreview>, _, cx| {
+                    let grab = e.drag(cx).grab.get();
+                    let room = e.bounds;
+                    // The card's top left (its border is outside the bar).
+                    let left = e.event.position.x - grab.x - px(1.) - room.origin.x;
+                    let top = e.event.position.y - grab.y - px(1.) - room.origin.y;
+                    let at = gpui_kit::point(
+                        room.size.width - left - px(PREVIEW_CARD_W),
+                        room.size.height - top - px(PREVIEW_CARD_H),
+                    );
+                    this.browser_preview_at = Some(keep_preview_in(at, room.size));
+                    cx.notify();
+                },
+            ))
             .child(
                 div()
                     .flex_1()
@@ -3976,6 +4000,14 @@ impl WorkspaceView {
                 ),
             )
             // Last, so it floats over the conversation.
+            .when(preview.is_some(), |d| {
+                let room = self.preview_room.clone();
+                d.child(
+                    gpui_kit::canvas(move |bounds, _, _| room.set(bounds.size), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
+            })
             .children(preview)
             .into_any_element()
     }
@@ -4153,8 +4185,8 @@ impl WorkspaceView {
         }
         let thread_id = self.store.read(cx).selected.clone()?;
         let browser = self.panel.read(cx).existing_browser(&thread_id, cx)?;
-        const W: f32 = 340.;
-        const H: f32 = 212.;
+        const W: f32 = PREVIEW_W;
+        const H: f32 = PREVIEW_H;
         let (title, surface) = {
             let b = browser.read(cx);
             let title = b
@@ -4165,11 +4197,15 @@ impl WorkspaceView {
             (title, b.preview_surface(W)?)
         };
         let loading = browser.read(cx).is_loading();
+        let at = match self.browser_preview_at {
+            Some(at) => keep_preview_in(at, self.preview_room.get()),
+            None => gpui_kit::point(px(20.), px(150.)),
+        };
         Some(
             v_flex()
                 .absolute()
-                .right(px(20.))
-                .bottom(px(150.))
+                .right(at.x)
+                .bottom(at.y)
                 .w(px(W + 2.))
                 .rounded(px(12.))
                 .overflow_hidden()
@@ -4179,6 +4215,7 @@ impl WorkspaceView {
                 .shadow_lg()
                 .child(
                     h_flex()
+                        .id("preview-bar")
                         .h(px(30.))
                         .px_2()
                         .gap_1p5()
@@ -4186,6 +4223,11 @@ impl WorkspaceView {
                         .text_xs()
                         .border_b_1()
                         .border_color(p.border)
+                        .cursor(gpui_kit::CursorStyle::OpenHand)
+                        .on_drag(DraggedPreview::default(), |d, grab, _, cx| {
+                            d.grab.set(grab);
+                            cx.new(|_| d.clone())
+                        })
                         .child(if loading {
                             Spinner::new()
                                 .xsmall()
@@ -5770,6 +5812,41 @@ const PANE_MIN_H: f32 = 320.;
 /// Most panes a window shows.
 const MAX_PANES: usize = 8;
 
+/// The mini browser's picture size, and the whole card's (borders and
+/// title bar included).
+const PREVIEW_W: f32 = 340.;
+const PREVIEW_H: f32 = 212.;
+const PREVIEW_CARD_W: f32 = PREVIEW_W + 2.;
+const PREVIEW_CARD_H: f32 = PREVIEW_H + 30. + 1. + 2.;
+
+/// `at` (the mini browser's distance from the right and bottom edges) kept
+/// so the card stays whole inside `room`. An unknown room keeps it as is.
+fn keep_preview_in(
+    at: gpui_kit::Point<gpui_kit::Pixels>,
+    room: gpui_kit::Size<gpui_kit::Pixels>,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    if room.width <= px(0.) || room.height <= px(0.) {
+        return at;
+    }
+    let max_x = (room.width - px(PREVIEW_CARD_W)).max(px(0.));
+    let max_y = (room.height - px(PREVIEW_CARD_H)).max(px(0.));
+    gpui_kit::point(at.x.clamp(px(0.), max_x), at.y.clamp(px(0.), max_y))
+}
+
+/// The mini browser being dragged by its title bar (nothing is drawn under
+/// the pointer: the card itself moves). `grab` is where in the bar it was
+/// picked up.
+#[derive(Clone, Default)]
+pub(crate) struct DraggedPreview {
+    grab: std::rc::Rc<std::cell::Cell<gpui_kit::Point<gpui_kit::Pixels>>>,
+}
+
+impl Render for DraggedPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui_kit::Empty
+    }
+}
+
 /// A thread being dragged (from the sidebar, or a pane's title bar).
 #[derive(Clone)]
 pub(crate) struct DraggedThread {
@@ -6593,6 +6670,33 @@ const SETTINGS_TEMPLATE: &str = r##"# Agentloft settings — changes apply live.
 #[cfg(test)]
 mod tests {
     use super::pretty_model;
+
+    #[test]
+    fn mini_browser_stays_inside_the_conversation() {
+        use super::{PREVIEW_CARD_H, PREVIEW_CARD_W, keep_preview_in};
+        use gpui_kit::{point, px, size};
+        let room = size(px(800.), px(600.));
+        // Inside: left alone.
+        assert_eq!(
+            keep_preview_in(point(px(20.), px(150.)), room),
+            point(px(20.), px(150.))
+        );
+        // Past the right/bottom edges, or past the left/top ones.
+        assert_eq!(
+            keep_preview_in(point(px(-50.), px(-9.)), room),
+            point(px(0.), px(0.))
+        );
+        assert_eq!(
+            keep_preview_in(point(px(5000.), px(5000.)), room),
+            point(px(800. - PREVIEW_CARD_W), px(600. - PREVIEW_CARD_H))
+        );
+        // Not laid out yet: as it was.
+        let unknown = size(px(0.), px(0.));
+        assert_eq!(
+            keep_preview_in(point(px(5000.), px(1.)), unknown),
+            point(px(5000.), px(1.))
+        );
+    }
 
     #[test]
     fn model_names() {
