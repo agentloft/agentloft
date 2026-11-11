@@ -6330,12 +6330,15 @@ fn thread_row(
             },
         )
         .children(tucked)
-        // Under the pointer, the time (or status) makes way for a ··· menu.
+        // Under the pointer, the time (or status) makes way for Archive and
+        // a ··· menu (the title gives up room for both).
         .child(
             div()
                 .relative()
                 .flex_none()
                 .min_w(px(22.))
+                .when(menu_open, |d| d.min_w(px(46.)))
+                .group_hover("thread-row", |d| d.min_w(px(46.)))
                 .h(px(20.))
                 .flex()
                 .items_center()
@@ -6359,7 +6362,25 @@ fn thread_row(
                         .when(!menu_open, |d| {
                             d.invisible().group_hover("thread-row", |d| d.visible())
                         })
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
                         .on_click(|_, _, cx| cx.stop_propagation())
+                        .child({
+                            use gpui_kit::component::button::{Button, ButtonVariants as _};
+                            let (store, id) = (store.clone(), thread.id.clone());
+                            Button::new(SharedString::from(format!("row-archive-{}", thread.id)))
+                                .cursor_pointer()
+                                .icon(IconName::Archive)
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Archive")
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let id = id.clone();
+                                    store.update(cx, |s, cx| s.archive_thread(id, false, cx));
+                                })
+                        })
                         .child({
                             use gpui_kit::component::button::{Button, ButtonVariants as _};
                             use gpui_kit::component::menu::DropdownMenu as _;
