@@ -67,7 +67,7 @@ fn started_threads(store: &AppStore, thread_id: &ThreadId) -> Vec<loft_protocol:
                     .as_ref()
                     .is_some_and(|p| p.thread_id == *thread_id && p.kind == ForkKind::Spawned)
         })
-        .cloned()
+        .map(loft_protocol::Thread::without_commands)
         .collect();
     all.sort_by_key(|t| t.created_at_ms);
     all

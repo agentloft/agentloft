@@ -3101,7 +3101,15 @@ impl WorkspaceView {
             let store = self.store.read(cx);
             (
                 store.workspace.projects.clone(),
-                store.workspace.threads.clone(),
+                // Without each agent's commands: nothing here reads them,
+                // and with them this copy, made for every frame, was half
+                // a megabyte for a couple of dozen threads.
+                store
+                    .workspace
+                    .threads
+                    .iter()
+                    .map(loft_protocol::Thread::without_commands)
+                    .collect::<Vec<_>>(),
                 store.conn.clone(),
                 store.unread.clone(),
                 store.collapsed.clone(),
@@ -5225,7 +5233,7 @@ impl Render for WorkspaceView {
                 .find(|p| p.id == model.thread.project_id)
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
-            Some((project, model.thread.clone()))
+            Some((project, model.thread.without_commands()))
         });
 
         self.details_amount = self

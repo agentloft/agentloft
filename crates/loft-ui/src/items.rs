@@ -1150,7 +1150,7 @@ fn agents_group(
                                 .threads
                                 .iter()
                                 .find(|t| t.id == id)
-                                .cloned()
+                                .map(loft_protocol::Thread::without_commands)
                         })
                 }
                 _ => None,
@@ -1786,7 +1786,7 @@ fn spawned_card(
                 .threads
                 .iter()
                 .find(|t| t.id == id)
-                .cloned()
+                .map(loft_protocol::Thread::without_commands)
         });
     let asked = |k: &str| {
         input

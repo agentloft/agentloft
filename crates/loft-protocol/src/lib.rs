@@ -981,6 +981,46 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_without_commands_is_the_thread_but_for_them() {
+        // Every field set to something that isn't its default, from JSON so
+        // that a field added later can be added here without a constructor.
+        let json = serde_json::json!({
+            "id": "t1", "project_id": "p1", "title": "A thread", "harness": "claude",
+            "cwd": "/repo/wt", "model": "fable", "permission_mode": "accept-edits", "effort": "high",
+            "native_session_id": "s1", "status": "running",
+            "created_at_ms": 5, "updated_at_ms": 9,
+            "workspace": {"kind": "worktree", "path": "/repo/wt", "branch": "b", "base": "main"},
+            "parent": {"thread_id": "t0", "turn_id": "u0", "kind": "spawned", "detached": true},
+            "slash_commands": ["help", "compact"],
+            "command_info": [{"name": "help", "description": "What you can do"}],
+            "started_at_ms": 6, "draft": "half a thought", "waiting_on": ["a dev server"],
+        });
+        let thread: Thread = serde_json::from_value(json).unwrap();
+        assert!(!thread.command_info.is_empty() && !thread.slash_commands.is_empty());
+        let bare = thread.without_commands();
+        assert!(bare.command_info.is_empty() && bare.slash_commands.is_empty());
+        let mut expected = thread.clone();
+        expected.slash_commands.clear();
+        expected.command_info.clear();
+        assert_eq!(bare, expected);
+        // Nothing above was left at a default that would hide a field the
+        // copy dropped.
+        let as_json = serde_json::to_value(&bare).unwrap();
+        for field in [
+            "model",
+            "permission_mode",
+            "effort",
+            "native_session_id",
+            "parent",
+            "started_at_ms",
+            "draft",
+            "waiting_on",
+        ] {
+            assert!(!as_json[field].is_null(), "{field}");
+        }
+    }
+
+    #[test]
     fn server_msg_round_trip() {
         let msg = ServerMsg::Response {
             id: 1,

@@ -175,6 +175,57 @@ impl Thread {
     pub fn draft_text(&self) -> Option<&str> {
         self.draft.as_deref().filter(|d| !d.trim().is_empty())
     }
+
+    /// A copy without the agent's commands, for whoever lists or labels
+    /// threads. The commands are most of a thread (a hundred or so, each
+    /// with a description: tens of kilobytes), and a list drawn on every
+    /// frame has no use for them.
+    pub fn without_commands(&self) -> Thread {
+        // Every field by name: a new one is a compile error here, not a
+        // value that goes missing from the copy.
+        let Thread {
+            id,
+            project_id,
+            title,
+            harness,
+            cwd,
+            model,
+            permission_mode,
+            effort,
+            native_session_id,
+            status,
+            created_at_ms,
+            updated_at_ms,
+            workspace,
+            parent,
+            slash_commands: _,
+            command_info: _,
+            started_at_ms,
+            draft,
+            waiting_on,
+        } = self;
+        Thread {
+            id: id.clone(),
+            project_id: project_id.clone(),
+            title: title.clone(),
+            harness: harness.clone(),
+            cwd: cwd.clone(),
+            model: model.clone(),
+            permission_mode: *permission_mode,
+            effort: effort.clone(),
+            native_session_id: native_session_id.clone(),
+            status: *status,
+            created_at_ms: *created_at_ms,
+            updated_at_ms: *updated_at_ms,
+            workspace: workspace.clone(),
+            parent: parent.clone(),
+            slash_commands: Vec::new(),
+            command_info: Vec::new(),
+            started_at_ms: *started_at_ms,
+            draft: draft.clone(),
+            waiting_on: waiting_on.clone(),
+        }
+    }
 }
 
 /// Where a fork came from (ADR-0011).
