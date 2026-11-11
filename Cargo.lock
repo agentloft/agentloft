@@ -4366,6 +4366,7 @@ dependencies = [
  "anyhow",
  "libc",
  "loft-protocol",
+ "loft-view",
  "serde_json",
  "tokio",
  "tracing",
@@ -4466,6 +4467,7 @@ dependencies = [
  "loft-docs",
  "loft-protocol",
  "loft-terminal",
+ "loft-view",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -4479,6 +4481,13 @@ dependencies = [
  "tracing",
  "web-sys",
  "web-time",
+]
+
+[[package]]
+name = "loft-view"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -4519,6 +4528,7 @@ dependencies = [
  "loft-harness-codex",
  "loft-protocol",
  "loft-store",
+ "loft-view",
  "rcgen",
  "serde",
  "serde_json",

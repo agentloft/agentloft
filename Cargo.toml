@@ -26,6 +26,7 @@ loft-ui = { path = "crates/loft-ui" }
 loft-testkit = { path = "crates/loft-testkit" }
 loft-git = { path = "crates/loft-git" }
 loft-terminal = { path = "crates/loft-terminal" }
+loft-view = { path = "crates/loft-view" }
 
 # UI — gpui-kit pins the matching gpui-pre release (ADR-0005). Syntax
 # highlighting is chosen per target in loft-ui: tree-sitter natively, syntect

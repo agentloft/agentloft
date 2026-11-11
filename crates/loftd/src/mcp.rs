@@ -1,7 +1,9 @@
 //! `agentloftd mcp --thread <id>`: a stdio MCP server attached to every agent
 //! session (ADR-0013). It bridges tool calls to the daemon:
 //! - `browser_*` drive the browser panel in the user's Agentloft window;
-//! - `list_threads` / `read_thread` / `get_thread_diff` read other threads.
+//! - `list_threads` / `read_thread` / `get_thread_diff` read other threads;
+//! - `show_ui` draws a view in the chat (ADR-0018): checked here, drawn by the
+//!   UI from the tool call itself.
 //!
 //! Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout. Nothing else
 //! may be written to stdout.
@@ -91,7 +93,27 @@ permissions unless the user explicitly asked for something else; `list_agents` l
 available. Agentloft itself: when the user asks to change its settings (theme, colours, fonts, \
 sidebar, agent defaults, folders…), use `get_settings` then `change_setting`; `save_theme` adds a \
 colour theme; `create_project`, `clone_project`, `add_project`, `update_project` (name, icon, \
-new-thread defaults) and `remove_project` manage projects. Changes show in the app at once.";
+new-thread defaults) and `remove_project` manage projects. Changes show in the app at once. \
+`show_ui` draws an interactive view in the chat (charts, tables, stats, forms, sliders, buttons \
+that reply for the user): use it when a visual or a choice says it better than prose, such as \
+results, comparisons or options to pick from; plain answers stay text.";
+
+/// What `show_ui` tells agents: the whole component reference, since this
+/// is all they get to go on.
+const SHOW_UI: &str = r#"Show the user an interactive view in the chat, drawn natively: charts, tables, stats, forms, sliders, and buttons that reply for them. Use it when a visual or a choice says it better than prose (results, comparisons, options to pick from, a calculator); keep plain answers as text. It returns at once and the view stays in the thread; a button's `send` arrives later as the user's next message.
+
+View: { title?, state?: {name: value}, body: [block] }. A string in a list of blocks is a Markdown paragraph. Any block takes when: "expr" (shown while it holds).
+
+Layout: row {children, gap?: none|sm|md|lg, align?: start|center|end|stretch, justify?: start|center|end|between, wrap?} · column {children, gap?} · grid {columns: 1-6, children} · card {title?, children} · tabs {tabs: [{label, children}]} · details {summary, children, open?} · divider
+Content: text {text, size?: xs|sm|md|lg|xl, weight?: normal|medium|bold, tone?, mono?} · heading {text, level?: 1-3} · markdown {text} · badge {text, tone?} · stat {label, value, delta?, delta_tone?, caption?, tone?} · progress {value, max?: 100, label?, tone?} · list {items: [{title, text?, badge?, tone?, and optionally one action}]} · key_value {items: [{label, value}]} · steps {items: [{title, text?, status: done|active|pending|failed}]} · callout {text, title?, tone?} · code {text, language?}
+Data: table {columns: [key | {key, label?, align?: left|center|right, format?}], rows} · chart {kind: bar|line|area|pie|donut, x: key, y: key | [key | {key, label}], data, format?, height?} (several y keys: line and area only). rows/data are [{key: value}], or generated: {for: "i", from: 0, to: 10, step?: 1, row: {key: "{{ i * 2 }}"}}.
+Inputs write state[bind]; `value` is where they start: slider {bind, min, max, step?, label?, format?} · input {bind, label?, placeholder?, kind?: text|number} · select {bind, options, label?} · choice {bind, options, label?, multiple?} · checkbox {bind, label} · toggle {bind, label}. options: ["a", "b"] or [{label, value}].
+button {label, style?: primary|secondary|ghost|danger} with one action: send: "what the user says to you" · set: {name: "{{ expr }}"} · copy: "text" · open: "https://… or a file path".
+
+tone: default|muted|accent|info|success|warning|danger. format: number|compact|percent|usd|bytes|duration (from ms).
+Text may hold {{ expressions }} over the state: + - * / % ^, == != < <= > >=, && || !, a ? b : c, a[i], a.b, and min max abs round floor ceil sqrt pow clamp sum avg len if contains join upper lower str num number compact percent usd money bytes duration. percent(0.42) is "42%".
+
+Example: {"title":"Seats","state":{"price":12},"body":[{"type":"slider","bind":"seats","label":"Seats","min":1,"max":50,"value":8},{"type":"stat","label":"Monthly","value":"{{ usd(seats * price) }}"},{"type":"button","label":"Buy","style":"primary","send":"Buy {{seats}} seats"}]}"#;
 
 async fn write(out: &mut tokio::io::Stdout, v: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(v)?;
@@ -305,6 +327,16 @@ pub fn tools() -> Vec<Value> {
             &["path"],
         ),
         tool(
+            loft_view::TOOL,
+            SHOW_UI,
+            json!({
+                "title": { "type": "string", "description": "A short title over the view" },
+                "state": { "type": "object", "description": "Starting values the view's expressions and inputs share" },
+                "body": { "type": "array", "description": "The blocks, top to bottom", "items": { "type": ["object", "string"] } }
+            }),
+            &["body"],
+        ),
+        tool(
             "list_threads",
             "List Agentloft threads (other agent conversations), optionally filtered by a title query and/or a project (its name, path or id).",
             json!({ "query": { "type": "string" }, "project": { "type": "string" } }),
@@ -366,6 +398,9 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
             Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
             Err(err) => text_result(err.message, true),
         };
+    }
+    if name == loft_view::TOOL {
+        return show_ui(args);
     }
     if let Some(result) = orchestrate(client, thread, name, args).await {
         return result;
@@ -439,6 +474,28 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
         }
         Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
         Err(err) => text_result(err.message, true),
+    }
+}
+
+/// `show_ui`: the UI draws the view from the tool call itself, so all there
+/// is to do here is check it and tell the agent what to fix.
+fn show_ui(args: &Value) -> Value {
+    match loft_view::parse(args) {
+        Ok((_, notes)) if notes.is_empty() => text_result(
+            "Shown in the chat. No need to repeat its contents in text.",
+            false,
+        ),
+        Ok((_, notes)) => text_result(
+            format!(
+                "Shown in the chat. No need to repeat its contents in text.\nNotes:\n- {}",
+                notes.join("\n- ")
+            ),
+            false,
+        ),
+        Err(problem) => text_result(
+            format!("Not shown, fix this and call again: {problem}"),
+            true,
+        ),
     }
 }
 
@@ -937,6 +994,32 @@ mod tests {
         for t in &tools {
             assert!(t["name"].as_str().unwrap().len() < 64);
             assert_eq!(t["inputSchema"]["type"], "object");
+        }
+    }
+
+    #[test]
+    fn show_ui_checks_the_view() {
+        let shown = show_ui(&json!({ "body": [{ "type": "badge", "text": "ok", "colour": "x" }] }));
+        assert_eq!(shown["isError"], false);
+        let text = shown["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Shown in the chat."), "{text}");
+        assert!(text.contains("unknown property `colour`"), "{text}");
+        let refused = show_ui(&json!({ "body": [{ "type": "sparkle" }] }));
+        assert_eq!(refused["isError"], true);
+        let text = refused["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("unknown block type `sparkle`"), "{text}");
+        // The example in the tool's own description must be one it takes.
+        let example = SHOW_UI.rsplit("Example: ").next().unwrap();
+        let example: Value = serde_json::from_str(example).unwrap();
+        assert_eq!(show_ui(&example)["isError"], false);
+        assert!(
+            show_ui(&example)["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| !t.contains("Notes"))
+        );
+        // And every block type is named in it.
+        for name in loft_view::TYPES {
+            assert!(SHOW_UI.contains(name), "{name} is not in the description");
         }
     }
 

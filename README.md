@@ -36,6 +36,10 @@ A native desktop app for running coding agents side by side: **Claude Code**, **
 - A Ghostty-powered terminal with tabs.
 - A browser that agents drive through Agentloft's built-in MCP server. Agents can also read other threads.
 
+**Answers you can see and click.**
+- Agents can answer with a view drawn in the thread: charts, tables, stats, forms, sliders ([ADR-0018](docs/adr/0018-agent-drawn-views.md)).
+- A button in a view replies for you, and sliders and inputs update the numbers and charts beside them as you move them.
+
 **Built for long-running agents.**
 - **Agents keep running:** a small daemon (`agentloftd`) owns agents, terminals and git, so agents keep working when you close or update the app. After an update, a new daemon takes over once agents go idle.
 - **Windows:** several windows and native tab groups, not tied to projects, restored on relaunch.
@@ -81,6 +85,7 @@ The same interface runs in a web browser, served by the daemon ([ADR-0016](docs/
 | `loft-core` | Threads, turns, approvals, worktrees, forks, terminals, the daemon's browser |
 | `loft-store` | SQLite event log and projections |
 | `loft-protocol` | Wire types |
+| `loft-view` | Views agents draw in the chat: the spec, its checks, its expressions |
 | `loft-harness*` | The agent adapters (Claude, Codex, ACP) |
 | `loft-git` | Checkpoints, diffs, worktrees |
 | `loft-terminal` | Terminal widget on libghostty-vt |

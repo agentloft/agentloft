@@ -466,6 +466,9 @@ pub(crate) fn render_item(
     if crate::ask::is_record(item) {
         return crate::ask::render_record(thread, state, item, p);
     }
+    if crate::view::is_view(item) {
+        return crate::view::render(state, item, p);
+    }
     match &item.body {
         ItemBody::UserMessage { text, attachments } => {
             use gpui_kit::StyledImage as _;

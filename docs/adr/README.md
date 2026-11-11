@@ -21,5 +21,6 @@ Each ADR records one significant decision: its context, the decision, the conseq
 | [0015](0015-thread-orchestration.md) | Agents orchestrate threads through the Agentloft MCP server | Accepted |
 | [0016](0016-web-client.md) | Agentloft in a browser: the same UI as wasm, over a secured listener in the daemon | Accepted |
 | [0017](0017-streamed-browser.md) | A browser the daemon runs, streamed to the web client | Accepted |
+| [0018](0018-agent-drawn-views.md) | Views agents draw in the chat (`show_ui`) | Proposed |
 
 To add an ADR, copy the structure of an existing one, use the next number, and add a row to this table.

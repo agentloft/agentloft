@@ -20,6 +20,7 @@ loft-harness-claude.workspace = true
 loft-harness-codex.workspace = true
 loft-harness-acp.workspace = true
 loft-client.workspace = true
+loft-view.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 futures.workspace = true

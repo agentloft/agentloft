@@ -6,6 +6,9 @@
 //! - contains `question`: asks two questions first (`AskUserQuestion`);
 //! - contains `plan`: proposes a plan first (`ExitPlanMode`);
 //! - contains `slow`: streams slowly (≈2 s) so interrupts can be tested;
+//! - contains `ui:<sample>`, `ui:all` or `ui:{…}`: shows views the way an
+//!   agent's `show_ui` calls do (samples: `loft_view::samples`); the other
+//!   keywords are then left alone, since a view's own text may hold them;
 //! - contains `fail`: completes the turn as failed.
 
 use crate::{
@@ -79,13 +82,51 @@ async fn run(mut ends: SessionEnds, session_id: String) {
 async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
     ends.emit(HarnessEvent::TurnStarted);
 
+    let views = fake_views(text);
+    for (n, spec) in views.iter().enumerate() {
+        let id = format!("view-{turn_no}-{n}");
+        let tool = format!("mcp__agentloft__{}", loft_view::TOOL);
+        ends.emit(HarnessEvent::ItemStarted {
+            parent: None,
+            native_id: id.clone(),
+            body: ItemBody::ToolCall {
+                tool: tool.clone(),
+                tool_kind: ToolKind::Mcp,
+                title: tool,
+                input: spec.clone(),
+                output: None,
+                is_error: false,
+            },
+        });
+        // What the real tool answers (`loftd::mcp`).
+        let checked = loft_view::parse(spec);
+        ends.emit(HarnessEvent::ItemCompleted {
+            native_id: id,
+            body: None,
+            tool_result: Some(ToolResult {
+                output: match &checked {
+                    Ok(_) => "Shown in the chat.".into(),
+                    Err(problem) => format!("Not shown, fix this and call again: {problem}"),
+                },
+                is_error: checked.is_err(),
+            }),
+            status: if checked.is_ok() {
+                ItemStatus::Completed
+            } else {
+                ItemStatus::Failed
+            },
+        });
+    }
+    // A view's text may hold any of the words below.
+    let script = if views.is_empty() { text } else { "" };
+
     // What the user said to a question or plan, echoed in the reply.
     let mut heard_back: Option<String> = None;
-    let ask = if text.contains("approve") {
+    let ask = if script.contains("approve") {
         Some(Ask::Approval)
-    } else if text.contains("question") {
+    } else if script.contains("question") {
         Some(Ask::Question)
-    } else if text.contains("plan") {
+    } else if script.contains("plan") {
         Some(Ask::Plan)
     } else {
         None
@@ -227,10 +268,11 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
         },
     });
     let reply = match heard_back {
+        _ if !views.is_empty() => "Here it is.".to_owned(),
         Some(heard) => format!("echo: {text} (heard: {heard})"),
         None => format!("echo: {text}"),
     };
-    let chunk_delay = if text.contains("slow") {
+    let chunk_delay = if script.contains("slow") {
         Duration::from_millis(400)
     } else {
         Duration::from_millis(5)
@@ -289,7 +331,7 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
             status: ItemStatus::Completed,
         });
     }
-    let failed = text.contains("fail");
+    let failed = script.contains("fail");
     ends.emit(HarnessEvent::TurnCompleted {
         status: if failed {
             TurnStatus::Failed
@@ -304,6 +346,27 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
         error: failed.then(|| "fake failure".into()),
     });
     true
+}
+
+/// The views a prompt asks for: `ui:all`, `ui:<sample>`, or `ui:{…}` with a
+/// spec of your own (the rest of the prompt).
+fn fake_views(text: &str) -> Vec<serde_json::Value> {
+    let Some(at) = text.find("ui:") else {
+        return Vec::new();
+    };
+    let rest = text[at + 3..].trim();
+    if rest.starts_with('{') {
+        // Not JSON: handed over as it is, for the check to turn down.
+        return vec![
+            serde_json::from_str(rest)
+                .unwrap_or_else(|_| serde_json::Value::String(rest.to_owned())),
+        ];
+    }
+    let name: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
+    match name.as_str() {
+        "all" => loft_view::samples::all(),
+        name => loft_view::samples::get(name).into_iter().collect(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

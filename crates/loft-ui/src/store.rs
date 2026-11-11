@@ -65,7 +65,8 @@ fn is_said(item: &loft_protocol::Item) -> bool {
 
 /// What of a turn's `work` stays in view while it is folded under "Worked
 /// for …": what the user said along the way (a steer is part of the
-/// conversation, not of the agent's work) and agents still at work.
+/// conversation, not of the agent's work), agents still at work, and views
+/// the agent drew (they are part of its answer, not a step towards it).
 fn shown_when_folded(
     items: &[loft_protocol::Item],
     work: &[usize],
@@ -73,7 +74,7 @@ fn shown_when_folded(
 ) -> Vec<usize> {
     work.iter()
         .copied()
-        .filter(|&i| is_said(&items[i]) || still_running(i))
+        .filter(|&i| is_said(&items[i]) || crate::view::is_view(&items[i]) || still_running(i))
         .collect()
 }
 
@@ -1970,6 +1971,23 @@ impl AppStore {
         self.queue_changed(&thread_id, cx);
     }
 
+    /// Say something in a thread as the user, from outside the composer
+    /// (a button in a view the agent drew): sent now, or queued behind the
+    /// turn that is running, as a typed message would be.
+    pub fn say(&mut self, thread_id: ThreadId, text: String, cx: &mut Context<Self>) {
+        let running = self.threads.get(&thread_id).is_some_and(|t| {
+            t.read(cx)
+                .model
+                .as_ref()
+                .is_some_and(|m| m.running_turn().is_some())
+        });
+        if running {
+            self.enqueue(thread_id, Queued::new(text, Vec::new()), cx);
+        } else {
+            self.send_message(thread_id, text, Vec::new(), cx);
+        }
+    }
+
     pub fn send_message(
         &mut self,
         thread_id: ThreadId,
@@ -2175,6 +2193,9 @@ pub struct ThreadState {
     pub rows: Vec<Row>,
     pub scroller: Entity<MessageScrollerState>,
     pub markdown: HashMap<ItemId, Entity<TextViewState>>,
+    /// The views agents drew (`show_ui`), each with where the user has
+    /// taken it: slider positions, what was typed, the tab on show.
+    pub(crate) views: HashMap<ItemId, Entity<crate::view::ViewCard>>,
     /// Tool groups / reasoning items the user expanded or collapsed,
     /// keyed by their first item id. `true` = expanded.
     pub expanded: HashMap<ItemId, bool>,
@@ -2218,6 +2239,7 @@ impl ThreadState {
             rows: Vec::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             markdown: HashMap::new(),
+            views: HashMap::new(),
             expanded: HashMap::new(),
             ticker: None,
             last_activity: None,
@@ -2394,14 +2416,22 @@ impl ThreadState {
                 .copied()
                 .filter(|&i| !(done && is_error(i)))
                 .collect();
-            if !done || !work.is_empty() {
+            // A finished turn that only drew views has nothing to unfold.
+            let only_views = done && work.iter().all(|&i| crate::view::is_view(&items[i]));
+            if only_views {
+                push_runs(&mut rows, items, &work);
+            } else if !done || !work.is_empty() {
                 let key = ItemId(format!("work:{}", turn.id.0));
                 let open = !done || self.expanded.get(&key).copied().unwrap_or(false);
                 rows.push(Row::Work {
                     turn_ix,
                     open,
-                    // What you said along the way isn't one of its steps.
-                    steps: work.iter().filter(|&&i| !is_said(&items[i])).count(),
+                    // What you said along the way isn't one of its steps,
+                    // nor is a view it drew (that stays in sight).
+                    steps: work
+                        .iter()
+                        .filter(|&&i| !is_said(&items[i]) && !crate::view::is_view(&items[i]))
+                        .count(),
                 });
                 if open {
                     push_runs(&mut rows, items, &work);
@@ -2692,8 +2722,13 @@ impl ThreadState {
             return;
         };
         self.markdown.clear();
+        // Views keep their state across a reconnect: only those whose item
+        // is gone are dropped.
+        self.views
+            .retain(|id, _| model.items.iter().any(|i| &i.id == id));
         for item in &model.items {
             self.sync_markdown(&item.id, &item.body, cx);
+            self.sync_view(item, cx);
         }
         self.model = Some(model);
         self.rebuild_rows();
@@ -2725,6 +2760,7 @@ impl ThreadState {
                 self.last_activity = Some(web_time::Instant::now());
                 let (id, body) = (item.id.clone(), item.body.clone());
                 self.sync_markdown(&id, &body, cx);
+                self.sync_view(item, cx);
                 Some(id)
             }
             Event::RequestOpened { request } | Event::RequestUpdated { request } => {
@@ -2759,6 +2795,39 @@ impl ThreadState {
             });
         }
         cx.notify();
+    }
+
+    /// Keep a view per `show_ui` call that can be drawn.
+    fn sync_view(&mut self, item: &loft_protocol::Item, cx: &mut Context<Self>) {
+        let ItemBody::ToolCall { input, .. } = &item.body else {
+            return;
+        };
+        if !crate::view::is_view(item) {
+            self.views.remove(&item.id);
+            return;
+        }
+        if let Some(card) = self.views.get(&item.id) {
+            if !card.update(cx, |card, cx| card.set_source(input, cx)) {
+                self.views.remove(&item.id);
+            }
+            return;
+        }
+        let (thread, store) = (cx.entity().downgrade(), self.store.clone());
+        if let Some(card) =
+            crate::view::ViewCard::new(thread, store, self.id.clone(), item.id.clone(), input)
+        {
+            self.views.insert(item.id.clone(), cx.new(|_| card));
+        }
+    }
+
+    /// An item's row changed height by itself (a view's tab, a folded
+    /// table): measure it again.
+    pub(crate) fn remeasure(&mut self, id: &ItemId, cx: &mut Context<Self>) {
+        if let Some(row) = self.row_of_item(id) {
+            self.scroller.update(cx, |s, cx| {
+                s.remeasure_items(row..row + 1, cx);
+            });
+        }
     }
 
     /// Keep a markdown document per assistant message in sync with its text.
@@ -2849,11 +2918,12 @@ pub(crate) fn agent_running(
 /// one group row; consecutive agents share an agents card.
 fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs: &[usize]) {
     let is_subagent = |i: usize| is_agent(&items[i]);
-    // Questions and plans stand on their own, not in a tool group.
+    // Questions, plans and views stand on their own, not in a tool group.
     let is_tool = |i: usize| {
         matches!(items[i].body, ItemBody::ToolCall { .. })
             && !is_subagent(i)
             && !crate::ask::is_record(&items[i])
+            && !crate::view::is_view(&items[i])
     };
     let mut k = 0;
     while k < ixs.len() {

@@ -29,6 +29,7 @@ mod shell_highlight;
 pub mod store;
 pub mod theme;
 pub mod themes;
+mod view;
 pub mod windows;
 pub mod workspace;
 
