@@ -22,6 +22,7 @@ The daemon is the only process that writes ([ADR-0001](0001-daemon-from-m0.md)).
   - `thread_events` is an append-only table, **kept forever**.
   - Projections (`turns`, `items`, `runtime_requests`) are updated in the same transaction and can be rebuilt from the log.
   - Command receipts provide idempotency.
+  - A thread update that leaves the agent's command list as it was is logged without the list (`"commands": "as_before"` beside the thread) and gets it back when the log is read (`Store::events_after`). Logged whole each time, the list (about 26 KB per thread) was 72 MB of a 113 MB database after four days: 2,784 updates, 18 of which changed it.
 - **Deltas** are not stored row by row. They are broadcast live, and the item snapshot is written about every 250 ms and when the item completes.
 
 **Migrations**

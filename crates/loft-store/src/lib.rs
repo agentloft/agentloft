@@ -142,7 +142,7 @@ impl Store {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             let at_ms = now_ms();
-            let payload = serde_json::to_string(&event)?;
+            let payload = logged(&tx, &event)?;
             tx.execute(
                 "INSERT INTO events(thread_id, at_ms, type, payload) VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -385,7 +385,9 @@ impl Store {
         Ok(max.map(|m| m as u32 + 1).unwrap_or(1))
     }
 
-    /// Events after `seq`, optionally limited to one thread.
+    /// Events after `seq`, optionally limited to one thread: as they were
+    /// committed, whatever the log left out to say them in less (see
+    /// [`logged`]).
     pub fn events_after(&self, seq: u64, thread: Option<&ThreadId>) -> Result<Vec<EventEnvelope>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, at_ms, payload FROM events
@@ -398,16 +400,60 @@ impl Store {
                 r.get::<_, String>(2)?,
             ))
         })?;
+        // Each thread's commands as of the events read so far.
+        let mut commands: std::collections::HashMap<ThreadId, Commands> = Default::default();
         let mut out = Vec::new();
         for row in rows {
             let (seq, at_ms, payload) = row?;
+            let logged: serde_json::Value = serde_json::from_str(&payload)?;
+            let as_before = logged.get(COMMANDS).and_then(|c| c.as_str()) == Some(AS_BEFORE);
+            let mut event: Event = serde_json::from_value(logged)?;
+            if let Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } = &mut event {
+                if as_before {
+                    let (names, info) = match commands.get(&thread.id) {
+                        Some(known) => known.clone(),
+                        None => self.commands_before(&thread.id, seq)?,
+                    };
+                    thread.slash_commands = names;
+                    thread.command_info = info;
+                }
+                commands.insert(
+                    thread.id.clone(),
+                    (thread.slash_commands.clone(), thread.command_info.clone()),
+                );
+            }
             out.push(EventEnvelope {
                 seq: seq as u64,
                 at_ms,
-                event: serde_json::from_str(&payload)?,
+                event,
             });
         }
         Ok(out)
+    }
+
+    /// A thread's commands as the log had them just before event `seq`:
+    /// those of the last event of the thread's that spelled them out.
+    fn commands_before(&self, thread: &ThreadId, seq: i64) -> Result<Commands> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM events
+                 WHERE thread_id = ?1 AND seq < ?2
+                   AND type IN ('thread_created', 'thread_updated')
+                   AND json_extract(payload, '$.commands') IS NULL
+                 ORDER BY seq DESC LIMIT 1",
+                params![thread.as_str(), seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(
+            match payload.map(|p| serde_json::from_str(&p)).transpose()? {
+                Some(Event::ThreadCreated { thread } | Event::ThreadUpdated { thread }) => {
+                    (thread.slash_commands, thread.command_info)
+                }
+                _ => Default::default(),
+            },
+        )
     }
 
     fn query_data<T: DeserializeOwned, P: rusqlite::Params>(
@@ -433,6 +479,49 @@ impl Store {
         data.map(|d| serde_json::from_str(&d).map_err(Into::into))
             .transpose()
     }
+}
+
+/// A thread's commands: their names, and what each does.
+type Commands = (Vec<String>, Vec<loft_protocol::SlashCommandInfo>);
+
+/// In a logged thread update, in place of the thread's commands: they are
+/// what they were. (`"commands": "as_before"` beside `"thread"`.)
+const COMMANDS: &str = "commands";
+const AS_BEFORE: &str = "as_before";
+
+/// An event as the log keeps it.
+///
+/// A thread carries its agent's commands with their descriptions, about
+/// 26 KB of it, and is logged whole every time anything about it changes: a
+/// status, a title, a draft saved after each pause in typing. In one real
+/// database that was 2,784 updates, 18 of which changed the commands, and
+/// 72 of the file's 113 MB. An update that leaves the commands as they were
+/// is logged without them and says so; [`Store::events_after`] puts them
+/// back. Projections and what subscribers are sent have the whole thread, as
+/// before.
+fn logged(conn: &Connection, event: &Event) -> Result<String> {
+    if let Event::ThreadUpdated { thread } = event
+        && !(thread.slash_commands.is_empty() && thread.command_info.is_empty())
+    {
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT data FROM threads WHERE id = ?1",
+                [thread.id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let before: Option<Thread> = before.and_then(|data| serde_json::from_str(&data).ok());
+        if before.is_some_and(|b| {
+            b.slash_commands == thread.slash_commands && b.command_info == thread.command_info
+        }) {
+            let mut bare = serde_json::to_value(Event::ThreadUpdated {
+                thread: thread.without_commands(),
+            })?;
+            bare[COMMANDS] = AS_BEFORE.into();
+            return Ok(serde_json::to_string(&bare)?);
+        }
+    }
+    Ok(serde_json::to_string(event)?)
 }
 
 fn event_type(event: &Event) -> &'static str {
@@ -610,6 +699,136 @@ mod tests {
         assert_eq!(store.max_seq().unwrap(), 3);
         assert_eq!(store.events_after(1, Some(&t.id)).unwrap().len(), 2);
         assert_eq!(store.events_after(0, None).unwrap().len(), 3);
+    }
+
+    /// A thread whose agent has commands worth not repeating.
+    fn thread_with_commands(project: &Project, described: &str) -> Thread {
+        let mut t = thread(project);
+        t.slash_commands = vec!["help".into(), "compact".into()];
+        t.command_info = vec![
+            SlashCommandInfo {
+                name: "help".into(),
+                description: described.into(),
+                ..Default::default()
+            },
+            SlashCommandInfo {
+                name: "compact".into(),
+                description: "Summarize the conversation so far".into(),
+                ..Default::default()
+            },
+        ];
+        t
+    }
+
+    fn logged_payloads(store: &Store) -> Vec<String> {
+        store
+            .conn
+            .prepare("SELECT payload FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn the_log_says_a_threads_commands_once_and_reads_back_whole() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let mut t = thread_with_commands(&p, "What you can do here");
+        let mut committed = store
+            .commit(vec![
+                Event::ProjectAdded { project: p.clone() },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        // Two updates that leave the commands alone, one that changes
+        // them, one more that doesn't (two of them in one commit).
+        t.status = ThreadStatus::Running;
+        committed.extend(
+            store
+                .commit(vec![Event::ThreadUpdated { thread: t.clone() }])
+                .unwrap(),
+        );
+        t.draft = Some("half a thought".into());
+        committed.extend(
+            store
+                .commit(vec![Event::ThreadUpdated { thread: t.clone() }])
+                .unwrap(),
+        );
+        t.command_info[0].description = "Something else entirely".into();
+        let changed = t.clone();
+        t.status = ThreadStatus::Idle;
+        committed.extend(
+            store
+                .commit(vec![
+                    Event::ThreadUpdated { thread: changed },
+                    Event::ThreadUpdated { thread: t.clone() },
+                ])
+                .unwrap(),
+        );
+
+        // In the log: spelled out when the thread is made and when they
+        // change, and not otherwise.
+        let payloads = logged_payloads(&store);
+        let spelled: Vec<bool> = payloads[1..]
+            .iter()
+            .map(|p| p.contains("Summarize the conversation"))
+            .collect();
+        assert_eq!(spelled, [true, false, false, true, false], "{payloads:#?}");
+        assert!(payloads[2].contains(r#""commands":"as_before""#));
+        assert!(payloads[2].contains("running"));
+
+        // Read back: every event as it was committed.
+        assert_eq!(store.events_after(0, None).unwrap(), committed);
+        assert_eq!(store.events_after(0, Some(&t.id)).unwrap(), committed[1..]);
+        // From the middle too, where the first event read is one that
+        // leaves the commands out: before the change, and after it.
+        for from in 2..committed.len() {
+            assert_eq!(
+                store.events_after(from as u64, Some(&t.id)).unwrap(),
+                committed[from..],
+                "from {from}"
+            );
+        }
+        // The thread itself (what the app is given) always has them.
+        assert_eq!(store.thread(&t.id).unwrap().unwrap(), t);
+    }
+
+    #[test]
+    fn a_log_written_before_commands_were_left_out_still_reads() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let mut t = thread_with_commands(&p, "As it was written then");
+        store
+            .commit(vec![
+                Event::ProjectAdded { project: p.clone() },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        // An update logged whole, as every update used to be.
+        t.status = ThreadStatus::Running;
+        let whole = Event::ThreadUpdated { thread: t.clone() };
+        store
+            .conn
+            .execute(
+                "INSERT INTO events(thread_id, at_ms, type, payload) VALUES (?1, 5, 'thread_updated', ?2)",
+                params![t.id.as_str(), serde_json::to_string(&whole).unwrap()],
+            )
+            .unwrap();
+        // And one from now, on top of it.
+        apply(&store.conn, &whole).unwrap();
+        t.status = ThreadStatus::Idle;
+        let now = Event::ThreadUpdated { thread: t.clone() };
+        store.commit(vec![now.clone()]).unwrap();
+
+        let events: Vec<Event> = store
+            .events_after(2, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        assert_eq!(events, [whole, now]);
     }
 
     #[test]
