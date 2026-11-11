@@ -702,7 +702,8 @@ pub fn can_compact(harness: &HarnessId) -> bool {
     matches!(harness.as_str(), HarnessId::CLAUDE | HarnessId::CODEX)
 }
 
-/// When an idle thread compacts first, in a few words.
+/// When an idle thread compacts first, in a few words ("1 h+ idle · 100K+
+/// tokens").
 pub fn compaction_rule(c: &loft_config::ThreadsConfig) -> String {
     let idle = match c.compact_idle_minutes {
         m if m >= 60 && m % 60 == 0 => format!("{} h", m / 60),
@@ -713,7 +714,7 @@ pub fn compaction_rule(c: &loft_config::ThreadsConfig) -> String {
         n if n >= 1_000 => format!("{}K", n / 1_000),
         n => n.to_string(),
     };
-    format!("Idle {idle}+ with {tokens}+ tokens: compacts before your message")
+    format!("{idle}+ idle · {tokens}+ tokens")
 }
 
 /// "Compact when idle" with its switch: one setting for every thread.
@@ -748,12 +749,19 @@ pub fn compaction_row<V: 'static>(
         )
         .child(
             div()
+                .id(SharedString::from(format!("{id}-rule")))
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_right()
                 .text_color(p.faint_foreground)
-                .child(compaction_rule(&config)),
+                .child(compaction_rule(&config))
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(
+                        "A message to a thread that sat idle this long, with at least this much in its context, compacts the conversation first: its prompt cache has expired, so the whole context would be read again at full price.",
+                    )
+                    .build(window, cx)
+                }),
         )
         .child(
             Switch::new(id)

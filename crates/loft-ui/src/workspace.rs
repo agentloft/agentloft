@@ -4922,7 +4922,7 @@ impl WorkspaceView {
                     .collect::<Vec<_>>()
                     .join(" · ");
                     v_flex()
-                        .w(px(300.))
+                        .w(px(340.))
                         .rounded(px(12.))
                         .overflow_hidden()
                         .child(
@@ -4974,8 +4974,11 @@ impl WorkspaceView {
                                             .gap_3()
                                             .items_center()
                                             .child(
+                                                // Wraps, so the button
+                                                // beside it keeps its room.
                                                 div()
                                                     .flex_1()
+                                                    .min_w_0()
                                                     .text_xs()
                                                     .text_color(p.muted_foreground)
                                                     .child(format!(
@@ -4984,6 +4987,7 @@ impl WorkspaceView {
                                             )
                                             .child(
                                                 Button::new("context-compact-now")
+                                                    .flex_none()
                                                     .cursor_pointer()
                                                     .outline()
                                                     .xsmall()
@@ -7594,7 +7598,11 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
             Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
         };
         cx.background_executor().timer(after).await;
-        let Ok(Some(target)) = cx.update(|_, cx| cx.active_window()) else {
+        // The front window (Settings, once it has opened), else this one:
+        // an app that isn't in front has no active window.
+        let Ok(target) =
+            cx.update(|window, cx| cx.active_window().unwrap_or_else(|| window.window_handle()))
+        else {
             return;
         };
         let (button, modifiers) = (MouseButton::Left, Modifiers::default());
@@ -7618,10 +7626,15 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
                 click_count: 1,
             }),
         ] {
-            let _ = cx.update(|_, cx| {
-                target.update(cx, |_, window, cx| {
+            let _ = cx.update(|window, cx| {
+                // This window is already in hand; another one is asked for.
+                if target == window.window_handle() {
                     window.dispatch_event(step, cx);
-                })
+                } else {
+                    let _ = target.update(cx, |_, window, cx| {
+                        window.dispatch_event(step, cx);
+                    });
+                }
             });
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(40))
