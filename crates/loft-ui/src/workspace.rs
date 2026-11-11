@@ -580,6 +580,66 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            Some(("viewhover", spec)) => {
+                // `x,y;x,y;…`: tell the thread's view the pointer is over
+                // those spots, one after another (a `mousemove` made in the
+                // page: the system only moves the real pointer). What
+                // pointer the page asks for at each is in the log.
+                let spots: Vec<(f32, f32)> = spec
+                    .split(';')
+                    .filter_map(|spot| {
+                        let (x, y) = spot.split_once(',')?;
+                        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                    })
+                    .collect();
+                let thread = thread.clone();
+                self.panel_open = false;
+                cx.spawn_in(window, async move |_, cx| {
+                    use gpui_kit::{Modifiers, MouseMoveEvent, PlatformInput, point};
+                    let executor = cx.background_executor().clone();
+                    let pause = |ms: u64| executor.timer(std::time::Duration::from_millis(ms));
+                    pause(1500).await;
+                    let _ = cx.update(|_, cx| {
+                        thread.update(cx, |state, cx| {
+                            if let Some(item) = state.last_view_item() {
+                                state.reveal(item, cx);
+                            }
+                        })
+                    });
+                    pause(4000).await;
+                    let Ok(Some((embed, bounds))) = cx.update(|_, cx| {
+                        let state = thread.read(cx);
+                        state.a_view_embed().zip(state.a_view_bounds(cx))
+                    }) else {
+                        tracing::info!("dev: no native view to hover");
+                        return;
+                    };
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: bounds.origin + point(px(20.), px(20.)),
+                                pressed_button: None,
+                                modifiers: Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                    });
+                    pause(500).await;
+                    for (x, y) in spots {
+                        let _ = cx.update(|_, cx| {
+                            if let Some(host) = embed.read(cx).host() {
+                                drop(host.run(&format!(
+                                    "(document.elementFromPoint({x}, {y}) || document).dispatchEvent(\
+                                     new MouseEvent('mousemove', {{ clientX: {x}, clientY: {y}, bubbles: true }}));"
+                                )));
+                            }
+                        });
+                        tracing::info!(x, y, "dev: the pointer moved over a native view");
+                        pause(400).await;
+                    }
+                })
+                .detach();
+            }
             Some(("viewkeys", spec)) => {
                 // `x,y,after_ms`: click a field of the thread's view, type
                 // "abc", press Cmd+A, type "z" (so the field holds "z" if

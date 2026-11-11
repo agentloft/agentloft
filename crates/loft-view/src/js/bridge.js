@@ -89,9 +89,15 @@
     // "url(hand.png) 4 4, pointer": the keyword at the end is the fallback.
     const named = style.cursor.split(",").pop().trim();
     if (named && named !== "auto") return named;
-    // `auto` is the browser's own choice: a hand on a link, an I-beam on
-    // text that can be selected, an arrow elsewhere.
+    // `auto` is the browser's own choice: a hand on a link, an I-beam in a
+    // field you type in and on text that can be selected, an arrow
+    // elsewhere. (Chrome says `text` for a field itself; WebKit says `auto`.)
     if (element.closest("a[href]")) return "pointer";
+    const field =
+      element.tagName === "TEXTAREA" ||
+      (element.tagName === "INPUT" &&
+        !/^(button|submit|reset|checkbox|radio|range|color|file|image|hidden)$/.test(element.type));
+    if (field) return element.disabled ? "default" : "text";
     if (element.isContentEditable) return "text";
     if (style.userSelect === "none") return "default";
     const caret = document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
