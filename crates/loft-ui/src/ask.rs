@@ -465,7 +465,11 @@ impl AskForm {
                                 )
                             }),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, o, window, cx))),
+                    // Picking gives the form the keys (1–9, ↩) again.
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        window.focus(&this.focus, cx);
+                        this.pick(ix, o, window, cx)
+                    })),
             );
         }
         if q.allow_other {
@@ -556,7 +560,7 @@ impl AskForm {
             )
             .child(right);
 
-        shell(p, "ask", &id, cx)
+        shell(p, "ask", &id)
             .gap_2()
             .child(top)
             .child(question)
@@ -565,7 +569,12 @@ impl AskForm {
             .into_any_element()
     }
 
-    fn render_plan(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn render_plan(
+        &mut self,
+        p: &Palette,
+        tall: gpui_kit::Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = self.request.id.clone();
         let plan = self.request.plan().unwrap_or_default().to_owned();
         let expanded = self.expanded;
@@ -607,7 +616,8 @@ impl AskForm {
         let body = div()
             .id(SharedString::from(format!("plan-{id}")))
             .px_1()
-            .when(!expanded, |d| d.max_h(px(300.)))
+            // Expanded: most of the window, still scrolling inside.
+            .max_h(if expanded { tall } else { px(300.) })
             .overflow_y_scroll()
             .child(
                 TextView::markdown(SharedString::from(format!("plan-md-{id}")), plan)
@@ -662,7 +672,7 @@ impl AskForm {
             )
             .child(buttons);
 
-        shell(p, "plan", &id, cx)
+        shell(p, "plan", &id)
             .gap_2()
             .child(top)
             .child(body)
@@ -672,10 +682,11 @@ impl AskForm {
 }
 
 impl Render for AskForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        let tall = (window.viewport_size().height * 0.6).max(px(300.));
         let body = match self.request.kind {
-            RequestKind::Plan => self.render_plan(&p, cx),
+            RequestKind::Plan => self.render_plan(&p, tall, cx),
             _ => self.render_question(&p, cx),
         };
         div()
@@ -699,7 +710,6 @@ fn shell(
     p: &Palette,
     kind: &str,
     id: &loft_protocol::RequestId,
-    cx: &mut Context<AskForm>,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
     v_flex()
         .id(SharedString::from(format!("{kind}-card-{id}")))
@@ -709,8 +719,6 @@ fn shell(
         .border_color(p.border)
         .bg(p.elevated)
         .shadow_md()
-        // A click on the card (not a field) gives it the keys.
-        .on_click(cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
 }
 
 /// The timeline's record of a question or plan tool call: what was asked
