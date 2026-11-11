@@ -1,94 +1,93 @@
 # ADR-0018: Views agents draw in the chat
 
-- **Status:** Proposed. Built on main on 2026-11-10 at the product owner's request ("something similar that agents can use"); the choices marked "to review" are theirs to revisit.
-- **Date:** 2026-11-10
+- **Status:** Proposed. Built on main on 2026-11-10 and reworked the same night at the product owner's request ("I want free-form… let agent be creative… remove components"); the choices marked "to review" are theirs to revisit.
+- **Date:** 2026-11-11
 
 ## Context
 
-- An agent's answer in Agentloft is text. Some answers are better seen: test results, a size over time, three options to pick from, a number that depends on two others.
+- An agent's answer in Agentloft is text. Some answers are better seen or tried: test results, a size over time, three options to pick from, a calculator, a diagram that moves.
 - Two products the product owner pointed at do this in different ways:
-  - **ChatGPT's Intelligent UI** (October 2026): the model composes an answer from a fixed library of native components (charts, forms, sliders, buttons). The app draws them; state changes stay in the app, and a button can start a new turn.
+  - **ChatGPT's Intelligent UI** (October 2026): the model composes an answer from a fixed library of native components, with an escape hatch for a self-contained HTML app.
   - **T3 Code's MCP Apps**: an MCP server ships an HTML page and the app shows it in a frame inside the thread.
-- Agentloft draws everything with GPUI, on the desktop and (as wasm on a canvas) in a browser. It has no DOM to put someone else's HTML in without a web view floating over a scrolling timeline.
+- The first version here (commit `1e8c049`) was the fixed-library kind: 27 blocks and a small expression language, drawn natively. The product owner's verdict was that a fixed set limits what an agent can make. This record replaces that design.
+- Agentloft draws everything with GPUI, on the desktop and (as wasm on a canvas) in a browser. Neither has a place to put someone else's HTML that scrolls, clips and stacks like the rest of the timeline.
+- The daemon already runs a headless Chrome and streams its pages to viewers ([ADR-0017](0017-streamed-browser.md)).
 - Every agent Agentloft runs already gets the Agentloft MCP server ([ADR-0013](0013-agentloft-mcp-cross-thread-context.md)).
 
 ## Decision
 
-**Agents call `show_ui` with a tree of blocks, and Agentloft draws it natively in the thread.**
+**An agent calls `show_ui` with HTML of its own, and the thread shows it as a live page.** The page runs in the daemon's browser, where it can reach almost nothing, and is streamed into the timeline.
 
 ### 1. The tool
 
-- `show_ui { title?, state?, body: [block] }` on the Agentloft MCP server, so Claude, Codex and ACP agents all have it with nothing per agent.
-- The bridge only **checks** the view and answers at once: "Shown in the chat", plus notes for properties it ignored, or what to fix. A view that doesn't pass is not shown, and the agent is told why in words it can act on (the block's path, the names it could have meant).
-- The tool's description is the whole component reference, since it is all an agent has to go on. A test keeps its example valid and every block type named.
+- `show_ui { title?, html }` on the Agentloft MCP server: Claude, Codex and ACP agents all have it with nothing per agent.
+- `html` is a fragment or a whole document, with its own CSS and JavaScript. Anything a page can draw, a view can show.
+- The tool's description is all an agent has to go on: the size it gets, the theme's variables, what loads and what doesn't, and `window.agentloft`. A test keeps it in step with what the page really gets.
+- **The agent hears back what it can't see.** The daemon loads the page once (with nobody looking, if need be) and the result lists script errors, loads that were refused, and calls that were ignored, so the agent can fix the page and call again.
 
-### 2. The blocks
+### 2. Where a view runs
 
-Twenty-seven, in five groups (`loft-view`, `TYPES`):
+- **In a tab of the daemon's browser**, like the web client's browser tab: pictures out, input in. So a view scrolls, clips and sits under menus like any other row, on the desktop and in the web client alike, from one implementation.
+- **A place of its own.** Each view lives at an address made up for it (`https://v<item>.view.agentloft.invalid/`), in a browser context apart from the user's tabs: its own storage and a secure context, none of their cookies.
+- **Nearly no network.** Every request a view makes stops at the daemon first. It answers for the view's own document; lets `GET`s through to a short list of script, style and font hosts (jsDelivr, unpkg, cdnjs, esm.sh, Tailwind's CDN, d3js.org, Plotly's CDN, Google Fonts); and refuses the rest, navigations included. A link opens for the user instead; a page that leaves is brought back.
+- **As wide as the chat column, as tall as its content** (24 to 1400 px; past that it scrolls inside, once clicked into). A view scrolls with the thread otherwise.
+- **Sharp.** Every picture of a view is taken at the viewer's real scale, also while it moves.
+- **It needs a browser.** Chrome, Chromium, Edge or Brave on the daemon's machine. Without one the view says so, and the agent is told the page was shown but not checked.
 
-| Group | Blocks |
+### 3. What a page gets
+
+- **A start that matches the app.** Before the agent's HTML come a doctype, the theme as CSS variables (`--bg`, `--fg`, `--muted`, `--border`, `--surface`, `--accent`, `--accent-fg`, `--success`, `--warning`, `--danger`, `--font`, `--mono`), and base styles for plain elements, all in `:where()` so any rule of the page's wins. The card a view sits in is the page's background. The theme follows the viewer, live.
+- **`window.agentloft`:**
+
+| Call | What happens |
 |---|---|
-| Layout | `row`, `column`, `grid`, `card`, `tabs`, `details`, `divider` |
-| Content | `text`, `heading`, `markdown`, `badge`, `stat`, `progress`, `list`, `key_value`, `steps`, `callout`, `code` |
-| Data | `table`, `chart` (bar, line, area, pie, donut) |
-| Inputs | `slider`, `input`, `select`, `choice`, `checkbox`, `toggle` |
-| Actions | `button` |
+| `send(text)` | `text` goes to the agent as the user's message: sent now, or queued behind a running turn exactly as a typed message is |
+| `setState(obj)` / `state` | JSON the view wants back next time. Kept by the daemon per view, so it survives reloads, restarts and other windows |
+| `copy(text)` | To the clipboard of whoever clicked |
+| `open(target)` | An `http(s)` link opens; anything else is a file of the thread's folder, shown in the side panel |
+| `theme` | The colours and fonts as values; `agentloft:theme` fires on `window` when they change |
 
-- Any block takes `when`: it shows while the expression holds.
-- Rows of a table or chart are written out, or generated from a range (`{ for, from, to, step?, row }`), so a chart can follow a slider.
-- Reading is lenient where the meaning is plain: a string where a block goes is a paragraph, common other names map to ours (`metric` is `stat`, `dropdown` is `select`), unknown properties are notes, not errors.
+- **Only a real click speaks for the user.** `send`, `copy` and `open` work while the browser itself says the user just clicked or pressed a key. That is checked by a bridge script in a world of its own, which the page's script can neither see nor change, and the bridge alone can reach Agentloft. A page that calls `send` on load is ignored, and the agent is told.
+- **Who clicked is who is answered.** With several viewers of one view, a `send`, `copy` or `open` goes to the connection whose input reached the page last.
 
-### 3. State and expressions
+### 4. As it is written
 
-- A view has state: what the agent gave in `state`, plus one value per input (`bind`).
-- Any text may hold `{{ expressions }}` over that state: arithmetic, comparisons, `a ? b : c`, lists, and about thirty functions, most of them for writing numbers the way people read them (`usd`, `percent`, `bytes`, `duration`).
-- The language is a small parser and evaluator of our own. It has no loops, no assignment and nothing to read but the view's state; expressions and nesting are capped, as are blocks (400), depth (8), rows (500) and the spec's size (200 KB).
-- A name an expression reads must exist, or the view is turned down. Without that check a misspelt name would show the user a blank where a number belongs.
-- State lives in the window showing the view and starts over when the thread is loaded again. **To review:** keep it in the daemon, so every window and a relaunch see the same slider position.
+- Claude writes a tool call's input a piece at a time. For `show_ui` the item starts with the call, the HTML so far is passed on about every 240 bytes, and the daemon writes each new piece into the open page (`document.write`). The page appears as it arrives, the way a slow page loads: structure, then style, then script.
+- What is half-written stays in memory. The log records the item three times: when it starts, when its input is whole, when it finishes.
+- Codex and ACP agents report a call whole, so their views appear when the call is complete.
 
-### 4. What a view can do
+### 5. Where a view lives in the thread
 
-One thing only: a button (or a list row) with an action.
-
-| Action | What happens |
-|---|---|
-| `send` | The text goes to the agent as the user's message: sent now, or queued behind a running turn exactly as a typed message is. It shows in the thread as theirs |
-| `set` | The view's own state changes |
-| `copy` | Text goes to the clipboard |
-| `open` | An `http(s)` link opens; anything else is a file of the thread's folder, shown in the side panel |
-
-- Hovering a `send` button shows the words it will say, so a label can't hide what is sent in the user's name.
-- Nothing else leaves a view. The agent cannot read the state; it learns what the user chose when a `send` says so.
-
-### 5. Where it is drawn
-
-- **From the tool call itself.** The call's arguments are already an item of the thread, stored and sent to every client. A `show_ui` call that went through is drawn as a view where it stands in the timeline; one that was turned down stays an ordinary failed tool line. No new item kind, no daemon state, nothing to migrate.
+- **In the `show_ui` tool call's own item.** The call's arguments are already an item of the thread, stored and sent to every client. A call that went through is drawn as a view; one that was turned down stays an ordinary failed tool line.
+- **A harness that never reports the call** (it ran inside a code-execution tool) gets an item made for it: the bridge tells the daemon what was shown, and the daemon adds the item if the harness hasn't.
 - A view is part of the answer: it stays in sight when the turn's work folds under "Worked for …".
-- Charts use fixed series colours in a fixed order, stepped separately for light and dark, with a legend from two series up. A pie folds what is past six slices into "Other".
+- Pages are opened as their rows are drawn and let go when they haven't been on screen for a while; the daemon closes pages nobody watches after two minutes and keeps at most 20. A view that comes back into sight shows its last picture at once and reopens behind it, with what it remembered.
 
 ## Why not something else
 
-- **HTML from the agent (or MCP Apps) in a frame.** Needs a web view over a virtualized, scrolling timeline on the desktop and an iframe over a canvas in the browser; looks like someone else's product; and runs script the agent wrote. MCP Apps from third-party servers may still be worth having one day, as their own thing.
-- **A fenced block in the answer's Markdown.** Streams with the text and saves a tool round trip, but every agent would need the format in its prompt, and a block that doesn't parse can't be sent back to the agent to fix.
-- **A new item kind written by the daemon.** Would also catch agents that call tools from inside a code-execution tool (OpenCode's code mode), at the price of a protocol change and a second copy of what the tool call already holds. **To review** if that case matters.
-- **A general scripting language for state.** More than a calculator needs, and something to sandbox.
+- **A fixed library of native components** (the first version). Fast, exact and safe, but an agent can only say what the library has words for. Dropped at the product owner's request.
+- **A web view in the timeline** (WKWebView on the desktop, an `<iframe>` over the canvas in the web client). Live at the display's frame rate with native text selection, but a native view draws above everything GPUI draws: every menu, tooltip and dialog over the conversation would be under it, and it would not clip to the scrolling list. Two implementations, and the desktop one is macOS-only today. **To review:** the desktop app could put a real web view over a view's picture while the pointer is in it.
+- **Letting pages reach the network.** Agents like to pull charts' libraries from a CDN, so a few script hosts are let through. More than that would make a view a way around the user's approvals: a page could send out whatever the agent put in it.
+- **A new item kind.** The tool call's item already holds everything; a second kind would be a protocol change that buys nothing now that the daemon can add the item itself.
 
 ## Consequences
 
-- An agent can answer with a chart, a table or a form, and ask a question whose answer is a click.
-- The component set is ours to keep stable: agents learn it from the tool's description, and old threads hold old specs. Blocks may be added; a block's meaning shouldn't change.
-- A view an agent drew through a code-execution tool (no `show_ui` call of its own in the thread) is not drawn.
-- The description costs every session about 700 tokens of tool definitions.
-- `read_thread` shows a view as its spec, not as a picture.
+- An agent can answer with anything a web page can be, and ask a question whose answer is a click.
+- A view is pictures of a page, not the page: no native text selection or screen reader inside it (copy works through the page's own selection), and motion is limited to what the stream carries (about 14 pictures a second).
+- Each view on screen is a tab in the daemon's browser. Twenty at once, at most.
+- The description costs every session about 500 tokens of tool definitions.
+- `read_thread` shows a view as its HTML, not as a picture.
+- A page is only as good as the agent's HTML. The check at the end of `show_ui` catches what throws or doesn't load, not what merely looks wrong.
 
 ## What's left
 
-- State kept in the daemon (see 3).
-- A view that streams in as the agent writes it.
-- Images, and icons on buttons.
-- A way for a view to wait for its answer (a blocking form), rather than hearing it as the next message.
+- MCP Apps: pages that MCP servers ship with their tools, shown the same way.
+- Images a view may load: none from the web today, and none from the thread's folder.
+- A real web view over the picture on the desktop (see above).
+- Letting the agent read what a view remembered, rather than hearing it in a `send`.
 
 ## References
 
-- `crates/loft-view` (spec, expressions, samples), `crates/loft-ui/src/view.rs` (drawing), `crates/loftd/src/mcp.rs` (`show_ui`).
-- Try it without an agent: a thread with the `fake` agent and the prompt `ui:all` (or `ui:tests`, `ui:pricing`, `ui:deploy`, `ui:approach`, `ui:release`, `ui:sizes`, or `ui:{…}` with a spec of your own).
+- `crates/loft-view` (what a view is, the page's head and bridge, samples), `crates/loft-core/src/pages/views.rs` (the page in the daemon's browser), `crates/loft-ui/src/view.rs` and `panel/page.rs` (the row and its pictures), `crates/loftd/src/mcp.rs` (`show_ui`).
+- Try it without an agent: a thread with the `fake` agent and the prompt `ui:all` (or `ui:tests`, `ui:pricing`, `ui:approach`, `ui:orbit`; `ui:stream:pricing` writes one out slowly; `ui:<p>…` shows a page of your own).
+- Real browser test: `cargo test -p loft-core pages::views::tests::live -- --ignored`.

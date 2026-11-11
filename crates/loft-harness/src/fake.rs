@@ -6,9 +6,11 @@
 //! - contains `question`: asks two questions first (`AskUserQuestion`);
 //! - contains `plan`: proposes a plan first (`ExitPlanMode`);
 //! - contains `slow`: streams slowly (≈2 s) so interrupts can be tested;
-//! - contains `ui:<sample>`, `ui:all` or `ui:{…}`: shows views the way an
-//!   agent's `show_ui` calls do (samples: `loft_view::samples`); the other
-//!   keywords are then left alone, since a view's own text may hold them;
+//! - contains `ui:<sample>`, `ui:all`, `ui:{…}` or `ui:<html…`: shows views
+//!   the way an agent's `show_ui` calls do (samples: `loft_view::samples`);
+//!   `ui:stream:<sample>` writes one out slowly, as an agent does. The
+//!   other keywords are then left alone, since a view's own text may hold
+//!   them;
 //! - contains `fail`: completes the turn as failed.
 
 use crate::{
@@ -82,10 +84,14 @@ async fn run(mut ends: SessionEnds, session_id: String) {
 async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
     ends.emit(HarnessEvent::TurnStarted);
 
-    let views = fake_views(text);
+    let (views, slowly) = fake_views(text);
     for (n, spec) in views.iter().enumerate() {
         let id = format!("view-{turn_no}-{n}");
         let tool = format!("mcp__agentloft__{}", loft_view::TOOL);
+        // An agent's call arrives a piece at a time; its item starts
+        // before its input is whole.
+        let html = spec["html"].as_str().unwrap_or_default();
+        let streamed = slowly && !html.is_empty();
         ends.emit(HarnessEvent::ItemStarted {
             parent: None,
             native_id: id.clone(),
@@ -93,11 +99,35 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
                 tool: tool.clone(),
                 tool_kind: ToolKind::Mcp,
                 title: tool,
-                input: spec.clone(),
+                input: if streamed {
+                    serde_json::json!({ loft_view::PARTIAL: true })
+                } else {
+                    spec.clone()
+                },
                 output: None,
                 is_error: false,
             },
         });
+        if streamed {
+            let mut end = 0;
+            while end < html.len() {
+                end = (end + 90).min(html.len());
+                while !html.is_char_boundary(end) {
+                    end += 1;
+                }
+                ends.emit(HarnessEvent::ToolInput {
+                    native_id: id.clone(),
+                    input: serde_json::json!({ "title": spec["title"], "html": &html[..end] }),
+                    partial: true,
+                });
+                tokio::time::sleep(Duration::from_millis(35)).await;
+            }
+            ends.emit(HarnessEvent::ToolInput {
+                native_id: id.clone(),
+                input: spec.clone(),
+                partial: false,
+            });
+        }
         // What the real tool answers (`loftd::mcp`).
         let checked = loft_view::parse(spec);
         ends.emit(HarnessEvent::ItemCompleted {
@@ -348,25 +378,34 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
     true
 }
 
-/// The views a prompt asks for: `ui:all`, `ui:<sample>`, or `ui:{…}` with a
-/// spec of your own (the rest of the prompt).
-fn fake_views(text: &str) -> Vec<serde_json::Value> {
+/// The views a prompt asks for, and whether to write them out slowly:
+/// `ui:all`, `ui:<sample>`, `ui:stream:<sample>`, `ui:{…}` with arguments
+/// of your own, or `ui:<…` with a page of your own (the rest of the
+/// prompt).
+fn fake_views(text: &str) -> (Vec<serde_json::Value>, bool) {
     let Some(at) = text.find("ui:") else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let rest = text[at + 3..].trim();
+    let (rest, slowly) = match rest.strip_prefix("stream:") {
+        Some(rest) => (rest.trim(), true),
+        None => (rest, false),
+    };
     if rest.starts_with('{') {
         // Not JSON: handed over as it is, for the check to turn down.
-        return vec![
-            serde_json::from_str(rest)
-                .unwrap_or_else(|_| serde_json::Value::String(rest.to_owned())),
-        ];
+        let args = serde_json::from_str(rest)
+            .unwrap_or_else(|_| serde_json::json!({ "html": serde_json::Value::Null }));
+        return (vec![args], slowly);
+    }
+    if rest.starts_with('<') {
+        return (vec![serde_json::json!({ "html": rest })], slowly);
     }
     let name: String = rest.chars().take_while(|c| c.is_alphanumeric()).collect();
-    match name.as_str() {
+    let views = match name.as_str() {
         "all" => loft_view::samples::all(),
         name => loft_view::samples::get(name).into_iter().collect(),
-    }
+    };
+    (views, slowly)
 }
 
 #[derive(Debug, Clone, Copy)]

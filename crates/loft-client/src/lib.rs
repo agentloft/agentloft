@@ -68,6 +68,12 @@ pub enum ClientEvent {
         id: loft_protocol::PageId,
         reason: String,
     },
+    /// A view asked for something on this viewer's click.
+    PageAction {
+        sub_id: u64,
+        id: loft_protocol::PageId,
+        action: loft_protocol::PageAction,
+    },
     /// The daemon asks this client to do something (answer with
     /// [`Client::respond_call`]).
     ClientCall {
@@ -133,6 +139,9 @@ pub(crate) fn dispatch(
         ServerMsg::PageState { sub_id, page } => ClientEvent::PageState { sub_id, page },
         ServerMsg::PageClosed { sub_id, id, reason } => {
             ClientEvent::PageClosed { sub_id, id, reason }
+        }
+        ServerMsg::PageAction { sub_id, id, action } => {
+            ClientEvent::PageAction { sub_id, id, action }
         }
         ServerMsg::ClientCall { call_id, call } => ClientEvent::ClientCall { call_id, call },
         ServerMsg::Fatal(e) => ClientEvent::Fatal(e),

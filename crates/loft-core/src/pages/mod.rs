@@ -14,6 +14,9 @@
 mod cdp;
 mod chrome;
 mod keys;
+mod views;
+
+pub use views::{StateKeeper, ViewRequest};
 
 use crate::BusMsg;
 use base64::Engine as _;
@@ -41,6 +44,10 @@ const TITLE_EVERY: Duration = Duration::from_millis(1500);
 const IDLE_BROWSER: Duration = Duration::from_secs(300);
 const MOVING_QUALITY: u32 = 72;
 const STILL_QUALITY: u32 = 88;
+/// A view (ADR-0018) is small, and mostly text and thin lines that are
+/// read while they move (a slider's number, a chart redrawing): every
+/// picture of one is taken at the viewer's real scale.
+const VIEW_QUALITY: u32 = 90;
 const MAX_PAGES: usize = 16;
 const MIN_SIDE: u32 = 120;
 const MAX_SIDE: u32 = 3840;
@@ -83,6 +90,10 @@ struct Browser {
     dead: AtomicBool,
     /// When the last page closed (for the idle stop).
     emptied: Mutex<Instant>,
+    /// The browser context views live in (ADR-0018), once there is one.
+    view_context: Mutex<Option<String>>,
+    /// Whether the task that closes idle views is running.
+    sweeping: AtomicBool,
 }
 
 struct Page {
@@ -92,6 +103,8 @@ struct Page {
     /// Input in the order it arrived; one task replays it.
     input: mpsc::UnboundedSender<PageInput>,
     state: Mutex<State>,
+    /// Set when the page draws a view an agent made rather than a site.
+    view: Option<views::ViewPage>,
 }
 
 struct State {
@@ -105,6 +118,53 @@ struct State {
     /// after a screenshot, and that is not news.
     last_cast: u64,
     main_frame: Option<String>,
+    /// The connection whose input reached the page last: who a view's
+    /// request (say this, copy that) is for.
+    actor: Option<u64>,
+    /// A view is being pictured at full scale right now, and has changed
+    /// again since that started.
+    picturing: bool,
+    changed_again: bool,
+}
+
+impl Browser {
+    /// Picture a view at its real scale, and again for as long as it keeps
+    /// changing: one screenshot at a time, always of the page as it is now.
+    async fn picture_view(self: Arc<Self>, page: Arc<Page>) {
+        loop {
+            let shot = self
+                .cdp
+                .send(
+                    "Page.captureScreenshot",
+                    json!({ "format": "jpeg", "quality": VIEW_QUALITY, "optimizeForSpeed": true }),
+                    Some(&page.session),
+                )
+                .await
+                .ok()
+                .and_then(|shot| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(shot["data"].as_str()?)
+                        .ok()
+                });
+            let again = {
+                let mut state = lock(&page.state);
+                if let Some(jpeg) = shot {
+                    state.seq += 1;
+                    state.frame = Some(Arc::new(jpeg));
+                    let _ = self.bus.send(BusMsg::PageFrame {
+                        id: page.id.clone(),
+                        seq: state.seq,
+                    });
+                }
+                let again = std::mem::take(&mut state.changed_again) && state.viewers > 0;
+                state.picturing = again;
+                again
+            };
+            if !again || self.dead.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+    }
 }
 
 /// A size a page can have, whatever a client asked for.
@@ -176,13 +236,17 @@ impl Pages {
         };
         let existing = lock(&browser.pages)
             .values()
-            .find(|p| lock(&p.state).info.thread_id == thread)
+            .find(|p| p.view.is_none() && lock(&p.state).info.thread_id == thread)
             .cloned();
         if let Some(page) = existing {
             browser.resize(&page, width, height, scale).await?;
             return Ok(lock(&page.state).info.clone());
         }
-        if lock(&browser.pages).len() >= MAX_PAGES {
+        let tabs = lock(&browser.pages)
+            .values()
+            .filter(|p| p.view.is_none())
+            .count();
+        if tabs >= MAX_PAGES {
             return Err(ErrorBody::new(
                 ErrorCode::Conflict,
                 "Too many browser tabs are open. Close one first.",
@@ -206,6 +270,13 @@ impl Pages {
         page.input.send(input).map_err(|_| gone())
     }
 
+    /// Connection `conn` is the one using the page now.
+    pub fn touched(&self, id: &PageId, conn: u64) {
+        if let Ok((_, page)) = self.page(id) {
+            lock(&page.state).actor = Some(conn);
+        }
+    }
+
     pub async fn resize(
         &self,
         id: &PageId,
@@ -215,6 +286,12 @@ impl Pages {
     ) -> Result<(), ErrorBody> {
         let (browser, page) = self.page(id)?;
         let (width, height, scale) = fit(width, height, scale);
+        // A view is as tall as its content, whatever its viewer's size.
+        let height = if page.view.is_some() {
+            lock(&page.state).info.height
+        } else {
+            height
+        };
         browser.resize(&page, width, height, scale).await
     }
 
@@ -302,6 +379,9 @@ impl Pages {
         if start {
             browser.start_pictures(&page).await;
         } else if stop {
+            if let Some(view) = &page.view {
+                view.left_alone();
+            }
             let _ = browser
                 .cdp
                 .send("Page.stopScreencast", json!({}), Some(&page.session))
@@ -360,6 +440,8 @@ impl Browser {
             popups: Mutex::default(),
             dead: AtomicBool::new(false),
             emptied: Mutex::new(Instant::now()),
+            view_context: Mutex::default(),
+            sweeping: AtomicBool::new(false),
         });
         tokio::spawn(browser.clone().run(events));
         // Hear about titles, and about windows pages open.
@@ -465,6 +547,8 @@ impl Browser {
             width,
             height,
             scale,
+            view: false,
+            overflow: false,
         };
         let page = Arc::new(Page {
             id: info.id.clone(),
@@ -479,7 +563,11 @@ impl Browser {
                 motion: 0,
                 last_cast: 0,
                 main_frame: None,
+                actor: None,
+                picturing: false,
+                changed_again: false,
             }),
+            view: None,
         });
         lock(&self.sessions).insert(session.clone(), page.id.clone());
         lock(&self.pages).insert(page.id.clone(), page.clone());
@@ -719,6 +807,19 @@ impl Browser {
                         .cdp
                         .send("Target.closeTarget", json!({ "targetId": target }), None)
                         .await;
+                    // A view doesn't go anywhere: the link opens for the
+                    // viewer instead.
+                    if opener.view.is_some() {
+                        let to = lock(&opener.state).actor;
+                        let _ = self.bus.send(BusMsg::PageAction {
+                            id: opener.id.clone(),
+                            action: loft_protocol::PageAction::Open {
+                                target: url.to_owned(),
+                            },
+                            to,
+                        });
+                        return;
+                    }
                     let _ = self
                         .cdp
                         .send(
@@ -745,6 +846,9 @@ impl Browser {
     }
 
     async fn on_page_event(self: &Arc<Self>, page: Arc<Page>, event: Event) {
+        if page.view.is_some() && self.on_view_event(&page, &event).await {
+            return;
+        }
         let params = &event.params;
         let session = Some(page.session.as_str());
         let changed = match event.method.as_str() {
@@ -902,6 +1006,42 @@ impl Browser {
             jpeg.hash(&mut hasher);
             hasher.finish()
         };
+        // A view on a dense screen: the screencast only says "it changed";
+        // the picture shown is a screenshot at the real scale.
+        if page.view.is_some() {
+            let start = {
+                let mut state = lock(&page.state);
+                if state.last_cast == fingerprint && state.frame.is_some() {
+                    return;
+                }
+                state.last_cast = fingerprint;
+                if state.info.scale > 1.0 {
+                    if state.picturing {
+                        state.changed_again = true;
+                        return;
+                    }
+                    state.picturing = true;
+                    Some(())
+                } else {
+                    None
+                }
+            };
+            if start.is_some() {
+                tokio::spawn(self.clone().picture_view(page.clone()));
+                return;
+            }
+            let seq = {
+                let mut state = lock(&page.state);
+                state.seq += 1;
+                state.frame = Some(Arc::new(jpeg));
+                state.seq
+            };
+            let _ = self.bus.send(BusMsg::PageFrame {
+                id: page.id.clone(),
+                seq,
+            });
+            return;
+        }
         let (seq, motion, sharpen) = {
             let mut state = lock(&page.state);
             if state.last_cast == fingerprint && state.frame.is_some() {

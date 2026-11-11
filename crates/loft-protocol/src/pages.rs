@@ -22,6 +22,30 @@ pub struct PageInfo {
     pub height: u32,
     /// Device pixels per CSS pixel the page renders at.
     pub scale: f32,
+    /// The page draws a view an agent made (ADR-0018), not a browser tab:
+    /// it is as tall as its content, and has no address to show.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view: bool,
+    /// A view with more content than its tallest size: it scrolls inside.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overflow: bool,
+}
+
+/// The app's look, as a view is told it (CSS variables and
+/// `agentloft.theme`).
+pub use loft_view::Theme as ViewTheme;
+
+/// Something a view asked for on the user's click (`agentloft.send`,
+/// `.copy`, `.open`, or a link). It goes to the viewer who clicked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum PageAction {
+    /// Say this to the agent, as the user.
+    Send { text: String },
+    /// Put this on the viewer's clipboard.
+    Copy { text: String },
+    /// Open a link, or a file of the thread's folder.
+    Open { target: String },
 }
 
 /// A picture of the page's viewport. Only the newest matters.

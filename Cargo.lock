@@ -4327,6 +4327,7 @@ dependencies = [
  "loft-harness",
  "loft-protocol",
  "loft-store",
+ "loft-view",
  "portable-pty",
  "serde",
  "serde_json",
@@ -4395,6 +4396,7 @@ dependencies = [
  "loft-config",
  "loft-harness",
  "loft-protocol",
+ "loft-view",
  "serde_json",
  "tokio",
  "tracing",
@@ -4419,6 +4421,7 @@ name = "loft-protocol"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "loft-view",
  "serde",
  "serde_json",
  "uuid",
@@ -4487,6 +4490,7 @@ dependencies = [
 name = "loft-view"
 version = "0.0.1"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 

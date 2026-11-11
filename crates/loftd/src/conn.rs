@@ -276,6 +276,10 @@ pub(crate) async fn run<S>(
         match msg {
             ClientMsg::Hello(_) => {}
             ClientMsg::Request { id, body } => {
+                // Whoever clicks in a page is who that page answers.
+                if let Request::PageInput { id, .. } = &body {
+                    core.page_touched(id, conn_id);
+                }
                 if let Some((session, policy)) = &remote {
                     // What remote sessions asked for, by name only.
                     if let Some(op) = peek_op(&frame)
@@ -348,6 +352,7 @@ pub(crate) async fn run<S>(
                         registered.page_acks.insert(sub_id, acked);
                         tokio::spawn(forward_page(
                             core.clone(),
+                            conn_id,
                             sub_id,
                             page,
                             out_tx.clone(),
@@ -523,7 +528,10 @@ async fn forward(
                 }
                 // Pages have a forwarder of their own (`forward_page`).
                 Ok(
-                    BusMsg::PageFrame { .. } | BusMsg::PageState { .. } | BusMsg::PageClosed { .. },
+                    BusMsg::PageFrame { .. }
+                    | BusMsg::PageState { .. }
+                    | BusMsg::PageClosed { .. }
+                    | BusMsg::PageAction { .. },
                 ) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(n, sub_id, "subscriber lagged; resending snapshot");
@@ -557,6 +565,7 @@ impl Drop for Watching {
 /// slow link gets fewer pictures instead of a queue of stale ones.
 async fn forward_page(
     core: Arc<Core>,
+    conn_id: u64,
     sub_id: u64,
     page: loft_protocol::PageId,
     out: mpsc::UnboundedSender<ServerMsg>,
@@ -627,6 +636,15 @@ async fn forward_page(
                 Ok(BusMsg::PageClosed { id, reason }) if id == page => {
                     let _ = out.send(ServerMsg::PageClosed { sub_id, id, reason });
                     return;
+                }
+                // What a view asked for goes to whoever clicked in it (to
+                // every viewer if nobody is known to have).
+                Ok(BusMsg::PageAction { id, action, to })
+                    if id == page && to.is_none_or(|conn| conn == conn_id) =>
+                {
+                    if out.send(ServerMsg::PageAction { sub_id, id, action }).is_err() {
+                        return;
+                    }
                 }
                 Ok(_) => {}
                 // Missed some: the newest picture and the current state

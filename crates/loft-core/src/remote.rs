@@ -311,6 +311,19 @@ impl Core {
                 }
             }
 
+            // A view is a page that can reach nothing: it comes with the
+            // thread it is in, whether or not the browser is on.
+            Request::ViewOpen { .. } | Request::ViewTheme { .. } => Ok(()),
+            Request::PageInput { id, .. }
+            | Request::PageResize { id, .. }
+            | Request::PageSelection { id }
+                if self.pages.is_view(id) =>
+            {
+                Ok(())
+            }
+            // Only an agent's own bridge says what an agent showed.
+            Request::ShowView { .. } => Err(forbidden("Showing a view")),
+
             Request::PageOpen { .. }
             | Request::PageNavigate { .. }
             | Request::PageInput { .. }
@@ -388,7 +401,7 @@ impl Core {
             Topic::Workspace | Topic::Thread(_) => Ok(()),
             Topic::Terminal(_) if policy.allow_terminal => Ok(()),
             Topic::Terminal(_) => Err(terminals_off()),
-            Topic::Page(_) if policy.allow_browser => Ok(()),
+            Topic::Page(id) if policy.allow_browser || self.pages.is_view(id) => Ok(()),
             Topic::Page(_) => Err(browser_off()),
         }
     }
@@ -972,6 +985,33 @@ mod tests {
                 .check_remote_topic(&Topic::Page(id.clone()), &WEB)
                 .is_err()
         );
+
+        // A view comes with its thread: it may be opened with the browser
+        // off (it can reach nothing). What an agent showed is for that
+        // agent's own bridge to say, never a remote session.
+        let view = |req: Request| f.core.check_remote(&req, &WEB);
+        assert!(
+            view(Request::ViewOpen {
+                thread_id: thread.clone(),
+                item_id: loft_protocol::ItemId::new(),
+                width: 600,
+                scale: 1.0,
+                theme: Default::default(),
+            })
+            .is_ok()
+        );
+        assert!(
+            view(Request::ViewTheme {
+                id: id.clone(),
+                theme: Default::default(),
+            })
+            .is_ok()
+        );
+        assert!(is_forbidden(&view(Request::ShowView {
+            thread_id: thread.clone(),
+            title: None,
+            html: "<p>hi</p>".into(),
+        })));
 
         // Allowed once `[web] allow_browser` is on. Nothing is open, so
         // what goes through finds no page, which is not "forbidden".

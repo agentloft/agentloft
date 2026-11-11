@@ -1,12 +1,13 @@
 [package]
 name = "loft-view"
-description = "Views an agent draws in the chat: the spec, its validation and its expressions (ADR-0018)"
+description = "Views an agent draws in the chat: what a view is, the page it runs in, and its checks (ADR-0018)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -10,16 +10,18 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollEvent, Styled as _,
-    Subscription, Task, UTF16Selection, Window, canvas, div, img, px,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollEvent,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UTF16Selection, Window,
+    canvas, div, img, px,
 };
 use loft_protocol::{
-    PageButton, PageInfo, PageInput, PageMouse, PageNav, Request, Response, ThreadId,
-    page_modifiers,
+    ItemId, PageAction, PageButton, PageInfo, PageInput, PageMouse, PageNav, Request, Response,
+    ThreadId, ViewTheme, page_modifiers,
 };
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -37,6 +39,15 @@ const TOOLBAR_HEIGHT: f32 = 40.;
 const MOVE_EVERY: Duration = Duration::from_millis(16);
 /// A resize is sent once the size has held this long.
 const RESIZE_AFTER: Duration = Duration::from_millis(120);
+/// How tall a view is drawn before its page has said how tall it is.
+const VIEW_FIRST_HEIGHT: u32 = 120;
+/// A view that hasn't been on screen for this long lets go of its page
+/// (the daemon closes pages nobody watches; it comes back when seen again).
+const VIEW_UNSEEN: Duration = Duration::from_secs(20);
+
+/// A view's page changed height: whatever holds it should measure again.
+pub struct PageResized;
+impl gpui_kit::EventEmitter<PageResized> for PageView {}
 
 struct Initialized;
 impl gpui_kit::Global for Initialized {}
@@ -96,6 +107,21 @@ pub struct PageView {
     marked: Option<String>,
     last_move: Option<Instant>,
     last_point: Point<Pixels>,
+    /// Set when this draws a view an agent made (the `show_ui` call's
+    /// item, ADR-0018) rather than a browser tab: no toolbar, as tall as
+    /// its content, and it only scrolls or takes keys once clicked.
+    view: Option<ItemId>,
+    /// The look the daemon was last told (a view dresses like the app).
+    themed: Option<ViewTheme>,
+    /// The height a view's page last had: what it keeps while reopening.
+    last_height: Option<u32>,
+    /// When the page was last painted.
+    seen: Rc<Cell<Option<Instant>>>,
+    /// Lets go of a view's page once it has gone unseen.
+    resting: Option<Task<()>>,
+    /// Whether a view's page is the top of its card (no title over it),
+    /// so its upper corners are the card's.
+    flush_top: Rc<Cell<bool>>,
     _subs: Vec<Subscription>,
 }
 
@@ -130,10 +156,13 @@ impl PageView {
             // The view going away (its thread's panel closed) closes the
             // page: nothing else would.
             cx.on_release(|this, cx| {
+                // A view's page is the daemon's to close (others may be
+                // watching it, and it is cheap to keep for a while).
+                let closes = this.view.is_none();
                 if let Some(info) = this.info.take() {
                     this.store.update(cx, |store, _| {
                         store.forget_page(&info.id);
-                        if let Some(client) = store.client() {
+                        if closes && let Some(client) = store.client() {
                             drop(client.request(Request::PageClose { id: info.id }));
                         }
                     });
@@ -166,8 +195,34 @@ impl PageView {
             marked: None,
             last_move: None,
             last_point: Point::default(),
+            view: None,
+            themed: None,
+            last_height: None,
+            seen: Rc::default(),
+            resting: None,
+            flush_top: Rc::default(),
             _subs: subs,
         }
+    }
+
+    /// The page of a view an agent made: the `show_ui` call `item`.
+    pub fn for_view(
+        store: Entity<AppStore>,
+        thread: ThreadId,
+        item: ItemId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(store, thread, window, cx);
+        this.view = Some(item);
+        this.last_url = None;
+        this
+    }
+
+    /// Whether a view's page is the top of its card. Whoever draws the
+    /// card says so each time it draws.
+    pub fn flush_top(&self) -> Rc<Cell<bool>> {
+        self.flush_top.clone()
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -264,6 +319,10 @@ impl PageView {
     fn wanted_size(&self, window: &Window) -> Option<(u32, u32, f32)> {
         let bounds = self.bounds.get()?;
         let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        // A view's width is ours to say; its height is its content's.
+        if self.view.is_some() {
+            return (w >= 1.).then(|| (w.round() as u32, 0, window.scale_factor().clamp(1., 2.)));
+        }
         (w >= 1. && h >= 1.).then(|| {
             (
                 w.round() as u32,
@@ -277,12 +336,25 @@ impl PageView {
         self.opening = true;
         self.note = None;
         self.asked = Some(size);
-        let body = Request::PageOpen {
-            thread_id: self.thread.clone(),
-            url: self.last_url.clone(),
-            width: size.0,
-            height: size.1,
-            scale: size.2,
+        let body = match &self.view {
+            Some(item) => {
+                let theme = crate::view::theme(cx);
+                self.themed = Some(theme.clone());
+                Request::ViewOpen {
+                    thread_id: self.thread.clone(),
+                    item_id: item.clone(),
+                    width: size.0,
+                    scale: size.2,
+                    theme: Box::new(theme),
+                }
+            }
+            None => Request::PageOpen {
+                thread_id: self.thread.clone(),
+                url: self.last_url.clone(),
+                width: size.0,
+                height: size.1,
+                scale: size.2,
+            },
         };
         request_in(&self.store, body, cx, |this, result, cx| {
             this.opening = false;
@@ -292,6 +364,9 @@ impl PageView {
                     this.store
                         .update(cx, |s, _| s.subscribe_page(page.id.clone(), weak));
                     this.on_state(page, cx);
+                    if this.view.is_some() {
+                        this.rest_when_unseen(cx);
+                    }
                 }
                 Ok(other) => this.note = Some(format!("unexpected response: {other:?}")),
                 Err(err) => this.note = Some(err.message),
@@ -347,9 +422,93 @@ impl PageView {
         if !page.url.is_empty() {
             self.last_url = Some(page.url.clone());
         }
+        if self.view.is_some() && self.last_height != Some(page.height) {
+            self.last_height = Some(page.height);
+            cx.emit(PageResized);
+        }
         self.info = Some(page);
         self.note = None;
         cx.notify();
+    }
+
+    /// What a view asked for on this viewer's click. Called while the
+    /// store is handing out what the daemon sent, so anything that needs
+    /// the store waits until it is done.
+    pub fn on_action(&mut self, action: PageAction, cx: &mut Context<Self>) {
+        let (store, thread) = (self.store.clone(), self.thread.clone());
+        match action {
+            PageAction::Send { text } => {
+                let text = text.trim().to_owned();
+                if !text.is_empty() {
+                    cx.defer(move |cx| store.update(cx, |store, cx| store.say(thread, text, cx)));
+                }
+            }
+            PageAction::Copy { text } => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            PageAction::Open { target } => {
+                let target = target.trim().to_owned();
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    cx.open_url(&target);
+                } else if !target.is_empty() && !target.contains("://") {
+                    // A file of the thread's folder, shown in the panel.
+                    cx.defer(move |cx| {
+                        let cwd = store.read(cx).thread_cwd(&thread, cx).unwrap_or_default();
+                        let path = target
+                            .split_once(':')
+                            .map_or(target.as_str(), |(path, _line)| path);
+                        let rel = crate::items::relative_to(path, &cwd);
+                        store.update(cx, |store, cx| store.open_file(thread, rel, cx));
+                    });
+                }
+            }
+        }
+    }
+
+    /// The look a view should have, if it changed since the daemon was
+    /// told (light to dark, another accent).
+    fn follow_theme(&mut self, cx: &mut Context<Self>) {
+        let Some(info) = &self.info else {
+            return;
+        };
+        let theme = crate::view::theme(cx);
+        if self.themed.as_ref() != Some(&theme) {
+            self.send(
+                Request::ViewTheme {
+                    id: info.id.clone(),
+                    theme: Box::new(theme.clone()),
+                },
+                cx,
+            );
+            self.themed = Some(theme);
+        }
+    }
+
+    /// Check now and then whether the view is still drawn; when it hasn't
+    /// been for a while, stop watching its page. Its last picture stays,
+    /// and drawing it again opens the page again.
+    fn rest_when_unseen(&mut self, cx: &mut Context<Self>) {
+        self.resting = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let resting = this.update(cx, |this, cx| {
+                    let Some(info) = &this.info else {
+                        return true;
+                    };
+                    if this.seen.get().is_some_and(|at| at.elapsed() < VIEW_UNSEEN) {
+                        return false;
+                    }
+                    let id = info.id.clone();
+                    this.store.update(cx, |store, _| store.forget_page(&id));
+                    this.info = None;
+                    this.asked = None;
+                    this.held = PageButton::None;
+                    this.keys_down.clear();
+                    true
+                });
+                if resting.unwrap_or(true) {
+                    break;
+                }
+            }
+        }));
     }
 
     /// A new picture. One is decoded at a time; while that happens only the
@@ -369,6 +528,9 @@ impl PageView {
             let _ = this.update(cx, |this, cx| {
                 this.decoding = false;
                 if let Some(picture) = picture {
+                    if this.view.is_some() && this.picture.is_none() {
+                        tracing::debug!(seq, "a view's first picture is in");
+                    }
                     this.drop_picture(cx);
                     this.picture = Some(picture);
                     cx.notify();
@@ -400,7 +562,11 @@ impl PageView {
         self.asked = None;
         self.held = PageButton::None;
         self.keys_down.clear();
-        self.note = Some(reason);
+        // A view's page comes and goes (the daemon closes idle ones); it
+        // opens again the next time the view is drawn.
+        if self.view.is_none() {
+            self.note = Some(reason);
+        }
         cx.notify();
     }
 
@@ -466,11 +632,18 @@ impl PageView {
     /// A window position as a point in the page, if the page is showing.
     fn page_point(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
         let bounds = self.bounds.get()?;
-        self.info.as_ref()?;
-        Some((
+        let info = self.info.as_ref()?;
+        let (x, y) = (
             f32::from(position.x - bounds.origin.x),
             f32::from(position.y - bounds.origin.y),
-        ))
+        );
+        // A view's picture is stretched over its element while the page
+        // catches up with a new size.
+        let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        if self.view.is_some() && w >= 1. && h >= 1. {
+            return Some((x * info.width as f32 / w, y * info.height as f32 / h));
+        }
+        Some((x, y))
     }
 
     fn on_mouse_down(
@@ -547,6 +720,14 @@ impl PageView {
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A view scrolls with the thread around it. Only one with more
+        // content than it can show, and only once clicked into, takes the
+        // wheel for itself.
+        if self.view.is_some()
+            && !(self.info.as_ref().is_some_and(|i| i.overflow) && self.focus.is_focused(window))
+        {
+            return;
+        }
         let Some((x, y)) = self.page_point(event.position) else {
             return;
         };
@@ -891,8 +1072,130 @@ impl EntityInputHandler for PageView {
     }
 }
 
+impl PageView {
+    /// A view an agent made: its page and nothing around it.
+    fn render_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let p = Palette::of(cx);
+        self.follow_size(window, cx);
+        self.follow_theme(cx);
+        let height = self
+            .info
+            .as_ref()
+            .map(|i| i.height)
+            .or(self.last_height)
+            .unwrap_or(VIEW_FIRST_HEIGHT);
+        let (bounds, seen, focus, entity) = (
+            self.bounds.clone(),
+            self.seen.clone(),
+            self.focus.clone(),
+            cx.entity(),
+        );
+        let id = entity.entity_id();
+        let body = match (&self.note, &self.picture) {
+            (Some(note), _) => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(crate::host_ui::unavailable(
+                    IconName::Globe,
+                    "This view can't be shown",
+                    note,
+                    &p,
+                ))
+                .child(
+                    Button::new("view-retry")
+                        .small()
+                        .label("Try again")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.note = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+            // The card's corners are round; a picture's are not, unless
+            // told so.
+            (None, Some(picture)) => img(picture.clone())
+                .size_full()
+                .rounded_b(px(11.))
+                .when(self.flush_top.get(), |i| i.rounded_t(px(11.)))
+                .into_any_element(),
+            (None, None) => h_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_sm()
+                .text_color(p.muted_foreground)
+                .child(Spinner::new().xsmall().color(p.muted_foreground))
+                .child("Drawing…")
+                .into_any_element(),
+        };
+        let height = if self.note.is_some() { 180 } else { height };
+        div()
+            .id(("view-page", id))
+            .relative()
+            .w_full()
+            .h(px(height as f32))
+            .overflow_hidden()
+            .track_focus(&self.focus)
+            .key_context(KEY_CONTEXT)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(false, cx)))
+            .on_action(cx.listener(|this, _: &CutSelection, _, cx| this.copy_selection(true, cx)))
+            .on_action(cx.listener(Self::paste_clipboard))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll(cx.listener(Self::on_scroll))
+            // The pointer left: the page shouldn't go on showing a hover.
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered && this.held == PageButton::None {
+                    this.input(
+                        PageInput::Mouse {
+                            action: PageMouse::Move,
+                            x: -10.,
+                            y: -10.,
+                            button: PageButton::None,
+                            click_count: 0,
+                            modifiers: 0,
+                        },
+                        cx,
+                    );
+                }
+            }))
+            .child(body)
+            .child(
+                canvas(
+                    move |area, _, cx| {
+                        seen.set(Some(Instant::now()));
+                        // Its width is known from here on: open, or resize.
+                        let before = bounds.replace(Some(area));
+                        if before.is_none_or(|b| b.size.width != area.size.width) {
+                            cx.notify(id);
+                        }
+                    },
+                    move |area, (), window, cx| {
+                        window.handle_input(&focus, ElementInputHandler::new(area, entity), cx);
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for PageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.view.is_some() {
+            return self.render_view(window, cx);
+        }
         let p = Palette::of(cx);
         // A browser session the daemon doesn't give its browser to.
         if !self.store.read(cx).pages_allowed() {

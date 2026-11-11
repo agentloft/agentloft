@@ -66,6 +66,17 @@ const MIGRATIONS: &[&str] = &[
         thread_id     TEXT
     );
     "#,
+    // 2: what views remember (`agentloft.setState`, ADR-0018). Not an
+    // event: nobody needs its history, only its latest value.
+    r#"
+    CREATE TABLE view_state (
+        thread_id     TEXT NOT NULL,
+        item_id       TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        data          TEXT NOT NULL,
+        PRIMARY KEY (thread_id, item_id)
+    );
+    "#,
 ];
 
 pub struct Store {
@@ -166,6 +177,39 @@ impl Store {
         self.conn
             .execute("DELETE FROM processes WHERE pid = ?1", params![pid])?;
         Ok(())
+    }
+
+    /// Keep what a view asked to remember (its latest value only).
+    pub fn set_view_state(
+        &self,
+        thread: &ThreadId,
+        item: &loft_protocol::ItemId,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO view_state(thread_id, item_id, updated_at_ms, data) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id, item_id) DO UPDATE SET
+                 updated_at_ms = excluded.updated_at_ms, data = excluded.data",
+            params![thread.as_str(), item.as_str(), now_ms(), json(state)?],
+        )?;
+        Ok(())
+    }
+
+    /// What a view remembered, if anything.
+    pub fn view_state(
+        &self,
+        thread: &ThreadId,
+        item: &loft_protocol::ItemId,
+    ) -> Result<Option<serde_json::Value>> {
+        let data: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM view_state WHERE thread_id = ?1 AND item_id = ?2",
+                params![thread.as_str(), item.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
     }
 
     pub fn processes(&self) -> Result<Vec<(u32, String)>> {
@@ -411,6 +455,7 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
                 "DELETE FROM items WHERE thread_id = ?1",
                 "DELETE FROM turns WHERE thread_id = ?1",
                 "DELETE FROM requests WHERE thread_id = ?1",
+                "DELETE FROM view_state WHERE thread_id = ?1",
                 "DELETE FROM threads WHERE id = ?1",
                 // The log keeps only the deletion itself.
                 "DELETE FROM events WHERE thread_id = ?1 AND type != 'thread_deleted'",
@@ -559,5 +604,37 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.projects().unwrap().len(), 1);
         store.backup_to(&dir.path().join("backup.sqlite")).unwrap();
+    }
+
+    #[test]
+    fn views_remember_until_their_thread_goes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project, item) = (project(), ItemId::new());
+        let thread = thread(&project);
+        store
+            .commit(vec![
+                Event::ProjectAdded {
+                    project: project.clone(),
+                },
+                Event::ThreadCreated {
+                    thread: thread.clone(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), None);
+        let first = serde_json::json!({ "seats": 12 });
+        store.set_view_state(&thread.id, &item, &first).unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), Some(first));
+        // Only the latest is kept.
+        let second = serde_json::json!({ "seats": 57, "tier": "scale" });
+        store.set_view_state(&thread.id, &item, &second).unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), Some(second));
+        assert_eq!(store.view_state(&thread.id, &ItemId::new()).unwrap(), None);
+        store
+            .commit(vec![Event::ThreadDeleted {
+                thread_id: thread.id.clone(),
+            }])
+            .unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), None);
     }
 }

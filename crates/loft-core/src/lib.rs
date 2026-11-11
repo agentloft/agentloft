@@ -66,7 +66,20 @@ pub enum BusMsg {
         id: loft_protocol::PageId,
         reason: String,
     },
+    /// A view asked for something on a click. `to`: the connection that
+    /// clicked, when it is known (else every viewer hears it).
+    PageAction {
+        id: loft_protocol::PageId,
+        action: loft_protocol::PageAction,
+        to: Option<u64>,
+    },
 }
+
+/// How wide a view is laid out when it is loaded with nobody looking yet
+/// (to see whether its script runs).
+const UNWATCHED_VIEW_WIDTH: u32 = 760;
+/// How long a view gets to load and run before `show_ui` answers.
+const VIEW_CHECK: Duration = Duration::from_millis(2500);
 
 /// How agent sessions reach the Agentloft MCP server (`agentloftd mcp`).
 #[derive(Debug, Clone)]
@@ -589,6 +602,163 @@ impl Core {
         self.pages.watching(id, joined).await;
     }
 
+    /// Connection `conn` just used the page: what a view asks for next
+    /// (say this, copy that) is for whoever is on that connection.
+    pub fn page_touched(&self, id: &loft_protocol::PageId, conn: u64) {
+        self.pages.touched(id, conn);
+    }
+
+    /// The agent wrote more of a view, or finished it: its page, if one is
+    /// open, shows it.
+    pub(crate) fn view_written(
+        self: &Arc<Self>,
+        thread: &ThreadId,
+        item: &ItemId,
+        html: String,
+        done: bool,
+    ) {
+        let (core, thread, item) = (self.clone(), thread.clone(), item.clone());
+        tokio::spawn(async move {
+            core.pages.update_view(&thread, &item, html, done).await;
+        });
+    }
+
+    /// Where the daemon's browser keeps its profile, and which browser.
+    fn browser_setup(&self) -> CoreResult<(PathBuf, Option<String>)> {
+        let profile = self
+            .opts()
+            .config_file
+            .as_ref()
+            .and_then(|f| f.parent())
+            .map(|home| home.join("browser").join("profile"))
+            .ok_or_else(|| {
+                ErrorBody::new(ErrorCode::Unsupported, "The browser isn't available here.")
+            })?;
+        Ok((profile, self.config().browser.executable))
+    }
+
+    /// The page that draws the view in `item` (a `show_ui` call of
+    /// `thread`), opened if it isn't.
+    async fn open_view(
+        self: &Arc<Self>,
+        thread: &ThreadId,
+        item: &ItemId,
+        width: u32,
+        scale: f32,
+        theme: Option<loft_protocol::ViewTheme>,
+    ) -> CoreResult<loft_protocol::PageInfo> {
+        // As it is being written, if it still is; else as it was kept.
+        let live = self.live().get(item).cloned();
+        let found = match live {
+            Some(found) => Some(found),
+            None => self
+                .with_store(|s| s.items(thread))?
+                .into_iter()
+                .find(|i| &i.id == item),
+        };
+        let not_a_view = || ErrorBody::new(ErrorCode::NotFound, "That isn't a view.");
+        let found = found
+            .filter(|i| &i.thread_id == thread)
+            .ok_or_else(not_a_view)?;
+        let loft_protocol::ItemBody::ToolCall { tool, input, .. } = &found.body else {
+            return Err(not_a_view());
+        };
+        if !loft_view::is_tool(tool) {
+            return Err(not_a_view());
+        }
+        let done = input[loft_view::PARTIAL] != true;
+        let html = input["html"].as_str().unwrap_or_default().to_owned();
+        let state = self
+            .with_store(|s| s.view_state(thread, item))?
+            .unwrap_or(serde_json::Value::Null);
+        let keep: pages::StateKeeper = {
+            let core = Arc::downgrade(self);
+            Arc::new(move |thread, item, state| {
+                if let Some(core) = core.upgrade()
+                    && let Err(err) = core.with_store(|s| s.set_view_state(thread, item, state))
+                {
+                    tracing::warn!(err = %err.message, "keeping a view's state");
+                }
+            })
+        };
+        let (profile, executable) = self.browser_setup()?;
+        self.pages
+            .open_view(
+                pages::ViewRequest {
+                    thread: thread.clone(),
+                    item: item.clone(),
+                    html,
+                    done,
+                    width,
+                    scale,
+                    theme,
+                    state,
+                    keep,
+                },
+                executable.as_deref(),
+                &profile,
+                self.bus.clone(),
+            )
+            .await
+    }
+
+    /// An agent's `show_ui` call: find (or make) its item, load the page
+    /// once, and say what went wrong in it, if anything did.
+    async fn show_view(
+        self: &Arc<Self>,
+        thread_id: ThreadId,
+        title: Option<String>,
+        html: String,
+    ) -> CoreResult<Response> {
+        let view = loft_view::parse(&serde_json::json!({ "title": title, "html": html }))
+            .map_err(|problem| ErrorBody::new(ErrorCode::BadRequest, problem))?;
+        // The harness reports the call on its own channel; give that a
+        // moment to arrive before deciding it never will.
+        let mut item_id = None;
+        for attempt in 0..3 {
+            let make = attempt == 2;
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            let (title, html) = (view.title.clone(), view.html.clone());
+            let reply = self
+                .thread_call(&thread_id, |reply| ThreadCmd::ShowView {
+                    title,
+                    html,
+                    make,
+                    reply,
+                })
+                .await?;
+            if let Response::Json { value } = reply
+                && let Some(id) = value["item_id"].as_str()
+            {
+                item_id = Some(ItemId(id.to_owned()));
+                break;
+            }
+        }
+        let item_id = item_id.ok_or_else(|| internal("the view has no item"))?;
+        // Load it with nobody looking, to tell the agent whether it runs.
+        let (problems, unchecked) = match self
+            .open_view(&thread_id, &item_id, UNWATCHED_VIEW_WIDTH, 2.0, None)
+            .await
+        {
+            Ok(_) => (
+                self.pages
+                    .view_problems(&thread_id, &item_id, VIEW_CHECK)
+                    .await,
+                None,
+            ),
+            Err(err) => (Vec::new(), Some(err.message)),
+        };
+        Ok(Response::Json {
+            value: serde_json::json!({
+                "item_id": item_id.0,
+                "problems": problems,
+                "unchecked": unchecked,
+            }),
+        })
+    }
+
     pub async fn handle(self: &Arc<Self>, req: Request) -> CoreResult<Response> {
         match req {
             Request::Ping => Ok(Response::Pong),
@@ -879,16 +1049,7 @@ impl Core {
                 // The thread has to be one of ours.
                 self.with_store(|s| s.thread(&thread_id))?
                     .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "no such thread"))?;
-                let profile = self
-                    .opts()
-                    .config_file
-                    .as_ref()
-                    .and_then(|f| f.parent())
-                    .map(|home| home.join("browser").join("profile"))
-                    .ok_or_else(|| {
-                        ErrorBody::new(ErrorCode::Unsupported, "The browser isn't available here.")
-                    })?;
-                let executable = self.config().browser.executable;
+                let (profile, executable) = self.browser_setup()?;
                 let page = self
                     .pages
                     .open(
@@ -905,9 +1066,37 @@ impl Core {
                 Ok(Response::Page { page })
             }
             Request::PageNavigate { id, nav } => {
+                // A view has nowhere to go.
+                if self.pages.is_view(&id) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::BadRequest,
+                        "A view can't be sent to an address.",
+                    ));
+                }
                 self.pages.navigate(&id, nav).await?;
                 Ok(Response::Ok)
             }
+            Request::ViewOpen {
+                thread_id,
+                item_id,
+                width,
+                scale,
+                theme,
+            } => {
+                let page = self
+                    .open_view(&thread_id, &item_id, width, scale, Some(*theme))
+                    .await?;
+                Ok(Response::Page { page })
+            }
+            Request::ViewTheme { id, theme } => {
+                self.pages.theme_view(&id, &theme).await?;
+                Ok(Response::Ok)
+            }
+            Request::ShowView {
+                thread_id,
+                title,
+                html,
+            } => self.show_view(thread_id, title, html).await,
             Request::PageInput { id, input } => {
                 self.pages.input(&id, input)?;
                 Ok(Response::Ok)

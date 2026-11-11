@@ -361,13 +361,20 @@ pub fn render_row(
     store: &Entity<AppStore>,
     p: &Palette,
     ix: usize,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    // A view's page is made the first time its row is drawn.
+    crate::view::ensure(thread, store, ix, window, cx);
     let state = thread.read(cx);
     let (Some(model), Some(row)) = (state.model.as_ref(), state.rows.get(ix)) else {
         return div().into_any_element();
     };
+    if let Row::Item(i) = row
+        && crate::view::is_view(&model.items[*i])
+    {
+        crate::view::settle(state, &model.items[*i], cx);
+    }
     let content = match row {
         // Your messages say where they're drawn (the turn map lights the
         // ticks of those in view).

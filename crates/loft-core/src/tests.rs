@@ -1645,3 +1645,109 @@ async fn expired_archived_threads_are_deleted() {
         .delete_archived_after_days = 0;
     assert_eq!(core.delete_expired_archived().await, 0);
 }
+
+fn views(items: &[Item]) -> Vec<&Item> {
+    items
+        .iter()
+        .filter(|i| matches!(&i.body, ItemBody::ToolCall { tool, .. } if loft_view::is_tool(tool)))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_view_written_slowly_is_kept_whole() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let mut bus = f.core.subscribe();
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "ui:stream:approach".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    let shown = views(&items);
+    assert_eq!(shown.len(), 1);
+    let ItemBody::ToolCall {
+        input, is_error, ..
+    } = &shown[0].body
+    else {
+        panic!()
+    };
+    // As the agent finished it: all of the page, nothing marking it partial.
+    assert_eq!(*input, loft_view::samples::get("approach").unwrap());
+    assert!(!is_error && shown[0].status == ItemStatus::Completed);
+    // What was half-written never went to the log: the item was recorded
+    // when it started, when its input was whole, and when it finished.
+    let mut records = 0;
+    while let Ok(msg) = bus.try_recv() {
+        if let BusMsg::Event(env) = msg
+            && matches!(&env.event, loft_protocol::Event::ItemUpserted { item } if item.id == shown[0].id)
+        {
+            records += 1;
+        }
+    }
+    assert_eq!(records, 3);
+}
+
+#[tokio::test]
+async fn a_view_the_harness_never_reported_gets_an_item() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    // The bridge's word is all there is (the call ran inside another tool).
+    let shown = f
+        .core
+        .handle(Request::ShowView {
+            thread_id: thread.id.clone(),
+            title: Some("Sizes".into()),
+            html: "<p>hello</p>".into(),
+        })
+        .await
+        .unwrap();
+    let Response::Json { value } = shown else {
+        panic!()
+    };
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    let made = views(&items);
+    assert_eq!(made.len(), 1);
+    assert_eq!(value["item_id"], made[0].id.0);
+    assert!(
+        matches!(&made[0].body, ItemBody::ToolCall { input, output, .. }
+        if input["html"] == "<p>hello</p>" && input["title"] == "Sizes" && output.is_some())
+    );
+    assert_eq!(made[0].status, ItemStatus::Completed);
+    // No browser here to load it in: the agent is told it wasn't checked.
+    assert_eq!(value["problems"], serde_json::json!([]));
+    assert!(value["unchecked"].is_string(), "{value}");
+
+    // A page the tool wouldn't take is turned down before anything is made.
+    let refused = f
+        .core
+        .handle(Request::ShowView {
+            thread_id: thread.id.clone(),
+            title: None,
+            html: "   ".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(refused.message.contains("empty"), "{}", refused.message);
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(views(&items).len(), 1);
+
+    // Its page can't be opened for something that isn't a view.
+    let not_a_view = f
+        .core
+        .handle(Request::ViewOpen {
+            thread_id: thread.id.clone(),
+            item_id: loft_protocol::ItemId::new(),
+            width: 600,
+            scale: 1.0,
+            theme: Default::default(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(not_a_view.code, loft_protocol::ErrorCode::NotFound);
+}

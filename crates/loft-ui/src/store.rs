@@ -845,6 +845,11 @@ impl AppStore {
                     let _ = view.update(cx, |v, cx| v.on_state(page, cx));
                 }
             }
+            ClientEvent::PageAction { sub_id, action, .. } => {
+                if let Some(view) = self.page_view(sub_id) {
+                    let _ = view.update(cx, |v, cx| v.on_action(action, cx));
+                }
+            }
             ClientEvent::PageClosed { sub_id, id, reason } => {
                 let view = self.page_view(sub_id);
                 self.forget_page(&id);
@@ -1231,6 +1236,12 @@ impl AppStore {
 
     pub fn client(&self) -> Option<Client> {
         self.client.clone()
+    }
+
+    /// The folder a thread works in, if the thread is loaded.
+    pub fn thread_cwd(&self, thread_id: &ThreadId, cx: &App) -> Option<String> {
+        let state = self.threads.get(thread_id)?.read(cx);
+        Some(state.model.as_ref()?.thread.cwd.clone())
     }
 
     pub fn open_file(&mut self, thread_id: ThreadId, rel_path: String, cx: &mut Context<Self>) {
@@ -2193,9 +2204,9 @@ pub struct ThreadState {
     pub rows: Vec<Row>,
     pub scroller: Entity<MessageScrollerState>,
     pub markdown: HashMap<ItemId, Entity<TextViewState>>,
-    /// The views agents drew (`show_ui`), each with where the user has
-    /// taken it: slider positions, what was typed, the tab on show.
-    pub(crate) views: HashMap<ItemId, Entity<crate::view::ViewCard>>,
+    /// The views agents drew (`show_ui`, ADR-0018): each one's page, and
+    /// the watch kept on its height.
+    views: HashMap<ItemId, (Entity<crate::panel::page::PageView>, gpui_kit::Subscription)>,
     /// Tool groups / reasoning items the user expanded or collapsed,
     /// keyed by their first item id. `true` = expanded.
     pub expanded: HashMap<ItemId, bool>,
@@ -2797,31 +2808,45 @@ impl ThreadState {
         cx.notify();
     }
 
-    /// Keep a view per `show_ui` call that can be drawn.
-    fn sync_view(&mut self, item: &loft_protocol::Item, cx: &mut Context<Self>) {
-        let ItemBody::ToolCall { input, .. } = &item.body else {
-            return;
-        };
+    /// A view's page goes when its item stops being a view (the call was
+    /// turned down after all). Pages are made as rows are drawn
+    /// ([`crate::view::ensure`]).
+    fn sync_view(&mut self, item: &loft_protocol::Item, _cx: &mut Context<Self>) {
         if !crate::view::is_view(item) {
             self.views.remove(&item.id);
-            return;
-        }
-        if let Some(card) = self.views.get(&item.id) {
-            if !card.update(cx, |card, cx| card.set_source(input, cx)) {
-                self.views.remove(&item.id);
-            }
-            return;
-        }
-        let (thread, store) = (cx.entity().downgrade(), self.store.clone());
-        if let Some(card) =
-            crate::view::ViewCard::new(thread, store, self.id.clone(), item.id.clone(), input)
-        {
-            self.views.insert(item.id.clone(), cx.new(|_| card));
         }
     }
 
-    /// An item's row changed height by itself (a view's tab, a folded
-    /// table): measure it again.
+    pub(crate) fn has_view(&self, id: &ItemId) -> bool {
+        self.views.contains_key(id)
+    }
+
+    /// The page of the view in item `id`, once its row has been drawn.
+    pub(crate) fn view(&self, id: &ItemId) -> Option<Entity<crate::panel::page::PageView>> {
+        self.views.get(id).map(|(page, _)| page.clone())
+    }
+
+    /// Keep a view's page, and measure its row again whenever the page
+    /// changes height.
+    pub(crate) fn adopt_view(
+        &mut self,
+        id: ItemId,
+        page: Entity<crate::panel::page::PageView>,
+        cx: &mut Context<Self>,
+    ) {
+        let item = id.clone();
+        let resized = cx.subscribe(
+            &page,
+            move |this, _, _: &crate::panel::page::PageResized, cx| {
+                this.remeasure(&item, cx);
+                cx.notify();
+            },
+        );
+        self.views.insert(id, (page, resized));
+    }
+
+    /// An item's row changed height by itself (a view's page grew):
+    /// measure it again.
     pub(crate) fn remeasure(&mut self, id: &ItemId, cx: &mut Context<Self>) {
         if let Some(row) = self.row_of_item(id) {
             self.scroller.update(cx, |s, cx| {

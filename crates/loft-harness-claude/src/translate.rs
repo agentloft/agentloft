@@ -33,6 +33,21 @@ struct PendingApproval {
     tool_use_id: Option<String>,
 }
 
+/// A `show_ui` call whose input is arriving: shown as it is written
+/// (ADR-0018), so its item starts before its input is whole.
+#[derive(Debug)]
+struct ViewCall {
+    /// The tool call's id (the item's native id).
+    id: String,
+    /// The input's JSON as far as it has come.
+    json: String,
+    /// How much of it the last update covered.
+    sent: usize,
+}
+
+/// A view being written is passed on each time this much more has come.
+const VIEW_STEP: usize = 240;
+
 #[derive(Debug, Default)]
 pub struct Translator {
     /// (api message id, block index) → (native item id, channel).
@@ -42,6 +57,9 @@ pub struct Translator {
     /// Tool calls started but without a result yet → their subagent (the
     /// Agent call they run under), if any.
     open_tools: HashMap<String, Option<String>>,
+    /// Views being written (`show_ui` calls whose input is still
+    /// streaming), by (api message id, block index).
+    view_calls: HashMap<(String, u64), ViewCall>,
     /// Tool calls the user denied (their error result becomes `Declined`).
     denied_tools: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
@@ -405,6 +423,39 @@ impl Translator {
                         },
                         DeltaChannel::Reasoning,
                     ),
+                    // A view: its page shows up as the agent writes it.
+                    Some("tool_use")
+                        if str_at(block, "name").is_some_and(loft_view::is_tool)
+                            && str_at(block, "id").is_some() =>
+                    {
+                        let id = str_at(block, "id").unwrap_or_default().to_owned();
+                        let name = str_at(block, "name").unwrap_or_default().to_owned();
+                        if self.open_tools.contains_key(&id) {
+                            return vec![];
+                        }
+                        self.open_tools.insert(id.clone(), parent.clone());
+                        self.view_calls.insert(
+                            (msg_id, index),
+                            ViewCall {
+                                id: id.clone(),
+                                json: String::new(),
+                                sent: 0,
+                            },
+                        );
+                        let input = serde_json::json!({ loft_view::PARTIAL: true });
+                        return vec![Out::Event(HarnessEvent::ItemStarted {
+                            native_id: id,
+                            body: ItemBody::ToolCall {
+                                title: tool_title(&name, &input),
+                                tool_kind: tool_kind(&name),
+                                tool: name,
+                                input,
+                                output: None,
+                                is_error: false,
+                            },
+                            parent,
+                        })];
+                    }
                     _ => return vec![],
                 };
                 let native_id = format!("{msg_id}:{index}");
@@ -418,10 +469,27 @@ impl Translator {
                 })]
             }
             Some("content_block_delta") => {
+                let delta = event.get("delta").unwrap_or(&Value::Null);
+                if let Some(call) = self.view_calls.get_mut(&(msg_id.clone(), index)) {
+                    if str_at(delta, "type") != Some("input_json_delta") {
+                        return vec![];
+                    }
+                    call.json
+                        .push_str(str_at(delta, "partial_json").unwrap_or_default());
+                    if call.json.len() < call.sent + VIEW_STEP {
+                        return vec![];
+                    }
+                    call.sent = call.json.len();
+                    let so_far = loft_view::partial(&call.json);
+                    return vec![Out::Event(HarnessEvent::ToolInput {
+                        native_id: call.id.clone(),
+                        input: serde_json::json!({ "title": so_far.title, "html": so_far.html }),
+                        partial: true,
+                    })];
+                }
                 let Some((native_id, channel)) = self.open_blocks.get(&(msg_id, index)) else {
                     return vec![];
                 };
-                let delta = event.get("delta").unwrap_or(&Value::Null);
                 let text = match (str_at(delta, "type"), channel) {
                     (Some("text_delta"), DeltaChannel::Text) => str_at(delta, "text"),
                     (Some("thinking_delta"), DeltaChannel::Reasoning) => str_at(delta, "thinking"),
@@ -435,6 +503,24 @@ impl Translator {
                     })],
                     _ => vec![],
                 }
+            }
+            Some("content_block_stop")
+                if self.view_calls.contains_key(&(msg_id.clone(), index)) =>
+            {
+                let Some(call) = self.view_calls.remove(&(msg_id, index)) else {
+                    return vec![];
+                };
+                // Whole now: as the agent wrote it, or (should the JSON not
+                // read) as much of it as did.
+                let input = serde_json::from_str::<Value>(&call.json).unwrap_or_else(|_| {
+                    let view = loft_view::partial(&call.json);
+                    serde_json::json!({ "title": view.title, "html": view.html })
+                });
+                vec![Out::Event(HarnessEvent::ToolInput {
+                    native_id: call.id,
+                    input,
+                    partial: false,
+                })]
             }
             Some("content_block_stop") => match self.open_blocks.remove(&(msg_id, index)) {
                 Some((native_id, _)) => vec![Out::Event(HarnessEvent::ItemCompleted {
@@ -1080,6 +1166,79 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_view_is_passed_on_while_it_is_written() {
+        let mut t = Translator::new();
+        let mut out = t.start_turn("prompt");
+        let event = |event: Value| {
+            serde_json::json!({ "type": "stream_event", "api_message_id": "msg_1", "event": event })
+                .to_string()
+        };
+        let html = format!("<h1>Sizes</h1>{}", "<p>row</p>".repeat(80));
+        let whole = serde_json::json!({ "title": "Sizes", "html": html });
+        let json = whole.to_string();
+        out.extend(t.on_line(&event(serde_json::json!({
+            "type": "content_block_start", "index": 1,
+            "content_block": { "type": "tool_use", "id": "toolu_1",
+                               "name": "mcp__agentloft__show_ui", "input": {} }
+        }))));
+        // The input arrives a few characters at a time.
+        for piece in json.as_bytes().chunks(37) {
+            out.extend(t.on_line(&event(serde_json::json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": { "type": "input_json_delta",
+                           "partial_json": std::str::from_utf8(piece).unwrap() }
+            }))));
+        }
+        out.extend(t.on_line(&event(
+            serde_json::json!({ "type": "content_block_stop", "index": 1 }),
+        )));
+        // The message itself, whole: its tool call is the one already started.
+        out.extend(
+            t.on_line(
+                &serde_json::json!({
+                    "type": "assistant",
+                    "message": { "id": "msg_1", "content": [
+                        { "type": "tool_use", "id": "toolu_1",
+                          "name": "mcp__agentloft__show_ui", "input": whole }
+                    ]}
+                })
+                .to_string(),
+            ),
+        );
+        let evs = events(&out);
+        let started: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ItemStarted {
+                    native_id, body, ..
+                } => Some((native_id, body)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 1, "one item, started once");
+        assert_eq!(started[0].0, "toolu_1");
+        assert!(matches!(started[0].1, ItemBody::ToolCall { input, .. }
+            if input[loft_view::PARTIAL] == true));
+        let inputs: Vec<(&Value, bool)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ToolInput { input, partial, .. } => Some((input, *partial)),
+                _ => None,
+            })
+            .collect();
+        let (last, earlier) = inputs.split_last().unwrap();
+        assert!(earlier.len() >= 2, "it was passed on as it grew");
+        let mut seen = 0;
+        for (input, partial) in earlier {
+            assert!(partial);
+            let so_far = input["html"].as_str().unwrap();
+            assert!(html.starts_with(so_far) && so_far.len() >= seen);
+            seen = so_far.len();
+        }
+        assert_eq!(*last, (&whole, false), "and once more, whole");
     }
 
     #[test]

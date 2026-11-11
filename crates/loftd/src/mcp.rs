@@ -2,8 +2,7 @@
 //! session (ADR-0013). It bridges tool calls to the daemon:
 //! - `browser_*` drive the browser panel in the user's Agentloft window;
 //! - `list_threads` / `read_thread` / `get_thread_diff` read other threads;
-//! - `show_ui` draws a view in the chat (ADR-0018): checked here, drawn by the
-//!   UI from the tool call itself.
+//! - `show_ui` shows a page of the agent's own HTML in the chat (ADR-0018).
 //!
 //! Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout. Nothing else
 //! may be written to stdout.
@@ -94,26 +93,25 @@ available. Agentloft itself: when the user asks to change its settings (theme, c
 sidebar, agent defaults, folders…), use `get_settings` then `change_setting`; `save_theme` adds a \
 colour theme; `create_project`, `clone_project`, `add_project`, `update_project` (name, icon, \
 new-thread defaults) and `remove_project` manage projects. Changes show in the app at once. \
-`show_ui` draws an interactive view in the chat (charts, tables, stats, forms, sliders, buttons \
-that reply for the user): use it when a visual or a choice says it better than prose, such as \
-results, comparisons or options to pick from; plain answers stay text.";
+`show_ui` shows a live page you write (HTML, CSS, JavaScript) in the chat: use it when something \
+is better seen or tried than read, such as results, a diagram, options to pick from, a small tool; \
+plain answers stay text.";
 
 /// What `show_ui` tells agents: the whole component reference, since this
 /// is all they get to go on.
-const SHOW_UI: &str = r#"Show the user an interactive view in the chat, drawn natively: charts, tables, stats, forms, sliders, and buttons that reply for them. Use it when a visual or a choice says it better than prose (results, comparisons, options to pick from, a calculator); keep plain answers as text. It returns at once and the view stays in the thread; a button's `send` arrives later as the user's next message.
+const SHOW_UI: &str = r#"Show the user a live page in the chat, written by you: HTML with its own CSS and JavaScript. Use it when something is better seen or tried than read: results, a comparison, a diagram, options to pick from, a calculator, a small tool or game. Be creative; keep plain answers as text. The page appears as you write it and stays in the thread.
 
-View: { title?, state?: {name: value}, body: [block] }. A string in a list of blocks is a Markdown paragraph. Any block takes when: "expr" (shown while it holds).
+html: a fragment (`<div>…</div><style>…</style><script>…</script>`) or a whole document. It is as wide as the chat column (about 700px, narrower on small windows, so lay out fluidly) and as tall as its content, up to 1400px. It starts with base styles that match the app, so plain headings, tables, buttons (`<button class="primary">`), inputs and code already look right. Colours and fonts are CSS variables, light or dark as the user has it: --bg --fg --muted --border --surface --accent --accent-fg --success --warning --danger --font --mono. Prefer them to colours of your own.
 
-Layout: row {children, gap?: none|sm|md|lg, align?: start|center|end|stretch, justify?: start|center|end|between, wrap?} · column {children, gap?} · grid {columns: 1-6, children} · card {title?, children} · tabs {tabs: [{label, children}]} · details {summary, children, open?} · divider
-Content: text {text, size?: xs|sm|md|lg|xl, weight?: normal|medium|bold, tone?, mono?} · heading {text, level?: 1-3} · markdown {text} · badge {text, tone?} · stat {label, value, delta?, delta_tone?, caption?, tone?} · progress {value, max?: 100, label?, tone?} · list {items: [{title, text?, badge?, tone?, and optionally one action}]} · key_value {items: [{label, value}]} · steps {items: [{title, text?, status: done|active|pending|failed}]} · callout {text, title?, tone?} · code {text, language?}
-Data: table {columns: [key | {key, label?, align?: left|center|right, format?}], rows} · chart {kind: bar|line|area|pie|donut, x: key, y: key | [key | {key, label}], data, format?, height?} (several y keys: line and area only). rows/data are [{key: value}], or generated: {for: "i", from: 0, to: 10, step?: 1, row: {key: "{{ i * 2 }}"}}.
-Inputs write state[bind]; `value` is where they start: slider {bind, min, max, step?, label?, format?} · input {bind, label?, placeholder?, kind?: text|number} · select {bind, options, label?} · choice {bind, options, label?, multiple?} · checkbox {bind, label} · toggle {bind, label}. options: ["a", "b"] or [{label, value}].
-button {label, style?: primary|secondary|ghost|danger} with one action: send: "what the user says to you" · set: {name: "{{ expr }}"} · copy: "text" · open: "https://… or a file path".
+The page has no network: no fetch, no images or frames from the web. Put data in the page and draw with HTML, CSS, SVG or canvas. Scripts, styles and fonts may load from cdn.jsdelivr.net, unpkg.com, cdnjs.cloudflare.com, esm.sh, cdn.tailwindcss.com, d3js.org, cdn.plot.ly and Google Fonts.
 
-tone: default|muted|accent|info|success|warning|danger. format: number|compact|percent|usd|bytes|duration (from ms).
-Text may hold {{ expressions }} over the state: + - * / % ^, == != < <= > >=, && || !, a ? b : c, a[i], a.b, and min max abs round floor ceil sqrt pow clamp sum avg len if contains join upper lower str num number compact percent usd money bytes duration. percent(0.42) is "42%".
+window.agentloft talks to the app:
+- agentloft.send(text): say `text` to you as the user's next message (a button that picks an option, a form's answer). Works only from the user's own click or key press.
+- agentloft.setState(obj) / agentloft.state: remember JSON (slider positions, what was typed) so the page comes back as it was left.
+- agentloft.copy(text), agentloft.open(urlOrProjectFile): on a click. Links open for the user the same way.
+- agentloft.theme: { dark, background, foreground, accent, … }; `agentloft:theme` fires on window when it changes.
 
-Example: {"title":"Seats","state":{"price":12},"body":[{"type":"slider","bind":"seats","label":"Seats","min":1,"max":50,"value":8},{"type":"stat","label":"Monthly","value":"{{ usd(seats * price) }}"},{"type":"button","label":"Buy","style":"primary","send":"Buy {{seats}} seats"}]}"#;
+The result tells you if the page's script threw or a load was refused: fix it and call again. Don't repeat the page's contents in text."#;
 
 async fn write(out: &mut tokio::io::Stdout, v: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(v)?;
@@ -330,11 +328,10 @@ pub fn tools() -> Vec<Value> {
             loft_view::TOOL,
             SHOW_UI,
             json!({
-                "title": { "type": "string", "description": "A short title over the view" },
-                "state": { "type": "object", "description": "Starting values the view's expressions and inputs share" },
-                "body": { "type": "array", "description": "The blocks, top to bottom", "items": { "type": ["object", "string"] } }
+                "title": { "type": "string", "description": "A short title shown over the page" },
+                "html": { "type": "string", "description": "The page: HTML with its CSS and JavaScript" }
             }),
-            &["body"],
+            &["html"],
         ),
         tool(
             "list_threads",
@@ -400,7 +397,7 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
         };
     }
     if name == loft_view::TOOL {
-        return show_ui(args);
+        return show_ui(client, thread, args).await;
     }
     if let Some(result) = orchestrate(client, thread, name, args).await {
         return result;
@@ -477,25 +474,53 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
     }
 }
 
-/// `show_ui`: the UI draws the view from the tool call itself, so all there
-/// is to do here is check it and tell the agent what to fix.
-fn show_ui(args: &Value) -> Value {
-    match loft_view::parse(args) {
-        Ok((_, notes)) if notes.is_empty() => text_result(
-            "Shown in the chat. No need to repeat its contents in text.",
-            false,
+/// `show_ui`: the daemon checks the page, loads it once in its browser and
+/// says what went wrong there, so the agent can fix what it can't see.
+async fn show_ui(client: &Client, thread: &ThreadId, args: &Value) -> Value {
+    let view = match loft_view::parse(args) {
+        Ok(view) => view,
+        Err(problem) => {
+            return text_result(
+                format!("Not shown, fix this and call again: {problem}"),
+                true,
+            );
+        }
+    };
+    let shown = client
+        .request(Request::ShowView {
+            thread_id: thread.clone(),
+            title: view.title,
+            html: view.html,
+        })
+        .await;
+    match shown {
+        Ok(Response::Json { value }) => text_result(shown_text(&value), false),
+        Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
+        Err(err) => text_result(format!("Not shown: {}", err.message), true),
+    }
+}
+
+/// What the agent hears back about a view that was shown.
+fn shown_text(report: &Value) -> String {
+    let problems: Vec<&str> = report["problems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !problems.is_empty() {
+        return format!(
+            "Shown in the chat, but the page has problems. Fix them and call show_ui again with the whole page:\n- {}",
+            problems.join("\n- ")
+        );
+    }
+    match report["unchecked"].as_str() {
+        // It is in the thread; it just couldn't be loaded to look for errors.
+        Some(why) => format!(
+            "Shown in the chat (not checked for script errors: {why}). No need to repeat its contents in text."
         ),
-        Ok((_, notes)) => text_result(
-            format!(
-                "Shown in the chat. No need to repeat its contents in text.\nNotes:\n- {}",
-                notes.join("\n- ")
-            ),
-            false,
-        ),
-        Err(problem) => text_result(
-            format!("Not shown, fix this and call again: {problem}"),
-            true,
-        ),
+        None => "Shown in the chat; the page loaded without errors. No need to repeat its contents in text."
+            .into(),
     }
 }
 
@@ -998,29 +1023,54 @@ mod tests {
     }
 
     #[test]
-    fn show_ui_checks_the_view() {
-        let shown = show_ui(&json!({ "body": [{ "type": "badge", "text": "ok", "colour": "x" }] }));
-        assert_eq!(shown["isError"], false);
-        let text = shown["content"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with("Shown in the chat."), "{text}");
-        assert!(text.contains("unknown property `colour`"), "{text}");
-        let refused = show_ui(&json!({ "body": [{ "type": "sparkle" }] }));
-        assert_eq!(refused["isError"], true);
-        let text = refused["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("unknown block type `sparkle`"), "{text}");
-        // The example in the tool's own description must be one it takes.
-        let example = SHOW_UI.rsplit("Example: ").next().unwrap();
-        let example: Value = serde_json::from_str(example).unwrap();
-        assert_eq!(show_ui(&example)["isError"], false);
+    fn show_ui_says_what_to_fix() {
+        let fine = shown_text(&json!({ "item_id": "i", "problems": [], "unchecked": null }));
         assert!(
-            show_ui(&example)["content"][0]["text"]
-                .as_str()
-                .is_some_and(|t| !t.contains("Notes"))
+            fine.starts_with("Shown in the chat; the page loaded without errors"),
+            "{fine}"
         );
-        // And every block type is named in it.
-        for name in loft_view::TYPES {
-            assert!(SHOW_UI.contains(name), "{name} is not in the description");
+        let broken = shown_text(&json!({ "problems": [
+            "Script error: ReferenceError: Chart is not defined",
+            "Blocked https://example.com/x.png: a view has no network.",
+        ] }));
+        assert!(
+            broken.contains("has problems") && broken.contains("- Script error: ReferenceError")
+        );
+        assert!(
+            broken.contains("- Blocked https://example.com/x.png"),
+            "{broken}"
+        );
+        let blind = shown_text(&json!({ "problems": [], "unchecked": "No browser was found." }));
+        assert!(
+            blind.contains("not checked for script errors: No browser was found."),
+            "{blind}"
+        );
+        // What the description promises is what the page gets.
+        for host in [
+            "cdn.jsdelivr.net",
+            "unpkg.com",
+            "cdn.tailwindcss.com",
+            "d3js.org",
+        ] {
+            assert!(
+                SHOW_UI.contains(host) && loft_view::ALLOWED_HOSTS.contains(&host),
+                "{host}"
+            );
         }
+        for name in [
+            "--bg",
+            "--fg",
+            "--accent",
+            "agentloft.send",
+            "agentloft.setState",
+        ] {
+            assert!(SHOW_UI.contains(name), "{name}");
+        }
+        let schema = tools()
+            .into_iter()
+            .find(|t| t["name"] == loft_view::TOOL)
+            .unwrap();
+        assert_eq!(schema["inputSchema"]["required"], json!(["html"]));
     }
 
     #[test]

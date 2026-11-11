@@ -1,0 +1,58 @@
+<style>
+  body { padding: 0; }
+  canvas { display: block; width: 100%; height: 300px; cursor: crosshair; }
+  .bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--border); }
+  .bar span { flex: 1; color: var(--muted); font-size: 13px; }
+</style>
+
+<canvas id="sky"></canvas>
+<div class="bar">
+  <span id="count"></span>
+  <button id="clear">Clear</button>
+  <button class="primary" id="tell">Tell the agent how many</button>
+</div>
+
+<script>
+  // A view is a page: anything a page can draw, it can show. Click to add a
+  // moon; they pull on each other a little and leave trails.
+  const sky = document.getElementById("sky"), pen = sky.getContext("2d");
+  const hues = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"];
+  let moons = (agentloft.state && agentloft.state.moons) || [];
+  let w = 0, h = 0;
+  function fit() {
+    const scale = devicePixelRatio || 1;
+    w = sky.clientWidth; h = sky.clientHeight;
+    sky.width = w * scale; sky.height = h * scale;
+    pen.setTransform(scale, 0, 0, scale, 0, 0);
+  }
+  function add(x, y) {
+    const dx = x - w / 2, dy = y - h / 2, r = Math.hypot(dx, dy) || 1, speed = Math.sqrt(900 / r);
+    moons.push({ x, y, vx: (-dy / r) * speed, vy: (dx / r) * speed, hue: hues[moons.length % hues.length] });
+    save();
+  }
+  function save() {
+    agentloft.setState({ moons });
+    document.getElementById("count").textContent = moons.length === 1 ? "1 moon in orbit" : moons.length + " moons in orbit";
+  }
+  function step() {
+    pen.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--bg");
+    pen.globalAlpha = 0.16; pen.fillRect(0, 0, w, h); pen.globalAlpha = 1;
+    pen.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--fg");
+    pen.beginPath(); pen.arc(w / 2, h / 2, 7, 0, 7); pen.fill();
+    for (const m of moons) {
+      const dx = w / 2 - m.x, dy = h / 2 - m.y, d2 = Math.max(dx * dx + dy * dy, 400), d = Math.sqrt(d2);
+      m.vx += (dx / d) * (900 / d2); m.vy += (dy / d) * (900 / d2);
+      m.x += m.vx; m.y += m.vy;
+      pen.fillStyle = m.hue; pen.beginPath(); pen.arc(m.x, m.y, 4, 0, 7); pen.fill();
+    }
+    requestAnimationFrame(step);
+  }
+  sky.onclick = (e) => add(e.offsetX, e.offsetY);
+  document.getElementById("clear").onclick = () => { moons = []; save(); };
+  document.getElementById("tell").onclick = () => agentloft.send(`There are ${moons.length} moons in orbit.`);
+  addEventListener("resize", fit);
+  fit();
+  if (!moons.length) { add(w / 2 + 70, h / 2); add(w / 2 - 110, h / 2 + 20); add(w / 2, h / 2 - 95); }
+  save();
+  step();
+</script>

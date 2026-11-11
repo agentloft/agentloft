@@ -30,6 +30,16 @@ pub(crate) enum ThreadCmd {
     Interrupt {
         reply: Reply,
     },
+    /// The agent's `show_ui` call, as its bridge saw it: answer with the
+    /// item that holds it (`{ item_id }`). `make`: if the harness reported
+    /// no call of its own (it ran inside some other tool), add an item for
+    /// it; otherwise `item_id` is null and the caller asks again.
+    ShowView {
+        title: Option<String>,
+        html: String,
+        make: bool,
+        reply: Reply,
+    },
     StopSubagent {
         item_id: ItemId,
         reply: Reply,
@@ -251,6 +261,14 @@ impl ThreadActor {
                 ok,
                 text,
             } => self.on_setup_done(turn_id, item_id, ok, text),
+            ThreadCmd::ShowView {
+                title,
+                html,
+                make,
+                reply,
+            } => {
+                let _ = reply.send(self.show_view(title, html, make));
+            }
             ThreadCmd::Interrupt { reply } => {
                 let res = match (&self.session, &self.turn) {
                     (Some(s), Some(_)) => {
@@ -1026,6 +1044,42 @@ impl ThreadActor {
                 channel,
                 text,
             } => self.on_delta(&native_id, channel, text),
+            HarnessEvent::ToolInput {
+                native_id,
+                mut input,
+                partial,
+            } => {
+                let Some(item_id) = self.items.get(&native_id).cloned() else {
+                    return Ok(());
+                };
+                let Some(mut item) = self.core.live().get(&item_id).cloned() else {
+                    return Ok(());
+                };
+                let ItemBody::ToolCall {
+                    tool, input: slot, ..
+                } = &mut item.body
+                else {
+                    return Ok(());
+                };
+                let view = loft_view::is_tool(tool);
+                if partial && let Some(map) = input.as_object_mut() {
+                    // Marks an input that isn't all there yet.
+                    map.insert(loft_view::PARTIAL.into(), true.into());
+                }
+                let html = input["html"].as_str().unwrap_or_default().to_owned();
+                *slot = input;
+                item.updated_at_ms = now_ms();
+                self.core.live().insert(item_id.clone(), item.clone());
+                // What is half-written stays in memory; the log gets the
+                // input once, whole.
+                if !partial {
+                    self.core.commit(vec![Event::ItemUpserted { item }])?;
+                }
+                if view {
+                    self.core
+                        .view_written(&self.thread.id, &item_id, html, !partial);
+                }
+            }
             HarnessEvent::ItemCompleted {
                 native_id,
                 body,
@@ -1253,6 +1307,51 @@ impl ThreadActor {
 
     fn turn_id(&self) -> Option<TurnId> {
         self.turn.as_ref().map(|t| t.id.clone())
+    }
+
+    /// The item that holds a `show_ui` call (see [`ThreadCmd::ShowView`]).
+    fn show_view(
+        &mut self,
+        title: Option<String>,
+        html: String,
+        make: bool,
+    ) -> CoreResult<Response> {
+        // The call as the harness reported it: still open, same page.
+        let reported = self
+            .core
+            .live()
+            .values()
+            .filter(|i| i.thread_id == self.thread.id)
+            .find(|i| {
+                matches!(&i.body, ItemBody::ToolCall { tool, input, .. }
+                    if loft_view::is_tool(tool) && input["html"].as_str() == Some(html.as_str()))
+            })
+            .map(|i| i.id.clone());
+        let item_id = match reported {
+            Some(id) => Some(id),
+            None if make => {
+                let tool = format!("mcp__agentloft__{}", loft_view::TOOL);
+                let item = self.new_item(
+                    self.turn_id(),
+                    ItemBody::ToolCall {
+                        title: tool.clone(),
+                        tool,
+                        tool_kind: loft_protocol::ToolKind::Mcp,
+                        input: serde_json::json!({ "title": title, "html": html }),
+                        output: Some("Shown in the chat.".into()),
+                        is_error: false,
+                    },
+                    ItemStatus::Completed,
+                )?;
+                let id = item.id.clone();
+                self.core.commit(vec![Event::ItemUpserted { item }])?;
+                Some(id)
+            }
+            None => None,
+        };
+        Ok(Response::Json {
+            value: serde_json::json!({ "item_id": item_id.map(|id| id.0) }),
+        })
     }
 
     fn new_item(

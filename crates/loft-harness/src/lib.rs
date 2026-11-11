@@ -130,6 +130,14 @@ pub enum HarnessEvent {
         channel: DeltaChannel,
         text: String,
     },
+    /// A tool call's input as it stands while the agent is still writing
+    /// it (`partial`), or once it is whole. Only for calls whose item was
+    /// started before their input was known (a view being written, ADR-0018).
+    ToolInput {
+        native_id: String,
+        input: serde_json::Value,
+        partial: bool,
+    },
     ItemCompleted {
         native_id: String,
         /// Replace the body entirely (e.g. final full text). `None` keeps the

@@ -405,6 +405,34 @@ pub enum Request {
     PageClose {
         id: PageId,
     },
+    /// Open the page that draws a view an agent made (the `show_ui` call
+    /// `item_id`, ADR-0018), or return the one it has. Answers
+    /// `Response::Page`; subscribe to [`Topic::Page`] for its pictures and
+    /// send [`Request::PageInput`] as for any page. The page is as wide as
+    /// asked and as tall as its content; it closes by itself a while after
+    /// its last viewer leaves.
+    ViewOpen {
+        thread_id: ThreadId,
+        item_id: ItemId,
+        width: u32,
+        scale: f32,
+        theme: Box<ViewTheme>,
+    },
+    /// The viewer's look changed (light to dark, another accent).
+    ViewTheme {
+        id: PageId,
+        theme: Box<ViewTheme>,
+    },
+    /// An agent's `show_ui` call, from the MCP bridge: check the page, make
+    /// sure the thread has an item for it (a harness that didn't report the
+    /// call gets one made), and load it once to see whether its script
+    /// runs. Answers `Response::Json`: `{ item_id, problems: [..] }`.
+    ShowView {
+        thread_id: ThreadId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        html: String,
+    },
     /// Run a browser command in the user's browser panel (from an agent).
     BrowserCall {
         thread_id: ThreadId,
@@ -586,6 +614,12 @@ pub enum ServerMsg {
         sub_id: u64,
         id: PageId,
         reason: String,
+    },
+    /// A view asked for something on this viewer's click.
+    PageAction {
+        sub_id: u64,
+        id: PageId,
+        action: PageAction,
     },
     /// Daemon → client call (e.g. drive the browser panel); answer with
     /// [`ClientMsg::ClientCallResult`].
