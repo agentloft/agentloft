@@ -474,10 +474,6 @@ impl BrowserView {
         cx.notify();
     }
 
-    pub fn is_annotating(&self) -> bool {
-        self.annotating
-    }
-
     fn page_shown(&self) -> bool {
         self.visible
     }
@@ -754,14 +750,6 @@ impl BrowserView {
             native.release_focus();
         }
         self.address.update(cx, |state, cx| state.focus(window, cx));
-    }
-
-    /// Gives the page keyboard focus, as clicking into it would.
-    pub fn focus_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle, cx);
-        if let Some(native) = &self.native {
-            native.focus();
-        }
     }
 
     /// Runs one automation command. The task resolves with a JSON result

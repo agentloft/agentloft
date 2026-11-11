@@ -77,14 +77,6 @@ impl ClientRegistry {
             .is_some_and(|subs| subs.values().any(|t| t == thread))
     }
 
-    pub fn has_browser_host(&self) -> bool {
-        self.browser_hosts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|(_, tx)| !tx.is_closed())
-    }
-
     /// Send a call to the most recent capable client and await its answer.
     pub async fn call(
         &self,

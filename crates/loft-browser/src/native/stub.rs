@@ -90,9 +90,6 @@ impl NativeWebView {
     pub fn is_focused(&self) -> bool {
         match self.never {}
     }
-    pub fn focus(&self) {
-        match self.never {}
-    }
     pub fn release_focus(&self) {
         match self.never {}
     }

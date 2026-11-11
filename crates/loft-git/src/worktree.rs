@@ -258,12 +258,6 @@ pub fn prune(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Files that would conflict when merging `branch` into `base`
-/// (`git merge-tree --write-tree`, no work tree touched).
-pub fn merge_conflicts(repo: &Path, base: &str, branch: &str) -> Result<Vec<String>> {
-    Ok(merge_tree(repo, base, branch)?.1)
-}
-
 /// The tree a merge of `branch` into `base` would produce, and the files
 /// that would conflict.
 fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<(String, Vec<String>)> {

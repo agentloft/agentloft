@@ -91,11 +91,6 @@ impl Paths {
         self.home.join("attachments")
     }
 
-    /// Project icons the user chose.
-    pub fn icons_dir(&self) -> PathBuf {
-        self.home.join("icons")
-    }
-
     /// Colour themes the user (or an agent) added.
     pub fn themes_dir(&self) -> PathBuf {
         self.home.join("themes")

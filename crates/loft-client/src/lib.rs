@@ -223,10 +223,6 @@ impl Client {
     pub fn unsubscribe(&self, sub_id: u64) {
         let _ = self.inner.tx.send(ClientMsg::Unsubscribe { sub_id });
     }
-
-    pub fn is_connected(&self) -> bool {
-        !self.inner.tx.is_closed()
-    }
 }
 
 pub(crate) fn disconnected() -> ErrorBody {

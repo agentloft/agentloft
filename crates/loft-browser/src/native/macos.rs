@@ -386,13 +386,6 @@ impl NativeWebView {
             .is_some_and(|view| view.isDescendantOf(&self.wk))
     }
 
-    /// Gives the web content key focus (explicit user intent only).
-    pub fn focus(&self) {
-        if !self.hidden.get() && !self.is_focused() {
-            let _ = self.webview.focus();
-        }
-    }
-
     /// Hands key focus back to GPUI's view if the web content has it.
     pub fn release_focus(&self) {
         if self.is_focused() {

@@ -68,15 +68,6 @@ impl WorkspaceModel {
         true
     }
 
-    pub fn threads_for<'a>(
-        &'a self,
-        project: &'a Project,
-    ) -> impl Iterator<Item = &'a Thread> + 'a {
-        self.threads
-            .iter()
-            .filter(move |t| t.project_id == project.id)
-    }
-
     pub fn thread(&self, id: &ThreadId) -> Option<&Thread> {
         self.threads.iter().find(|t| &t.id == id)
     }

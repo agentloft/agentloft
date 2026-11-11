@@ -647,16 +647,6 @@ mod imp {
         });
     }
 
-    /// Forget what was fetched for `path` (it changed).
-    pub fn forget_image(path: &Path) {
-        let key = path.to_string_lossy().into_owned();
-        with(|h| {
-            if let Some(Picture::Ready(_, len)) = h.images.remove(&key) {
-                h.image_bytes = h.image_bytes.saturating_sub(len);
-            }
-        });
-    }
-
     /// End this browser's session: the page signs out and goes back to
     /// pairing (the HTTP side of the session is the page's business).
     pub fn sign_out() {

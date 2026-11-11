@@ -3075,8 +3075,3 @@ pub(crate) fn push_runs(rows: &mut Vec<Row>, items: &[loft_protocol::Item], ixs:
         }
     }
 }
-
-/// Extension used by views to read the store.
-pub fn store_read<'a>(store: &'a Entity<AppStore>, cx: &'a App) -> &'a AppStore {
-    store.read(cx)
-}

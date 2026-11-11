@@ -224,10 +224,6 @@ impl Translator {
         }
     }
 
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
-    }
-
     fn request(&mut self, kind: Pending, method: &str, params: Value) -> Value {
         self.next_id += 1;
         self.pending.insert(self.next_id, kind);
