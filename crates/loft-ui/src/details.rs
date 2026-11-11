@@ -511,6 +511,9 @@ impl Focusable for DetailsCard {
     }
 }
 
+/// A row of the card. Rows that do something light up under the pointer
+/// with `p.selected`: `p.hover` is a shade for the window's background and
+/// barely differs from the card's own (`p.elevated`).
 fn row(id: &str, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
     h_flex()
         .id(SharedString::from(id.to_owned()))
@@ -603,7 +606,7 @@ impl Render for DetailsCard {
                                 .rounded(px(6.))
                                 .cursor_pointer()
                                 .text_color(p.muted_foreground)
-                                .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                                .hover(|d| d.bg(p.selected).text_color(p.foreground))
                                 .child(Icon::new(IconName::FolderOpen).small())
                                 .on_click(move |_, window, cx| {
                                     cx.open_with_system(std::path::Path::new(&folder));
@@ -620,7 +623,7 @@ impl Render for DetailsCard {
                 let folder = cwd.clone();
                 row("details-editor", &p)
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.hover))
+                    .hover(|d| d.bg(p.selected))
                     .child(match editor_icon(ed) {
                         Some(picture) => {
                             use gpui_kit::StyledImage as _;
@@ -652,7 +655,7 @@ impl Render for DetailsCard {
                                         .p(px(4.))
                                         .rounded(px(5.))
                                         .text_color(p.muted_foreground)
-                                        .hover(|d| d.bg(p.selected).text_color(p.foreground))
+                                        .hover(|d| d.bg(p.border).text_color(p.foreground))
                                         .child(Icon::new(IconName::ChevronDown).xsmall())
                                         .on_click(move |_, window, cx| {
                                             cx.stop_propagation();
@@ -722,7 +725,7 @@ impl Render for DetailsCard {
         top = top.child(
             row("details-branch", &p)
                 .cursor_pointer()
-                .hover(|d| d.bg(p.hover))
+                .hover(|d| d.bg(p.selected))
                 .child(icon(IconName::GitBranch, &p))
                 .child(
                     div()
@@ -776,7 +779,7 @@ impl Render for DetailsCard {
         top = top.child(
             row("details-changes", &p)
                 .cursor_pointer()
-                .hover(|d| d.bg(p.hover))
+                .hover(|d| d.bg(p.selected))
                 .child(icon(IconName::FileDiff, &p))
                 .child(
                     h_flex()
@@ -812,7 +815,7 @@ impl Render for DetailsCard {
             top = top.child(divider(&p)).child(
                 row("details-parent", &p)
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.hover))
+                    .hover(|d| d.bg(p.selected))
                     .child(icon(IconName::GitFork, &p))
                     .child(div().flex_1().min_w_0().truncate().child(from))
                     .child(
@@ -878,7 +881,7 @@ impl Render for DetailsCard {
                     row(&format!("details-agent-{}", agent.id), &p)
                         .group("details-agent")
                         .cursor_pointer()
-                        .hover(|d| d.bg(p.hover))
+                        .hover(|d| d.bg(p.selected))
                         .child(crate::items::agent_avatar(
                             harness.as_ref().map(|h| h.as_str()).unwrap_or("claude"),
                             22.,
@@ -951,7 +954,7 @@ impl Render for DetailsCard {
             lists = lists.child(
                 row(&format!("details-thread-{}", thread.id.0), &p)
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.hover))
+                    .hover(|d| d.bg(p.selected))
                     .child(crate::items::agent_avatar(
                         thread.harness.as_str(),
                         22.,
