@@ -193,6 +193,12 @@ pub struct WorkspaceView {
     sidebar_amount: f32,
     panel_slide: Slide,
     details_slide: Slide,
+    /// How far open the details card is drawn this frame (0–1).
+    details_amount: f32,
+    /// The card floats over the conversation's right margin (one pane):
+    /// how much of the margin it takes, which the conversation keeps clear.
+    /// Zero when it docks as a column beside the panes instead.
+    details_inset: f32,
     /// The side panel's width as last laid out (it slides, and reopens, at
     /// this width). Zero until it first opens, when it gets a share of the room.
     panel_width: std::rc::Rc<std::cell::Cell<f32>>,
@@ -327,6 +333,8 @@ impl WorkspaceView {
             sidebar_amount: 1.,
             panel_slide: Slide::default(),
             details_slide: Slide::default(),
+            details_amount: 0.,
+            details_inset: 0.,
             panel_width: std::rc::Rc::new(std::cell::Cell::new(0.)),
             details_card: None,
             details_room: Default::default(),
@@ -1000,9 +1008,8 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.store.read(cx).selected.clone();
-        let amount = self
-            .details_slide
-            .update(self.details_open && self.can_dock(), window);
+        let amount = self.details_amount;
+        let float = self.details_inset > 0.;
         let dock = match (&selected, amount > 0.) {
             (Some(id), true) => {
                 if self
@@ -1053,6 +1060,7 @@ impl WorkspaceView {
             )
             .children(dock.map(|card| {
                 div()
+                    .when(float, |d| d.absolute().top_0().right_0())
                     .flex_none()
                     .w(px(DOCK_WIDTH * amount))
                     .h_full()
@@ -2137,6 +2145,13 @@ impl WorkspaceView {
         });
         let total: usize = layout.iter().map(Vec::len).sum();
         let multi = total > 1;
+        // One conversation spans the width (its scrollbar at the edge) with
+        // the card over its margin; several make room for it as a column.
+        self.details_inset = if multi {
+            0.
+        } else {
+            DOCK_WIDTH * self.details_amount
+        };
         let dragging = cx.has_active_drag();
         // Resizing keeps while the arrangement stays; a new one starts even.
         let shape: String = layout
@@ -3539,6 +3554,10 @@ impl WorkspaceView {
         let current_mode = model.thread.permission_mode;
         let harness = model.thread.harness.clone();
         let scroller_state = state.scroller.clone();
+        let following = scroller_state.read(cx).is_following_tail();
+        // Clear of the details card floating over the right margin.
+        let inset = self.details_inset;
+        let pad = px(24. + inset);
         let pending = self
             .attachments
             .get(&thread_id)
@@ -3680,10 +3699,17 @@ impl WorkspaceView {
                     MessageScroller::new("timeline", scroller_state, move |ix, window, cx| {
                         render_row(&thread, &store, &palette, ix, window, cx)
                     })
+                    // It shows on every move, and following a working agent
+                    // moves it all the time: only once you scroll away.
+                    .scrollbar(!following)
                     .with_bottom_fade(p.background)
                     // Rows space themselves (`Palette::row_gap`); the
                     // scroller's own 32px gap under each row is too much.
-                    .with_row_style(gpui_kit::StyleRefinement::default().pb(px(0.)))
+                    .with_row_style(
+                        gpui_kit::StyleRefinement::default()
+                            .pb(px(0.))
+                            .pr(px(inset)),
+                    )
                     .flex_1(),
                 )
                 .into_any_element()
@@ -3782,222 +3808,235 @@ impl WorkspaceView {
                     }),
             )
             .child(
-                div().px_6().pb_5().pt_1().flex().justify_center().child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .max_w(p.content_width)
-                        .gap_1()
-                        .when(!pinned.is_empty(), |d| {
-                            d.child(v_flex().gap_2().pb_2().children(pinned))
-                        })
-                        .when(waiting, |d| {
-                            d.child(
-                                h_flex()
-                                    .gap_1p5()
-                                    .px_2()
-                                    .text_xs()
-                                    .text_color(p.warning)
-                                    .child(Icon::new(IconName::ShieldCheck).xsmall())
-                                    .child(format!(
-                                        "{} is waiting for your approval",
-                                        harness_name(&model.thread.harness)
-                                    )),
+                div()
+                    .px_6()
+                    .pr(pad)
+                    .pb_5()
+                    .pt_1()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .max_w(p.content_width)
+                            .gap_1()
+                            .when(!pinned.is_empty(), |d| {
+                                d.child(v_flex().gap_2().pb_2().children(pinned))
+                            })
+                            .when(waiting, |d| {
+                                d.child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .px_2()
+                                        .text_xs()
+                                        .text_color(p.warning)
+                                        .child(Icon::new(IconName::ShieldCheck).xsmall())
+                                        .child(format!(
+                                            "{} is waiting for your approval",
+                                            harness_name(&model.thread.harness)
+                                        )),
+                                )
+                            })
+                            .children(
+                                self.completion
+                                    .as_ref()
+                                    .filter(|c| c.thread_id == thread_id)
+                                    .map(|c| {
+                                        let view = cx.entity().downgrade();
+                                        crate::completion::popover(c, p, move |ix, window, cx| {
+                                            let _ = view.update(cx, |this, cx| {
+                                                this.accept_completion(Some(ix), window, cx)
+                                            });
+                                        })
+                                    }),
                             )
-                        })
-                        .children(
-                            self.completion
-                                .as_ref()
-                                .filter(|c| c.thread_id == thread_id)
-                                .map(|c| {
-                                    let view = cx.entity().downgrade();
-                                    crate::completion::popover(c, p, move |ix, window, cx| {
-                                        let _ = view.update(cx, |this, cx| {
-                                            this.accept_completion(Some(ix), window, cx)
-                                        });
-                                    })
-                                }),
-                        )
-                        .child(
-                            v_flex()
-                                .id("composer-card")
-                                .p_2()
-                                .gap_2()
-                                .rounded(px(18.))
-                                .border_1()
-                                .border_color(p.border)
-                                .bg(p.elevated)
-                                .shadow_lg()
-                                // While completions show, ↑/↓/⏎/⇥/esc drive them
-                                // instead of the textarea.
-                                .capture_action(cx.listener(
-                                    |this, _: &gpui_kit::component::input::MoveUp, _, cx| {
-                                        if let Some(c) = &mut this.completion {
-                                            c.move_by(-1);
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }
-                                    },
-                                ))
-                                .capture_action(cx.listener(
-                                    |this, _: &gpui_kit::component::input::MoveDown, _, cx| {
-                                        if let Some(c) = &mut this.completion {
-                                            c.move_by(1);
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }
-                                    },
-                                ))
-                                .capture_action(cx.listener(
-                                    |this, _: &gpui_kit::component::input::Enter, window, cx| {
-                                        if this.completion.is_some() {
-                                            cx.stop_propagation();
-                                            this.accept_completion(None, window, cx);
-                                        }
-                                    },
-                                ))
-                                .capture_action(cx.listener(
-                                    |this,
-                                     _: &gpui_kit::component::input::IndentInline,
-                                     window,
-                                     cx| {
-                                        if this.completion.is_some() {
-                                            cx.stop_propagation();
-                                            this.accept_completion(None, window, cx);
-                                        }
-                                    },
-                                ))
-                                .capture_action(cx.listener(
-                                    |this, _: &gpui_kit::component::input::Escape, _, cx| {
-                                        if this.completion.take().is_some() {
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }
-                                    },
-                                ))
-                                // ⌘V with an image on the clipboard attaches it;
-                                // text pastes fall through to the textarea.
-                                .capture_action({
-                                    let id = thread_id.clone();
-                                    cx.listener(
-                                        move |this,
-                                              _: &gpui_kit::component::input::Paste,
-                                              _,
-                                              cx| {
-                                            let Some(item) = cx.read_from_clipboard() else {
-                                                return;
-                                            };
-                                            let images = crate::attachments::from_clipboard(&item);
-                                            if !images.is_empty() {
+                            .child(
+                                v_flex()
+                                    .id("composer-card")
+                                    .p_2()
+                                    .gap_2()
+                                    .rounded(px(18.))
+                                    .border_1()
+                                    .border_color(p.border)
+                                    .bg(p.elevated)
+                                    .shadow_lg()
+                                    // While completions show, ↑/↓/⏎/⇥/esc drive them
+                                    // instead of the textarea.
+                                    .capture_action(cx.listener(
+                                        |this, _: &gpui_kit::component::input::MoveUp, _, cx| {
+                                            if let Some(c) = &mut this.completion {
+                                                c.move_by(-1);
                                                 cx.stop_propagation();
-                                                this.add_images(&id, images, cx);
-                                            } else if let Some(text) = item.text()
-                                                && is_large_paste(&text)
-                                            {
-                                                // A chip, not a wall of text.
-                                                cx.stop_propagation();
-                                                this.pasted
-                                                    .entry(id.clone())
-                                                    .or_default()
-                                                    .push(text);
                                                 cx.notify();
                                             }
                                         },
-                                    )
-                                })
-                                .drag_over::<gpui_kit::ExternalPaths>(move |d, _, _, _| {
-                                    d.border_color(drop_accent)
-                                })
-                                .on_drop({
-                                    let id = thread_id.clone();
-                                    cx.listener(
-                                        move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
-                                            this.attach_paths(
-                                                id.clone(),
-                                                paths.paths().to_vec(),
-                                                cx,
-                                            );
+                                    ))
+                                    .capture_action(cx.listener(
+                                        |this, _: &gpui_kit::component::input::MoveDown, _, cx| {
+                                            if let Some(c) = &mut this.completion {
+                                                c.move_by(1);
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
                                         },
-                                    )
-                                })
-                                .children(strip)
-                                .children(self.note_chips(&thread_id, p, cx))
-                                .children(self.paste_chips(&thread_id, p, cx))
-                                .child(
-                                    div()
-                                        .key_context("Composer")
-                                        .px_2()
-                                        .pt_1()
-                                        // ⌘↩ (Ctrl+Enter): into the running turn now.
-                                        .on_action({
-                                            let id = thread_id.clone();
-                                            let composer = composer.clone();
-                                            cx.listener(
-                                                move |this, _: &SteerMessage, window, cx| {
-                                                    this.steer_or_approve(
-                                                        &id, &composer, window, cx,
-                                                    );
-                                                },
-                                            )
-                                        })
-                                        .child(Textarea::new(&composer).appearance(false)),
-                                )
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
-                                                // In a narrow column the
-                                                // model's name gives way,
-                                                // never the send button.
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                // Picking files uses this
-                                                // computer's file dialog.
-                                                .when(!crate::host::IS_WEB, |d| {
-                                                    let id = thread_id.clone();
-                                                    d.child(icon_button(
-                                                        "attach",
-                                                        IconName::Paperclip,
-                                                        p,
-                                                        cx.listener(move |this, _, _, cx| {
-                                                            this.pick_images(id.clone(), cx)
-                                                        }),
-                                                    ))
-                                                })
-                                                .child(self.model_picker_button(
-                                                    &thread_id,
-                                                    &harness,
-                                                    model_name,
-                                                    effort_name,
-                                                    current_mode,
-                                                    p,
-                                                    window,
-                                                    cx,
-                                                )),
+                                    ))
+                                    .capture_action(cx.listener(
+                                        |this,
+                                         _: &gpui_kit::component::input::Enter,
+                                         window,
+                                         cx| {
+                                            if this.completion.is_some() {
+                                                cx.stop_propagation();
+                                                this.accept_completion(None, window, cx);
+                                            }
+                                        },
+                                    ))
+                                    .capture_action(cx.listener(
+                                        |this,
+                                         _: &gpui_kit::component::input::IndentInline,
+                                         window,
+                                         cx| {
+                                            if this.completion.is_some() {
+                                                cx.stop_propagation();
+                                                this.accept_completion(None, window, cx);
+                                            }
+                                        },
+                                    ))
+                                    .capture_action(cx.listener(
+                                        |this, _: &gpui_kit::component::input::Escape, _, cx| {
+                                            if this.completion.take().is_some() {
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        },
+                                    ))
+                                    // ⌘V with an image on the clipboard attaches it;
+                                    // text pastes fall through to the textarea.
+                                    .capture_action({
+                                        let id = thread_id.clone();
+                                        cx.listener(
+                                            move |this,
+                                                  _: &gpui_kit::component::input::Paste,
+                                                  _,
+                                                  cx| {
+                                                let Some(item) = cx.read_from_clipboard() else {
+                                                    return;
+                                                };
+                                                let images =
+                                                    crate::attachments::from_clipboard(&item);
+                                                if !images.is_empty() {
+                                                    cx.stop_propagation();
+                                                    this.add_images(&id, images, cx);
+                                                } else if let Some(text) = item.text()
+                                                    && is_large_paste(&text)
+                                                {
+                                                    // A chip, not a wall of text.
+                                                    cx.stop_propagation();
+                                                    this.pasted
+                                                        .entry(id.clone())
+                                                        .or_default()
+                                                        .push(text);
+                                                    cx.notify();
+                                                }
+                                            },
                                         )
-                                        .child(
-                                            h_flex()
-                                                .flex_none()
-                                                .gap_2()
-                                                .items_center()
-                                                .when(running && !stop_hint.is_empty(), |d| {
-                                                    d.child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(p.faint_foreground)
-                                                            .child(format!("{stop_hint} to stop")),
-                                                    )
-                                                })
-                                                .child(action),
-                                        ),
-                                ),
-                        ),
-                ),
+                                    })
+                                    .drag_over::<gpui_kit::ExternalPaths>(move |d, _, _, _| {
+                                        d.border_color(drop_accent)
+                                    })
+                                    .on_drop({
+                                        let id = thread_id.clone();
+                                        cx.listener(
+                                            move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                                                this.attach_paths(
+                                                    id.clone(),
+                                                    paths.paths().to_vec(),
+                                                    cx,
+                                                );
+                                            },
+                                        )
+                                    })
+                                    .children(strip)
+                                    .children(self.note_chips(&thread_id, p, cx))
+                                    .children(self.paste_chips(&thread_id, p, cx))
+                                    .child(
+                                        div()
+                                            .key_context("Composer")
+                                            .px_2()
+                                            .pt_1()
+                                            // ⌘↩ (Ctrl+Enter): into the running turn now.
+                                            .on_action({
+                                                let id = thread_id.clone();
+                                                let composer = composer.clone();
+                                                cx.listener(
+                                                    move |this, _: &SteerMessage, window, cx| {
+                                                        this.steer_or_approve(
+                                                            &id, &composer, window, cx,
+                                                        );
+                                                    },
+                                                )
+                                            })
+                                            .child(Textarea::new(&composer).appearance(false)),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    // In a narrow column the
+                                                    // model's name gives way,
+                                                    // never the send button.
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    // Picking files uses this
+                                                    // computer's file dialog.
+                                                    .when(!crate::host::IS_WEB, |d| {
+                                                        let id = thread_id.clone();
+                                                        d.child(icon_button(
+                                                            "attach",
+                                                            IconName::Paperclip,
+                                                            p,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.pick_images(id.clone(), cx)
+                                                            }),
+                                                        ))
+                                                    })
+                                                    .child(self.model_picker_button(
+                                                        &thread_id,
+                                                        &harness,
+                                                        model_name,
+                                                        effort_name,
+                                                        current_mode,
+                                                        p,
+                                                        window,
+                                                        cx,
+                                                    )),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .flex_none()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .when(running && !stop_hint.is_empty(), |d| {
+                                                        d.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(p.faint_foreground)
+                                                                .child(format!(
+                                                                    "{stop_hint} to stop"
+                                                                )),
+                                                        )
+                                                    })
+                                                    .child(action),
+                                            ),
+                                    ),
+                            ),
+                    ),
             )
             // Last, so it floats over the conversation.
             .when(preview.is_some(), |d| {
@@ -4527,6 +4566,10 @@ impl Render for WorkspaceView {
             Some((project, model.thread.clone()))
         });
 
+        self.details_amount = self
+            .details_slide
+            .update(self.details_open && self.can_dock(), window);
+        self.details_inset = 0.;
         let body = match selected {
             Some(thread) => self.render_panes(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
