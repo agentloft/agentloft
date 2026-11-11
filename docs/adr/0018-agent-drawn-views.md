@@ -27,7 +27,20 @@
 
 ### 2. Where a view runs
 
-- **In a tab of the daemon's browser**, like the web client's browser tab: pictures out, input in. So a view scrolls, clips and sits under menus like any other row, on the desktop and in the web client alike, from one implementation.
+A view runs in two kinds of place, written from the same HTML with the same head and the same bridge.
+
+**In the desktop app (macOS): the real page.** The app hosts it in a web view of its own (WKWebView), so a click, a hover, the pointer, selection and typing are the web view's, with nothing in between.
+
+- **Live under the pointer, a picture otherwise.** A native view draws above everything the app draws: menus, popups and tooltips would be under it, and it can't follow a scroll as smoothly as the rest. So the row shows the page itself only while the pointer is on it (or the keyboard is in one of its fields). The rest of the time it shows a picture the app took of that same page, which waits out of sight, still running. Going from one to the other shows nothing: the picture is taken as the pointer leaves, and the page comes in over the same pixels. A press on the picture brings the page in under it and is handed to it.
+- **The thread scrolls through it.** The wheel over a shown page turns the thread, as over any row (the page takes it only if it has more than it shows and was clicked into), and the page gives way to its picture while that lasts.
+- **Cut where the list cuts it**, with the card's round corners.
+- **The same walls.** Its own address and storage (nothing of the user's browser), no navigation, and nothing loads but scripts, styles and fonts from the same hosts (WebKit content rules, in place before the page is). The bridge runs in a script world of its own, the only one that can post to the app, and still asks the browser whether the user really clicked.
+- **A process each, while in sight.** A view out of sight for half a minute gives up its page; its picture stays, and the page comes back with what it remembered when it is drawn again.
+- **The agent's check is unchanged**: the daemon still loads the page once in its own browser to say what went wrong in it.
+
+**Everywhere else (a browser client, a system without a native web view, `AGENTLOFT_VIEWS=stream`): in a tab of the daemon's browser**, like the web client's browser tab: pictures out, input in. The rest of this section is about that.
+
+- **Pictures of a real page.** So a view scrolls, clips and sits under menus like any other row, from one implementation.
 - **A place of its own.** Each view lives at an address made up for it (`https://v<item>.view.agentloft.invalid/`), in a browser context apart from the user's tabs: its own storage and a secure context, none of their cookies.
 - **Nearly no network.** Every request a view makes stops at the daemon first. It answers for the view's own document; lets `GET`s through to a short list of script, style and font hosts (jsDelivr, unpkg, cdnjs, esm.sh, Tailwind's CDN, d3js.org, Plotly's CDN, Google Fonts); and refuses the rest, navigations included. A link opens for the user instead; a page that leaves is brought back.
 - **As wide as the chat column, as tall as its content** (24 to 1400 px; past that it scrolls inside, once clicked into). A view scrolls with the thread otherwise.
@@ -68,7 +81,9 @@
 ## Why not something else
 
 - **A fixed library of native components** (the first version). Fast, exact and safe, but an agent can only say what the library has words for. Dropped at the product owner's request.
-- **A web view in the timeline** (WKWebView on the desktop, an `<iframe>` over the canvas in the web client). Live at the display's frame rate with native text selection, but a native view draws above everything GPUI draws: every menu, tooltip and dialog over the conversation would be under it, and it would not clip to the scrolling list. Two implementations, and the desktop one is macOS-only today. **To review:** the desktop app could put a real web view over a view's picture while the pointer is in it.
+- **Only pictures on the desktop too** (how it was until 2026-11-11). One implementation, and correct under every menu; but every change cost a screenshot (50 to 100 ms), and a class of faults came with it: clicks that landed at half their coordinates while a screenshot was taken, pictures a step behind, no pointer or selection of the page's own. The product owner's verdict on learning it was pictures: "that's what was causing the issue.. can you add real embed??"
+- **The real page always on top** (a web view that is simply there). Menus, popups, tooltips and the scroll-to-bottom button would be under it wherever they overlap, and it lags a scroll by a frame. Showing it only under the pointer keeps what is good about both.
+- **An `<iframe>` over the canvas in the web client.** The same idea for browsers; not built. **To review.**
 - **Letting pages reach the network.** Agents like to pull charts' libraries from a CDN, so a few script hosts are let through. More than that would make a view a way around the user's approvals: a page could send out whatever the agent put in it.
 - **MCP Apps** (pages that MCP servers ship with their tools, as T3 Code shows them). Looked into and set aside at the product owner's request on 2026-11-11, before any of it was built: `show_ui` is the way an agent draws here. Should it come back, the same view pages can show them: Claude Code hands a host what it needs with `CLAUDE_CODE_MCP_APPS_HOST=1` and the `mcp_status`, `mcp_read_resource` and `mcp_call` control requests; Codex marks a call with `mcpAppUi` and has `mcpServer/resource/read`; ACP has nothing.
 - **A new item kind.** The tool call's item already holds everything; a second kind would be a protocol change that buys nothing now that the daemon can add the item itself.
@@ -76,8 +91,8 @@
 ## Consequences
 
 - An agent can answer with anything a web page can be, and ask a question whose answer is a click.
-- A view is pictures of a page, not the page: no native text selection or screen reader inside it (copy works through the page's own selection), and motion is limited to what the stream carries (about 20 pictures a second), and a click shows about a twentieth of a second after it lands.
-- Each view on screen is a tab in the daemon's browser. Twenty at once, at most.
+- In the desktop app a view is the page: native speed, the page's own pointer, selection and typing. A view that moves by itself is shown at about three pictures a second while the pointer isn't on it. In a browser client it is pictures of the page: no native text selection or screen reader inside it, and about 20 pictures a second.
+- Each view in sight is a web view process in the app (or a tab in the daemon's browser, twenty at once at most, for browser clients).
 - The description costs every session about 500 tokens of tool definitions.
 - `read_thread` shows a view as its HTML, not as a picture.
 - A page is only as good as the agent's HTML. The check at the end of `show_ui` catches what throws or doesn't load, not what merely looks wrong.
@@ -85,7 +100,9 @@
 ## What's left
 
 - Images a view may load: none from the web today, and none from the thread's folder.
-- A real web view over the picture on the desktop (see above).
+- The real page on other systems than macOS, and in the web client (an `<iframe>`).
+- A scrolling area inside a view that fits its row doesn't get the wheel (the thread does).
+- A view shown in a second window of the app keeps its page in the first.
 - Letting the agent read what a view remembered, rather than hearing it in a `send`.
 
 ## References

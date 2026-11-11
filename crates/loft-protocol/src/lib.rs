@@ -423,6 +423,19 @@ pub enum Request {
         id: PageId,
         theme: Box<ViewTheme>,
     },
+    /// What a view asked to be remembered (`agentloft.setState`), for a
+    /// client that shows the view itself rather than the daemon's page.
+    /// Answers `Response::Json` (`null` if nothing was kept).
+    ViewState {
+        thread_id: ThreadId,
+        item_id: ItemId,
+    },
+    /// Remember this for a view (from a client that shows it itself).
+    ViewKeep {
+        thread_id: ThreadId,
+        item_id: ItemId,
+        state: serde_json::Value,
+    },
     /// An agent's `show_ui` call, from the MCP bridge: check the page, make
     /// sure the thread has an item for it (a harness that didn't report the
     /// call gets one made), and load it once to see whether its script

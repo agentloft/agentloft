@@ -6,6 +6,7 @@
 //! the timeline: which items are views, the card each sits in, and the look
 //! a page is told to match.
 
+use crate::embed::EmbedView;
 use crate::panel::page::PageView;
 use crate::store::{AppStore, Row, ThreadState};
 use crate::theme::Palette;
@@ -16,6 +17,52 @@ use gpui_kit::{
     Styled as _, Window, div, px,
 };
 use loft_protocol::{Item, ItemBody, ItemStatus, ViewTheme};
+
+/// How a view is on screen: the real page in a web view of the app's own,
+/// where the platform has one ([`EmbedView`]), or pictures of the page the
+/// daemon runs ([`PageView`]: a browser client, a system without a native
+/// web view).
+#[derive(Clone)]
+pub(crate) enum Shown {
+    Page(Entity<PageView>),
+    Embed(Entity<EmbedView>),
+}
+
+impl Shown {
+    fn element(&self) -> AnyElement {
+        match self {
+            Shown::Page(page) => page.clone().into_any_element(),
+            Shown::Embed(embed) => embed.clone().into_any_element(),
+        }
+    }
+
+    /// Where the view is drawn in its window, once it has been.
+    pub(crate) fn bounds(&self, cx: &App) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        match self {
+            Shown::Page(page) => page.read(cx).bounds(),
+            Shown::Embed(embed) => embed.read(cx).bounds(),
+        }
+    }
+
+    fn flush_top(&self, cx: &App) -> std::rc::Rc<std::cell::Cell<bool>> {
+        match self {
+            Shown::Page(page) => page.read(cx).flush_top(),
+            Shown::Embed(embed) => embed.read(cx).flush_top(),
+        }
+    }
+}
+
+/// The agent's HTML in a view's item as it is now, and whether that is all
+/// of it (a call still being written says it isn't).
+fn html_of(item: &Item) -> (&str, bool) {
+    match &item.body {
+        ItemBody::ToolCall { input, .. } => (
+            input["html"].as_str().unwrap_or_default(),
+            !input[loft_view::PARTIAL].as_bool().unwrap_or(false),
+        ),
+        _ => ("", true),
+    }
+}
 
 /// Whether a timeline item is a view: a `show_ui` call that went through
 /// (or is still being written). One that was turned down stays an ordinary
@@ -83,20 +130,71 @@ pub(crate) fn ensure(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (thread_id, item_id) = {
+    let (thread_id, item_id, shown) = {
         let state = thread.read(cx);
         let (Some(model), Some(Row::Item(i))) = (state.model.as_ref(), state.rows.get(ix)) else {
             return;
         };
         let item = &model.items[*i];
-        if !is_view(item) || state.has_view(&item.id) {
+        if !is_view(item) {
             return;
         }
-        (state.id.clone(), item.id.clone())
+        (state.id.clone(), item.id.clone(), state.view(&item.id))
     };
-    let page =
-        cx.new(|cx| PageView::for_view(store.clone(), thread_id, item_id.clone(), window, cx));
-    thread.update(cx, |state, cx| state.adopt_view(item_id, page, cx));
+    let embed = match shown {
+        Some(Shown::Embed(embed)) => embed,
+        Some(Shown::Page(_)) => return,
+        None => {
+            let shown = make(store, &thread_id, &item_id, window, cx);
+            thread.update(cx, |state, cx| {
+                state.adopt_view(item_id.clone(), shown.clone(), cx)
+            });
+            match shown {
+                Shown::Embed(embed) => embed,
+                Shown::Page(_) => return,
+            }
+        }
+    };
+    // The app writes an embedded page itself: what its item has by now.
+    let fresh = {
+        let state = thread.read(cx);
+        state
+            .model
+            .as_ref()
+            .and_then(|model| model.items.iter().find(|item| item.id == item_id))
+            .map(html_of)
+            .filter(|(html, done)| !embed.read(cx).has(html, *done))
+            .map(|(html, done)| (html.to_owned(), done))
+    };
+    if let Some((html, done)) = fresh {
+        embed.update(cx, |embed, cx| embed.set_html(&html, done, cx));
+    }
+}
+
+/// A view's place on screen: the real page where that can be, else pictures
+/// of the daemon's.
+fn make(
+    store: &Entity<AppStore>,
+    thread: &loft_protocol::ThreadId,
+    item: &loft_protocol::ItemId,
+    window: &mut Window,
+    cx: &mut App,
+) -> Shown {
+    if crate::embed::native() {
+        let (events, heard) = futures::channel::mpsc::unbounded();
+        let origin = loft_view::origin(item.as_str());
+        match loft_browser::ViewHost::new(window, &origin, loft_view::ALLOWED_HOSTS, events) {
+            Ok(host) => {
+                return Shown::Embed(cx.new(|cx| {
+                    EmbedView::new(store.clone(), thread.clone(), item.clone(), host, heard, cx)
+                }));
+            }
+            Err(err) => tracing::warn!(err = %format!("{err:#}"), "no native page for a view"),
+        }
+    }
+    Shown::Page(
+        cx.new(|cx| PageView::for_view(store.clone(), thread.clone(), item.clone(), window, cx)),
+    )
 }
 
 /// The row of a view item: its title, if the agent gave one, over its page.
@@ -128,17 +226,17 @@ pub(crate) fn render(state: &ThreadState, item: &Item, p: &Palette) -> AnyElemen
                     .child(title),
             )
         })
-        .children(state.view(&item.id).map(|page| page.into_any_element()))
+        .children(state.view(&item.id).map(|shown| shown.element()))
         .into_any_element()
 }
 
 /// Tell a view's page whether it is the top of its card (see
 /// [`PageView::flush_top`]).
 pub(crate) fn settle(state: &ThreadState, item: &Item, cx: &App) {
-    if let Some(page) = state.view(&item.id) {
+    if let Some(shown) = state.view(&item.id) {
         let titled = matches!(&item.body, ItemBody::ToolCall { input, .. }
             if input["title"].as_str().is_some_and(|t| !t.trim().is_empty()));
-        page.read(cx).flush_top().set(!titled);
+        shown.flush_top(cx).set(!titled);
     }
 }
 
@@ -185,6 +283,28 @@ mod tests {
             ItemStatus::Completed,
             false
         )));
+    }
+
+    #[test]
+    fn a_call_still_being_written_is_not_all_of_its_html() {
+        let mut item = call("mcp__agentloft__show_ui", ItemStatus::InProgress, false);
+        let mut say = |input: serde_json::Value| {
+            if let ItemBody::ToolCall { input: slot, .. } = &mut item.body {
+                *slot = input;
+            }
+            let (html, done) = html_of(&item);
+            (html.to_owned(), done)
+        };
+        assert_eq!(
+            say(serde_json::json!({ "html": "<p>half", "_partial": true })),
+            ("<p>half".to_owned(), false)
+        );
+        // A harness that reports a call whole says nothing of parts.
+        assert_eq!(
+            say(serde_json::json!({ "html": "<p>whole</p>" })),
+            ("<p>whole</p>".to_owned(), true)
+        );
+        assert_eq!(say(serde_json::json!({})), (String::new(), true));
     }
 
     #[test]

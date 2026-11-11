@@ -11,6 +11,7 @@ mod branch_picker;
 pub mod brand;
 mod completion;
 mod details;
+mod embed;
 mod file_icons;
 mod folder_picker;
 pub mod host;

@@ -21,6 +21,7 @@ loft-docs = { path = "../loft-docs" }
 loft-browser = { path = "../loft-browser" }
 loft-terminal.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 serde.workspace = true

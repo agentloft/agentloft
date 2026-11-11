@@ -1092,6 +1092,25 @@ impl Core {
                 self.pages.theme_view(&id, &theme).await?;
                 Ok(Response::Ok)
             }
+            Request::ViewState { thread_id, item_id } => Ok(Response::Json {
+                value: self
+                    .with_store(|s| s.view_state(&thread_id, &item_id))?
+                    .unwrap_or(serde_json::Value::Null),
+            }),
+            Request::ViewKeep {
+                thread_id,
+                item_id,
+                state,
+            } => {
+                if state.to_string().len() > loft_view::MAX_STATE {
+                    return Err(ErrorBody::new(
+                        ErrorCode::BadRequest,
+                        "That is more than a view may ask to have remembered.",
+                    ));
+                }
+                self.with_store(|s| s.set_view_state(&thread_id, &item_id, &state))?;
+                Ok(Response::Ok)
+            }
             Request::ShowView {
                 thread_id,
                 title,

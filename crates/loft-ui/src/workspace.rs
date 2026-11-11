@@ -580,6 +580,126 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            Some(("viewnative", spec)) => {
+                // `x,y[,times[,gap_ms[,after_ms]]]`: real clicks in a view
+                // that is a page of the app's own, through the window as
+                // the system sends them (the pointer moved onto it first,
+                // which is what makes the page live).
+                let n: Vec<f32> = spec
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+                let (x, y, times) = (at(0, 10.), at(1, 10.), at(2, 1.) as usize);
+                let gap = std::time::Duration::from_millis(at(3, 150.) as u64);
+                let after = std::time::Duration::from_millis(at(4, 3000.) as u64);
+                // `…,wheel_lines,back(0|1),away(0|1),return_after_ms`.
+                let (wheel, back, away) = (at(5, 0.) as i32, at(6, 0.) > 0., at(7, 0.) > 0.);
+                let return_after = at(8, 0.) as u64;
+                // `…,cold(0|1)`: click the picture, without the pointer
+                // having come onto the view first.
+                let cold = at(9, 0.) > 0.;
+                let thread = thread.clone();
+                self.panel_open = false;
+                cx.spawn_in(window, async move |_, cx| {
+                    use gpui_kit::{Modifiers, MouseMoveEvent, PlatformInput, point};
+                    let executor = cx.background_executor().clone();
+                    let pause = |ms: u64| executor.timer(std::time::Duration::from_millis(ms));
+                    pause(1500).await;
+                    let _ = cx.update(|_, cx| {
+                        thread.update(cx, |state, cx| {
+                            if let Some(item) = state.last_view_item() {
+                                state.reveal(item, cx);
+                            }
+                        })
+                    });
+                    executor.timer(after).await;
+                    let Ok(Some((embed, bounds))) = cx.update(|_, cx| {
+                        let state = thread.read(cx);
+                        state.a_view_embed().zip(state.a_view_bounds(cx))
+                    }) else {
+                        tracing::info!("dev: no native view to click in");
+                        return;
+                    };
+                    if !cold {
+                        let _ = cx.update(|window, cx| {
+                            window.dispatch_event(
+                                PlatformInput::MouseMove(MouseMoveEvent {
+                                    position: bounds.origin + point(px(x), px(y)),
+                                    pressed_button: None,
+                                    modifiers: Modifiers::default(),
+                                }),
+                                cx,
+                            );
+                        });
+                    }
+                    pause(500).await;
+                    for i in 0..times {
+                        let _ = cx.update(|_, cx| {
+                            if let Some(host) = embed.read(cx).host() {
+                                if cold {
+                                    host.click_in_window(bounds.origin + point(px(x), px(y)));
+                                } else {
+                                    host.click_at(x, y);
+                                }
+                            }
+                        });
+                        tracing::info!(click = i + 1, "dev: clicked in a native view");
+                        executor.timer(gap).await;
+                    }
+                    // Then, if asked: the wheel over it, the pointer back on
+                    // it, the pointer away from it.
+                    if wheel != 0 {
+                        let _ = cx.update(|_, cx| {
+                            if let Some(host) = embed.read(cx).host() {
+                                host.wheel_at(x, y, wheel);
+                            }
+                        });
+                        tracing::info!(wheel, "dev: turned the wheel over a native view");
+                        pause(900).await;
+                    }
+                    let move_to = |position| {
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        })
+                    };
+                    if back {
+                        let at = cx
+                            .update(|_, cx| thread.read(cx).a_view_bounds(cx))
+                            .ok()
+                            .flatten()
+                            .map(|b| b.origin + point(px(x), px(40.)));
+                        if let Some(at) = at {
+                            let _ = cx.update(|window, cx| {
+                                window.dispatch_event(move_to(at), cx);
+                            });
+                            tracing::info!("dev: the pointer is back on the view");
+                            pause(900).await;
+                        }
+                    }
+                    if away {
+                        let _ = cx.update(|window, cx| {
+                            window.dispatch_event(move_to(point(px(600.), px(20.))), cx);
+                        });
+                        tracing::info!("dev: the pointer left the view");
+                    }
+                    // After a while out of sight, back to the view.
+                    if return_after > 0 {
+                        pause(return_after).await;
+                        let _ = cx.update(|_, cx| {
+                            thread.update(cx, |state, cx| {
+                                if let Some(item) = state.last_view_item() {
+                                    state.reveal(item, cx);
+                                }
+                            })
+                        });
+                        tracing::info!("dev: scrolled back to the view");
+                    }
+                })
+                .detach();
+            }
             Some(("addproject", text)) => {
                 let text = text.to_owned();
                 cx.defer_in(window, move |this, window, cx| {

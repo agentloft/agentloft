@@ -11,11 +11,20 @@
 mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::NativeWebView;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)] // as `macos`: objc2 calls, each with a SAFETY note.
+mod host_macos;
+#[cfg(target_os = "macos")]
+pub(crate) use host_macos::NativeHost;
 
 #[cfg(not(target_os = "macos"))]
 mod stub;
 #[cfg(not(target_os = "macos"))]
 pub(crate) use stub::NativeWebView;
+#[cfg(not(target_os = "macos"))]
+mod host_stub;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use host_stub::NativeHost;
 
 use crate::address::{SchemePolicy, scheme_policy};
 use futures::channel::mpsc::UnboundedSender;

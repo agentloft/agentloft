@@ -4461,6 +4461,7 @@ dependencies = [
  "anyhow",
  "block2 0.6.2",
  "chrono",
+ "futures",
  "gpui-kit",
  "image",
  "imagesize 0.14.0",

@@ -2228,7 +2228,7 @@ pub struct ThreadState {
     pub markdown: HashMap<ItemId, Entity<TextViewState>>,
     /// The views agents drew (`show_ui`, ADR-0018): each one's page, and
     /// the watch kept on its height.
-    views: HashMap<ItemId, (Entity<crate::panel::page::PageView>, gpui_kit::Subscription)>,
+    views: HashMap<ItemId, (crate::view::Shown, gpui_kit::Subscription)>,
     /// Tool groups / reasoning items the user expanded or collapsed,
     /// keyed by their first item id. `true` = expanded.
     pub expanded: HashMap<ItemId, bool>,
@@ -2830,13 +2830,9 @@ impl ThreadState {
         }
     }
 
-    pub(crate) fn has_view(&self, id: &ItemId) -> bool {
-        self.views.contains_key(id)
-    }
-
     /// The page of the view in item `id`, once its row has been drawn.
-    pub(crate) fn view(&self, id: &ItemId) -> Option<Entity<crate::panel::page::PageView>> {
-        self.views.get(id).map(|(page, _)| page.clone())
+    pub(crate) fn view(&self, id: &ItemId) -> Option<crate::view::Shown> {
+        self.views.get(id).map(|(shown, _)| shown.clone())
     }
 
     /// The thread's last view, if it has one (dev hooks).
@@ -2852,9 +2848,16 @@ impl ThreadState {
 
     /// Where one of the thread's views is drawn right now (dev hooks).
     pub(crate) fn a_view_bounds(&self, cx: &App) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
-        self.views
-            .values()
-            .find_map(|(page, _)| page.read(cx).bounds())
+        self.views.values().find_map(|(shown, _)| shown.bounds(cx))
+    }
+
+    /// One of the thread's views that is a real page of the app's own (dev
+    /// hooks).
+    pub(crate) fn a_view_embed(&self) -> Option<Entity<crate::embed::EmbedView>> {
+        self.views.values().find_map(|(shown, _)| match shown {
+            crate::view::Shown::Embed(embed) => Some(embed.clone()),
+            crate::view::Shown::Page(_) => None,
+        })
     }
 
     /// Keep a view's page, and measure its row again whenever the page
@@ -2862,18 +2865,26 @@ impl ThreadState {
     pub(crate) fn adopt_view(
         &mut self,
         id: ItemId,
-        page: Entity<crate::panel::page::PageView>,
+        shown: crate::view::Shown,
         cx: &mut Context<Self>,
     ) {
+        use crate::panel::page::PageResized;
         let item = id.clone();
-        let resized = cx.subscribe(
-            &page,
-            move |this, _, _: &crate::panel::page::PageResized, cx| {
-                this.remeasure(&item, cx);
-                cx.notify();
-            },
-        );
-        self.views.insert(id, (page, resized));
+        let resized = match &shown {
+            crate::view::Shown::Page(page) => {
+                cx.subscribe(page, move |this, _, _: &PageResized, cx| {
+                    this.remeasure(&item, cx);
+                    cx.notify();
+                })
+            }
+            crate::view::Shown::Embed(embed) => {
+                cx.subscribe(embed, move |this, _, _: &PageResized, cx| {
+                    this.remeasure(&item, cx);
+                    cx.notify();
+                })
+            }
+        };
+        self.views.insert(id, (shown, resized));
     }
 
     /// An item's row changed height by itself (a view's page grew):

@@ -25,6 +25,8 @@
     document.removeEventListener("load", previous.measure, true);
     document.removeEventListener("mousemove", previous.onMove, true);
     document.removeEventListener("mouseout", previous.onMove, true);
+    document.removeEventListener("focusin", previous.onFocus, true);
+    document.removeEventListener("focusout", previous.onFocus, true);
     clearInterval(previous.timer);
     if (previous.sizes) previous.sizes.disconnect();
   }
@@ -111,6 +113,24 @@
     }
   };
 
+  // Whether the keyboard is in a field of the page. A host that shows the
+  // page only while the pointer is on it keeps it there while this is so.
+  const typable = (element) =>
+    !!element &&
+    (element.isContentEditable ||
+      element.tagName === "TEXTAREA" ||
+      element.tagName === "SELECT" ||
+      (element.tagName === "INPUT" &&
+        !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/.test(element.type)));
+  let typing = false;
+  const onFocus = (event) => {
+    const now = event.type === "focusin" && typable(event.target);
+    if (now !== typing) {
+      typing = now;
+      post({ kind: "typing", value: now });
+    }
+  };
+
   let last = -1;
   let observed = null;
   let sizes = null;
@@ -145,7 +165,9 @@
   document.addEventListener("load", measure, true);
   document.addEventListener("mousemove", onMove, true);
   document.addEventListener("mouseout", onMove, true);
+  document.addEventListener("focusin", onFocus, true);
+  document.addEventListener("focusout", onFocus, true);
   const timer = setInterval(measure, 250);
-  world.__agentloftBridge = { onCall, onClick, onSubmit, onMove, measure, timer, sizes };
+  world.__agentloftBridge = { onCall, onClick, onSubmit, onMove, onFocus, measure, timer, sizes };
   measure();
 })();

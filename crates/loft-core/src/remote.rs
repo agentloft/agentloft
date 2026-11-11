@@ -323,6 +323,11 @@ impl Core {
             }
             // Only an agent's own bridge says what an agent showed.
             Request::ShowView { .. } => Err(forbidden("Showing a view")),
+            // A browser is shown the daemon's own page of a view, which
+            // keeps what the view remembers itself.
+            Request::ViewState { .. } | Request::ViewKeep { .. } => {
+                Err(forbidden("Keeping a view's state"))
+            }
 
             Request::PageOpen { .. }
             | Request::PageNavigate { .. }

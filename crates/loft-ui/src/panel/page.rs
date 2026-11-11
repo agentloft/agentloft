@@ -71,13 +71,13 @@ pub fn frame_drawn(window: &Window) {
 
 /// The frame a view's page was last painted in.
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct Seen {
+pub(crate) struct Seen {
     window: u64,
     frame: u64,
 }
 
 impl Seen {
-    fn now(window: &Window) -> Self {
+    pub(crate) fn now(window: &Window) -> Self {
         let window = window.window_handle().window_id().as_u64();
         Self {
             window,
@@ -91,7 +91,7 @@ impl Seen {
 
     /// Whether that is still the last frame its window drew: the view is on
     /// screen, however long ago that was.
-    fn in_sight(self) -> bool {
+    pub(crate) fn in_sight(self) -> bool {
         Self::latest(self.window) == self.frame
     }
 }
@@ -122,6 +122,38 @@ fn pointer_for(cursor: &str) -> gpui_kit::CursorStyle {
         "nwse-resize" | "nw-resize" | "se-resize" => C::ResizeUpLeftDownRight,
         "nesw-resize" | "ne-resize" | "sw-resize" => C::ResizeUpRightDownLeft,
         _ => C::Arrow,
+    }
+}
+
+/// Carry out what a view asked for on its viewer's click. May be called
+/// while the store is handing out what the daemon sent, so anything that
+/// needs the store waits until it is done.
+pub(crate) fn act(store: &Entity<AppStore>, thread: &ThreadId, action: PageAction, cx: &mut App) {
+    let (store, thread) = (store.clone(), thread.clone());
+    match action {
+        PageAction::Send { text } => {
+            let text = text.trim().to_owned();
+            if !text.is_empty() {
+                cx.defer(move |cx| store.update(cx, |store, cx| store.say(thread, text, cx)));
+            }
+        }
+        PageAction::Copy { text } => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+        PageAction::Open { target } => {
+            let target = target.trim().to_owned();
+            if target.starts_with("http://") || target.starts_with("https://") {
+                cx.open_url(&target);
+            } else if !target.is_empty() && !target.contains("://") {
+                // A file of the thread's folder, shown in the panel.
+                cx.defer(move |cx| {
+                    let cwd = store.read(cx).thread_cwd(&thread, cx).unwrap_or_default();
+                    let path = target
+                        .split_once(':')
+                        .map_or(target.as_str(), |(path, _line)| path);
+                    let rel = crate::items::relative_to(path, &cwd);
+                    store.update(cx, |store, cx| store.open_file(thread, rel, cx));
+                });
+            }
+        }
     }
 }
 
@@ -548,32 +580,7 @@ impl PageView {
     /// store is handing out what the daemon sent, so anything that needs
     /// the store waits until it is done.
     pub fn on_action(&mut self, action: PageAction, cx: &mut Context<Self>) {
-        let (store, thread) = (self.store.clone(), self.thread.clone());
-        match action {
-            PageAction::Send { text } => {
-                let text = text.trim().to_owned();
-                if !text.is_empty() {
-                    cx.defer(move |cx| store.update(cx, |store, cx| store.say(thread, text, cx)));
-                }
-            }
-            PageAction::Copy { text } => cx.write_to_clipboard(ClipboardItem::new_string(text)),
-            PageAction::Open { target } => {
-                let target = target.trim().to_owned();
-                if target.starts_with("http://") || target.starts_with("https://") {
-                    cx.open_url(&target);
-                } else if !target.is_empty() && !target.contains("://") {
-                    // A file of the thread's folder, shown in the panel.
-                    cx.defer(move |cx| {
-                        let cwd = store.read(cx).thread_cwd(&thread, cx).unwrap_or_default();
-                        let path = target
-                            .split_once(':')
-                            .map_or(target.as_str(), |(path, _line)| path);
-                        let rel = crate::items::relative_to(path, &cwd);
-                        store.update(cx, |store, cx| store.open_file(thread, rel, cx));
-                    });
-                }
-            }
-        }
+        act(&self.store, &self.thread, action, cx);
     }
 
     /// The look a view should have, if it changed since the daemon was

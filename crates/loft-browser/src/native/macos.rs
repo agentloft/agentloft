@@ -507,7 +507,7 @@ unsafe fn js_outcome(
     }
 }
 
-fn png_from_image(image: &NSImage) -> Result<Screenshot, String> {
+pub(super) fn png_from_image(image: &NSImage) -> Result<Screenshot, String> {
     let tiff = image
         .TIFFRepresentation()
         .ok_or("could not read the snapshot bitmap")?;
