@@ -1970,7 +1970,7 @@ fn render_turn_changes(
     if files.is_empty() {
         return None;
     }
-    let open = !state.folded_diffs.contains(&turn.id);
+    let open = state.open_diffs.contains(&turn.id);
     let added: u32 = files.iter().map(|f| f.added).sum();
     let removed: u32 = files.iter().map(|f| f.removed).sum();
     let stat = |added: u32, removed: u32, binary: bool| {

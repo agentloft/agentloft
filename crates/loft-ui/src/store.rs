@@ -2197,8 +2197,8 @@ pub struct ThreadState {
     /// Turns from before turns kept their changes, asked for once (the
     /// daemon then keeps them on the turn).
     asked_changes: HashSet<loft_protocol::TurnId>,
-    /// Turns whose "changed files" card is folded.
-    pub folded_diffs: HashSet<loft_protocol::TurnId>,
+    /// Turns whose "changed files" card is open (they start folded).
+    pub open_diffs: HashSet<loft_protocol::TurnId>,
     store: WeakEntity<AppStore>,
 }
 
@@ -2207,7 +2207,7 @@ impl ThreadState {
         Self {
             id,
             asked_changes: HashSet::new(),
-            folded_diffs: HashSet::new(),
+            open_diffs: HashSet::new(),
             store,
             model: None,
             rows: Vec::new(),
@@ -2648,8 +2648,8 @@ impl ThreadState {
     }
 
     pub fn toggle_turn_diff(&mut self, turn_id: &loft_protocol::TurnId, cx: &mut Context<Self>) {
-        if !self.folded_diffs.remove(turn_id) {
-            self.folded_diffs.insert(turn_id.clone());
+        if !self.open_diffs.remove(turn_id) {
+            self.open_diffs.insert(turn_id.clone());
         }
         self.remeasure_turn_footer(turn_id, cx);
     }
