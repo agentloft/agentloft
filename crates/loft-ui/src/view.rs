@@ -130,7 +130,13 @@ pub(crate) fn ensure(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (thread_id, item_id, shown) = {
+    // The row's view, and (for a page the app writes itself) what its item
+    // has of the HTML by now, if the page hasn't been told yet.
+    let fresh_for = |embed: &Entity<EmbedView>, item: &Item, cx: &App| {
+        let (html, done) = html_of(item);
+        (!embed.read(cx).has(html, done)).then(|| (html.to_owned(), done))
+    };
+    let (embed, fresh) = {
         let state = thread.read(cx);
         let (Some(model), Some(Row::Item(i))) = (state.model.as_ref(), state.rows.get(ix)) else {
             return;
@@ -139,32 +145,30 @@ pub(crate) fn ensure(
         if !is_view(item) {
             return;
         }
-        (state.id.clone(), item.id.clone(), state.view(&item.id))
-    };
-    let embed = match shown {
-        Some(Shown::Embed(embed)) => embed,
-        Some(Shown::Page(_)) => return,
-        None => {
-            let shown = make(store, &thread_id, &item_id, window, cx);
-            thread.update(cx, |state, cx| {
-                state.adopt_view(item_id.clone(), shown.clone(), cx)
-            });
-            match shown {
-                Shown::Embed(embed) => embed,
-                Shown::Page(_) => return,
+        match state.view(&item.id) {
+            Some(Shown::Page(_)) => return,
+            Some(Shown::Embed(embed)) => {
+                let fresh = fresh_for(&embed, item, cx);
+                (embed, fresh)
+            }
+            None => {
+                let (thread_id, item_id) = (state.id.clone(), item.id.clone());
+                let shown = make(store, &thread_id, &item_id, window, cx);
+                thread.update(cx, |state, cx| {
+                    state.adopt_view(item_id.clone(), shown.clone(), cx)
+                });
+                let Shown::Embed(embed) = shown else {
+                    return;
+                };
+                let state = thread.read(cx);
+                let fresh = state
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.items.iter().find(|item| item.id == item_id))
+                    .and_then(|item| fresh_for(&embed, item, cx));
+                (embed, fresh)
             }
         }
-    };
-    // The app writes an embedded page itself: what its item has by now.
-    let fresh = {
-        let state = thread.read(cx);
-        state
-            .model
-            .as_ref()
-            .and_then(|model| model.items.iter().find(|item| item.id == item_id))
-            .map(html_of)
-            .filter(|(html, done)| !embed.read(cx).has(html, *done))
-            .map(|(html, done)| (html.to_owned(), done))
     };
     if let Some((html, done)) = fresh {
         embed.update(cx, |embed, cx| embed.set_html(&html, done, cx));

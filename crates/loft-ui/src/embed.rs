@@ -1,14 +1,19 @@
 //! A view an agent drew, shown as the real page (ADR-0018): a native web
 //! view the app hosts itself ([`loft_browser::ViewHost`]), where the
-//! platform has one. Clicks, hover, the pointer, selection and typing are
-//! the web view's own, with nothing streamed in between.
+//! platform has one. Clicks, hover, the pointer's shape, selection and
+//! typing are the system's and the web view's own, with nothing of ours in
+//! between.
 //!
 //! A native view draws above everything the app draws, so the page is only
 //! *live* under the pointer. The rest of the time the row shows a picture
 //! of it, which menus can cover and which scrolls in step with the thread;
 //! the page itself waits out of sight, still running.
+//!
+//! What this file decides is only when the page is live. It never makes up
+//! input for it: the one thing it passes on is a press (with its drag and
+//! release) that landed on the picture a moment before the page came in.
 
-use crate::panel::page::{PageResized, Seen, act, pointer_for};
+use crate::panel::page::{PageResized, Seen, act};
 use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use futures::StreamExt as _;
@@ -94,13 +99,10 @@ pub struct EmbedView {
     /// The keyboard is in a field of the page: it stays, wherever the
     /// pointer goes, or what is typed would go nowhere.
     typing: bool,
-    /// A press was handed to the page: its release is too.
-    handed: bool,
-    /// The pointer the page wants where the mouse is, as CSS names it. The
-    /// web view sets it itself, but the app sets its own again whenever it
-    /// redraws (an arrow, for a row it knows nothing about): so the app is
-    /// told to want the same.
-    cursor: String,
+    /// A press that landed on the picture was handed to the page: its drag
+    /// and its release are the page's too (the system sends those to
+    /// whoever got the press, which was the app).
+    handed: Rc<Cell<bool>>,
     /// The app's own focus while the page has the keyboard. Without it the
     /// composer would still be what the app thinks is focused, and would
     /// take Cmd+A, Cmd+C and Cmd+V meant for the page.
@@ -112,12 +114,17 @@ pub struct EmbedView {
     print: u64,
     picturing: bool,
     picture_again: bool,
+    /// The page was just left: whatever its next picture shows, it is
+    /// looked at once more (it may still be on its way back from how it
+    /// looked under the pointer).
+    look_again: bool,
     settle: Option<Task<()>>,
     /// The look the page was last given.
     themed: Option<ViewTheme>,
-    /// Where the row is drawn, and how much of that is in sight.
+    /// Where the row is drawn, and what cuts it off (the list's edges,
+    /// less the band at its bottom).
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    visible: Rc<Cell<Option<Bounds<Pixels>>>>,
+    clip: Rc<Cell<Option<Bounds<Pixels>>>>,
     seen: Rc<Cell<Option<Seen>>>,
     /// The view reaches into the band at the bottom of the list, where its
     /// picture shows even while the page is live: so the picture is kept
@@ -207,18 +214,18 @@ impl EmbedView {
             leaving: false,
             scrolled: Rc::default(),
             typing: false,
-            handed: false,
-            cursor: String::new(),
+            handed: Rc::default(),
             focus,
             _blur,
             still: None,
             print: 0,
             picturing: false,
             picture_again: false,
+            look_again: false,
             settle: None,
             themed: None,
             bounds: Rc::default(),
-            visible: Rc::default(),
+            clip: Rc::default(),
             seen: Rc::default(),
             banded: Rc::default(),
             flush_top: Rc::default(),
@@ -263,9 +270,11 @@ impl EmbedView {
         self.write_again = false;
         self.picturing = false;
         self.picture_again = false;
+        self.look_again = false;
         self.live = false;
         self.leaving = false;
         self.typing = false;
+        self.handed.set(false);
         cx.notify();
     }
 
@@ -432,9 +441,6 @@ impl EmbedView {
                             self.height = height;
                             cx.emit(PageResized);
                             cx.notify();
-                            if self.live {
-                                self.settle_sticky();
-                            }
                         }
                         self.picture_soon(cx);
                     }
@@ -474,25 +480,18 @@ impl EmbedView {
                             host.set_reach([way(0), way(1), way(2), way(3)]);
                         }
                     }
-                    // Something of the page moved or changed under the
-                    // pointer: the part of it that is a picture follows.
-                    Some(kind @ ("scrolled" | "cursor")) => {
-                        if kind == "cursor" {
-                            let wanted = match call["value"].as_str() {
-                                Some("default" | "auto") | None => "",
-                                Some(name) => name,
-                            };
-                            if self.cursor != wanted {
-                                tracing::debug!(
-                                    cursor = wanted,
-                                    "a view's page wants another pointer"
-                                );
-                                self.cursor = wanted.to_owned();
-                                cx.notify();
-                            }
-                        }
+                    // Something in the page scrolled: the part of it that
+                    // is a picture follows.
+                    Some("scrolled") => {
                         if self.live && self.banded.get() {
                             self.picture(cx);
+                        }
+                    }
+                    // The page changed by its own doing: so does whatever
+                    // of it is a picture.
+                    Some("changed") => {
+                        if !self.live || self.banded.get() {
+                            self.picture_soon(cx);
                         }
                     }
                     Some("send") => self.act(PageAction::Send { text: text() }, cx),
@@ -535,6 +534,11 @@ impl EmbedView {
         };
         self.picturing = true;
         let (taken, epoch) = (host.snapshot(), self.epoch);
+        // (Asked for before this picture was taken: it is this one that
+        // is looked at again, and this one the page leaves on, not one
+        // that was already on its way.)
+        let look_again = std::mem::take(&mut self.look_again);
+        let left = self.leaving;
         cx.spawn(async move |this, cx| {
             let picture = match taken.await {
                 Ok(picture) => cx.background_executor().spawn(render(picture)).await,
@@ -548,17 +552,17 @@ impl EmbedView {
                     return;
                 }
                 this.picturing = false;
-                let mut moving = false;
+                let mut moving = look_again;
                 if let Some((picture, print)) = picture {
                     // The first picture can't say whether the page moves:
                     // a second look will.
-                    moving = this.still.is_none() || print != this.print;
+                    moving |= this.still.is_none() || print != this.print;
                     this.print = print;
                     if let Some(old) = this.still.replace(picture) {
                         cx.drop_image(old, None);
                     }
                 }
-                if std::mem::take(&mut this.leaving) {
+                if left && std::mem::take(&mut this.leaving) {
                     tracing::debug!("a view's page goes back to being a picture");
                     this.live = false;
                 }
@@ -583,7 +587,8 @@ impl EmbedView {
 
     // -- live, or a picture --------------------------------------------------------
 
-    /// The pointer is on the view: show the real page.
+    /// The pointer is on the view: show the real page. (It finds the
+    /// pointer on it when it comes in: the system tells it.)
     fn come_alive(&mut self, cx: &mut Context<Self>) {
         self.leaving = false;
         if self
@@ -596,20 +601,12 @@ impl EmbedView {
         if !self.live && self.opened {
             tracing::debug!("a view's page comes in under the pointer");
             self.live = true;
-            self.settle_sticky();
             cx.notify();
         }
-    }
-
-    /// The page was out of sight and is about to be shown (or changed size
-    /// while it is): have WebKit place its sticky and fixed parts anew. It
-    /// keeps where it last put them, and that was worked out for a page
-    /// somewhere else, of another size; a scroll to where it already is
-    /// makes it work them out again. (A picture of the page never shows
-    /// this: it is drawn afresh.)
-    fn settle_sticky(&self) {
-        if let Some(host) = &self.host {
-            drop(host.run("window.scrollBy(0, 1); window.scrollBy(0, -1);"));
+        // Where the view reaches into the band its picture shows even now,
+        // and the page changes under the pointer.
+        if self.live && self.banded.get() {
+            self.picture_soon(cx);
         }
     }
 
@@ -621,20 +618,8 @@ impl EmbedView {
         }
         if self.live && !self.leaving {
             self.leaving = true;
-            if let Some(host) = &self.host {
-                host.pointer_left();
-            }
-            // Once the page has heard that (a turn of the run loop away).
-            self.settle = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(30))
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.leaving {
-                        this.picture(cx);
-                    }
-                });
-            }));
+            self.look_again = true;
+            self.picture(cx);
         }
     }
 
@@ -646,8 +631,8 @@ impl EmbedView {
             tracing::debug!("a view's page rests at once");
             self.live = false;
             self.leaving = false;
+            self.look_again = true;
             if let Some(host) = &self.host {
-                host.pointer_left();
                 host.park();
             }
             cx.notify();
@@ -661,8 +646,8 @@ impl EmbedView {
         if !self.opened {
             return;
         }
-        let (Some(bounds), Some(visible), Some(host)) =
-            (self.bounds.get(), self.visible.get(), self.host.clone())
+        let (Some(bounds), Some(clip), Some(host)) =
+            (self.bounds.get(), self.clip.get(), self.host.clone())
         else {
             return;
         };
@@ -670,10 +655,9 @@ impl EmbedView {
         // the bottom of the list, where only its picture is.)
         if !self.live {
             self.live = true;
-            self.settle_sticky();
             host.show_now(
                 bounds,
-                visible,
+                clip,
                 window.scale_factor(),
                 px(RADIUS),
                 self.corners(),
@@ -681,15 +665,29 @@ impl EmbedView {
         }
         self.leaving = false;
         host.take_press();
-        self.handed = true;
+        self.handed.set(true);
         cx.stop_propagation();
         cx.notify();
     }
 
-    /// The release of a press that was handed to the page: the system
-    /// sends it to whoever got the press, which was us.
-    fn on_release(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        if std::mem::take(&mut self.handed)
+    /// The pointer moved somewhere in the window while the page is in.
+    fn on_move(&mut self, event: &MouseMoveEvent, on_page: bool, cx: &mut Context<Self>) {
+        if self.handed.get() {
+            // Still holding the press the page was handed.
+            match (&self.host, event.pressed_button) {
+                (Some(host), Some(MouseButton::Left)) => host.take_drag(),
+                _ => self.handed.set(false),
+            }
+        } else if !on_page {
+            // While the page is shown it takes every pointer event inside
+            // it, so one that reaches the app is somewhere else.
+            self.leave(cx);
+        }
+    }
+
+    /// The release of a press that was handed to the page.
+    fn on_release(&mut self) {
+        if self.handed.replace(false)
             && let Some(host) = &self.host
         {
             host.take_release();
@@ -719,18 +717,33 @@ impl EmbedView {
     }
 }
 
-/// A page's picture as GPUI paints it, and its pixels hashed.
+/// A page's picture as GPUI paints it, and a print of its pixels (two
+/// pictures with the same print show the same thing). Reads every pixel:
+/// for a background thread.
 async fn render(picture: HostPicture) -> Option<(Arc<RenderImage>, u64)> {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let (width, height) = (picture.width, picture.height);
-    let bgra = picture.into_bgra();
-    bgra.hash(&mut hasher);
+    let bgra = picture.into_bgra()?;
+    let print = print_of(&bgra);
     let pixels = image::RgbaImage::from_raw(width, height, bgra)?;
     Some((
         Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])),
-        hasher.finish(),
+        print,
     ))
+}
+
+/// A quick print of a picture's pixels, eight bytes at a step. Only ever
+/// compared with the print of the picture before.
+fn print_of(pixels: &[u8]) -> u64 {
+    const MIX: u64 = 0x517c_c1b7_2722_0a95;
+    let (words, rest) = pixels.as_chunks::<8>();
+    let mut print = pixels.len() as u64;
+    for word in words {
+        print = (print.rotate_left(5) ^ u64::from_ne_bytes(*word)).wrapping_mul(MIX);
+    }
+    for byte in rest {
+        print = (print.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(MIX);
+    }
+    print
 }
 
 impl Render for EmbedView {
@@ -758,11 +771,11 @@ impl Render for EmbedView {
                 .child("Drawing…")
                 .into_any_element(),
         };
-        let (bounds, visible, seen) =
-            (self.bounds.clone(), self.visible.clone(), self.seen.clone());
+        let (bounds, clip, seen) = (self.bounds.clone(), self.clip.clone(), self.seen.clone());
         let (live, host, entity) = (self.live, self.host.clone(), cx.entity().downgrade());
         let banded = self.banded.clone();
         let scrolled = self.scrolled.clone();
+        let handed = self.handed.clone();
         let band = window.rem_size() * BAND;
         div()
             .id(("view-embed", cx.entity_id()))
@@ -770,11 +783,9 @@ impl Render for EmbedView {
             .w_full()
             .h(px(self.height as f32))
             .overflow_hidden()
-            .cursor(pointer_for(&self.cursor))
             .track_focus(&self.focus)
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.come_alive(cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_press))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_release))
             .child(body)
             .children(self.host.as_ref().map(|host| {
                 div().absolute().top_0().left_0().size_full().child(
@@ -794,9 +805,10 @@ impl Render for EmbedView {
                         banded.set(
                             area.bottom() > mask.bottom() - band && area.top() < mask.bottom(),
                         );
-                        visible.set(Some(
-                            area.intersect(&loft_browser::without_band(mask, band)),
-                        ));
+                        let cut = loft_browser::without_band(mask, band);
+                        clip.set(Some(cut));
+                        // What of the page can be in sight.
+                        let shown = area.intersect(&cut);
                         // The thread scrolls (the wheel over anything but a
                         // shown page comes here first).
                         window.on_mouse_event(move |_: &ScrollEvent, phase, _, _| {
@@ -804,22 +816,34 @@ impl Render for EmbedView {
                                 scrolled.set(Some(Instant::now()));
                             }
                         });
+                        // The pointer left the page; or it drags, holding a
+                        // press the page was handed.
+                        let moved = entity.clone();
+                        let held = handed.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            let on_page = shown.contains(&event.position);
+                            if phase == DispatchPhase::Capture && (held.get() || (live && !on_page))
+                            {
+                                let _ =
+                                    moved.update(cx, |this, cx| this.on_move(event, on_page, cx));
+                            }
+                        });
+                        let released = entity.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture
+                                && event.button == MouseButton::Left
+                                && handed.get()
+                            {
+                                let _ = released.update(cx, |this, _| this.on_release());
+                            }
+                        });
                         if !live {
                             return;
                         }
-                        // While the page is shown it takes every pointer
-                        // event inside it, so one that reaches the app is
-                        // somewhere else: the pointer has left.
-                        let left = entity.clone();
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                            if phase == DispatchPhase::Capture && !area.contains(&event.position) {
-                                let _ = left.update(cx, |this, cx| this.leave(cx));
-                            }
-                        });
                         // A press elsewhere takes the keyboard back with it.
                         let (pressed, focused) = (entity.clone(), host.clone());
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
-                            if phase == DispatchPhase::Capture && !area.contains(&event.position) {
+                            if phase == DispatchPhase::Capture && !shown.contains(&event.position) {
                                 if let Some(host) = &focused {
                                     host.release_focus();
                                 }

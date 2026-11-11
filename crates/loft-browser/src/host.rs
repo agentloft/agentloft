@@ -15,6 +15,10 @@
 //! picture of it ([`ViewHost::snapshot`]) that menus and popups can cover
 //! and that scrolls in step with everything else.
 //!
+//! While it is shown the page is an ordinary web view under the pointer:
+//! clicks, the keyboard, hover and the pointer's shape are the system's
+//! and WebKit's own business, with nothing of ours in between.
+//!
 //! macOS only (WKWebView). Elsewhere [`ViewHost::new`] fails and the owner
 //! falls back to the daemon's streamed page.
 
@@ -22,7 +26,7 @@ use crate::native::NativeHost;
 use futures::channel::{mpsc::UnboundedSender, oneshot};
 use gpui_kit::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Style, Window, relative,
+    Pixels, Style, Window, px, relative,
 };
 use std::panic::Location;
 use std::rc::{Rc, Weak};
@@ -52,48 +56,89 @@ pub struct Corners {
 }
 
 impl Corners {
-    /// `CACornerMask` for a page at `y..y+h` of which `vy..vy+vh` shows: an
-    /// edge that is cut off has square corners.
+    /// `CACornerMask` for a layer whose y axis points down (`flipped`), or
+    /// up.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn mask(self, y: f64, h: f64, vy: f64, vh: f64) -> usize {
-        // Min-Y is the bottom edge in AppKit's unflipped coordinates.
-        const BOTTOM: usize = 0b0011;
-        const TOP: usize = 0b1100;
+    pub(crate) fn mask(self, flipped: bool) -> usize {
+        const MIN_Y: usize = 0b0011;
+        const MAX_Y: usize = 0b1100;
+        let (top, bottom) = if flipped {
+            (MIN_Y, MAX_Y)
+        } else {
+            (MAX_Y, MIN_Y)
+        };
         let mut mask = 0;
-        if self.top && (vy - y).abs() < 0.5 {
-            mask |= TOP;
+        if self.top {
+            mask |= top;
         }
-        if self.bottom && ((vy + vh) - (y + h)).abs() < 0.5 {
-            mask |= BOTTOM;
+        if self.bottom {
+            mask |= bottom;
         }
         mask
     }
 }
 
-/// A picture of a hosted page: its pixels, four bytes each, rows top to
-/// bottom, at the display's density.
-#[derive(Debug, Clone)]
+/// A picture of a hosted page, at the display's density. Its pixels are
+/// still in the system's image: reading them out copies every one, which is
+/// for a background thread to do ([`HostPicture::into_bgra`]).
 pub struct HostPicture {
-    pub pixels: Vec<u8>,
-    /// Where blue, green, red and alpha sit in each pixel. GPUI draws
-    /// `[0, 1, 2, 3]`; see [`HostPicture::into_bgra`].
-    pub order: [u8; 4],
     pub width: u32,
     pub height: u32,
+    read: Box<dyn FnOnce() -> Option<Vec<u8>> + Send>,
 }
 
 impl HostPicture {
-    /// The pixels as GPUI draws them (BGRA). Worth doing off the main
-    /// thread: it walks every pixel unless they are in that order already.
-    pub fn into_bgra(mut self) -> Vec<u8> {
-        if self.order != [0, 1, 2, 3] {
-            let [b, g, r, a] = self.order.map(usize::from);
-            for pixel in self.pixels.as_chunks_mut::<4>().0 {
-                *pixel = [pixel[b], pixel[g], pixel[r], pixel[a]];
-            }
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn new(
+        width: u32,
+        height: u32,
+        read: impl FnOnce() -> Option<Vec<u8>> + Send + 'static,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            read: Box::new(read),
         }
-        self.pixels
     }
+
+    /// The pixels as GPUI draws them: blue, green, red, alpha; rows from
+    /// the top, with nothing between them. `None` if the system's image
+    /// turned out not to be readable.
+    pub fn into_bgra(self) -> Option<Vec<u8>> {
+        (self.read)()
+    }
+}
+
+/// `width` × `height` pixels out of `bytes`, whose rows are `row` bytes
+/// apart (they may be padded), as BGRA with nothing between the rows.
+/// `order` says where blue, green, red and alpha sit in each pixel now.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn packed_bgra(
+    bytes: &[u8],
+    row: usize,
+    order: [u8; 4],
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    let line = width.checked_mul(4)?;
+    if width == 0 || height == 0 || row < line || bytes.len() < row * (height - 1) + line {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(line * height);
+    if row == line {
+        pixels.extend_from_slice(&bytes[..line * height]);
+    } else {
+        for y in 0..height {
+            pixels.extend_from_slice(&bytes[y * row..y * row + line]);
+        }
+    }
+    if order != [0, 1, 2, 3] {
+        let [b, g, r, a] = order.map(usize::from);
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            *pixel = [pixel[b], pixel[g], pixel[r], pixel[a]];
+        }
+    }
+    Some(pixels)
 }
 
 /// A page the app hosts natively. Cheap to clone (one page behind it).
@@ -124,10 +169,13 @@ impl ViewHost {
     /// Runs `script` in the bridge's world: the only one that can post
     /// [`HostEvent::Message`]s, as `globalThis.__agentloft(json)`.
     pub fn run_bridge(&self, script: &str) -> oneshot::Receiver<Result<(), String>> {
-        // What only this world can do: post to us. And no menu of the web
-        // view's own (its "Reload" would empty the page).
+        // What only this world can do: post to us. The bridge is told that
+        // the user has the page itself in front of them (not pictures of
+        // it). And no menu of the web view's own (its "Reload" would empty
+        // the page).
         let post = "globalThis.__agentloft = (message) => \
                     window.webkit.messageHandlers.agentloftView.postMessage(String(message));\
+                    globalThis.__agentloftReal = true;\
                     if (!globalThis.__agentloftMenu) { globalThis.__agentloftMenu = true; \
                     document.addEventListener('contextmenu', (e) => e.preventDefault(), true); }";
         self.native.run(&format!("{post}\n{script}"), true)
@@ -151,18 +199,18 @@ impl ViewHost {
         }
     }
 
-    /// Show the page now at `bounds`, as much of it as is inside
-    /// `visible` (window coordinates), without waiting for the next paint:
-    /// for a press that is to reach it.
+    /// Show the page now at `bounds`, as much of it as is inside `clip`
+    /// (window coordinates), without waiting for the next paint: for a
+    /// press that is to reach it.
     pub fn show_now(
         &self,
         bounds: Bounds<Pixels>,
-        visible: Bounds<Pixels>,
+        clip: Bounds<Pixels>,
         scale: f32,
         radius: Pixels,
         corners: Corners,
     ) {
-        place(&self.native, bounds, visible, scale, radius, corners);
+        place(&self.native, bounds, clip, scale, radius, corners);
     }
 
     /// Whether the page is in sight right now.
@@ -195,10 +243,10 @@ impl ViewHost {
         self.native.take_release();
     }
 
-    /// Tell the page the pointer is no longer on it (before it is taken
-    /// out from under the pointer, which it wouldn't notice).
-    pub fn pointer_left(&self) {
-        self.native.pointer_left();
+    /// The pointer moved with that press still held: the drag is the
+    /// page's as well.
+    pub fn take_drag(&self) {
+        self.native.take_drag();
     }
 
     pub fn is_focused(&self) -> bool {
@@ -236,7 +284,7 @@ impl ViewHost {
 }
 
 /// Shows a hosted page where this element is painted (while it is to be
-/// shown), clipped to what of the element is in sight; takes it out of
+/// shown), cut off where whatever clips the element ends; takes it out of
 /// sight on the first frame the element isn't painted.
 pub struct HostSurface {
     native: Rc<NativeHost>,
@@ -349,13 +397,11 @@ impl Element for HostSurface {
                 ((), guard.unwrap_or_else(|| PaintGuard::new(native)))
             });
         }
-        let clip = without_band(window.content_mask().bounds, self.clear_below);
-        let visible = bounds.intersect(&clip);
         if self.shown {
             place(
                 &self.native,
                 bounds,
-                visible,
+                without_band(window.content_mask().bounds, self.clear_below),
                 window.scale_factor(),
                 self.radius,
                 self.corners,
@@ -381,19 +427,26 @@ fn rect(bounds: Bounds<Pixels>, scale: f32) -> [f64; 4] {
     ]
 }
 
-/// Show the page at `bounds`, or park it if none of that is in sight.
+/// Show the page at `bounds` as far as `clip` reaches, or park it if none
+/// of it is inside.
 fn place(
     native: &NativeHost,
     bounds: Bounds<Pixels>,
-    visible: Bounds<Pixels>,
+    clip: Bounds<Pixels>,
     scale: f32,
     radius: Pixels,
     corners: Corners,
 ) {
-    let (whole, visible) = (rect(bounds, scale), rect(visible, scale));
+    let whole = rect(bounds, scale);
     native.set_size(whole[2], whole[3]);
-    if visible[2] >= 1.0 && visible[3] >= 1.0 {
-        native.place(whole, visible, f64::from(f32::from(radius)), corners);
+    let visible = bounds.intersect(&clip);
+    if visible.size.width >= px(1.) && visible.size.height >= px(1.) {
+        native.place(
+            whole,
+            rect(clip, scale),
+            f64::from(f32::from(radius)),
+            corners,
+        );
     } else {
         native.park();
     }
@@ -404,22 +457,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_edge_that_is_cut_off_has_square_corners() {
-        let both = Corners {
-            top: true,
-            bottom: true,
-        };
-        // All of it in sight.
-        assert_eq!(both.mask(100., 200., 100., 200.), 0b1111);
-        // Scrolled under the top of the list: only the bottom is its own.
-        assert_eq!(both.mask(100., 200., 150., 150.), 0b0011);
-        // Cut off below: only the top.
-        assert_eq!(both.mask(100., 200., 100., 120.), 0b1100);
-        // A title sits over it: its top is never rounded.
+    fn corners_follow_the_way_the_layer_counts() {
         let under_a_title = Corners {
             top: false,
             bottom: true,
         };
-        assert_eq!(under_a_title.mask(100., 200., 100., 200.), 0b0011);
+        // Min-Y is the top of a layer that counts down, the bottom of one
+        // that counts up.
+        assert_eq!(under_a_title.mask(true), 0b1100);
+        assert_eq!(under_a_title.mask(false), 0b0011);
+        let both = Corners {
+            top: true,
+            bottom: true,
+        };
+        assert_eq!(both.mask(true), 0b1111);
+        assert_eq!(Corners::default().mask(true), 0);
+    }
+
+    #[test]
+    fn pixels_are_packed_and_put_in_order() {
+        // Two pixels a row, rows padded to twelve bytes, as R G B A.
+        let bytes = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, //
+            9, 10, 11, 12, 13, 14, 15, 16,
+        ];
+        assert_eq!(
+            packed_bgra(&bytes, 12, [2, 1, 0, 3], 2, 2).unwrap(),
+            [3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12, 15, 14, 13, 16]
+        );
+        // Already in order, nothing between the rows: as it is.
+        let bytes: Vec<u8> = (0..16).collect();
+        assert_eq!(packed_bgra(&bytes, 8, [0, 1, 2, 3], 2, 2).unwrap(), bytes);
+        // Shorter than it says it is.
+        assert!(packed_bgra(&bytes, 8, [0, 1, 2, 3], 2, 3).is_none());
+        assert!(packed_bgra(&bytes, 4, [0, 1, 2, 3], 2, 2).is_none());
     }
 }

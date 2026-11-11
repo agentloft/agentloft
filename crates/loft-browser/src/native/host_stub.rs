@@ -37,7 +37,7 @@ impl NativeHost {
 
     pub fn park(&self) {}
 
-    pub fn place(&self, _bounds: [f64; 4], _visible: [f64; 4], _radius: f64, _corners: Corners) {}
+    pub fn place(&self, _bounds: [f64; 4], _clip: [f64; 4], _radius: f64, _corners: Corners) {}
 
     pub fn is_shown(&self) -> bool {
         false
@@ -53,7 +53,7 @@ impl NativeHost {
 
     pub fn take_release(&self) {}
 
-    pub fn pointer_left(&self) {}
+    pub fn take_drag(&self) {}
 
     pub fn click_at(&self, _x: f64, _y: f64) {}
 
