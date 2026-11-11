@@ -992,6 +992,23 @@ impl WorkspaceView {
                 "terminal" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Terminal, window, cx)),
+                // A shell in the side panel, and the panel shut a moment
+                // later: what size the shell is told as the panel slides
+                // away (`list_terminals` on the daemon's socket says).
+                "terminalshut" => {
+                    self.panel
+                        .update(cx, |p, cx| p.show(Tab::Terminal, window, cx));
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(2500))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.panel_open = false;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
                 "dock" => self.toggle_terminal(window, cx),
                 "browser" => self
                     .panel
@@ -5356,6 +5373,42 @@ impl Render for WorkspaceView {
                         })
                         .when(!maximized && panel_sliding, |d| {
                             // Mid-slide: a plain row at the panel's width.
+                            let shown = self.panel_width.get() * panel_amount;
+                            // A web page is a native view (or the picture of
+                            // one): nothing can clip it, so it is made as
+                            // narrow as what shows. Everything else keeps
+                            // the panel's full width and is cut off at the
+                            // edge, as the dock is. Squeezed, a terminal was
+                            // told a new width on every frame of the slide,
+                            // and left two columns wide once the panel had
+                            // shut: whatever a program printed until it
+                            // opened again was wrapped at two.
+                            let squeezed = self.panel.read(cx).active_tab(cx) == Some(Tab::Browser);
+                            let panel = if squeezed {
+                                div()
+                                    .flex_none()
+                                    .h_full()
+                                    .w(px(shown))
+                                    .overflow_hidden()
+                                    .border_l_1()
+                                    .border_color(p.border)
+                                    .child(self.panel.clone())
+                            } else {
+                                div()
+                                    .flex_none()
+                                    .h_full()
+                                    .w(px(shown))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .h_full()
+                                            .w(px(self.panel_width.get()))
+                                            .border_l_1()
+                                            .border_color(p.border)
+                                            .child(self.panel.clone()),
+                                    )
+                            };
                             d.child(
                                 h_flex()
                                     .flex_1()
@@ -5367,16 +5420,7 @@ impl Render for WorkspaceView {
                                             .h_full()
                                             .children(body_slot.take()),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .h_full()
-                                            .w(px(self.panel_width.get() * panel_amount))
-                                            .overflow_hidden()
-                                            .border_l_1()
-                                            .border_color(p.border)
-                                            .child(self.panel.clone()),
-                                    ),
+                                    .child(panel),
                             )
                         })
                         .when(!maximized && !panel_sliding, |d| {
