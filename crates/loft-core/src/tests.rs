@@ -1852,3 +1852,105 @@ async fn a_message_after_idle_compacts_first() {
         .collect();
     assert_eq!(replies, ["echo: /compact"]);
 }
+
+/// Subagents launched in the background stay "in progress" from their
+/// launch until they finish: through the end of the turn, and between
+/// their steps, when nothing of theirs is running.
+#[tokio::test]
+async fn a_background_subagent_is_open_until_it_finishes() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let mut bus = f.core.subscribe();
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "bgagents quick".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+
+    let agents = |items: &[Item]| -> Vec<Item> {
+        items
+            .iter()
+            .filter(|i| {
+                matches!(&i.body, ItemBody::ToolCall { tool_kind, .. }
+                    if *tool_kind == loft_protocol::ToolKind::Subagent)
+            })
+            .cloned()
+            .collect()
+    };
+    let (thread_now, turns, items, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(turns[0].status, TurnStatus::Completed);
+    assert_eq!(thread_now.waiting_on.len(), 3);
+    let launched = agents(&items);
+    assert_eq!(launched.len(), 3);
+    for agent in &launched {
+        assert_eq!(agent.status, ItemStatus::InProgress, "{agent:?}");
+        assert!(
+            matches!(&agent.body, ItemBody::ToolCall { output: Some(out), .. }
+            if out.starts_with("Async agent launched"))
+        );
+    }
+
+    wait_for(&f.core, &thread.id, |t, _| t.waiting_on.is_empty()).await;
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    for agent in agents(&items) {
+        assert_eq!(agent.status, ItemStatus::Completed);
+        let steps: Vec<&Item> = items
+            .iter()
+            .filter(|i| i.parent_id.as_ref() == Some(&agent.id))
+            .collect();
+        assert!(steps.len() >= 3, "{steps:?}");
+        assert!(steps.iter().all(|s| s.status == ItemStatus::Completed));
+    }
+    // Never "done" and then at work again.
+    let mut ended: std::collections::HashSet<ItemId> = Default::default();
+    while let Ok(msg) = bus.try_recv() {
+        if let BusMsg::Event(env) = msg
+            && let Event::ItemUpserted { item } = &env.event
+            && launched.iter().any(|a| a.id == item.id)
+        {
+            assert!(!ended.contains(&item.id), "reopened: {item:?}");
+            if item.status != ItemStatus::InProgress {
+                ended.insert(item.id.clone());
+            }
+        }
+    }
+    assert_eq!(ended.len(), 3);
+}
+
+/// A session that goes away takes its background subagents with it.
+#[tokio::test]
+async fn a_background_subagent_ends_with_its_session() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "bgagents".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    // A setting the running session can't take live: it restarts.
+    f.core
+        .handle(Request::SetEffort {
+            thread_id: thread.id.clone(),
+            effort: Some("high".into()),
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, |t, _| t.waiting_on.is_empty()).await;
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    let open: Vec<&Item> = items
+        .iter()
+        .filter(|i| i.status == ItemStatus::InProgress)
+        .collect();
+    assert!(open.is_empty(), "{open:?}");
+    assert!(items.iter().any(|i| i.status == ItemStatus::Declined
+        && matches!(&i.body, ItemBody::ToolCall { tool_kind, .. }
+            if *tool_kind == loft_protocol::ToolKind::Subagent)));
+}

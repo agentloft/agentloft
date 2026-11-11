@@ -138,6 +138,13 @@ pub enum HarnessEvent {
         input: serde_json::Value,
         partial: bool,
     },
+    /// What a tool call gave back while the work it started goes on: a
+    /// subagent launched in the background answers at once with a receipt.
+    /// The item stays in progress until its `ItemCompleted`.
+    ToolOutput {
+        native_id: String,
+        result: ToolResult,
+    },
     ItemCompleted {
         native_id: String,
         /// Replace the body entirely (e.g. final full text). `None` keeps the

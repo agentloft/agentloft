@@ -11,6 +11,9 @@
 //!   `ui:stream:<sample>` writes one out slowly, as an agent does. The
 //!   other keywords are then left alone, since a view's own text may hold
 //!   them;
+//! - contains `bgagents`: starts three subagents in the background first.
+//!   They work on after the turn, a step at a time with a pause between
+//!   steps (short ones with `quick` in the text), then finish;
 //! - contains `fail`: completes the turn as failed.
 
 use crate::{
@@ -62,11 +65,12 @@ async fn run(mut ends: SessionEnds, session_id: String) {
         slash_commands: vec!["help".into()],
     });
     let mut turn_no = 0u32;
+    let mut background = Background::default();
     while let Some(cmd) = ends.commands.recv().await {
         match cmd {
             SessionCommand::StartTurn(input) => {
                 turn_no += 1;
-                if !run_turn(&mut ends, turn_no, &input.text).await {
+                if !run_turn(&mut ends, &mut background, turn_no, &input.text).await {
                     return;
                 }
             }
@@ -81,9 +85,141 @@ async fn run(mut ends: SessionEnds, session_id: String) {
     });
 }
 
+/// Background work of a session: it ends with the session.
+#[derive(Default)]
+struct Background(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Three subagents launched in the background, the way Claude reports
+/// them: each call answers at once with a receipt and stays open; its steps
+/// come later (after the turn too), with nothing running between two
+/// steps; then the agent says it finished.
+fn start_background_agents(
+    ends: &SessionEnds,
+    turn_no: u32,
+    quick: bool,
+) -> tokio::task::JoinHandle<()> {
+    let names = ["Audit the daemon", "Audit the UI", "Find unused code"];
+    let (step, pause) = if quick {
+        (Duration::from_millis(15), Duration::from_millis(30))
+    } else {
+        (Duration::from_millis(700), Duration::from_millis(1800))
+    };
+    let agent = move |n: usize| format!("agent-{turn_no}-{n}");
+    for (n, name) in names.iter().enumerate() {
+        ends.emit(HarnessEvent::ItemStarted {
+            parent: None,
+            native_id: agent(n),
+            body: ItemBody::ToolCall {
+                tool: "Agent".into(),
+                tool_kind: ToolKind::Subagent,
+                title: (*name).into(),
+                input: serde_json::json!({ "description": name, "prompt": name, "run_in_background": true }),
+                output: None,
+                is_error: false,
+            },
+        });
+        ends.emit(HarnessEvent::ToolOutput {
+            native_id: agent(n),
+            result: ToolResult {
+                output: "Async agent launched successfully.".into(),
+                is_error: false,
+            },
+        });
+    }
+    let mut open: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+    ends.emit(HarnessEvent::BackgroundTasks(open.clone()));
+    let events = ends.events.clone();
+    tokio::spawn(async move {
+        let emit = |event| {
+            let _ = events.send(event);
+        };
+        // The agents take turns, and the later ones have more to do.
+        for round in 0..names.len() + 2 {
+            for (n, name) in names.iter().enumerate() {
+                if round > n + 2 {
+                    continue;
+                }
+                if round == n + 2 {
+                    let said = format!("{}-said", agent(n));
+                    emit(HarnessEvent::ItemStarted {
+                        parent: Some(agent(n)),
+                        native_id: said.clone(),
+                        body: ItemBody::AssistantMessage {
+                            text: String::new(),
+                        },
+                    });
+                    emit(HarnessEvent::ItemCompleted {
+                        native_id: said,
+                        body: Some(ItemBody::AssistantMessage {
+                            text: format!("{name}: nothing to report."),
+                        }),
+                        tool_result: None,
+                        status: ItemStatus::Completed,
+                    });
+                    emit(HarnessEvent::ItemCompleted {
+                        native_id: agent(n),
+                        body: None,
+                        tool_result: None,
+                        status: ItemStatus::Completed,
+                    });
+                    open.retain(|o| o != name);
+                    emit(HarnessEvent::BackgroundTasks(open.clone()));
+                    continue;
+                }
+                let id = format!("{}-step-{round}", agent(n));
+                emit(HarnessEvent::ItemStarted {
+                    parent: Some(agent(n)),
+                    native_id: id.clone(),
+                    body: ItemBody::ToolCall {
+                        tool: "Bash".into(),
+                        tool_kind: ToolKind::Command,
+                        title: format!("grep -rn step-{round} crates"),
+                        input: serde_json::json!({ "command": format!("grep -rn step-{round} crates") }),
+                        output: None,
+                        is_error: false,
+                    },
+                });
+                tokio::time::sleep(step).await;
+                emit(HarnessEvent::ItemCompleted {
+                    native_id: id,
+                    body: None,
+                    tool_result: Some(ToolResult {
+                        output: "ok".into(),
+                        is_error: false,
+                    }),
+                    status: ItemStatus::Completed,
+                });
+            }
+            // Thinking: nothing of theirs is running.
+            tokio::time::sleep(pause).await;
+        }
+    })
+}
+
 /// Returns `false` if the session should end.
-async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
+async fn run_turn(
+    ends: &mut SessionEnds,
+    background: &mut Background,
+    turn_no: u32,
+    text: &str,
+) -> bool {
     ends.emit(HarnessEvent::TurnStarted);
+
+    if text.contains("bgagents") {
+        background.0.push(start_background_agents(
+            ends,
+            turn_no,
+            text.contains("quick"),
+        ));
+    }
 
     let (views, slowly) = fake_views(text);
     for (n, spec) in views.iter().enumerate() {

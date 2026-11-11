@@ -1023,6 +1023,7 @@ impl ThreadActor {
                 while events.recv().await.is_some() {}
             })
             .await;
+            self.background_work_gone();
         }
         if let Some(pid) = self.session_pid.take() {
             self.core.forget_process(pid);
@@ -1201,6 +1202,24 @@ impl ThreadActor {
                         .view_written(&self.thread.id, &item_id, html, !partial);
                 }
             }
+            HarnessEvent::ToolOutput { native_id, result } => {
+                let Some(item_id) = self.items.get(&native_id).cloned() else {
+                    return Ok(());
+                };
+                let Some(mut item) = self.core.live().get(&item_id).cloned() else {
+                    return Ok(());
+                };
+                if let ItemBody::ToolCall {
+                    output, is_error, ..
+                } = &mut item.body
+                {
+                    *output = Some(result.output);
+                    *is_error = result.is_error;
+                }
+                item.updated_at_ms = now_ms();
+                self.core.live().insert(item_id, item.clone());
+                self.core.commit(vec![Event::ItemUpserted { item }])?;
+            }
             HarnessEvent::ItemCompleted {
                 native_id,
                 body,
@@ -1328,13 +1347,7 @@ impl ThreadActor {
 
     fn on_session_lost(&mut self, code: Option<i32>, stderr_tail: String) {
         self.session = None;
-        // Its background work went with it.
-        if !self.thread.waiting_on.is_empty() {
-            self.thread.waiting_on.clear();
-            let _ = self.core.commit(vec![Event::ThreadUpdated {
-                thread: self.thread.clone(),
-            }]);
-        }
+        self.background_work_gone();
         if let Some(pid) = self.session_pid.take() {
             self.core.forget_process(pid);
         }
@@ -1354,6 +1367,42 @@ impl ThreadActor {
         }
     }
 
+    /// The session is gone and its background work with it: nothing is
+    /// waited on any more, and subagents it left working (and their steps)
+    /// are closed, since nothing more will come from them.
+    fn background_work_gone(&mut self) {
+        let mut events = Vec::new();
+        if self.turn.is_none() {
+            let subagents: HashSet<&ItemId> = self.subagents.values().collect();
+            for item_id in self.items.values() {
+                if let Some(mut item) = self.core.live().remove(item_id) {
+                    item.status = if subagents.contains(item_id) {
+                        // Shown as stopped, not as done.
+                        ItemStatus::Declined
+                    } else {
+                        ItemStatus::Failed
+                    };
+                    item.updated_at_ms = now_ms();
+                    events.push(Event::ItemUpserted { item });
+                }
+            }
+            self.items.clear();
+            self.dirty.clear();
+        }
+        self.subagents.clear();
+        if !self.thread.waiting_on.is_empty() {
+            self.thread.waiting_on.clear();
+            events.push(Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            });
+        }
+        if !events.is_empty()
+            && let Err(err) = self.core.commit(events)
+        {
+            tracing::error!(%err, "failed to close what the session left open");
+        }
+    }
+
     fn finish_turn(
         &mut self,
         status: TurnStatus,
@@ -1361,21 +1410,31 @@ impl ThreadActor {
         error: Option<String>,
     ) -> CoreResult<()> {
         let mut events = Vec::new();
-        // A background subagent's steps carry on after the turn: keep them
-        // (and their ids) unless the turn was stopped or failed.
-        let keep: HashMap<String, ItemId> = if status == TurnStatus::Completed {
+        // A subagent launched in the background works on after the turn,
+        // whichever way that ended: it stays open until the agent says it
+        // finished. It is the one call that is still open with its result
+        // (a receipt, `HarnessEvent::ToolOutput`) already in. Its steps
+        // carry on too: keep them (and their ids) unless the turn was
+        // stopped or failed.
+        let keep: HashMap<String, ItemId> = {
+            let live = self.core.live();
             self.items
                 .iter()
-                .filter(|(_, id)| {
-                    self.core
-                        .live()
-                        .get(*id)
-                        .is_some_and(|i| i.parent_id.is_some())
+                .filter(|(native, id)| {
+                    live.get(*id).is_some_and(|i| {
+                        let launched = self.subagents.contains_key(*native)
+                            && matches!(
+                                &i.body,
+                                ItemBody::ToolCall {
+                                    output: Some(_),
+                                    ..
+                                }
+                            );
+                        launched || (i.parent_id.is_some() && status == TurnStatus::Completed)
+                    })
                 })
                 .map(|(n, id)| (n.clone(), id.clone()))
                 .collect()
-        } else {
-            HashMap::new()
         };
         // Close anything else still streaming.
         for item_id in self.items.values() {

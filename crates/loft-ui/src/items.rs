@@ -1604,20 +1604,26 @@ pub(crate) struct SubagentStatus {
     pub elapsed: Option<String>,
 }
 
+/// Whether a subagent was launched in the background: its call returned at
+/// once with a receipt, and it works on by itself.
+pub(crate) fn in_background(item: &Item) -> bool {
+    matches!(&item.body, ItemBody::ToolCall { output: Some(out), .. }
+        if out.trim_start().starts_with("Async agent launched"))
+}
+
 pub(crate) fn subagent_status(model: &ThreadModel, item: &Item) -> SubagentStatus {
     let children: Vec<&Item> = model
         .items
         .iter()
         .filter(|i| i.parent_id.as_ref() == Some(&item.id))
         .collect();
-    // Launched in the background: the call returns at once with a receipt;
-    // the agent's own steps tell how it is going.
-    let background = matches!(&item.body, ItemBody::ToolCall { output: Some(out), .. }
-        if out.trim_start().starts_with("Async agent launched"));
+    let background = in_background(item);
     let stopped = item.status == ItemStatus::Declined;
-    let running = !stopped
-        && (item.status == ItemStatus::InProgress
-            || (background && children.iter().any(|c| c.status == ItemStatus::InProgress)));
+    // Its call stays open until the agent has finished, in the background
+    // too (the daemon closes it when the agent says so). Going by whether
+    // one of its steps happens to be running made it read as done between
+    // every two steps.
+    let running = item.status == ItemStatus::InProgress;
     let failed = matches!(item.status, ItemStatus::Failed | ItemStatus::Declined)
         || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. });
     // Under the title: what it is doing now, else what it answered.

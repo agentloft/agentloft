@@ -59,6 +59,10 @@ pub struct Translator {
     /// Tool calls started but without a result yet → their subagent (the
     /// Agent call they run under), if any.
     open_tools: HashMap<String, Option<String>>,
+    /// Subagent calls whose item is open. One run in the foreground ends
+    /// with the call's result; one launched in the background gets only a
+    /// receipt as its result and ends when Claude says its task did.
+    agents: HashSet<String>,
     /// Views being written (`show_ui` calls whose input is still
     /// streaming), by (api message id, block index).
     view_calls: HashMap<(String, u64), ViewCall>,
@@ -467,7 +471,12 @@ impl Translator {
                 if let (Some(task), Some(tool)) = (str_at(v, "task_id"), str_at(v, "tool_use_id")) {
                     self.tasks.insert(tool.to_owned(), task.to_owned());
                 }
+                // A command a subagent runs and waits for is one of its
+                // steps, not background work of its own.
+                let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
+                let step = flag("owned_by_subagent") && !flag("is_backgrounded");
                 match str_at(v, "task_id") {
+                    Some(_) if step => vec![],
                     Some(task) => {
                         let what = str_at(v, "description")
                             .or_else(|| str_at(v, "subagent_type"))
@@ -481,8 +490,14 @@ impl Translator {
             }
             // A task finished (or stopped, or failed).
             Some("task_notification") => match str_at(v, "task_id") {
-                Some(task) if self.open_tasks.remove(task).is_some() => self.background_tasks(),
-                _ => vec![],
+                Some(task) => {
+                    let mut out = self.task_ended(task, str_at(v, "status"));
+                    if self.open_tasks.remove(task).is_some() {
+                        out.extend(self.background_tasks());
+                    }
+                    out
+                }
+                None => vec![],
             },
             Some("api_retry") => vec![Out::Event(HarnessEvent::Notice {
                 level: NoticeLevel::Warning,
@@ -543,6 +558,58 @@ impl Translator {
             },
             None => HarnessEvent::Notice { level, text },
         })]
+    }
+
+    /// A task ended. When it was a subagent launched in the background,
+    /// this is where its item ends too (see `agents`), along with any step
+    /// it still had open.
+    fn task_ended(&mut self, task: &str, how: Option<&str>) -> Vec<Out> {
+        let Some(tool) = self
+            .tasks
+            .iter()
+            .find(|(_, t)| t.as_str() == task)
+            .map(|(tool, _)| tool.clone())
+        else {
+            return vec![];
+        };
+        self.tasks.remove(&tool);
+        // Still waiting for its result: run in the foreground, and the
+        // result ends it.
+        if self.open_tools.contains_key(&tool) || !self.agents.remove(&tool) {
+            return vec![];
+        }
+        let status = match how {
+            Some("completed") | None => ItemStatus::Completed,
+            Some("stopped" | "killed") => ItemStatus::Declined,
+            Some(_) => ItemStatus::Failed,
+        };
+        let steps: Vec<String> = self
+            .open_tools
+            .iter()
+            .filter(|(_, parent)| parent.as_deref() == Some(tool.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut out = Vec::new();
+        for step in steps {
+            self.open_tools.remove(&step);
+            self.agents.remove(&step);
+            out.push(Out::Event(HarnessEvent::ItemCompleted {
+                native_id: step,
+                body: None,
+                tool_result: None,
+                status: match status {
+                    ItemStatus::Completed => ItemStatus::Completed,
+                    _ => ItemStatus::Failed,
+                },
+            }));
+        }
+        out.push(Out::Event(HarnessEvent::ItemCompleted {
+            native_id: tool,
+            body: None,
+            tool_result: None,
+            status,
+        }));
+        out
     }
 
     fn background_tasks(&self) -> Vec<Out> {
@@ -748,6 +815,9 @@ impl Translator {
                     }
                     self.open_tools.insert(id.to_owned(), parent.clone());
                     let name = str_at(block, "name").unwrap_or("tool").to_owned();
+                    if tool_kind(&name) == ToolKind::Subagent {
+                        self.agents.insert(id.to_owned());
+                    }
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
                     out.push(Out::Event(HarnessEvent::ItemStarted {
                         parent: parent.clone(),
@@ -814,6 +884,26 @@ impl Translator {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let result = ToolResult {
+                output: tool_result_text(block.get("content")),
+                is_error,
+            };
+            // A subagent launched in the background: this is its receipt,
+            // and it works on until Claude says its task ended.
+            let works_on = !is_error
+                && self.agents.contains(tool_id)
+                && self
+                    .tasks
+                    .get(tool_id)
+                    .is_some_and(|task| self.open_tasks.contains_key(task));
+            if works_on {
+                out.push(Out::Event(HarnessEvent::ToolOutput {
+                    native_id: tool_id.to_owned(),
+                    result,
+                }));
+                continue;
+            }
+            self.agents.remove(tool_id);
             let status = if self.denied_tools.remove(tool_id) {
                 ItemStatus::Declined
             } else if is_error {
@@ -824,10 +914,7 @@ impl Translator {
             out.push(Out::Event(HarnessEvent::ItemCompleted {
                 native_id: tool_id.to_owned(),
                 body: None,
-                tool_result: Some(ToolResult {
-                    output: tool_result_text(block.get("content")),
-                    is_error,
-                }),
+                tool_result: Some(result),
                 status,
             }));
         }
@@ -1088,6 +1175,7 @@ impl Translator {
             .collect();
         for tool in ended {
             self.open_tools.remove(&tool);
+            self.agents.remove(&tool);
             out.push(Out::Event(HarnessEvent::ItemCompleted {
                 native_id: tool,
                 body: None,
@@ -1868,6 +1956,104 @@ mod tests {
         }
         let agent_id = agent_id.expect("an Agent tool call");
         assert_eq!(child_parent.as_deref(), Some(agent_id.as_str()));
+    }
+
+    /// Claude 2.1.322, one turn: an agent launched in the background and
+    /// one run in the foreground; the turn ends while the first is still
+    /// at work.
+    #[test]
+    fn a_background_subagent_is_open_until_its_task_ends() {
+        const BG: &str = "toolu_01N6B9rZJKn11tkvd9Addcev";
+        const FG: &str = "toolu_01Lz95BGMi7qGwzpibw4KD9i";
+        let mut t = Translator::new();
+        t.start_turn("x");
+        // What happened to the two calls, in order.
+        let mut seen: Vec<String> = Vec::new();
+        let mut waiting: Vec<Vec<String>> = Vec::new();
+        for line in include_str!("../fixtures/2.1.322-background-subagent.jsonl").lines() {
+            for event in events(&t.on_line(line)) {
+                match event {
+                    HarnessEvent::ToolOutput { native_id, result } => {
+                        assert!(result.output.starts_with("Async agent launched"));
+                        seen.push(format!("receipt {native_id}"));
+                    }
+                    HarnessEvent::ItemCompleted {
+                        native_id,
+                        status,
+                        tool_result,
+                        ..
+                    } if native_id == BG || native_id == FG => {
+                        assert_eq!(*status, ItemStatus::Completed);
+                        // The receipt stays what the background one said.
+                        assert_eq!(tool_result.is_some(), native_id == FG);
+                        seen.push(format!("done {native_id}"));
+                    }
+                    HarnessEvent::ItemCompleted {
+                        tool_result: Some(result),
+                        ..
+                    } if result.output == "two" => seen.push("last step".into()),
+                    HarnessEvent::TurnCompleted { .. } => seen.push("turn".into()),
+                    HarnessEvent::BackgroundTasks(tasks) => waiting.push(tasks.clone()),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                format!("receipt {BG}"),
+                format!("done {FG}"),
+                "turn".to_owned(),
+                "last step".to_owned(),
+                format!("done {BG}"),
+                // Claude's own turn about what the agent found.
+                "turn".to_owned(),
+            ]
+        );
+        // The commands an agent ran and waited for were its steps, never
+        // background work of their own.
+        assert!(
+            waiting
+                .iter()
+                .flatten()
+                .all(|w| w == "bg sleeper" || w == "fg quick"),
+            "{waiting:?}"
+        );
+        assert_eq!(waiting.last(), Some(&vec![]));
+    }
+
+    #[test]
+    fn a_stopped_background_subagent_ends_as_stopped() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"dig","prompt":"dig","run_in_background":true}}]}}"#);
+        t.on_line(r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu_a","description":"dig","is_backgrounded":true,"task_type":"local_agent"}"#);
+        let out = t.on_line(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_a","content":"Async agent launched successfully."}]}}"#);
+        assert!(matches!(
+            events(&out).as_slice(),
+            [HarnessEvent::ToolOutput { native_id, .. }] if native_id == "tu_a"
+        ));
+        // One of its steps is running when it is stopped.
+        t.on_line(r#"{"type":"assistant","parent_tool_use_id":"tu_a","message":{"id":"m2","content":[{"type":"tool_use","id":"tu_step","name":"Bash","input":{"command":"sleep 60"}}]}}"#);
+        let out = t.on_line(r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"tu_a","status":"stopped"}"#);
+        let ended: Vec<(String, ItemStatus)> = events(&out)
+            .into_iter()
+            .filter_map(|e| match e {
+                HarnessEvent::ItemCompleted {
+                    native_id, status, ..
+                } => Some((native_id.clone(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ended,
+            [
+                ("tu_step".to_owned(), ItemStatus::Failed),
+                ("tu_a".to_owned(), ItemStatus::Declined),
+            ]
+        );
+        // And nothing is left to stop.
+        assert!(t.stop_subagent("tu_a").is_empty());
     }
 
     #[test]

@@ -2515,10 +2515,12 @@ impl ThreadState {
             }
             if !done {
                 // Between steps: say so, instead of looking stuck.
-                let busy = work
-                    .iter()
-                    .any(|&i| items[i].status == ItemStatus::InProgress)
-                    || model.open_requests().next().is_some();
+                // An agent working in the background isn't a step the
+                // thread's own agent is on.
+                let busy = work.iter().any(|&i| {
+                    items[i].status == ItemStatus::InProgress
+                        && !crate::items::in_background(&items[i])
+                }) || model.open_requests().next().is_some();
                 // Only once things have gone quiet: the gap between one tool
                 // call ending and the next starting would flash it.
                 let settled = work.is_empty()
