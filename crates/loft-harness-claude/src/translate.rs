@@ -75,8 +75,8 @@ pub struct Translator {
     turn_active: bool,
     next_request: u64,
     /// Messages sent and not yet echoed back (`--replay-user-messages`),
-    /// oldest first: `true` for one sent into a running turn.
-    unechoed: std::collections::VecDeque<bool>,
+    /// oldest first: `true` for one sent into a running turn, and its text.
+    unechoed: std::collections::VecDeque<(bool, String)>,
     /// Whether Claude echoes our messages (older CLIs may not).
     echoes: bool,
     /// Claude's running cost for the session as the current turn began. It
@@ -92,6 +92,9 @@ pub struct Translator {
     /// What the turn used before a message sent mid-turn made it go on.
     /// Claude ends one part and starts the next, with a result for each.
     carried: Option<Usage>,
+    /// Claude finished its part and the turn is held open only for a
+    /// message it hasn't echoed yet. Stopping then gets no result back.
+    awaiting_echo: bool,
 }
 
 impl Translator {
@@ -131,7 +134,8 @@ impl Translator {
     pub fn start_turn_with(&mut self, text: &str, images: &[(String, String)]) -> Vec<Out> {
         self.turn_active = true;
         self.interrupt_requested = false;
-        self.unechoed.push_back(false);
+        self.awaiting_echo = false;
+        self.unechoed.push_back((false, text.to_owned()));
         let content = if images.is_empty() {
             json!(text)
         } else {
@@ -159,7 +163,7 @@ impl Translator {
         if !self.turn_active {
             return self.start_turn_with(text, images);
         }
-        self.unechoed.push_back(true);
+        self.unechoed.push_back((true, text.to_owned()));
         let content = if images.is_empty() {
             json!(text)
         } else {
@@ -184,9 +188,23 @@ impl Translator {
         }
         self.interrupt_requested = true;
         let id = self.next_request_id();
-        vec![Out::Send(json!({
+        let mut out = vec![Out::Send(json!({
             "type": "control_request", "request_id": id, "request": {"subtype": "interrupt"}
-        }))]
+        }))];
+        // Claude is idle, so no result will come to end the turn: end it
+        // here, and drop the messages the stop discards.
+        if self.awaiting_echo {
+            self.awaiting_echo = false;
+            self.turn_active = false;
+            self.interrupt_requested = false;
+            self.unechoed.clear();
+            out.push(Out::Event(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Interrupted,
+                usage: self.carried.take(),
+                error: None,
+            }));
+        }
+        out
     }
 
     /// Ask Claude for a report; the answer comes back as `Out::Reply`
@@ -333,6 +351,12 @@ impl Translator {
     }
 
     pub fn on_value(&mut self, v: &Value) -> Vec<Out> {
+        if matches!(
+            str_at(v, "type"),
+            Some("stream_event" | "assistant" | "user" | "result")
+        ) {
+            self.awaiting_echo = false;
+        }
         // Claude answering with no turn open has started one itself: a
         // background task that finished as a turn ended comes back to it
         // as a message of Claude's own. A background subagent's steps carry
@@ -682,7 +706,8 @@ impl Translator {
                 return vec![];
             }
             self.echoes = true;
-            let ours = self.unechoed.pop_front().is_some();
+            let echoed = tool_result_text(v.pointer("/message/content"));
+            let ours = self.take_echoed(&echoed);
             if ours && !self.turn_active {
                 // A message sent mid-turn that Claude only got to after the
                 // turn ended: it runs as a turn of its own.
@@ -879,6 +904,33 @@ impl Translator {
         vec![]
     }
 
+    /// Drops the messages an echo stands for; whether there were any. After
+    /// a stop, Claude takes the messages queued behind it in as one,
+    /// joined by newlines, and echoes that once.
+    fn take_echoed(&mut self, echoed: &str) -> bool {
+        if self.unechoed.is_empty() {
+            return false;
+        }
+        let echoed = echoed.trim();
+        let mut joined = String::new();
+        let mut covered = 1;
+        for (i, (_, text)) in self.unechoed.iter().enumerate() {
+            if i > 0 {
+                joined.push('\n');
+            }
+            joined.push_str(text.trim());
+            if joined == echoed {
+                covered = i + 1;
+                break;
+            }
+            if !echoed.starts_with(&joined) {
+                break;
+            }
+        }
+        self.unechoed.drain(..covered);
+        true
+    }
+
     fn on_result(&mut self, v: &Value) -> Vec<Out> {
         let mut out = Vec::new();
         // The model's context window, from its usage so far (the largest:
@@ -894,8 +946,9 @@ impl Translator {
         out.extend(self.context_now(None, window));
         // A message sent mid-turn that Claude hasn't taken in yet: it goes
         // on with it straight away, so this turn goes on too.
-        let goes_on =
-            self.echoes && !self.interrupt_requested && self.unechoed.iter().any(|steer| *steer);
+        let goes_on = self.echoes
+            && !self.interrupt_requested
+            && self.unechoed.iter().any(|(steer, _)| *steer);
         if !self.echoes {
             self.unechoed.clear();
         }
@@ -961,6 +1014,7 @@ impl Translator {
         let mut usage = add_usage(self.carried.take(), usage);
         if goes_on {
             self.carried = usage;
+            self.awaiting_echo = true;
             return out;
         }
         if let Some(total) = v.get("total_cost_usd").and_then(Value::as_f64) {
@@ -1603,6 +1657,40 @@ mod tests {
         assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
         assert!(t.turn_active());
         assert!(completed(&t.on_line(RESULT)));
+        assert!(!t.turn_active());
+    }
+
+    #[test]
+    fn messages_queued_behind_a_stop_come_back_as_one() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"x"}}"#);
+        t.steer_with("never mind", &[]);
+        t.steer_with("it's fine", &[]);
+        t.steer_with("on main?", &[]);
+        t.interrupt();
+        assert!(completed(&t.on_line(RESULT)));
+        // Claude 2.1.322 takes all three in as one message after the stop.
+        let out = t.on_line(
+            r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"never mind\nit's fine\non main?"}}"#,
+        );
+        assert!(matches!(events(&out)[..], [HarnessEvent::TurnStarted]));
+        assert!(completed(&t.on_line(RESULT)), "nothing is left to wait for");
+        // A message with a line break of its own is still one message.
+        t.start_turn("a\nb");
+        t.steer_with("c", &[]);
+        t.on_line(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"a\nb"}}"#);
+        assert!(!completed(&t.on_line(RESULT)), "the steer is still to come");
+        // Stopping now: Claude is idle and sends no result, so the stop
+        // itself ends the turn.
+        let out = t.interrupt();
+        assert!(events(&out).iter().any(|e| matches!(
+            e,
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Interrupted,
+                ..
+            }
+        )));
         assert!(!t.turn_active());
     }
 
