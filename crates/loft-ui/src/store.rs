@@ -2831,10 +2831,9 @@ impl ThreadState {
         let changed = match &env.event {
             Event::ItemUpserted { item } => {
                 self.last_activity = Some(web_time::Instant::now());
-                let (id, body) = (item.id.clone(), item.body.clone());
-                self.sync_markdown(&id, &body, cx);
+                self.sync_markdown(&item.id, &item.body, cx);
                 self.sync_view(item, cx);
-                Some(id)
+                Some(item.id.clone())
             }
             Event::RequestOpened { request } | Event::RequestUpdated { request } => {
                 request.item_id.clone()
@@ -2856,13 +2855,17 @@ impl ThreadState {
         if !model.apply_delta(delta) {
             return;
         }
-        let Some(ix) = model.items.iter().position(|i| i.id == delta.item_id) else {
+        let Some(item) = model.items.iter().find(|i| i.id == delta.item_id) else {
             return;
         };
-        let (id, body) = (model.items[ix].id.clone(), model.items[ix].body.clone());
-        // `set_text` appends incrementally when the new text extends the old.
-        self.sync_markdown(&id, &body, cx);
-        if let Some(row) = self.row_of_item(&id) {
+        // Borrowed where it lies: a copy of the body for every chunk is the
+        // whole of a reply (or of a command's output, megabytes of it) over
+        // and over as it grows.
+        if let ItemBody::AssistantMessage { text } = &item.body {
+            // `set_text` appends incrementally when the new text extends the old.
+            Self::sync_markdown_text(&mut self.markdown, &item.id, text, cx);
+        }
+        if let Some(row) = self.row_of_item(&delta.item_id) {
             self.scroller.update(cx, |s, cx| {
                 s.remeasure_items(row..row + 1, cx);
             });
@@ -2948,15 +2951,25 @@ impl ThreadState {
 
     /// Keep a markdown document per assistant message in sync with its text.
     fn sync_markdown(&mut self, id: &ItemId, body: &ItemBody, cx: &mut Context<Self>) {
-        let ItemBody::AssistantMessage { text } = body else {
-            return;
-        };
+        if let ItemBody::AssistantMessage { text } = body {
+            Self::sync_markdown_text(&mut self.markdown, id, text, cx);
+        }
+    }
+
+    /// [`Self::sync_markdown`] for a reply's text, with only the documents
+    /// borrowed (the text may be the model's own).
+    fn sync_markdown_text(
+        markdown: &mut HashMap<ItemId, Entity<TextViewState>>,
+        id: &ItemId,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
         let text = &*crate::items::sized_images(text);
-        match self.markdown.get(id) {
+        match markdown.get(id) {
             Some(md) => md.update(cx, |md, cx| md.set_text(text, cx)),
             None => {
                 let md = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
-                self.markdown.insert(id.clone(), md);
+                markdown.insert(id.clone(), md);
             }
         }
     }
