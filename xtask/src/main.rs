@@ -6,7 +6,8 @@
 //! - `live-claude`: run the live Claude end-to-end test (uses real tokens).
 //! - `web [--release]`: build the browser client into `target/web`
 //!   (wasm + JS glue + static shell); `agentloftd` serves that folder.
-//! - `ci`: fmt check, clippy, tests, cargo-deny — what CI runs.
+//! - `ci`: fmt check, clippy, tests, workspace-hack check, cargo-deny — what
+//!   CI runs (needs `cargo-hakari` and `cargo-deny` installed).
 //! - `bundle [--debug] [--open]`: build `target/bundle/Agentloft.app`
 //!   (macOS; both binaries, `AppIcon.icns`, Info.plist, ad-hoc signature).
 
@@ -34,15 +35,22 @@ fn main() -> Result<()> {
         ])),
         "ci" => {
             run(cargo().args(["fmt", "--all", "--check"]))?;
+            // loft-terminal's view tests need GPUI's test platform, which
+            // is a feature (crates/loft-terminal/Cargo.toml says why).
+            const VIEW_TESTS: &str = "loft-terminal/test-support";
             run(cargo().args([
                 "clippy",
                 "--workspace",
                 "--all-targets",
+                "--features",
+                VIEW_TESTS,
                 "--",
                 "-D",
                 "warnings",
             ]))?;
-            run(cargo().args(["test", "--workspace"]))?;
+            run(cargo().args(["test", "--workspace", "--features", VIEW_TESTS]))?;
+            // crates/workspace-hack as `cargo hakari generate` would write it.
+            run(cargo().args(["hakari", "generate", "--diff"]))?;
             run(cargo().args(["deny", "check"]))
         }
         _ => {

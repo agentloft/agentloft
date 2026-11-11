@@ -24,5 +24,9 @@ tracing = { workspace = true, features = ["log"] }
 wasm-bindgen = "=0.2.130"
 web-sys = { version = "0.3", features = ["Document", "Element", "Event", "Window"] }
 
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+
 [lints]
 workspace = true

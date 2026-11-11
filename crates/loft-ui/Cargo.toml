@@ -43,12 +43,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 web-sys = { version = "0.3", features = ["Event", "Storage", "Window"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSApplication", "NSDockTile", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
-objc2-foundation = { workspace = true, features = ["NSBundle", "NSString", "NSError", "NSData", "NSDictionary", "NSGeometry"] }
+objc2-app-kit = { workspace = true, features = ["NSDockTile", "NSWorkspace", "objc2-core-graphics"] }
+objc2-foundation = { workspace = true, features = ["NSBundle"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
 block2 = "0.6"
-raw-window-handle = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true

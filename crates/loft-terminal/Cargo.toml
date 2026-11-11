@@ -13,14 +13,32 @@ tracing.workspace = true
 # `Instant` that also works in the browser build (crates/loft-web).
 web-time = "1"
 
-[dev-dependencies]
-# GPUI's headless test platform for tests/view.rs. Enabled on gpui-pre
-# directly (the exact version gpui-kit 0.9.0 pins): gpui-kit's own
+# GPUI's headless test platform, for tests/view.rs: enabled on gpui-pre
+# directly (the exact version gpui-kit 0.9.0 pins), since gpui-kit's own
 # `test-support` feature drags its optional gpui-fast backend into resolution.
-gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }
+# A feature of this crate and not a dev-dependency: a dev-dependency switches
+# it on for every `cargo test --workspace` and `cargo clippy --all-targets`,
+# and GPUI and all that is built on it (most of the build) are then compiled
+# a second time, apart from the copy the app itself is built with. Run the
+# view tests with `cargo test -p loft-terminal --features test-support`
+# (CI and `cargo xtask ci` do).
+gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"], optional = true }
+
+[features]
+test-support = ["dep:gpui"]
+
+[[test]]
+name = "view"
+required-features = ["test-support"]
+
+[dev-dependencies]
 portable-pty.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
 
 [lints]
 workspace = true

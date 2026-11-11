@@ -429,11 +429,6 @@ fn probe_initialize(
     result
 }
 
-/// Generate a fresh session id for a new thread (Claude requires a UUID).
-pub fn new_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     /// Talks to the real `claude` (run with `--ignored`).

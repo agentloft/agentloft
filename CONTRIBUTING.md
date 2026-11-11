@@ -11,7 +11,18 @@ cargo xtask live-claude  # end-to-end against the real `claude` CLI (costs token
 ```
 
 - The toolchain is pinned in `rust-toolchain.toml`.
+- `cargo xtask ci` needs `cargo install cargo-hakari cargo-deny`.
 - **Always use an isolated `AGENTLOFT_HOME`** when running dev builds (`xtask dev` does this). Never point a dev daemon at your real `~/.agentloft`.
+
+## Keeping builds fast
+
+A build from nothing takes about a minute; after that, a change should cost seconds whatever cargo command you run. Three things keep it so:
+
+- **One build of each dependency.** Cargo picks a dependency's features from the packages a command names, so `-p loft-ui`, `-p loft-app -p loftd` and `--workspace` used to compile GPUI and everything on it once each. Every crate depends on `crates/workspace-hack`, which names those dependencies with all their features ([`.config/hakari.toml`](.config/hakari.toml)). After changing a dependency or its features, run `cargo hakari generate`; CI fails until you do.
+- **The terminal's view tests are opt-in**: `cargo test -p loft-terminal --features test-support` (CI and `cargo xtask ci` run them). They need GPUI's test platform, and switching that on for every test run compiled GPUI a second time.
+- **libghostty-vt is built once per machine**, not once per checkout and profile ([`vendor/ghostty-vt-sys`](vendor/ghostty-vt-sys/README.md)): a new worktree copies it from `~/Library/Caches/ghostty-vt-sys`.
+
+If a command you expect to be quick recompiles dependencies, something has split the build again: `cargo build --timings` shows what was compiled.
 
 ## Architecture rules
 

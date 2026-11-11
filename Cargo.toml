@@ -23,10 +23,11 @@ loft-harness-acp = { path = "crates/loft-harness-acp" }
 loft-core = { path = "crates/loft-core" }
 loft-client = { path = "crates/loft-client" }
 loft-ui = { path = "crates/loft-ui" }
-loft-testkit = { path = "crates/loft-testkit" }
 loft-git = { path = "crates/loft-git" }
 loft-terminal = { path = "crates/loft-terminal" }
 loft-view = { path = "crates/loft-view" }
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+workspace-hack = { path = "crates/workspace-hack" }
 
 # UI — gpui-kit pins the matching gpui-pre release (ADR-0005). Syntax
 # highlighting is chosen per target in loft-ui: tree-sitter natively, syntect
@@ -91,6 +92,16 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# Build scripts, proc macros and the crates they are made of get the same
+# debug info as everything else. Left alone, Cargo gives them none, except
+# when the same crate is also an ordinary dependency somewhere in the build
+# at hand: and whether one is depends on the command. With xtask in the
+# build (`--workspace`), `unicode-ident` is, so it was compiled differently,
+# and with it every proc macro and everything that uses one: nearly the
+# whole build a second time, for one crate.
+[profile.dev.build-override]
+debug = "line-tables-only"
 
 [profile.release]
 lto = "thin"

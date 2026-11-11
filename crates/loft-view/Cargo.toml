@@ -10,5 +10,9 @@ publish.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+
 [lints]
 workspace = true

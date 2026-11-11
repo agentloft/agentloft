@@ -28,10 +28,12 @@ jobs:
           version: 0.17.1
       - name: Format
         run: cargo fmt --all --check
+      # `loft-terminal/test-support`: its view tests run on GPUI's test
+      # platform, which is a feature (crates/loft-terminal/Cargo.toml).
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features loft-terminal/test-support -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --features loft-terminal/test-support
 
   linux-headless:
     name: Linux (headless crates)
@@ -72,6 +74,21 @@ jobs:
       # JS glue into target/web.
       - name: Build the web bundle
         run: cargo xtask web
+
+  workspace-hack:
+    name: Dependency features (workspace-hack)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+      # crates/workspace-hack is what `cargo hakari generate` writes for the
+      # dependencies as they are now (.config/hakari.toml says what it is for).
+      - name: workspace-hack is up to date
+        run: cargo hakari generate --diff
 
   deny:
     name: Dependency policy

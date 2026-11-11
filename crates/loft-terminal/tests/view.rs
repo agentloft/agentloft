@@ -1,6 +1,9 @@
 //! Headless GPUI tests for `TerminalView`: real key dispatch (bindings, key
 //! listeners and the text input handler), layout-driven resize, clipboard,
 //! IME and mouse reporting, on GPUI's test platform.
+//!
+//! Needs this crate's `test-support` feature (see Cargo.toml for why it is
+//! not on by default): `cargo test -p loft-terminal --features test-support`.
 
 use gpui_kit::{
     ClipboardItem, Entity, EntityInputHandler as _, Focusable as _, Modifiers, MouseButton,
