@@ -21,6 +21,7 @@ fn main() -> Result<()> {
         "bundle" => bundle(),
         "stop-dev" => stop_dev(),
         "web" => web(),
+        "signing-identity" => make_signing_identity(),
         "live-claude" => run(cargo().args([
             "test",
             "-p",
@@ -45,7 +46,9 @@ fn main() -> Result<()> {
             run(cargo().args(["deny", "check"]))
         }
         _ => {
-            eprintln!("usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|web>");
+            eprintln!(
+                "usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|web|signing-identity>"
+            );
             Ok(())
         }
     }
@@ -209,20 +212,123 @@ fn bundle() -> Result<()> {
         eprintln!("note: no web client in the bundle (build it with `cargo xtask web --release`)");
     }
 
-    // Ad-hoc signature so Gatekeeper treats the local build consistently.
+    // Signed with the same identity every build, when there is one: macOS
+    // keeps what the user allowed the app (screen recording, folders,
+    // notifications) per signer. An ad-hoc signature is a different app to
+    // it after every build, so each rebuild quietly loses those grants.
+    let identity = signing_identity();
     let signed = Command::new("codesign")
-        .args(["--force", "--deep", "--sign", "-"])
+        .args(["--force", "--deep", "--sign", &identity])
         .arg(&app)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !signed {
-        eprintln!("warning: ad-hoc codesign failed; the bundle is unsigned");
+        eprintln!("warning: codesign failed; the bundle is unsigned");
+    } else if identity == "-" {
+        eprintln!(
+            "note: ad-hoc signed. macOS will forget what this app was allowed (screen recording, …) on the next build; `cargo xtask signing-identity` makes a signer that lasts."
+        );
     }
     println!("{}", app.display());
     if args.iter().any(|a| a == "--open") {
         run(Command::new("open").arg(&app))?;
     }
+    Ok(())
+}
+
+/// The name of the self-signed certificate local builds are signed with.
+const DEV_IDENTITY: &str = "Agentloft Dev";
+
+/// Whose signature the bundle gets: `AGENTLOFT_SIGN_IDENTITY` if set, else
+/// the local [`DEV_IDENTITY`] if the keychain has it, else ad-hoc (`-`).
+fn signing_identity() -> String {
+    if let Some(identity) = std::env::var("AGENTLOFT_SIGN_IDENTITY")
+        .ok()
+        .filter(|i| !i.trim().is_empty())
+    {
+        return identity;
+    }
+    if has_dev_identity() {
+        DEV_IDENTITY.to_owned()
+    } else {
+        "-".to_owned()
+    }
+}
+
+fn has_dev_identity() -> bool {
+    Command::new("security")
+        .args(["find-identity", "-p", "codesigning"])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout).contains(&format!("\"{DEV_IDENTITY}\""))
+        })
+}
+
+/// `cargo xtask signing-identity`: make the certificate local builds are
+/// signed with (once per machine). It is self-signed and lives in the
+/// login keychain; only `codesign` may use its key without asking.
+fn make_signing_identity() -> Result<()> {
+    if has_dev_identity() {
+        println!("\"{DEV_IDENTITY}\" is already in the keychain");
+        return Ok(());
+    }
+    let dir = std::env::temp_dir().join(format!("agentloft-signing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let made = (|| {
+        let file = |name: &str| dir.join(name);
+        std::fs::write(
+            file("req.cnf"),
+            format!(
+                "[req]\ndistinguished_name = dn\nx509_extensions = ext\nprompt = no\n[dn]\nCN = {DEV_IDENTITY}\n[ext]\nbasicConstraints = critical, CA:false\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = critical, codeSigning\n"
+            ),
+        )?;
+        // The system's own openssl: a newer one writes a .p12 the keychain
+        // can't read.
+        run(Command::new("/usr/bin/openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            ])
+            .arg("-config")
+            .arg(file("req.cnf"))
+            .arg("-keyout")
+            .arg(file("key.pem"))
+            .arg("-out")
+            .arg(file("cert.pem"))
+            .stderr(std::process::Stdio::null()))?;
+        // The .p12 exists for the moment it takes to import it.
+        let pass = format!(
+            "{:x}{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        run(Command::new("/usr/bin/openssl")
+            .args(["pkcs12", "-export", "-name", DEV_IDENTITY])
+            .arg("-inkey")
+            .arg(file("key.pem"))
+            .arg("-in")
+            .arg(file("cert.pem"))
+            .arg("-out")
+            .arg(file("id.p12"))
+            .arg("-passout")
+            .arg(format!("pass:{pass}")))?;
+        run(Command::new("security")
+            .arg("import")
+            .arg(file("id.p12"))
+            .args(["-P", &pass, "-T", "/usr/bin/codesign"]))
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    made?;
+    println!(
+        "made \"{DEV_IDENTITY}\": `cargo xtask bundle` signs with it from now on. Allow the app once more where macOS asks; it will remember."
+    );
     Ok(())
 }
 
