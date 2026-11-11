@@ -790,23 +790,18 @@ fn render_pending(p: &Palette) -> AnyElement {
 
 /// What is going on right now, pulsing while it does.
 fn render_doing(icon: IconName, what: String, p: &Palette) -> AnyElement {
-    use gpui_kit::{Animation, AnimationExt as _, pulsating_between};
-    h_flex()
+    let row = h_flex()
         .gap_1p5()
         .items_center()
         .text_sm()
         .text_color(p.muted_foreground)
         .child(Icon::new(icon).small())
-        .child(what)
-        .with_animation(
-            "pending-pulse",
-            Animation::new(std::time::Duration::from_millis(1400))
-                .repeat()
-                .with_easing(pulsating_between(0.45, 1.0))
-                .with_max_fps(crate::spinner::FADING_FPS),
-            |d, delta| d.opacity(delta),
-        )
-        .into_any_element()
+        .child(what);
+    crate::spinner::looping(std::time::Duration::from_millis(1400), |at| {
+        row.opacity(gpui_kit::pulsating_between(0.45, 1.0)(at))
+            .into_any_element()
+    })
+    .into_any_element()
 }
 
 /// A message waiting for the current turn to end, where it will land in
@@ -1005,12 +1000,11 @@ fn render_queued(
 /// The turn is over, but work the agent started in the background isn't:
 /// say what it's waiting on.
 fn render_waiting(tasks: &[String], p: &Palette) -> AnyElement {
-    use gpui_kit::{Animation, AnimationExt as _, pulsating_between};
     let what = match tasks {
         [one] => one.clone(),
         many => format!("{} background tasks", many.len()),
     };
-    h_flex()
+    let row = h_flex()
         .gap_1p5()
         .items_center()
         .text_sm()
@@ -1023,16 +1017,12 @@ fn render_waiting(tasks: &[String], p: &Palette) -> AnyElement {
                 .truncate()
                 .text_color(p.foreground)
                 .child(what),
-        )
-        .with_animation(
-            "waiting-pulse",
-            Animation::new(std::time::Duration::from_millis(1800))
-                .repeat()
-                .with_easing(pulsating_between(0.5, 1.0))
-                .with_max_fps(crate::spinner::FADING_FPS),
-            |d, delta| d.opacity(delta),
-        )
-        .into_any_element()
+        );
+    crate::spinner::looping(std::time::Duration::from_millis(1800), |at| {
+        row.opacity(gpui_kit::pulsating_between(0.5, 1.0)(at))
+            .into_any_element()
+    })
+    .into_any_element()
 }
 
 /// A thought's first line, as its label ("Checking the parser").
@@ -1537,14 +1527,12 @@ pub(crate) fn tool_line(
 /// it runs. The dot sits on top of the circle (drawn after it), never cut
 /// by its border.
 pub(crate) fn agent_avatar(
-    id: &str,
     harness: &str,
     size: f32,
     dot: gpui_kit::Hsla,
     running: bool,
     p: &Palette,
 ) -> AnyElement {
-    use gpui_kit::{Animation, AnimationExt as _, ease_in_out};
     let dot_size = (size * 0.34).round().max(7.);
     let ring = 2.;
     let circle = div()
@@ -1572,27 +1560,19 @@ pub(crate) fn agent_avatar(
     let mut avatar = div().relative().flex_none().size(px(size)).child(circle);
     if running {
         // A soft halo that swells and fades behind the dot.
-        let halo = div()
-            .absolute()
-            .right(px(-ring))
-            .bottom(px(-ring))
-            .size(px(dot_size + ring * 2.))
-            .rounded_full()
-            .bg(dot)
-            .with_animation(
-                SharedString::from(format!("{id}-halo")),
-                Animation::new(std::time::Duration::from_millis(1400))
-                    .repeat()
-                    .with_easing(ease_in_out)
-                    .with_max_fps(crate::spinner::FADING_FPS),
-                move |d, t| {
-                    let grow = dot_size * 0.9 * t;
-                    d.right(px(-ring - grow / 2.))
-                        .bottom(px(-ring - grow / 2.))
-                        .size(px(dot_size + ring * 2. + grow))
-                        .opacity(0.45 * (1. - t))
-                },
-            );
+        let halo = crate::spinner::looping(std::time::Duration::from_millis(1400), move |at| {
+            let t = gpui_kit::ease_in_out(at);
+            let grow = dot_size * 0.9 * t;
+            div()
+                .absolute()
+                .right(px(-ring - grow / 2.))
+                .bottom(px(-ring - grow / 2.))
+                .size(px(dot_size + ring * 2. + grow))
+                .rounded_full()
+                .bg(dot)
+                .opacity(0.45 * (1. - t))
+                .into_any_element()
+        });
         avatar = avatar.child(halo);
     }
     avatar.child(badge).into_any_element()
@@ -1720,7 +1700,6 @@ fn agent_card(
         .cursor_pointer()
         .hover(|d| d.bg(p.hover))
         .child(agent_avatar(
-            &format!("agent-dot-{}", item.id),
             model.thread.harness.as_str(),
             30.,
             dot,
@@ -1847,14 +1826,7 @@ fn spawned_card(
         .when(target.is_some(), |d| {
             d.cursor_pointer().hover(|d| d.bg(p.hover))
         })
-        .child(agent_avatar(
-            &format!("spawned-dot-{}", item.id),
-            &harness,
-            30.,
-            dot,
-            running,
-            p,
-        ))
+        .child(agent_avatar(&harness, 30., dot, running, p))
         .child(
             v_flex()
                 .flex_1()

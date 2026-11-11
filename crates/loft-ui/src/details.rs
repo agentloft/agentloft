@@ -880,7 +880,6 @@ impl Render for DetailsCard {
                         .cursor_pointer()
                         .hover(|d| d.bg(p.hover))
                         .child(crate::items::agent_avatar(
-                            &format!("details-dot-{}", agent.id),
                             harness.as_ref().map(|h| h.as_str()).unwrap_or("claude"),
                             22.,
                             dot,
@@ -954,7 +953,6 @@ impl Render for DetailsCard {
                     .cursor_pointer()
                     .hover(|d| d.bg(p.hover))
                     .child(crate::items::agent_avatar(
-                        &format!("details-thread-dot-{}", thread.id.0),
                         thread.harness.as_str(),
                         22.,
                         dot,

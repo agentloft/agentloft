@@ -266,7 +266,7 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some(svg) = brand_svg(path) {
+        if let Some(svg) = brand_svg(path).or_else(|| own_svg(path)) {
             return Ok(Some(Cow::Borrowed(svg)));
         }
         match AppIcons.load(path)? {
@@ -294,10 +294,24 @@ fn brand_svg(path: &str) -> Option<&'static [u8]> {
     })
 }
 
+/// Drawings of our own that aren't Lucide's.
+fn own_svg(path: &str) -> Option<&'static [u8]> {
+    Some(match path {
+        crate::spinner::SPOKES => include_bytes!("../assets/spinner/spokes.svg"),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui_kit::assets::IconName;
+
+    #[test]
+    fn the_spinner_is_bundled() {
+        let found = Assets.load(crate::spinner::SPOKES).ok().flatten();
+        assert!(found.is_some_and(|svg| svg.starts_with(b"<svg")));
+    }
 
     #[test]
     fn browser_tab_speaker_icons_are_bundled() {
