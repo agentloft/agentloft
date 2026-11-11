@@ -757,12 +757,16 @@ impl ThreadActor {
                 && mode == Some(PermissionMode::AskAll));
             if let Some(mode) = mode.filter(|_| !keep) {
                 self.thread.permission_mode = Some(mode);
-                if let Some(s) = &self.session {
-                    let _ = s
-                        .commands
-                        .send(SessionCommand::SetPermissionMode(Some(mode)));
-                }
                 self.save_thread()?;
+            }
+            // The agent leaves plan mode for the thread's mode (one it
+            // entered planning from on its own, e.g. Full access, stays).
+            if mode.is_some()
+                && let Some(s) = &self.session
+            {
+                let _ = s.commands.send(SessionCommand::SetPermissionMode(
+                    self.thread.permission_mode,
+                ));
             }
         }
         Ok(Response::Ok)
