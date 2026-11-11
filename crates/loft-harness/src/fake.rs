@@ -152,6 +152,7 @@ async fn run_turn(ends: &mut SessionEnds, turn_no: u32, text: &str) -> bool {
                     DecisionKind::AllowSession,
                     DecisionKind::AllowOnce,
                     DecisionKind::Deny,
+                    DecisionKind::DenyAndStop,
                 ],
             ),
         };
@@ -317,9 +318,9 @@ const FAKE_PLAN: &str = "## Plan: add a greeting\n\n1. Add `greet(name)` to `src
 fn fake_questions() -> serde_json::Value {
     serde_json::json!({ "questions": [
         {
-            "id": "Which database should the service use?",
+            "id": "Which database should the service use? It stores user accounts, sessions and an audit log, runs on one small server for now, and may need to scale out later.",
             "header": "Database",
-            "question": "Which database should the service use?",
+            "question": "Which database should the service use? It stores user accounts, sessions and an audit log, runs on one small server for now, and may need to scale out later.",
             "options": [
                 { "label": "SQLite", "description": "One file, nothing to run. Good for a single machine." },
                 { "label": "Postgres", "description": "A server; scales out and has richer types." },

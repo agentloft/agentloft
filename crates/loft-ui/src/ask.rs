@@ -294,7 +294,7 @@ impl AskForm {
         let q = self.questions[ix].clone();
 
         // Top line: who asks (or the questions, as tabs) and where we are.
-        let mut top = h_flex().gap_1().items_center().min_w_0().child(
+        let mut top = h_flex().gap_1().items_center().flex_wrap().min_w_0().child(
             div()
                 .mr_1()
                 .text_color(p.accent)
@@ -360,13 +360,16 @@ impl AskForm {
                 )
             });
 
-        let question = h_flex()
+        // The question wraps (agents write long ones); "Pick any" under it.
+        let question = v_flex()
             .px_1()
-            .gap_2()
-            .items_baseline()
-            .flex_wrap()
+            .gap_0p5()
+            .w_full()
+            .min_w_0()
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.foreground)
@@ -432,7 +435,15 @@ impl AskForm {
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .child(div().text_sm().text_color(p.foreground).child(label))
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .flex_shrink_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .text_color(p.foreground)
+                                            .child(label),
+                                    )
                                     .when(recommended, |d| {
                                         d.child(
                                             div()
@@ -621,7 +632,7 @@ impl AskForm {
                 DecisionKind::AllowSession => "Approve & accept edits".to_owned(),
                 DecisionKind::Deny if feedback => "Send feedback".to_owned(),
                 DecisionKind::Deny => "Keep planning".to_owned(),
-                DecisionKind::DenyAndStop => "Stop".to_owned(),
+                DecisionKind::DenyAndStop => "Discard".to_owned(),
             };
             let button = Button::new(SharedString::from(format!("{id}-{decision:?}")))
                 .label(label)

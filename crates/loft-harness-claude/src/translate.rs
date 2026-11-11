@@ -651,6 +651,7 @@ impl Translator {
                             DecisionKind::AllowSession,
                             DecisionKind::AllowOnce,
                             DecisionKind::Deny,
+                            DecisionKind::DenyAndStop,
                         ],
                         related_item: tool_use_id,
                     })];
