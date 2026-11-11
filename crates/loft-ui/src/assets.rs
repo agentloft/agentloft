@@ -126,6 +126,8 @@ gpui_kit::assets::icon_assets!(
         Circle,
         CircleDot,
         SquareCheck,
+        Volume2,
+        VolumeX,
     ]
 );
 
@@ -289,4 +291,18 @@ fn brand_svg(path: &str) -> Option<&'static [u8]> {
         "brand/opencode.svg" => include_bytes!("../assets/brand/opencode.svg"),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::assets::IconName;
+
+    #[test]
+    fn browser_tab_speaker_icons_are_bundled() {
+        for icon in [IconName::Volume2, IconName::VolumeX] {
+            let found = Assets.load(&icon.path()).ok().flatten();
+            assert!(found.is_some(), "{} isn't bundled", icon.path());
+        }
+    }
 }

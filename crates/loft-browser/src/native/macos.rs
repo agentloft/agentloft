@@ -19,6 +19,9 @@ use std::rc::Rc;
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder, WebViewExtMacOS as _};
 
+/// `_WKMediaAudioMuted`, from WebKit's `_WKMediaMutedState` flags.
+const WK_MEDIA_AUDIO_MUTED: usize = 1 << 0;
+
 /// Safari's user agent: the bare WKWebView one lacks `Version/… Safari/…`
 /// and some sites serve degraded pages to it.
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
@@ -257,7 +260,48 @@ impl NativeWebView {
                 progress: self.wk.estimatedProgress(),
                 can_go_back: self.wk.canGoBack(),
                 can_go_forward: self.wk.canGoForward(),
+                playing_audio: self.playing_audio(),
+                muted: self.muted(),
             }
+        }
+    }
+
+    /// Mute or unmute the page's sound.
+    pub fn set_muted(&self, muted: bool) {
+        // SAFETY: `_setPageMuted:` is WebKit's own SPI (Safari's tab mute),
+        // taking `_WKMediaMutedState` flags; checked before it's sent.
+        unsafe {
+            let sel = objc2::sel!(_setPageMuted:);
+            let responds: bool = objc2::msg_send![&*self.wk, respondsToSelector: sel];
+            if responds {
+                let flags: usize = if muted { WK_MEDIA_AUDIO_MUTED } else { 0 };
+                let () = objc2::msg_send![&*self.wk, _setPageMuted: flags];
+            }
+        }
+    }
+
+    /// Whether the page's sound is muted.
+    fn muted(&self) -> bool {
+        // SAFETY: as `set_muted`: WebKit SPI, checked before it's sent.
+        unsafe {
+            let sel = objc2::sel!(_mediaMutedState);
+            let responds: bool = objc2::msg_send![&*self.wk, respondsToSelector: sel];
+            if !responds {
+                return false;
+            }
+            let flags: usize = objc2::msg_send![&*self.wk, _mediaMutedState];
+            flags & WK_MEDIA_AUDIO_MUTED != 0
+        }
+    }
+
+    /// Whether the page is making sound right now.
+    fn playing_audio(&self) -> bool {
+        // SAFETY: `_isPlayingAudio` is WebKit's own SPI (a BOOL property,
+        // what Safari's tab speaker reads); checked before it's sent.
+        unsafe {
+            let sel = objc2::sel!(_isPlayingAudio);
+            let responds: bool = objc2::msg_send![&*self.wk, respondsToSelector: sel];
+            responds && objc2::msg_send![&*self.wk, _isPlayingAudio]
         }
     }
 

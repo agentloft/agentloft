@@ -63,6 +63,9 @@ impl NativeWebView {
     pub fn stop(&self) {
         match self.never {}
     }
+    pub fn set_muted(&self, _muted: bool) {
+        match self.never {}
+    }
     pub fn state(&self) -> PageState {
         match self.never {}
     }

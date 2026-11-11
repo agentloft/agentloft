@@ -43,6 +43,10 @@ pub(crate) struct PageState {
     pub progress: f64,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    /// The page is making sound (WebKit's own reading, where it has one).
+    pub playing_audio: bool,
+    /// The page's sound is muted.
+    pub muted: bool,
 }
 
 /// Which JS world a script runs in.

@@ -62,6 +62,8 @@ pub enum BrowserEvent {
     UrlChanged(String),
     TitleChanged(String),
     LoadingChanged(bool),
+    /// The page started or stopped making sound, or was muted or unmuted.
+    AudioChanged,
     /// The user left a note on an element in annotation mode.
     Annotation(Annotation),
     /// The user took a screenshot of the page (PNG).
@@ -369,6 +371,34 @@ impl BrowserView {
 
     pub fn is_loading(&self) -> bool {
         self.page.loading
+    }
+
+    /// Whether the page is making sound.
+    pub fn is_playing_audio(&self) -> bool {
+        self.page.playing_audio
+    }
+
+    /// Whether the page's sound is muted.
+    pub fn is_muted(&self) -> bool {
+        self.page.muted
+    }
+
+    /// Mute or unmute the page's sound.
+    pub fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
+        let Some(native) = self.native.clone() else {
+            return;
+        };
+        native.set_muted(muted);
+        let page = native.state();
+        if page != self.page {
+            let audio =
+                (page.playing_audio, page.muted) != (self.page.playing_audio, self.page.muted);
+            self.page = page;
+            if audio {
+                cx.emit(BrowserEvent::AudioChanged);
+            }
+            cx.notify();
+        }
     }
 
     /// Shows or hides the web view. A hidden view keeps its page and can
@@ -1002,6 +1032,9 @@ impl BrowserView {
             }
             if page.loading != self.page.loading {
                 cx.emit(BrowserEvent::LoadingChanged(page.loading));
+            }
+            if (page.playing_audio, page.muted) != (self.page.playing_audio, self.page.muted) {
+                cx.emit(BrowserEvent::AudioChanged);
             }
             self.page = page;
             cx.notify();

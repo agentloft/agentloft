@@ -59,6 +59,7 @@ impl Demo {
                 BrowserEvent::TitleChanged(title) => format!("title: {title}"),
                 BrowserEvent::LoadingChanged(true) => "loading…".into(),
                 BrowserEvent::LoadingChanged(false) => "loaded".into(),
+                BrowserEvent::AudioChanged => "audio changed".into(),
                 BrowserEvent::Annotation(a) => format!("note on {}: {}", a.selector, a.note),
                 BrowserEvent::Screenshot(png) => format!("screenshot: {} bytes", png.len()),
                 BrowserEvent::AnnotatingStopped => "annotation mode off".into(),

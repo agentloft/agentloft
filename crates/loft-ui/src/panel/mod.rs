@@ -384,7 +384,7 @@ impl WorkbenchPanel {
             loft_browser::BrowserEvent::AnnotatingStopped => {
                 cx.emit(PanelEvent::AnnotatingStopped(id.clone()))
             }
-            // Titles and loading state show on the tab.
+            // Titles, loading and sound show on the tab.
             _ => cx.notify(),
         })];
         if let Some(panel) = self.threads.get_mut(thread_id) {
@@ -982,6 +982,14 @@ impl Render for WorkbenchPanel {
         for (ix, tab) in panel.tabs.iter().enumerate() {
             let is_active = ix == active;
             let (icon, label) = tab_face(tab, &p, cx);
+            // A page making sound (or muted) shows a speaker that mutes it.
+            let sound = match tab {
+                Open::Browser { view } => {
+                    let b = view.read(cx);
+                    (b.is_playing_audio() || b.is_muted()).then(|| (view.clone(), b.is_muted()))
+                }
+                _ => None,
+            };
             let (tid, cid, mid) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
             tabs = tabs.child(
                 h_flex()
@@ -1011,6 +1019,38 @@ impl Render for WorkbenchPanel {
                     })
                     .child(div().flex_none().child(icon))
                     .child(div().flex_1().min_w_0().truncate().child(label))
+                    .when_some(sound, |d, (view, muted)| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("panel-tab-sound-{ix}")))
+                                .flex_none()
+                                .cursor_pointer()
+                                .p(px(2.))
+                                .rounded(px(4.))
+                                .text_color(p.muted_foreground)
+                                .hover(|d| d.bg(p.border).text_color(p.foreground))
+                                .child(
+                                    Icon::new(if muted {
+                                        IconName::VolumeX
+                                    } else {
+                                        IconName::Volume2
+                                    })
+                                    .xsmall(),
+                                )
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(if muted {
+                                        "Unmute tab"
+                                    } else {
+                                        "Mute tab"
+                                    })
+                                    .build(window, cx)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    view.update(cx, |b, cx| b.set_muted(!muted, cx));
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .id(SharedString::from(format!("panel-tab-x-{ix}")))
