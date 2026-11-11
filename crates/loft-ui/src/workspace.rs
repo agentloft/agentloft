@@ -132,6 +132,9 @@ pub struct WorkspaceView {
     query: String,
     /// The sidebar lists archived threads too.
     show_archived: bool,
+    /// Sidebar groups showing their threads idle for over 12 hours: the
+    /// Threads list (`None`) or a project's.
+    show_older: std::collections::HashSet<Option<ProjectId>>,
     /// The sidebar thread whose ··· menu is open.
     row_menu: Option<ThreadId>,
     /// Threads sidebar: only this project's threads (`None` = all).
@@ -295,6 +298,7 @@ impl WorkspaceView {
             search,
             query: String::new(),
             show_archived: false,
+            show_older: Default::default(),
             row_menu: None,
             project_filter: None,
             multi: Vec::new(),
@@ -2456,8 +2460,12 @@ impl WorkspaceView {
             .find(|t| t.id == id)
             .map(|t| t.project_id.clone())
         {
-            self.store
-                .update(cx, |s, cx| s.set_collapsed(&[project], false, cx));
+            self.store.update(cx, |s, cx| {
+                s.set_collapsed(std::slice::from_ref(&project), false, cx)
+            });
+            // So do older threads.
+            self.show_older.insert(None);
+            self.show_older.insert(Some(project));
         }
         self.sidebar_open = true;
         let input = cx.new(|cx| {
@@ -2691,13 +2699,122 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    /// A run of sidebar rows. With `older` (the group's key), threads idle
+    /// for over 12 hours fold under an "Older" row at the end.
+    fn render_rows(
+        &mut self,
+        rows: Vec<Nested<'_>>,
+        older: Option<Option<ProjectId>>,
+        subtitle: &dyn Fn(&loft_protocol::Thread) -> Option<Subtitle>,
+        drawn: &mut Vec<ThreadId>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Div {
+        let (recent, old) = match &older {
+            Some(_) => split_older(rows, &self.store.read(cx).unread, now_ms()),
+            None => (rows, Vec::new()),
+        };
+        let mut list = v_flex().gap_px();
+        for row in &recent {
+            list = list.child(self.sidebar_row(row, subtitle, drawn, p, cx));
+        }
+        let Some(key) = older.filter(|_| !old.is_empty()) else {
+            return list;
+        };
+        let open = self.show_older.contains(&key);
+        let count = old.iter().filter(|r| r.depth == 0).count();
+        let toggle_id = SharedString::from(format!(
+            "older-{}",
+            key.as_ref().map_or("threads", |k| k.as_str())
+        ));
+        list = list.child(
+            h_flex()
+                .id(toggle_id)
+                .gap_1p5()
+                .items_center()
+                .pl(px(12.))
+                .pr_2()
+                .py(px(5.))
+                .rounded(px(7.))
+                .cursor_pointer()
+                .text_xs()
+                .text_color(p.faint_foreground)
+                .hover(|d| d.bg(p.hover).text_color(p.muted_foreground))
+                .child(Icon::new(IconName::Clock).xsmall())
+                .child(format!("Older ({count})"))
+                .child(div().flex_1())
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .xsmall(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.show_older.remove(&key) {
+                        this.show_older.insert(key.clone());
+                    }
+                    cx.notify();
+                })),
+        );
+        if open {
+            for row in &old {
+                list = list.child(self.sidebar_row(row, subtitle, drawn, p, cx));
+            }
+        }
+        list
+    }
+
+    /// One thread's sidebar row.
+    fn sidebar_row(
+        &self,
+        row: &Nested<'_>,
+        subtitle: &dyn Fn(&loft_protocol::Thread) -> Option<Subtitle>,
+        drawn: &mut Vec<ThreadId>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let thread = row.thread;
+        let id = &thread.id;
+        drawn.push(id.clone());
+        let (selected, unread) = {
+            let store = self.store.read(cx);
+            (
+                store.selected.as_ref() == Some(id),
+                store.unread.contains(id),
+            )
+        };
+        let multi = &self.multi;
+        thread_row(
+            &self.store,
+            thread,
+            row.depth,
+            row.under,
+            selected || multi.contains(id),
+            unread,
+            self.row_menu.as_ref() == Some(id),
+            self.renaming
+                .as_ref()
+                .filter(|(r, _, _)| r == id)
+                .map(|(_, input, _)| input.clone()),
+            // A message matched (not just the title): show where.
+            self.search_hits
+                .get(id)
+                .filter(|_| !thread.title.to_lowercase().contains(&self.query)),
+            (row.depth == 0).then(|| subtitle(thread)).flatten(),
+            (multi.len() > 1 && multi.contains(id)).then(|| multi.clone()),
+            p,
+            cx,
+        )
+    }
+
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let (projects, all_threads, selected, conn, unread, collapsed) = {
+        let (projects, all_threads, conn, unread, collapsed) = {
             let store = self.store.read(cx);
             (
                 store.workspace.projects.clone(),
                 store.workspace.threads.clone(),
-                store.selected.clone(),
                 store.conn.clone(),
                 store.unread.clone(),
                 store.collapsed.clone(),
@@ -2714,7 +2831,6 @@ impl WorkspaceView {
         // Rows picked together (gone threads drop out).
         self.multi
             .retain(|id| all_threads.iter().any(|t| &t.id == id));
-        let multi = self.multi.clone();
         let mut drawn: Vec<ThreadId> = Vec::new();
         let mut list = v_flex().gap_4().px_2().pb_4();
         // Chats (threads without a project) come first.
@@ -2736,14 +2852,79 @@ impl WorkspaceView {
             )
         });
 
+        // Under a top-level row's title (when projects are mixed): its project.
+        let subtitle = |t: &loft_protocol::Thread| {
+            Some(match projects.iter().find(|p| p.id == t.project_id) {
+                Some(pr) if !chats.contains(&pr.id) => Subtitle::Project(pr.clone()),
+                _ => Subtitle::NoProject,
+            })
+        };
+        let folded_threads = if query.is_empty() {
+            self.store.read(cx).folded_threads.clone()
+        } else {
+            Default::default()
+        };
+
+        // Pinned threads first (in pin order), with what's under them.
+        let pinned_threads = self.store.read(cx).pinned_threads.clone();
+        let mut pinned: Vec<&loft_protocol::Thread> = pinned_threads
+            .iter()
+            .filter_map(|id| all_threads.iter().find(|t| &t.id == id))
+            .filter(|t| t.status != ThreadStatus::Archived)
+            .collect();
+        let mut at = 0;
+        while at < pinned.len() {
+            let parent = pinned[at].id.clone();
+            let children: Vec<_> = all_threads
+                .iter()
+                .filter(|t| {
+                    t.status != ThreadStatus::Archived
+                        && t.parent
+                            .as_ref()
+                            .is_some_and(|p| !p.detached && p.thread_id == parent)
+                        && !pinned.iter().any(|x| x.id == t.id)
+                })
+                .collect();
+            pinned.extend(children);
+            at += 1;
+        }
+        // Kept out of the lists below either way.
+        let pinned_rows: std::collections::HashSet<ThreadId> =
+            pinned.iter().map(|t| t.id.clone()).collect();
+        let pinned: Vec<_> = pinned
+            .into_iter()
+            .filter(|t| self.lists_thread(t))
+            .filter(|t| {
+                let name = projects
+                    .iter()
+                    .find(|p| p.id == t.project_id)
+                    .map_or("", |p| p.name.as_str());
+                self.search_matches(t, name)
+            })
+            .collect();
+        if !pinned.is_empty() {
+            let rows = nest_forks(pinned, &folded_threads);
+            let rows = self.render_rows(rows, None, &subtitle, &mut drawn, p, cx);
+            list = list.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .px_2()
+                            .text_xs()
+                            .text_color(p.faint_foreground)
+                            .child(Icon::new(IconName::Pin).xsmall())
+                            .child("Pinned"),
+                    )
+                    .child(rows),
+            );
+        }
+
         // One list, most recent first, each row with its project.
         let flat = !theme::sidebar_by_project(cx);
         if flat {
-            let folded_threads = if query.is_empty() {
-                self.store.read(cx).folded_threads.clone()
-            } else {
-                Default::default()
-            };
             let filter = self
                 .project_filter
                 .clone()
@@ -2751,6 +2932,7 @@ impl WorkspaceView {
             let threads: Vec<_> = all_threads
                 .iter()
                 .filter(|t| t.status != ThreadStatus::Archived)
+                .filter(|t| !pinned_rows.contains(&t.id))
                 .filter(|t| filter.as_ref().is_none_or(|f| &t.project_id == f))
                 .filter(|t| self.lists_thread(t))
                 .filter(|t| {
@@ -2761,44 +2943,15 @@ impl WorkspaceView {
                     self.search_matches(t, name)
                 })
                 .collect();
-            let mut rows = v_flex().gap_px();
-            for Nested {
-                thread,
-                depth,
-                under,
-            } in nest_forks(threads, &folded_threads)
-            {
-                let id = thread.id.clone();
-                let project = projects.iter().find(|p| p.id == thread.project_id);
-                // Under the title (top-level rows): its project.
-                let subtitle = (depth == 0).then(|| match project {
-                    Some(pr) if chats.contains(&pr.id) => Subtitle::NoProject,
-                    Some(pr) => Subtitle::Project(pr.clone()),
-                    None => Subtitle::NoProject,
-                });
-                drawn.push(id.clone());
-                rows = rows.child(thread_row(
-                    &self.store,
-                    thread,
-                    depth,
-                    under,
-                    selected.as_ref() == Some(&id) || multi.contains(&id),
-                    unread.contains(&id),
-                    self.row_menu.as_ref() == Some(&id),
-                    self.renaming
-                        .as_ref()
-                        .filter(|(r, _, _)| *r == id)
-                        .map(|(_, input, _)| input.clone()),
-                    self.search_hits
-                        .get(&id)
-                        .filter(|_| !thread.title.to_lowercase().contains(&query)),
-                    subtitle,
-                    (multi.len() > 1 && multi.contains(&id)).then(|| multi.clone()),
-                    p,
-                    cx,
-                ));
-            }
-            list = list.child(rows);
+            let rows = nest_forks(threads, &folded_threads);
+            list = list.child(self.render_rows(
+                rows,
+                query.is_empty().then_some(None),
+                &subtitle,
+                &mut drawn,
+                p,
+                cx,
+            ));
         }
 
         for project in projects.iter().filter(|_| !flat) {
@@ -2807,6 +2960,7 @@ impl WorkspaceView {
             let threads: Vec<_> = all_threads
                 .iter()
                 .filter(|t| t.project_id == project.id && t.status != ThreadStatus::Archived)
+                .filter(|t| !pinned_rows.contains(&t.id))
                 .filter(|t| self.lists_thread(t))
                 .filter(|t| self.search_matches(t, &project.name))
                 .collect();
@@ -2834,41 +2988,14 @@ impl WorkspaceView {
             );
             let mut rows = v_flex().gap_px();
             if !folded {
-                let folded_threads = if query.is_empty() {
-                    self.store.read(cx).folded_threads.clone()
-                } else {
-                    Default::default()
-                };
-                for Nested {
-                    thread,
-                    depth,
-                    under,
-                } in nest_forks(threads, &folded_threads)
-                {
-                    let id = thread.id.clone();
-                    drawn.push(id.clone());
-                    rows = rows.child(thread_row(
-                        &self.store,
-                        thread,
-                        depth,
-                        under,
-                        selected.as_ref() == Some(&id) || multi.contains(&id),
-                        unread.contains(&id),
-                        self.row_menu.as_ref() == Some(&id),
-                        self.renaming
-                            .as_ref()
-                            .filter(|(r, _, _)| *r == id)
-                            .map(|(_, input, _)| input.clone()),
-                        // A message matched (not just the title): show where.
-                        self.search_hits
-                            .get(&id)
-                            .filter(|_| !thread.title.to_lowercase().contains(&query)),
-                        None,
-                        (multi.len() > 1 && multi.contains(&id)).then(|| multi.clone()),
-                        p,
-                        cx,
-                    ));
-                }
+                rows = self.render_rows(
+                    nest_forks(threads, &folded_threads),
+                    query.is_empty().then(|| Some(project.id.clone())),
+                    &|_| None,
+                    &mut drawn,
+                    p,
+                    cx,
+                );
             }
             list = list.child(v_flex().gap_1().child(header).child(rows));
         }
@@ -5059,6 +5186,48 @@ fn nest_forks<'a>(
     out
 }
 
+/// How long a thread sits idle before the sidebar folds it under "Older".
+const OLDER_AFTER_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// Sidebar rows split into recent and older ones, a top-level thread and
+/// the threads under it kept together. They stay recent while any of them
+/// did something in the last 12 hours, is at work or unread, or is a draft.
+fn split_older<'a>(
+    rows: Vec<Nested<'a>>,
+    unread: &std::collections::HashSet<ThreadId>,
+    now: i64,
+) -> (Vec<Nested<'a>>, Vec<Nested<'a>>) {
+    let live = |r: &Nested| {
+        let t = r.thread;
+        now - t.updated_at_ms < OLDER_AFTER_MS
+            || matches!(
+                t.status,
+                ThreadStatus::Running | ThreadStatus::WaitingApproval
+            )
+            || t.is_waiting()
+            || !t.is_started()
+            || unread.contains(&t.id)
+            || r.under.is_some_and(|u| u.busy)
+    };
+    let (mut recent, mut old) = (Vec::new(), Vec::new());
+    let mut family: Vec<Nested<'a>> = Vec::new();
+    let mut flush = |family: &mut Vec<Nested<'a>>| {
+        if family.iter().any(live) {
+            recent.append(family);
+        } else {
+            old.append(family);
+        }
+    };
+    for row in rows {
+        if row.depth == 0 {
+            flush(&mut family);
+        }
+        family.push(row);
+    }
+    flush(&mut family);
+    (recent, old)
+}
+
 /// A project's sidebar heading. Clicking it folds or unfolds its threads;
 /// folded, it still says how many there are and whether any need you.
 #[allow(clippy::too_many_arguments)]
@@ -6170,6 +6339,21 @@ fn thread_menu_items(
                     });
                 }),
         );
+        // Pinned threads sit at the top of the sidebar.
+        let pinned = store.read(cx).pinned_threads.contains(&id);
+        let (s, t) = (store.clone(), id.clone());
+        menu = menu.item(
+            PopupMenuItem::new(if pinned { "Unpin" } else { "Pin" })
+                .icon(if pinned {
+                    IconName::PinOff
+                } else {
+                    IconName::Pin
+                })
+                .on_click(move |_, _, cx| {
+                    let t = t.clone();
+                    s.update(cx, |s, cx| s.set_threads_pinned(&[t], !pinned, cx));
+                }),
+        );
         let (s, t) = (store.clone(), id.clone());
         menu = menu
             .item(
@@ -6311,7 +6495,7 @@ fn bulk_menu_items(
 + 'static {
     use gpui_kit::component::menu::PopupMenuItem;
     let store = store.clone();
-    move |menu, _, _| {
+    move |menu, _, cx| {
         let n = ids.len();
         let clear = {
             let view = view.clone();
@@ -6326,7 +6510,25 @@ fn bulk_menu_items(
         let (s2, i2, c2) = (store.clone(), ids.clone(), clear.clone());
         let c3 = clear.clone();
         let (s4, i4) = (store.clone(), ids.clone());
+        // Pin them all, unless all are pinned already.
+        let pin = {
+            let pinned = &store.read(cx).pinned_threads;
+            !ids.iter().all(|t| pinned.contains(t))
+        };
+        let (s5, i5, c5) = (store.clone(), ids.clone(), clear.clone());
         menu.item(
+            PopupMenuItem::new(if pin {
+                format!("Pin ({n})")
+            } else {
+                format!("Unpin ({n})")
+            })
+            .icon(if pin { IconName::Pin } else { IconName::PinOff })
+            .on_click(move |_, _, cx| {
+                s5.update(cx, |s, cx| s.set_threads_pinned(&i5, pin, cx));
+                c5(cx);
+            }),
+        )
+        .item(
             PopupMenuItem::new(format!("Open in Panes ({n})"))
                 .icon(IconName::Columns2)
                 .on_click(move |_, _, cx| {

@@ -298,6 +298,8 @@ pub struct AppStore {
     pub folded_threads: std::collections::HashSet<ThreadId>,
     /// Projects pinned to the top (sidebar and pickers), in pin order.
     pub pinned_projects: Vec<ProjectId>,
+    /// Threads pinned to the top of the sidebar, in pin order.
+    pub pinned_threads: Vec<ThreadId>,
     /// The GitHub account `gh` is signed in to: `None` = not asked yet,
     /// `Some(None)` = asked, none (yet).
     pub github_login: Option<Option<String>>,
@@ -347,6 +349,7 @@ impl AppStore {
         let collapsed = load_collapsed(&paths);
         let folded_threads = load_folded_threads(&paths);
         let pinned_projects = load_list::<ProjectId>(&paths, "pinned_projects");
+        let pinned_threads = load_list::<ThreadId>(&paths, "pinned_threads");
         let mut this = Self {
             runtime,
             paths,
@@ -364,6 +367,7 @@ impl AppStore {
             collapsed,
             folded_threads,
             pinned_projects,
+            pinned_threads,
             github_login: None,
             next_in_new_pane: false,
             commands: HashMap::new(),
@@ -1109,12 +1113,30 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Pin threads to the top of the sidebar, or unpin them.
+    pub fn set_threads_pinned(&mut self, threads: &[ThreadId], pin: bool, cx: &mut Context<Self>) {
+        for t in threads {
+            let at = self.pinned_threads.iter().position(|p| p == t);
+            match (pin, at) {
+                (true, None) => self.pinned_threads.push(t.clone()),
+                (false, Some(at)) => {
+                    self.pinned_threads.remove(at);
+                }
+                _ => {}
+            }
+        }
+        self.save_sidebar();
+        cx.notify();
+    }
+
     fn save_sidebar(&self) {
         let projects: Vec<&str> = self.collapsed.iter().map(|p| p.as_str()).collect();
         let threads: Vec<&str> = self.folded_threads.iter().map(|t| t.as_str()).collect();
         let pinned: Vec<&str> = self.pinned_projects.iter().map(|p| p.as_str()).collect();
+        let pinned_threads: Vec<&str> = self.pinned_threads.iter().map(|t| t.as_str()).collect();
         if let Ok(json) = serde_json::to_vec_pretty(&serde_json::json!({
             "collapsed": projects, "folded_threads": threads, "pinned_projects": pinned,
+            "pinned_threads": pinned_threads,
         })) {
             let _ = crate::host::write(&sidebar_file(&self.paths), &json);
         }
