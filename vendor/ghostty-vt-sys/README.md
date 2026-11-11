@@ -13,6 +13,17 @@ What differs from the published crate:
   built with `-Dsimd=false` (Ghostty's SIMD paths need a libc) and
   `-Doptimize=ReleaseSmall`. A wasm build installs the archive but no
   headers, so the include path is the source tree's.
+- `build.rs`: a build of the pinned tarball keeps only the static archive
+  and the headers in `$OUT_DIR/ghostty-vt` (about 13 MB; the source tree and
+  Zig's cache beside them were some 600 MB per profile and checkout), and
+  leaves a copy in a per-user folder (`~/Library/Caches/ghostty-vt-sys` on
+  macOS, `$XDG_CACHE_HOME/ghostty-vt-sys` or `~/.cache/ghostty-vt-sys`
+  elsewhere, `%LOCALAPPDATA%\ghostty-vt-sys` on Windows) that the next
+  `$OUT_DIR` copies from instead of downloading and running Zig again: a new
+  worktree or profile gets the library in well under a second, and needs no
+  Zig. `GHOSTTY_VT_CACHE_DIR` moves the folder; set to nothing, every
+  `$OUT_DIR` builds for itself. Deleting the folder only costs a rebuild.
+  Builds from `GHOSTTY_SOURCE_DIR` or the submodule are as upstream.
 - `src/bindings_wasm32.rs`: bindings generated for a 32-bit target. bindgen
   checks struct layouts at compile time, and the published bindings carry
   the 64-bit ones. `src/lib.rs` picks the file by target.
@@ -22,10 +33,11 @@ What differs from the published crate:
 To regenerate the wasm32 bindings (needs libclang; on macOS the command
 line tools have it), from the repository root, with `GHOSTTY_SOURCE_DIR`
 set to an extracted Ghostty source tarball for the commit in
-`GHOSTTY.lock` (a native build leaves one under
-`target/debug/build/ghostty-vt-sys-*/out/src`):
+`GHOSTTY.lock`:
 
 ```sh
+curl -L "$(sed -n 's/^url = //p' vendor/ghostty-vt-sys/GHOSTTY.lock)" | tar xz -C /tmp
+export GHOSTTY_SOURCE_DIR="/tmp/$(sed -n 's/^root = //p' vendor/ghostty-vt-sys/GHOSTTY.lock)"
 LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib \
 GHOSTTY_INCLUDE_DIR="$GHOSTTY_SOURCE_DIR/include" \
 GHOSTTY_BINDINGS_TARGET=wasm32-unknown-unknown \

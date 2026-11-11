@@ -11,6 +11,12 @@
 //! The source tree is copied into `$OUT_DIR/src` before Zig runs so that Zig
 //! never writes into the submodule or the registry directory.
 //!
+//! Agentloft: a build of the pinned tarball keeps only the static archive and
+//! the headers (`$OUT_DIR/ghostty-vt`, about 13 MB; the source tree and Zig's
+//! cache it was built from are some 600 MB) and is shared between every
+//! checkout, worktree and Cargo profile on the machine: see
+//! [`shared_cache_dir`].
+//!
 //! Adapted from libghostty-vt-sys 0.2.2 (MIT OR Apache-2.0).
 
 use std::env;
@@ -117,10 +123,179 @@ fn main() {
         return;
     }
 
+    // Agentloft: the pinned tarball always builds to the same library, so one
+    // build serves every `$OUT_DIR` that asks for it.
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let src = out_dir.join("src");
-    download_and_extract(&lock, &src);
-    build_tree(&src, &lock, &target);
+    let install = out_dir.join("ghostty-vt");
+    let key = build_key(&lock, &target);
+    if !is_installed(&install, &key, &target) && !restore_shared(&install, &key, &target) {
+        let src = out_dir.join("src");
+        download_and_extract(&lock, &src);
+        let built = build_tree(&src, &lock, &target);
+        install_build(&built, &install, &key, &target);
+        publish_shared(&install, &key);
+    }
+    // What a build is made from is not needed again (a rerun finds the
+    // installed library above), nor is what an older version of this script
+    // left in the same `$OUT_DIR`.
+    for dir in ["src", "zig-cache", "zig-out"] {
+        let _ = fs::remove_dir_all(out_dir.join(dir));
+    }
+    emit_link(&install.join("lib"), &install.join("include"), &target);
+}
+
+/// Agentloft: names one build of the pinned source: what goes in decides
+/// what comes out. Readable, so the shared folder can be looked through.
+fn build_key(lock: &Lock, target: &str) -> String {
+    let cpu = env::var("GHOSTTY_VT_CPU").unwrap_or_else(|_| "baseline".to_owned());
+    let key = format!(
+        "{}-{}-{cpu}-r{BUILD_RECIPE}",
+        lock.sha256.get(..16).unwrap_or(&lock.sha256),
+        zig_target(target),
+    );
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Agentloft: bump when [`build_tree`] builds differently (flags, what is
+/// installed), so that builds made the old way are not reused.
+const BUILD_RECIPE: u32 = 1;
+
+/// Agentloft: where finished builds are kept for the next `$OUT_DIR` that
+/// needs one: a per-user cache folder. `GHOSTTY_VT_CACHE_DIR` moves it; set
+/// it to nothing to go without. Losing the folder only costs a rebuild.
+fn shared_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("GHOSTTY_VT_CACHE_DIR") {
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
+    }
+    let home = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let caches = if cfg!(target_os = "macos") {
+        home.map(|home| home.join("Library").join("Caches"))
+    } else if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        env::var_os("XDG_CACHE_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.map(|home| home.join(".cache")))
+    };
+    caches.map(|dir| dir.join("ghostty-vt-sys"))
+}
+
+fn archive_name(target: &str) -> String {
+    let lib_name = lib_name(target);
+    if target.contains("windows") {
+        format!("{lib_name}.lib")
+    } else {
+        format!("lib{lib_name}.a")
+    }
+}
+
+fn lib_name(target: &str) -> &'static str {
+    if target.ends_with("windows-msvc") {
+        "ghostty-vt-static"
+    } else {
+        "ghostty-vt"
+    }
+}
+
+/// Whether `dir` holds a whole build (archive and headers) made for `key`.
+fn is_installed(dir: &Path, key: &str, target: &str) -> bool {
+    fs::read_to_string(dir.join(".key")).is_ok_and(|found| found.trim() == key)
+        && dir.join("lib").join(archive_name(target)).is_file()
+        && dir.join("include").join("ghostty").join("vt.h").is_file()
+}
+
+/// Copy the archive and the headers of a build into `install` and mark it
+/// with `key`. The key goes in last: a copy cut short is not a build.
+fn install_build(built: &Built, install: &Path, key: &str, target: &str) {
+    let _ = fs::remove_dir_all(install);
+    let lib = install.join("lib");
+    fs::create_dir_all(&lib)
+        .unwrap_or_else(|error| panic!("failed to create {}: {error}", lib.display()));
+    let archive = lib.join(archive_name(target));
+    fs::copy(&built.archive, &archive).unwrap_or_else(|error| {
+        panic!(
+            "failed to copy {} to {}: {error}",
+            built.archive.display(),
+            archive.display()
+        )
+    });
+    copy_tree(&built.include_dir, &install.join("include"));
+    fs::write(install.join(".key"), key)
+        .unwrap_or_else(|error| panic!("failed to mark {}: {error}", install.display()));
+}
+
+/// Take the build for `key` from the shared folder, if it has one.
+fn restore_shared(install: &Path, key: &str, target: &str) -> bool {
+    let Some(shared) = shared_cache_dir().map(|dir| dir.join(key)) else {
+        return false;
+    };
+    if !is_installed(&shared, key, target) {
+        return false;
+    }
+    let built = Built {
+        archive: shared.join("lib").join(archive_name(target)),
+        include_dir: shared.join("include"),
+    };
+    install_build(&built, install, key, target);
+    true
+}
+
+/// Leave the build for `key` in the shared folder. Best effort: a folder
+/// that can't be written only means the next `$OUT_DIR` builds for itself.
+/// The build appears under its name in one step (a rename), so another
+/// build running at the same time never reads half of it.
+fn publish_shared(install: &Path, key: &str) {
+    let Some(cache) = shared_cache_dir() else {
+        return;
+    };
+    let shared = cache.join(key);
+    if shared.exists() {
+        return;
+    }
+    let staging = cache.join(format!(".{key}.{}", std::process::id()));
+    let _ = fs::remove_dir_all(&staging);
+    // The key file is copied with the rest: the copy is whole.
+    let published = try_copy_tree(install, &staging).and_then(|()| fs::rename(&staging, &shared));
+    if published.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+}
+
+fn try_copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            try_copy_tree(&entry.path(), &dest)?;
+        } else {
+            fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_link(lib_dir: &Path, include_dir: &Path, target: &str) {
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=static={}", lib_name(target));
+    println!("cargo:include={}", include_dir.display());
+}
+
+/// What `zig build` left behind that the crate needs.
+struct Built {
+    archive: PathBuf,
+    include_dir: PathBuf,
 }
 
 /// Check that the published crate version identifies the pinned Ghostty source.
@@ -172,7 +347,11 @@ fn build_from(source: &Path, lock: &Lock, target: &str) {
             .unwrap_or_else(|error| panic!("failed to remove {}: {error}", src.display()));
     }
     copy_tree(source, &src);
-    build_tree(&src, lock, target);
+    // A local source tree changes under us: it is built where it always was
+    // (Zig's cache stays, so a rerun is quick) and never shared.
+    let built = build_tree(&src, lock, target);
+    let lib_dir = built.archive.parent().expect("archive directory");
+    emit_link(lib_dir, &built.include_dir, target);
 }
 
 /// Copy a Ghostty tree without git metadata and Zig outputs.
@@ -330,8 +509,8 @@ fn download_failure(lock: &Lock, url: &str, error: &str) -> String {
     )
 }
 
-/// Run `zig build` in `src` and emit the link lines.
-fn build_tree(src: &Path, lock: &Lock, target: &str) {
+/// Run `zig build` in `src`; the archive and the headers it made.
+fn build_tree(src: &Path, lock: &Lock, target: &str) -> Built {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let zig = resolve_zig();
 
@@ -378,17 +557,7 @@ fn build_tree(src: &Path, lock: &Lock, target: &str) {
 
     run(build, "zig build");
 
-    let lib_dir = prefix.join("lib");
-    let lib_name = if target.ends_with("windows-msvc") {
-        "ghostty-vt-static"
-    } else {
-        "ghostty-vt"
-    };
-    let archive = if target.contains("windows") {
-        lib_dir.join(format!("{lib_name}.lib"))
-    } else {
-        lib_dir.join(format!("lib{lib_name}.a"))
-    };
+    let archive = prefix.join("lib").join(archive_name(target));
     assert!(
         archive.exists(),
         "zig build did not produce {}",
@@ -406,10 +575,10 @@ fn build_tree(src: &Path, lock: &Lock, target: &str) {
         "zig build did not install headers in {}",
         include_dir.display()
     );
-
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=static={lib_name}");
-    println!("cargo:include={}", include_dir.display());
+    Built {
+        archive,
+        include_dir,
+    }
 }
 
 fn resolve_zig() -> PathBuf {
@@ -523,12 +692,7 @@ fn try_pkg_config(target: &str) -> bool {
     for framework in &lib.frameworks {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
-    let lib_name = if target.ends_with("windows-msvc") {
-        "ghostty-vt-static"
-    } else {
-        "ghostty-vt"
-    };
-    println!("cargo:rustc-link-lib=static={lib_name}");
+    println!("cargo:rustc-link-lib=static={}", lib_name(target));
     for library in &lib.libs {
         if library != "ghostty-vt" && library != "ghostty-vt-static" {
             println!("cargo:rustc-link-lib={library}");
