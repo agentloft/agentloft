@@ -362,6 +362,7 @@ impl Browser {
                 actor: None,
                 picturing: false,
                 changed_again: false,
+                last_shot: 0,
             }),
             view: Some(ViewPage {
                 origin: loft_view::origin(req.item.as_str()),
@@ -1091,6 +1092,96 @@ mod tests {
                 "a view {} px tall is pictured {:?} px tall (at twice the scale)",
                 info.height,
                 frame.and_then(|frame| jpeg_height(&frame.jpeg.0)),
+            );
+        }
+        pages.shutdown().await;
+    }
+
+    /// Quick clicks, each changing the page: the picture left at the end
+    /// shows the last change, not the one before it. (The screencast drops
+    /// what it can't send, so the last change of a burst could go unsaid
+    /// and the view stayed a step behind until something else moved.)
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a real browser"]
+    async fn live_a_views_last_change_is_pictured() {
+        use loft_protocol::{PageButton, PageInput, PageMouse};
+
+        // Every click swaps a patch between flat grey and noise, which a
+        // JPEG's size tells apart without decoding it.
+        const HTML: &str = "<canvas id=\"c\" width=\"120\" height=\"120\" \
+            style=\"position:fixed;left:0;top:0;width:120px;height:120px\"></canvas>\
+            <div style=\"height:200px\"></div>\
+            <script>let n = 0; const x = c.getContext('2d');\
+            function draw() { if (n % 2) { const d = x.createImageData(120, 120);\
+              for (let i = 0; i < d.data.length; i++) d.data[i] = (Math.imul(i, 2654435761) >>> 13) & 255;\
+              x.putImageData(d, 0, 0); } else { x.fillStyle = '#888'; x.fillRect(0, 0, 120, 120); } }\
+            c.onclick = () => { n++; draw(); }; draw();</script>";
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let (bus, _heard) = tokio::sync::broadcast::channel(4096);
+        let pages = Pages::default();
+        let request = ViewRequest {
+            thread: ThreadId::new(),
+            item: ItemId::new(),
+            html: HTML.to_owned(),
+            done: true,
+            width: 500,
+            scale: 2.0,
+            theme: Some(Theme::default()),
+            state: Value::Null,
+            keep: Arc::new(|_, _, _| {}),
+        };
+        let page = pages
+            .open_view(request, None, &profile, bus.clone())
+            .await
+            .unwrap();
+        pages.watching(&page.id, true).await;
+        let click = |count: u8| {
+            for action in [PageMouse::Down, PageMouse::Up] {
+                pages
+                    .input(
+                        &page.id,
+                        PageInput::Mouse {
+                            action,
+                            x: 60.0,
+                            y: 60.0,
+                            button: PageButton::Left,
+                            click_count: count,
+                            modifiers: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+        };
+        let weight = || {
+            let (_, frame, _) = pages.snapshot(&page.id).unwrap();
+            frame.map_or(0, |frame| frame.jpeg.0.len())
+        };
+        let rest = |ms: u64| tokio::time::sleep(Duration::from_millis(ms));
+
+        rest(800).await;
+        let flat = weight();
+        click(1);
+        rest(600).await;
+        let noisy = weight();
+        assert!(noisy > flat + 2_000, "flat {flat}, noisy {noisy}");
+        click(1);
+        rest(600).await;
+        let middle = (flat + noisy) / 2;
+
+        let mut odd = false;
+        for round in 0..20u64 {
+            let clicks = 1 + round * 7 % 4;
+            for n in 0..clicks {
+                click((n + 1).min(3) as u8);
+                rest([10, 20, 40][((round + n) % 3) as usize]).await;
+            }
+            odd ^= clicks % 2 == 1;
+            rest(500).await;
+            assert_eq!(
+                weight() > middle,
+                odd,
+                "round {round}: after {clicks} quick clicks the picture is a step behind"
             );
         }
         pages.shutdown().await;

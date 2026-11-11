@@ -48,6 +48,9 @@ const STILL_QUALITY: u32 = 88;
 /// read while they move (a slider's number, a chart redrawing): every
 /// picture of one is taken at the viewer's real scale.
 const VIEW_QUALITY: u32 = 90;
+/// A view is looked at again no sooner than this after the last look began
+/// (about 20 pictures a second while it moves).
+const VIEW_EVERY: Duration = Duration::from_millis(50);
 const MAX_PAGES: usize = 16;
 const MIN_SIDE: u32 = 120;
 const MAX_SIDE: u32 = 3840;
@@ -127,35 +130,68 @@ struct State {
     /// The connection whose input reached the page last: who a view's
     /// request (say this, copy that) is for.
     actor: Option<u64>,
-    /// A view is being pictured at full scale right now, and has changed
-    /// again since that started.
+    /// A view is being pictured right now, and has been said to have
+    /// changed again since the last look began.
     picturing: bool,
     changed_again: bool,
+    /// The last picture taken of a view, hashed: the same one again isn't
+    /// sent, and means the view holds still.
+    last_shot: u64,
 }
 
 impl Browser {
-    /// Picture a view at its real scale, and again for as long as it keeps
-    /// changing: one screenshot at a time, always of the page as it is now.
-    async fn picture_view(self: Arc<Self>, page: Arc<Page>) {
-        loop {
-            let shot = self.screenshot(&page, VIEW_QUALITY).await;
-            let again = {
-                let mut state = lock(&page.state);
-                if let Some(jpeg) = shot {
-                    state.seq += 1;
-                    state.frame = Some(Arc::new(jpeg));
-                    let _ = self.bus.send(BusMsg::PageFrame {
-                        id: page.id.clone(),
-                        seq: state.seq,
-                    });
-                }
-                let again = std::mem::take(&mut state.changed_again) && state.viewers > 0;
-                state.picturing = again;
-                again
-            };
-            if !again || self.dead.load(Ordering::Relaxed) {
+    /// Look at a view again: it changed, or was just clicked or typed in.
+    fn picture_soon(self: &Arc<Self>, page: &Arc<Page>) {
+        {
+            let mut state = lock(&page.state);
+            if state.viewers == 0 {
                 return;
             }
+            if state.picturing {
+                state.changed_again = true;
+                return;
+            }
+            state.picturing = true;
+        }
+        tokio::spawn(self.clone().picture_view(page.clone()));
+    }
+
+    /// Picture a view until it holds still: one screenshot at a time,
+    /// always of the page as it is now, at its real scale.
+    ///
+    /// The screencast says "something changed", but not every time: Chrome
+    /// drops the pictures it can't send while earlier ones are waiting to
+    /// be acknowledged, and what it dropped last it never sends. A view
+    /// whose last change went unsaid would show the step before it until
+    /// something else moved. So a look that shows a change is followed by
+    /// another, until one shows the same picture again.
+    async fn picture_view(self: Arc<Self>, page: Arc<Page>) {
+        loop {
+            let began = tokio::time::Instant::now();
+            let shot = self.screenshot(&page, VIEW_QUALITY).await;
+            {
+                let mut state = lock(&page.state);
+                let mut moved = false;
+                if let Some(jpeg) = shot {
+                    let print = fingerprint(&jpeg);
+                    if state.last_shot != print || state.frame.is_none() {
+                        state.last_shot = print;
+                        state.seq += 1;
+                        state.frame = Some(Arc::new(jpeg));
+                        let _ = self.bus.send(BusMsg::PageFrame {
+                            id: page.id.clone(),
+                            seq: state.seq,
+                        });
+                        moved = true;
+                    }
+                }
+                let told = std::mem::take(&mut state.changed_again);
+                if !(moved || told) || state.viewers == 0 || self.dead.load(Ordering::Relaxed) {
+                    state.picturing = false;
+                    return;
+                }
+            }
+            tokio::time::sleep_until(began + VIEW_EVERY).await;
         }
     }
 
@@ -175,6 +211,14 @@ impl Browser {
             .decode(shot["data"].as_str()?)
             .ok()
     }
+}
+
+/// A picture's bytes as one number, to tell "the same again" cheaply.
+fn fingerprint(jpeg: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    jpeg.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A size a page can have, whatever a client asked for.
@@ -580,6 +624,7 @@ impl Browser {
                 actor: None,
                 picturing: false,
                 changed_again: false,
+                last_shot: 0,
             }),
             view: None,
         });
@@ -756,9 +801,22 @@ impl Browser {
             if self.dead.load(Ordering::Relaxed) {
                 break;
             }
+            // What a click or a key did to a view is looked at, whether or
+            // not the screencast says anything came of it.
+            let acts = page.view.is_some()
+                && !matches!(
+                    input,
+                    PageInput::Mouse {
+                        action: PageMouse::Move,
+                        ..
+                    }
+                );
             let (method, params) = input_command(input);
             if let Err(err) = self.cdp.send(method, params, Some(&page.session)).await {
                 tracing::debug!(%err, "page input");
+            }
+            if acts {
+                self.picture_soon(&page);
             }
         }
     }
@@ -1009,8 +1067,16 @@ impl Browser {
         };
         let ack = params["sessionId"].clone();
         let (browser, paced) = (self.clone(), page.clone());
+        // A view's screencast is only the sign that it changed (its picture
+        // is a screenshot), so nothing is gained by slowing it, and a sign
+        // that waits is a sign Chrome drops.
+        let pace = if page.view.is_some() {
+            Duration::ZERO
+        } else {
+            FRAME_PACE
+        };
         tokio::spawn(async move {
-            tokio::time::sleep(FRAME_PACE).await;
+            tokio::time::sleep(pace).await;
             let _ = browser
                 .cdp
                 .send(
@@ -1020,49 +1086,21 @@ impl Browser {
                 )
                 .await;
         });
-        let fingerprint = {
-            use std::hash::{Hash as _, Hasher as _};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            jpeg.hash(&mut hasher);
-            hasher.finish()
-        };
-        // A view on a dense screen: the screencast only says "it changed";
-        // the picture shown is a screenshot at the real scale.
+        let fingerprint = fingerprint(&jpeg);
+        // A view: the screencast only says "it changed"; the picture shown
+        // is a screenshot at the real scale.
         if page.view.is_some() {
-            let start = {
+            {
                 let mut state = lock(&page.state);
                 if state.last_cast == fingerprint && state.frame.is_some() {
                     return;
                 }
                 state.last_cast = fingerprint;
-                if state.info.scale > 1.0 {
-                    if state.picturing {
-                        state.changed_again = true;
-                        return;
-                    }
-                    state.picturing = true;
-                    Some(())
-                } else {
-                    None
-                }
-            };
-            if start.is_some() {
-                tokio::spawn(self.clone().picture_view(page.clone()));
-                return;
             }
-            let seq = {
-                let mut state = lock(&page.state);
-                state.seq += 1;
-                state.frame = Some(Arc::new(jpeg));
-                state.seq
-            };
-            let _ = self.bus.send(BusMsg::PageFrame {
-                id: page.id.clone(),
-                seq,
-            });
+            self.picture_soon(page);
             return;
         }
-        let (seq, motion, sharpen) = {
+        let (seq, motion) = {
             let mut state = lock(&page.state);
             if state.last_cast == fingerprint && state.frame.is_some() {
                 // The page as it already was (Chrome repeats itself after
@@ -1073,17 +1111,17 @@ impl Browser {
             state.seq += 1;
             state.motion += 1;
             state.frame = Some(Arc::new(jpeg));
-            (state.seq, state.motion, state.info.scale > 1.0)
+            (state.seq, state.motion)
         };
         let _ = self.bus.send(BusMsg::PageFrame {
             id: page.id.clone(),
             seq,
         });
-        if !sharpen {
-            return;
-        }
-        // Screencast pictures are one device pixel per CSS pixel. Once the
-        // page holds still, one screenshot at its real scale replaces them.
+        // Once the page holds still, one screenshot replaces the screencast
+        // pictures. It is at the page's real scale (they are one device
+        // pixel per CSS pixel), and it is what is really there: Chrome
+        // drops the pictures it can't send while earlier ones wait to be
+        // acknowledged, the last change included.
         let (browser, page) = (self.clone(), page.clone());
         tokio::spawn(async move {
             tokio::time::sleep(STILL_AFTER).await;

@@ -161,6 +161,8 @@ pub struct PageView {
     last_height: Option<u32>,
     /// The frame of its window the page was last painted in.
     seen: Rc<Cell<Option<Seen>>>,
+    /// The newest picture not drawn yet, and when it arrived (for the log).
+    arrived: Rc<Cell<Option<(u64, Instant)>>>,
     /// Lets go of a view's page once it has gone unseen.
     resting: Option<Task<()>>,
     /// Whether a view's page is the top of its card (no title over it),
@@ -243,6 +245,7 @@ impl PageView {
             themed: None,
             last_height: None,
             seen: Rc::default(),
+            arrived: Rc::default(),
             resting: None,
             flush_top: Rc::default(),
             _subs: subs,
@@ -572,6 +575,7 @@ impl PageView {
             return;
         }
         self.decoding = true;
+        let (arrived, bytes) = (Instant::now(), jpeg.len());
         let decoded = crate::host::decode_jpeg(jpeg, cx);
         cx.spawn(async move |this, cx| {
             let picture = decoded.await;
@@ -581,6 +585,13 @@ impl PageView {
                     if this.view.is_some() && this.picture.is_none() {
                         tracing::debug!(seq, "a view's first picture is in");
                     }
+                    tracing::trace!(
+                        seq,
+                        bytes,
+                        ms = arrived.elapsed().as_millis() as u64,
+                        "a page's picture is decoded"
+                    );
+                    this.arrived.set(Some((seq, arrived)));
                     this.drop_picture(cx);
                     this.picture = Some(picture);
                     cx.notify();
@@ -1140,6 +1151,7 @@ impl PageView {
             self.focus.clone(),
             cx.entity(),
         );
+        let arrived = self.arrived.clone();
         let id = entity.entity_id();
         let body = match (&self.note, &self.picture) {
             (Some(note), _) => v_flex()
@@ -1222,6 +1234,13 @@ impl PageView {
                 canvas(
                     move |area, window, cx| {
                         seen.set(Some(Seen::now(window)));
+                        if let Some((seq, at)) = arrived.take() {
+                            tracing::trace!(
+                                seq,
+                                ms = at.elapsed().as_millis() as u64,
+                                "a page's picture is drawn"
+                            );
+                        }
                         // Its width is known from here on: open, or resize.
                         let before = bounds.replace(Some(area));
                         if before.is_none_or(|b| b.size.width != area.size.width) {

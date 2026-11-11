@@ -31,7 +31,7 @@
 - **A place of its own.** Each view lives at an address made up for it (`https://v<item>.view.agentloft.invalid/`), in a browser context apart from the user's tabs: its own storage and a secure context, none of their cookies.
 - **Nearly no network.** Every request a view makes stops at the daemon first. It answers for the view's own document; lets `GET`s through to a short list of script, style and font hosts (jsDelivr, unpkg, cdnjs, esm.sh, Tailwind's CDN, d3js.org, Plotly's CDN, Google Fonts); and refuses the rest, navigations included. A link opens for the user instead; a page that leaves is brought back.
 - **As wide as the chat column, as tall as its content** (24 to 1400 px; past that it scrolls inside, once clicked into). A view scrolls with the thread otherwise.
-- **Sharp.** Every picture of a view is taken at the viewer's real scale, also while it moves.
+- **Sharp, and never a step behind.** Every picture of a view is a screenshot at the viewer's real scale, also while it moves. The browser's own stream of pictures only serves as the sign that something changed, and it is not a reliable one (Chrome drops what it can't send, the last change included). So a change, a click or a key is followed by looks at the page until one shows the same picture again.
 - **It needs a browser.** Chrome, Chromium, Edge or Brave on the daemon's machine. Without one the view says so, and the agent is told the page was shown but not checked.
 
 ### 3. What a page gets
@@ -74,7 +74,7 @@
 ## Consequences
 
 - An agent can answer with anything a web page can be, and ask a question whose answer is a click.
-- A view is pictures of a page, not the page: no native text selection or screen reader inside it (copy works through the page's own selection), and motion is limited to what the stream carries (about 14 pictures a second).
+- A view is pictures of a page, not the page: no native text selection or screen reader inside it (copy works through the page's own selection), and motion is limited to what the stream carries (about 20 pictures a second), and a click shows about a twentieth of a second after it lands.
 - Each view on screen is a tab in the daemon's browser. Twenty at once, at most.
 - The description costs every session about 500 tokens of tool definitions.
 - `read_thread` shows a view as its HTML, not as a picture.
