@@ -4617,6 +4617,9 @@ impl WorkspaceView {
                 .w_full()
                 .min_w_0()
                 .px_6()
+                // Centred on the column left clear of the details card,
+                // like the composer below.
+                .pr(pad)
                 .items_center()
                 .justify_center()
                 .gap_2()
@@ -4741,6 +4744,9 @@ impl WorkspaceView {
                             .pb(px(0.))
                             .pr(px(inset)),
                     )
+                    // The jump button's row spans the width; a right margin
+                    // of the card's inset centres it on the rows instead.
+                    .with_jump_button_style(gpui_kit::StyleRefinement::default().mr(px(inset)))
                     .flex_1(),
                 )
                 // Right click: Copy, and Quote, for what is selected.
