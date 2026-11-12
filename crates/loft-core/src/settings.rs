@@ -128,7 +128,7 @@ const KEYS: &[Key] = &[
     Key {
         key: "worktrees.delete_remote_branch",
         kind: Kind::Bool,
-        about: "Cleaning up also deletes the branch on the remote, once its pull request is merged",
+        about: "Cleaning up by hand (never automatically) also deletes the branch on the remote, once its pull request is merged",
     },
     Key {
         key: "worktrees.archive_after_cleanup",

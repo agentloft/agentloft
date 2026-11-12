@@ -568,7 +568,8 @@ pub struct WorktreeConfig {
     /// is kept on the thread, to restore it).
     pub delete_branch: bool,
     /// …and the branch on the remote, once its pull request is merged and
-    /// the remote branch is where the thread pushed it.
+    /// the remote branch is where the thread pushed it. Only when the user
+    /// cleans up by hand: nothing remote is deleted automatically.
     pub delete_remote_branch: bool,
     /// Archive the thread after cleaning up (otherwise it stays, and its
     /// next message gets a new worktree).

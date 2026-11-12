@@ -84,7 +84,7 @@ impl SettingsView {
             ))
             .child(row(
                 "Delete the remote branch",
-                "Once its pull request is merged and the remote branch is where the thread pushed it. GitHub can also do this for you.",
+                "Only when you click Clean up, never automatically, and once its pull request is merged and the remote branch is where the thread pushed it. GitHub can also do this for you.",
                 switch(
                     "wt-delete-remote",
                     "delete_remote_branch",

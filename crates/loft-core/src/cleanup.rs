@@ -10,6 +10,8 @@
 //! merged, after Merge, and every hour for every worktree thread (the base
 //! fetched once per repository). `offer` shows it on the thread; `auto`
 //! cleans up there and then, as long as nothing runs in the worktree.
+//! Only local worktrees and branches go by themselves: a remote branch is
+//! deleted only when the user cleans up and has asked for that.
 
 use crate::thread::ThreadCmd;
 use crate::worktrees::blocking;
@@ -182,14 +184,16 @@ impl Core {
     }
 
     /// Remove a landed worktree (and per the settings its branch); the
-    /// thread is then `Released`. `fetch`: bring the base up to date first
-    /// (the automatic cleanup comes right after a look that did).
+    /// thread is then `Released`. `by_user`: the user asked for it now, so
+    /// the base is fetched first (the automatic cleanup comes right after a
+    /// look that did) and, with `delete_remote_branch`, the remote branch
+    /// goes too. Nothing on a remote is ever deleted unasked.
     pub(crate) async fn clean_up_worktree(
         self: &Arc<Self>,
         id: &ThreadId,
-        fetch: bool,
+        by_user: bool,
     ) -> CoreResult<Response> {
-        if fetch {
+        if by_user {
             // Outside the lock: other threads' worktrees needn't wait on
             // the network.
             let thread = self.load_thread(id)?;
@@ -271,7 +275,8 @@ impl Core {
             if !cfg.delete_branch {
                 return Ok(None);
             }
-            if cfg.delete_remote_branch
+            if by_user
+                && cfg.delete_remote_branch
                 && pr_merged
                 && let Some(remote) = wt::pushed_to(&repo, &b)
                 && let Err(err) = wt::delete_remote_branch(&repo, &remote, &b, &env, gh.as_deref())

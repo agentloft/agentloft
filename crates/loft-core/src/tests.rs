@@ -931,6 +931,102 @@ async fn merged_worktree_cleaned_up_then_made_again_in_the_same_folder() {
 }
 
 #[tokio::test]
+async fn automatic_cleanup_never_deletes_a_remote_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, remote) = (dir.path().join("repo"), dir.path().join("remote.git"));
+    std::fs::create_dir_all(&repo).unwrap();
+    git(dir.path(), &["init", "-q", "--bare", "remote.git"]);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    let mut config = loft_config::Config::default();
+    config.worktrees.cleanup = "auto".into();
+    config.worktrees.delete_remote_branch = true;
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            config,
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, &repo).await;
+    core.handle(Request::SetThreadWorkspace {
+        thread_id: thread.id.clone(),
+        worktree: true,
+        base: None,
+    })
+    .await
+    .unwrap();
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "Add notes".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    let (thread, ..) = thread_snapshot(&core, &thread.id);
+    let ThreadWorkspace::Worktree { path, branch, .. } = thread.workspace.clone() else {
+        panic!("{:?}", thread.workspace)
+    };
+    let wt = PathBuf::from(&path);
+    // Pushed, its pull request merged on GitHub (here: main took it).
+    std::fs::write(wt.join("notes.txt"), "notes\n").unwrap();
+    git(&wt, &["add", "."]);
+    git(&wt, &["commit", "-qm", "notes"]);
+    git(&wt, &["push", "-q", "origin", &branch]);
+    git(&repo, &["merge", "-q", "--squash", &branch]);
+    git(&repo, &["commit", "-qm", "Add notes (#1)"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let head = git(&wt, &["rev-parse", "HEAD"]);
+    core.thread_call(&thread.id, |reply| {
+        crate::thread::ThreadCmd::SetPullRequest {
+            pull_request: loft_protocol::PullRequest {
+                number: 1,
+                url: "https://github.com/a/b/pull/1".into(),
+                title: "Add notes".into(),
+                state: loft_protocol::PullRequestState::Merged,
+                checks: Default::default(),
+                review: None,
+                head: Some(head),
+                refreshed_at_ms: 0,
+            },
+            reply,
+        }
+    })
+    .await
+    .unwrap();
+
+    // Cleaned up by itself: the worktree and local branch go, the remote
+    // branch stays.
+    core.check_landed(&thread.id, true).await;
+    let (thread, ..) = thread_snapshot(&core, &thread.id);
+    assert!(
+        matches!(thread.workspace, ThreadWorkspace::Released { .. }),
+        "{:?}",
+        thread.workspace
+    );
+    assert!(!wt.exists());
+    assert_eq!(git(&repo, &["branch", "--list", &branch]), "");
+    assert_ne!(
+        git(&remote, &["branch", "--list", &branch]),
+        "",
+        "the remote branch is kept"
+    );
+}
+
+#[tokio::test]
 async fn fork_gets_own_worktree_and_handoff_draft() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
