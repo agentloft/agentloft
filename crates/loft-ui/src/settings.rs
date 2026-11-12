@@ -25,6 +25,7 @@ mod shortcuts;
 mod threads;
 mod usage;
 mod web;
+mod worktrees;
 
 struct SettingsWindow(AnyWindowHandle, gpui_kit::WeakEntity<SettingsView>);
 impl Global for SettingsWindow {}
@@ -33,6 +34,18 @@ impl Global for SettingsWindow {}
 /// (Agentloft in a browser tab).
 struct SettingsOverlay(Entity<SettingsView>);
 impl Global for SettingsOverlay {}
+
+thread_local! {
+    /// `AGENTLOFT_DEV_TAB=settings:<section>@end`: the page opens scrolled
+    /// to its end (for screenshots of what is below the fold), for this
+    /// many more frames while what it lists comes in.
+    static DEV_SCROLL_END: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The settings page scrolls to its end as it opens (a dev hook).
+pub fn dev_scroll_to_end() {
+    DEV_SCROLL_END.set(300);
+}
 
 /// Open the settings window (optionally at a section), or bring the open
 /// one to the front.
@@ -604,6 +617,10 @@ pub struct SettingsView {
     /// "Custom" is picked for deleting archived threads (its days field
     /// shows even while the value is a preset or never).
     archive_custom: bool,
+    /// The worktree leftovers were asked for (once per opening).
+    leftovers_asked: bool,
+    /// The page's scroll position.
+    scroll: gpui_kit::ScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -680,6 +697,8 @@ impl SettingsView {
             browser: browser::BrowserPage::default(),
             usage: usage::UsagePage::default(),
             archive_custom: false,
+            leftovers_asked: false,
+            scroll: gpui_kit::ScrollHandle::new(),
             _subs: subs,
         }
     }
@@ -866,6 +885,8 @@ impl SettingsView {
                     .into_any_element(),
                 p,
             ))
+            .child(self.worktree_cleanup(p, cx))
+            .child(self.worktree_leftovers(p, cx))
             .into_any_element()
     }
 
@@ -915,6 +936,16 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        // Laid out once first, so the end is known; then again until the
+        // page has settled (lists fill in as answers come).
+        let frames = DEV_SCROLL_END.get();
+        if frames > 0 {
+            DEV_SCROLL_END.set(frames - 1);
+            if self.scroll.max_offset().y > px(0.) {
+                self.scroll.scroll_to_bottom();
+            }
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
+        }
         let mut nav = v_flex().gap_0p5().px_2();
         for section in Section::all() {
             let active = section == self.section;
@@ -1062,6 +1093,7 @@ impl Render for SettingsView {
                     .child(
                         v_flex()
                             .id("settings-scroll")
+                            .track_scroll(&self.scroll)
                             .w_full()
                             .flex_1()
                             .min_h_0()

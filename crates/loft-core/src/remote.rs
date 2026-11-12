@@ -243,6 +243,10 @@ impl Core {
             | Request::RefreshPullRequest { .. }
             | Request::ArchiveThread { .. }
             | Request::DeleteThread { .. }
+            | Request::CleanUpWorktree { .. }
+            | Request::RestoreBranch { .. }
+            | Request::WorktreeLeftovers
+            | Request::RemoveWorktreeLeftovers { .. }
             | Request::SearchThreads { .. }
             | Request::UsageReport { .. }
             // Automations start threads, as a browser can itself.

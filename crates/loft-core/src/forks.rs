@@ -215,6 +215,7 @@ impl Core {
             limit: None,
             automation_id: None,
             pull_request: None,
+            landed: false,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
@@ -372,6 +373,7 @@ impl Core {
             limit: None,
             automation_id: None,
             pull_request: None,
+            landed: false,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
@@ -392,16 +394,21 @@ impl Core {
             .with_store(|s| s.project(&parent.project_id))?
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
         let repo = PathBuf::from(&project.root_path);
-        if loft_git::repo_root(&repo).is_none() || !Path::new(&parent.cwd).exists() {
+        // A parent whose worktree was cleaned up: its work is in its base,
+        // so the fork starts there (or at the turn it forks from).
+        let released = matches!(parent.workspace, ThreadWorkspace::Released { .. });
+        if loft_git::repo_root(&repo).is_none() || (!released && !Path::new(&parent.cwd).exists()) {
             return Ok((parent.cwd.clone(), parent.workspace.clone()));
         }
         let parent_cwd = PathBuf::from(&parent.cwd);
         let base = match &parent.workspace {
-            ThreadWorkspace::Worktree { base, .. } => Some(base.clone()),
+            ThreadWorkspace::Worktree { base, .. } | ThreadWorkspace::Released { base, .. } => {
+                Some(base.clone())
+            }
             _ => None,
         };
         let stem = match &parent.workspace {
-            ThreadWorkspace::Worktree { branch, .. } => {
+            ThreadWorkspace::Worktree { branch, .. } | ThreadWorkspace::Released { branch, .. } => {
                 branch.rsplit('/').next().unwrap_or("thread").to_owned()
             }
             _ => slug_or(&parent.title, "thread"),
@@ -428,6 +435,10 @@ impl Core {
             // Uncommitted work comes along as the fork-point commit.
             let commit = match start {
                 Some(commit) => commit,
+                None if released => wt::base_revs(&repo, &base, None)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| base.clone()),
                 None => loft_git::checkpoint(&parent_cwd, &ref_name, "Agentloft fork point")?,
             };
             let branch = wt::unique_branch(&repo, &prefix, &format!("{stem}-fork"));

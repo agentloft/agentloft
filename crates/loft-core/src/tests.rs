@@ -717,6 +717,220 @@ async fn worktree_thread_created_on_first_message_merged_and_archived() {
 }
 
 #[tokio::test]
+async fn merged_worktree_cleaned_up_then_made_again_in_the_same_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, &repo).await;
+    core.handle(Request::SetThreadWorkspace {
+        thread_id: thread.id.clone(),
+        worktree: true,
+        base: None,
+    })
+    .await
+    .unwrap();
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "Add a greet() function".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    let (thread, ..) = thread_snapshot(&core, &thread.id);
+    let session = thread.native_session_id.clone().expect("a session");
+    let ThreadWorkspace::Worktree { path, branch, .. } = thread.workspace.clone() else {
+        panic!("{:?}", thread.workspace)
+    };
+    let wt = PathBuf::from(&path);
+
+    // Not in main yet: nothing to clean up.
+    std::fs::write(wt.join("greet.py"), "def greet(): ...\n").unwrap();
+    let err = core
+        .handle(Request::CleanUpWorktree {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{}", err.message);
+    assert!(wt.exists());
+
+    // Merged: the thread says so, and cleaning up removes the worktree and
+    // its branch.
+    core.handle(Request::MergeThread {
+        thread_id: thread.id.clone(),
+        message: None,
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, |t, _| t.landed).await;
+    let Response::Thread { thread } = core
+        .handle(Request::CleanUpWorktree {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let ThreadWorkspace::Released { tip: Some(tip), .. } = thread.workspace.clone() else {
+        panic!("{:?}", thread.workspace)
+    };
+    assert!(!thread.landed);
+    assert_eq!(thread.status, ThreadStatus::Idle, "the thread stays");
+    assert!(!wt.exists());
+    assert_eq!(git(&repo, &["branch", "--list", &branch]), "");
+
+    // The deleted branch can come back where it was.
+    let Response::Thread { thread } = core
+        .handle(Request::RestoreBranch {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(matches!(
+        thread.workspace,
+        ThreadWorkspace::Released { tip: None, .. }
+    ));
+    assert_eq!(git(&repo, &["rev-parse", &branch]), tip);
+    git(&repo, &["branch", "-D", &branch]);
+
+    // The next message makes a new worktree in the same folder, from main
+    // as it is now, and the agent carries on its session, told why.
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "Now add a farewell() too".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, |_, turns| {
+        turns.len() == 2 && turns[1].status.is_terminal()
+    })
+    .await;
+    let (thread, _, items, _) = thread_snapshot(&core, &thread.id);
+    let ThreadWorkspace::Worktree {
+        path: again,
+        branch: branch_again,
+        base,
+    } = thread.workspace.clone()
+    else {
+        panic!("{:?}", thread.workspace)
+    };
+    assert_eq!(again, path, "same folder");
+    assert_eq!(thread.cwd, path);
+    assert_eq!(branch_again, branch, "the old name, free again");
+    assert_eq!(base, "main");
+    assert!(
+        wt.join("greet.py").exists(),
+        "starts from main, merged work in"
+    );
+    assert_eq!(thread.native_session_id.as_deref(), Some(session.as_str()));
+    assert!(items.iter().any(|i| matches!(&i.body,
+        ItemBody::Notice { text, .. } if text.starts_with(&format!("New worktree on {branch}")))));
+    assert!(
+        items.iter().any(|i| matches!(&i.body,
+        ItemBody::AssistantMessage { text } if text.contains("worktree (branch"))),
+        "the agent is told"
+    );
+
+    // Archiving a landed thread drops its branch too; unarchiving leaves
+    // the worktree to the next message.
+    std::fs::write(wt.join("farewell.py"), "def farewell(): ...\n").unwrap();
+    core.handle(Request::MergeThread {
+        thread_id: thread.id.clone(),
+        message: None,
+    })
+    .await
+    .unwrap();
+    let Response::Thread { thread } = core
+        .handle(Request::ArchiveThread {
+            thread_id: thread.id.clone(),
+            force: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(
+        matches!(
+            thread.workspace,
+            ThreadWorkspace::Released { tip: Some(_), .. }
+        ),
+        "{:?}",
+        thread.workspace
+    );
+    assert!(!wt.exists());
+    assert_eq!(git(&repo, &["branch", "--list", &branch]), "");
+    let Response::Thread { thread } = core
+        .handle(Request::UnarchiveThread {
+            thread_id: thread.id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.status, ThreadStatus::Idle);
+    assert!(matches!(thread.workspace, ThreadWorkspace::Released { .. }));
+    assert!(!wt.exists());
+
+    // Leftovers: a branch with nothing of its own goes, one with work not
+    // in main stays.
+    git(&repo, &["branch", "agentloft/old", "main"]);
+    git(&repo, &["switch", "-q", "-c", "agentloft/wip"]);
+    std::fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "wip"]);
+    git(&repo, &["switch", "-q", "main"]);
+    let Response::WorktreeLeftovers { leftovers } =
+        core.handle(Request::WorktreeLeftovers).await.unwrap()
+    else {
+        panic!()
+    };
+    let find = |name: &str| {
+        leftovers
+            .iter()
+            .find(|l| l.branch.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("{name} in {leftovers:?}"))
+            .clone()
+    };
+    assert!(find("agentloft/old").landed);
+    let wip = find("agentloft/wip");
+    assert!(!wip.landed);
+    assert_eq!(wip.ahead, 1);
+    let Response::Text { text } = core
+        .handle(Request::RemoveWorktreeLeftovers { leftovers })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(text.starts_with("Removed 1 branch"), "{text}");
+    assert_eq!(git(&repo, &["branch", "--list", "agentloft/old"]), "");
+    assert_ne!(git(&repo, &["branch", "--list", "agentloft/wip"]), "");
+}
+
+#[tokio::test]
 async fn fork_gets_own_worktree_and_handoff_draft() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -139,6 +139,12 @@ pub(crate) enum ThreadCmd {
         pull_request: loft_protocol::PullRequest,
         reply: Reply,
     },
+    /// Internal: whether the worktree's work is in its base branch
+    /// (`crate::cleanup`). Saved only if it changed.
+    SetLanded {
+        landed: bool,
+        reply: Reply,
+    },
 }
 
 pub(crate) type ThreadHandle = mpsc::UnboundedSender<ThreadCmd>;
@@ -501,6 +507,22 @@ impl ThreadActor {
                 let res = crate::pull_requests::apply(&self.core, &mut self.thread, pull_request);
                 let _ = reply.send(res);
             }
+            ThreadCmd::SetLanded { landed, reply } => {
+                // Not over a turn that has started since the look began.
+                let res = if self.thread.landed == landed || (landed && self.turn.is_some()) {
+                    Ok(Response::Ok)
+                } else {
+                    // Without touching `updated_at_ms`: the sidebar keeps
+                    // its order.
+                    self.thread.landed = landed;
+                    self.core
+                        .commit(vec![Event::ThreadUpdated {
+                            thread: self.thread.clone(),
+                        }])
+                        .map(|_| Response::Ok)
+                };
+                let _ = reply.send(res);
+            }
             ThreadCmd::Shutdown { .. } => unreachable!("handled in run loop"),
         }
     }
@@ -667,23 +689,46 @@ impl ThreadActor {
             },
             ItemStatus::Completed,
         )?;
+        // A new worktree in place of one that was cleaned up: said in the
+        // conversation, and to the agent with this prompt.
+        let renewed = match self.core.take_pending_note(&self.thread.id) {
+            Some((notice, note)) => {
+                self.pending_note = Some(match self.pending_note.take() {
+                    Some(earlier) => format!("{earlier}\n{note}"),
+                    None => note,
+                });
+                Some(self.new_item(
+                    Some(turn.id.clone()),
+                    ItemBody::Notice {
+                        level: loft_protocol::NoticeLevel::Info,
+                        text: notice,
+                    },
+                    ItemStatus::Completed,
+                )?)
+            }
+            None => None,
+        };
         if ordinal == 1 && self.thread.title == "New thread" {
             self.thread.title = title_from(&text);
             self.generate_title(&text, &attachments);
         }
         self.thread.status = ThreadStatus::Running;
         self.thread.updated_at_ms = now;
+        // The agent may change the worktree; looked at again when it ends.
+        self.thread.landed = false;
         self.limit_hit = None;
         if self.thread.limit.take().is_some() {
             self.core.limit_changed(&self.thread.id, None);
         }
-        self.core.commit(vec![
+        let mut events = vec![
             Event::TurnStarted { turn: turn.clone() },
             Event::ItemUpserted { item: user_item },
-            Event::ThreadUpdated {
-                thread: self.thread.clone(),
-            },
-        ])?;
+        ];
+        events.extend(renewed.map(|item| Event::ItemUpserted { item }));
+        events.push(Event::ThreadUpdated {
+            thread: self.thread.clone(),
+        });
+        self.core.commit(events)?;
         self.turn = Some(turn.clone());
 
         // Compact a conversation that sat idle first; the message follows
@@ -1708,6 +1753,7 @@ impl ThreadActor {
         });
         self.core.commit(events)?;
         crate::pull_requests::turn_ended(&self.core, &self.thread);
+        crate::cleanup::turn_ended(&self.core, &self.thread);
         if let Some(turn) = finished.filter(|t| t.checkpoint_before.is_some()) {
             self.capture_checkpoint(&turn, false);
         }

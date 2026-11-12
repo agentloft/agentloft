@@ -272,6 +272,9 @@ pub struct AppStore {
     pub models: HashMap<HarnessId, Vec<loft_protocol::ModelInfo>>,
     /// Installed CLIs (`ProbeHarness`).
     pub harness_status: HashMap<HarnessId, loft_protocol::HarnessStatus>,
+    /// Worktrees and branches no active thread works in (Settings ▸
+    /// Worktrees); `None` until asked, or while asking.
+    pub worktree_leftovers: Option<Vec<loft_protocol::WorktreeLeftover>>,
     /// Each project's branches (`ListBranches`), for worktree bases.
     pub branches: HashMap<ProjectId, loft_protocol::BranchList>,
     branches_loading: std::collections::HashSet<ProjectId>,
@@ -282,6 +285,9 @@ pub struct AppStore {
     pub browser: loft_config::BrowserConfig,
     /// `[threads]` in the settings (compacting idle threads), kept current.
     pub threads_config: loft_config::ThreadsConfig,
+    /// `[worktrees]` in the settings (cleaning up merged worktrees), kept
+    /// current.
+    pub worktrees_config: loft_config::WorktreeConfig,
     /// `[pricing]` in the settings: API prices over the built-in ones.
     pub pricing: std::collections::BTreeMap<String, loft_config::ModelPrice>,
     /// The model prices the daemon fetched (models.dev), as it last saved them.
@@ -334,11 +340,13 @@ impl AppStore {
             unread: Default::default(),
             models: HashMap::new(),
             harness_status: HashMap::new(),
+            worktree_leftovers: None,
             branches: HashMap::new(),
             branches_loading: Default::default(),
             disabled_agents: Default::default(),
             browser: Default::default(),
             threads_config: Default::default(),
+            worktrees_config: Default::default(),
             pricing: Default::default(),
             price_catalog: None,
             hidden_models: HashMap::new(),
@@ -526,6 +534,7 @@ impl AppStore {
         };
         self.browser = config.browser.clone();
         self.threads_config = config.threads.clone();
+        self.worktrees_config = config.worktrees.clone();
         self.pricing = config.pricing.clone();
         let file = loft_config::pricing::catalog_file(&self.paths);
         let fetched = self.price_catalog.as_ref().map(|c| c.fetched_at_ms);
@@ -1630,6 +1639,71 @@ impl AppStore {
         });
     }
 
+    /// Remove a worktree whose work is in its base (and per the settings
+    /// its branch); the thread stays and gets a new one with its next
+    /// message.
+    pub fn clean_up_worktree(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let body = Request::CleanUpWorktree { thread_id };
+        self.request_result(body, cx, |store, result, cx| {
+            let result = result.map(|r| match r {
+                Response::Thread { thread } => match thread.workspace {
+                    loft_protocol::ThreadWorkspace::Released { tip: Some(_), .. } => {
+                        "Worktree and branch removed".into()
+                    }
+                    _ => "Worktree removed".into(),
+                },
+                _ => "Worktree removed".into(),
+            });
+            store.notify_result(result, cx);
+        });
+    }
+
+    /// Bring back the branch a worktree cleanup deleted.
+    pub fn restore_branch(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let body = Request::RestoreBranch { thread_id };
+        self.request_result(body, cx, |store, result, cx| {
+            store.notify_result(result.map(|_| "Branch restored".into()), cx);
+        });
+    }
+
+    /// Worktrees and branches no active thread works in, into
+    /// `worktree_leftovers` (`None` while asking).
+    pub fn fetch_worktree_leftovers(&mut self, cx: &mut Context<Self>) {
+        self.worktree_leftovers = None;
+        cx.notify();
+        self.request_result(Request::WorktreeLeftovers, cx, |store, result, cx| {
+            match result {
+                Ok(Response::WorktreeLeftovers { leftovers }) => {
+                    store.worktree_leftovers = Some(leftovers);
+                }
+                Ok(_) => store.worktree_leftovers = Some(Vec::new()),
+                Err(err) => {
+                    store.worktree_leftovers = Some(Vec::new());
+                    store.notify_result(Err(err), cx);
+                }
+            }
+            cx.notify();
+        });
+    }
+
+    /// Remove these leftovers (each checked again by the daemon), then
+    /// list what is left.
+    pub fn remove_worktree_leftovers(
+        &mut self,
+        leftovers: Vec<loft_protocol::WorktreeLeftover>,
+        cx: &mut Context<Self>,
+    ) {
+        let body = Request::RemoveWorktreeLeftovers { leftovers };
+        self.request_result(body, cx, |store, result, cx| {
+            let result = result.map(|r| match r {
+                Response::Text { text } => text,
+                _ => "Removed".into(),
+            });
+            store.notify_result(result, cx);
+            store.fetch_worktree_leftovers(cx);
+        });
+    }
+
     /// Fork into `harness` (ADR-0011) and open the fork; a cross-provider
     /// fork's handoff digest lands in its composer for review.
     /// `at_turn` forks from the end of that turn instead of the latest.
@@ -2158,6 +2232,9 @@ pub enum Row {
     /// The agent's usage limit stopped the thread: when it resets, and
     /// whether the thread carries on then.
     Limit,
+    /// The worktree's work is all in its base (offer to clean it up), or
+    /// it was cleaned up (the next message makes a new one).
+    Worktree,
     /// A message of yours waiting for the turn to end (its id in the
     /// thread's queue): the last rows, in the order they'll go.
     Queued(u64),
@@ -2316,6 +2393,7 @@ impl ThreadState {
             | Row::TurnFooter { .. }
             | Row::Card(_)
             | Row::Limit
+            | Row::Worktree
             | Row::Queued(_) => false,
         })
     }
@@ -2447,6 +2525,17 @@ impl ThreadState {
         }
         if model.thread.limit.is_some() && model.running_turn().is_none() {
             rows.push(Row::Limit);
+        }
+        let released = matches!(
+            model.thread.workspace,
+            loft_protocol::ThreadWorkspace::Released { .. }
+        );
+        if (model.thread.landed || released)
+            && model.running_turn().is_none()
+            && model.thread.status != loft_protocol::ThreadStatus::Archived
+            && !model.items.is_empty()
+        {
+            rows.push(Row::Worktree);
         }
         rows.extend(model.queue.iter().map(|m| Row::Queued(m.id)));
         std::mem::replace(&mut self.rows, rows)

@@ -224,9 +224,21 @@ fn thread_info(store: &AppStore, id: &ThreadId) -> Option<Info> {
             .map(|t| t.title.clone())?;
         Some((p, title))
     });
+    // A worktree that was cleaned up: until the next message makes a new
+    // one, the thread's folder is the project's.
+    let cwd = match &thread.workspace {
+        ThreadWorkspace::Released { .. } => store
+            .workspace
+            .projects
+            .iter()
+            .find(|p| p.id == thread.project_id)
+            .map(|p| p.root_path.clone())
+            .unwrap_or_else(|| thread.cwd.clone()),
+        _ => thread.cwd.clone(),
+    };
     Some(Info {
         project: thread.project_id.clone(),
-        cwd: thread.cwd.clone(),
+        cwd,
         workspace: thread.workspace.clone(),
         parent,
     })
@@ -471,6 +483,11 @@ impl DetailsCard {
     }
 
     fn count_changes(&mut self, cx: &mut Context<Self>) {
+        // No worktree to compare: its work is in the base.
+        if matches!(self.info.workspace, ThreadWorkspace::Released { .. }) {
+            self.changes = Some((0, 0, 0));
+            return;
+        }
         let Some(client) = self.store.read(cx).client() else {
             return;
         };
@@ -590,6 +607,17 @@ fn icon(name: IconName, p: &Palette) -> AnyElement {
 impl Render for DetailsCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        // The thread may have changed under the card (its worktree cleaned
+        // up, or made again).
+        if let Some(info) = thread_info(self.store.read(cx), &self.thread_id) {
+            let renewed = info.workspace != self.info.workspace;
+            self.info = info;
+            if renewed {
+                self.changes = None;
+                self.changes_base = None;
+                self.count_changes(cx);
+            }
+        }
         let cwd = self.info.cwd.clone();
         let place = self.place;
         // What the thread is, then what it started: only the lists scroll.
@@ -742,6 +770,9 @@ impl Render for DetailsCard {
             ThreadWorkspace::NewWorktree { .. } => {
                 (Some("New worktree (on first message)".into()), None)
             }
+            ThreadWorkspace::Released { branch, base, .. } => {
+                (Some(branch.clone()), Some(base.clone()))
+            }
             ThreadWorkspace::Local => (
                 self.local_branch.clone().or_else(|| {
                     let branches = self.store.read(cx).branches.get(&self.info.project)?;
@@ -751,6 +782,31 @@ impl Render for DetailsCard {
             ),
         };
         let copy = branch.clone();
+        // Cleaned up: `Some(true)` when its branch was deleted and can be
+        // brought back.
+        let released = match &self.info.workspace {
+            ThreadWorkspace::Released { tip, .. } => Some(tip.is_some()),
+            _ => None,
+        };
+        let restore = released.filter(|deleted| *deleted).map(|_| {
+            let (store, id) = (self.store.clone(), self.thread_id.clone());
+            div()
+                .id("details-restore-branch")
+                .flex_none()
+                .px_1p5()
+                .rounded(px(5.))
+                .text_xs()
+                .text_color(p.accent)
+                .cursor_pointer()
+                .hover(|d| d.bg(p.hover))
+                .claims_press()
+                .child("Restore")
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let id = id.clone();
+                    store.update(cx, |s, cx| s.restore_branch(id, cx));
+                })
+        });
         top = top.child(
             row("details-branch", &p)
                 .cursor_pointer()
@@ -765,14 +821,20 @@ impl Render for DetailsCard {
                 )
                 .child(
                     div()
+                        .flex_none()
                         .text_xs()
                         .text_color(p.faint_foreground)
                         .child(if self.copied {
                             "Copied".to_owned()
+                        } else if released.is_some() {
+                            // Its worktree is gone; its work is in the base.
+                            base.map(|b| format!("in {b} · worktree removed"))
+                                .unwrap_or_default()
                         } else {
                             base.map(|b| format!("from {b}")).unwrap_or_default()
                         }),
                 )
+                .children(restore)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(name) = &copy {
                         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(name.clone()));

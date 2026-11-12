@@ -34,6 +34,7 @@ Run the full suite once, in the background if your tool allows it, saving the ou
 - New Lucide icons go in `AppIcons` in `crates/loft-ui/src/assets.rs`; an unlisted icon renders as a blank box.
 - gpui-kit `Button` / `Switch` / dropdown buttons default to the arrow cursor; chain `.cursor_pointer()`. Everything clickable shows a hand.
 - A hand-drawn control (a `div` with `on_click`) whose click calls `cx.stop_propagation()` also needs `.claims_press()` (`crates/loft-ui/src/press.rs`). The window's text selection starts on any press, even in blank space. Stopping propagation keeps the mouse-up from ending it, so it keeps following the pointer with no button held. gpui-kit's `Button` already claims its press.
+- `AGENTLOFT_DEV_TAB=settings:<section>@end` opens that settings page scrolled to its end (what is below the fold). `AGENTLOFT_DEV_CLICK=x,y,after_ms` then clicks in the settings window.
 - `AGENTLOFT_DEV_TAB=click:…` also takes `move x,y,after_ms` steps (the pointer moves with no button held), e.g. to check that nothing is left selecting after a click.
 - A `drag_over` style can't recolour text (text is coloured at layout); show a drop hint with an svg and `group_drag_over`.
 - A subagent's isolated worktree starts from `origin/main`, not the local `HEAD`: unpushed commits (and `press.rs`-style helpers they add) are missing there. Merge its files back with `git merge-file <ours> <base> <theirs>` per file, base being the worktree's `HEAD`.

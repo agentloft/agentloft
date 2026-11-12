@@ -560,6 +560,19 @@ pub struct WorktreeConfig {
     pub mode: String,
     /// Branch prefix for worktree branches.
     pub branch_prefix: String,
+    /// A worktree whose work is already in its base branch: `off` (it
+    /// stays until the thread is archived) | `offer` (the thread offers to
+    /// clean it up) | `auto` (cleaned up once the thread is idle).
+    pub cleanup: String,
+    /// Cleaning up also deletes the thread's local branch (its last commit
+    /// is kept on the thread, to restore it).
+    pub delete_branch: bool,
+    /// …and the branch on the remote, once its pull request is merged and
+    /// the remote branch is where the thread pushed it.
+    pub delete_remote_branch: bool,
+    /// Archive the thread after cleaning up (otherwise it stays, and its
+    /// next message gets a new worktree).
+    pub archive_after_cleanup: bool,
 }
 
 impl Default for WorktreeConfig {
@@ -567,7 +580,23 @@ impl Default for WorktreeConfig {
         Self {
             mode: "ask".into(),
             branch_prefix: "agentloft".into(),
+            cleanup: "offer".into(),
+            delete_branch: true,
+            delete_remote_branch: false,
+            archive_after_cleanup: false,
         }
+    }
+}
+
+impl WorktreeConfig {
+    /// `cleanup = "auto"`.
+    pub fn cleans_up_automatically(&self) -> bool {
+        self.cleanup == "auto"
+    }
+
+    /// Anything but `cleanup = "off"`.
+    pub fn cleans_up(&self) -> bool {
+        self.cleanup != "off"
     }
 }
 

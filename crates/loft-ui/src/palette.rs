@@ -525,6 +525,30 @@ fn build(
                     v.store.update(cx, |s, cx| s.create_pull_request(id, cx));
                 },
             ));
+            if t.landed {
+                let id = t.id.clone();
+                items.push(entry(
+                    "Clean up worktree",
+                    IconName::Trash,
+                    None,
+                    move |v, _, cx| {
+                        let id = id.clone();
+                        v.store.update(cx, |s, cx| s.clean_up_worktree(id, cx));
+                    },
+                ));
+            }
+        }
+        if let ThreadWorkspace::Released { tip: Some(_), .. } = &t.workspace {
+            let id = t.id.clone();
+            items.push(entry(
+                "Restore branch",
+                IconName::GitBranch,
+                None,
+                move |v, _, cx| {
+                    let id = id.clone();
+                    v.store.update(cx, |s, cx| s.restore_branch(id, cx));
+                },
+            ));
         }
         let id = t.id.clone();
         items.push(entry(

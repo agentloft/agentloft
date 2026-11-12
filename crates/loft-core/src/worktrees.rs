@@ -1,6 +1,7 @@
 //! Per-thread worktrees (ADR-0008, PLAN §5.2): chosen before the first
 //! message, created when it is sent (branch named after it), squash-merged
-//! back into the base branch, removed on archive.
+//! back into the base branch, removed on archive or once its work is in the
+//! base (`crate::cleanup`), and made again by the next message.
 
 use crate::thread::ThreadCmd;
 use crate::{Core, CoreResult, internal, lock};
@@ -12,7 +13,6 @@ use loft_protocol::{
 use loft_store::now_ms;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::oneshot;
 
 fn not_found() -> ErrorBody {
     ErrorBody::new(ErrorCode::NotFound, "thread not found")
@@ -97,7 +97,7 @@ impl Core {
         self.with_store(|s| s.thread(id))?.ok_or_else(not_found)
     }
 
-    fn save_thread(&self, thread: &Thread) -> CoreResult<()> {
+    pub(crate) fn save_thread(&self, thread: &Thread) -> CoreResult<()> {
         self.commit(vec![Event::ThreadUpdated {
             thread: thread.clone(),
         }])
@@ -145,7 +145,9 @@ impl Core {
     }
 
     /// Before a thread's first message: create its pending worktree, named
-    /// after the message, and move the thread into it.
+    /// after the message, and move the thread into it. A thread whose
+    /// worktree was cleaned up gets a new one, at the same folder, from its
+    /// base as it is now.
     pub(crate) async fn ensure_workspace(
         self: &Arc<Self>,
         id: &ThreadId,
@@ -153,8 +155,12 @@ impl Core {
     ) -> CoreResult<()> {
         let _guard = self.worktree_lock.lock().await;
         let mut thread = self.load_thread(id)?;
-        let ThreadWorkspace::NewWorktree { base: requested } = thread.workspace.clone() else {
-            return Ok(());
+        let (requested, again) = match thread.workspace.clone() {
+            ThreadWorkspace::NewWorktree { base } => (base, None),
+            ThreadWorkspace::Released {
+                path, branch, base, ..
+            } => (None, Some((path, branch, base))),
+            _ => return Ok(()),
         };
         let env = self.opts().env.clone();
         let project = self
@@ -166,14 +172,40 @@ impl Core {
             .opts()
             .worktrees_dir
             .join(slug_or(&project.name, "project"));
-        let slug = slug_or(text, "thread");
+        let slug = match &again {
+            // The old branch's name (`-2` if it is still there).
+            Some((_, branch, _)) => branch
+                .strip_prefix(&format!("{prefix}/"))
+                .or_else(|| branch.rsplit('/').next())
+                .unwrap_or("thread")
+                .to_owned(),
+            None => slug_or(text, "thread"),
+        };
         let project_cfg = loft_config::ProjectConfig::load(&repo);
         let setup = project_cfg.worktree.setup.clone();
-        let workspace = blocking(move || {
+        let wanted = again
+            .as_ref()
+            .map(|(path, _, base)| (path.clone(), base.clone()));
+        let (workspace, start) = blocking(move || {
+            let requested = match &wanted {
+                // Its base as the remote has it now, if it has it.
+                Some((_, base)) if base != "HEAD" => Some(WorktreeBase {
+                    branch: base.clone(),
+                    remote: wt::base_remote(&repo, base)
+                        .filter(|r| wt::rev_exists(&repo, &format!("{r}/{base}"))),
+                }),
+                Some(_) => None,
+                None => requested,
+            };
             let (start, base) = worktree_start(&repo, requested, &env)?;
             let branch = wt::unique_branch(&repo, &prefix, &slug);
             let leaf = branch.rsplit('/').next().unwrap_or(&slug).to_owned();
-            let mut path = dir.join(&leaf);
+            // The same folder as before, so the agent's session (kept per
+            // folder) carries on.
+            let mut path = match &wanted {
+                Some((old, _)) if !Path::new(old).exists() => PathBuf::from(old),
+                _ => dir.join(&leaf),
+            };
             let mut n = 2;
             while path.exists() {
                 path = dir.join(format!("{leaf}-{n}"));
@@ -182,13 +214,30 @@ impl Core {
             wt::add(&repo, &path, &branch, &start)?;
             let copied = wt::copy_untracked(&repo, &path, &project_cfg.worktree.copy);
             tracing::info!(branch, path = %path.display(), ?copied, "worktree created");
-            Ok(ThreadWorkspace::Worktree {
-                path: path.to_string_lossy().into_owned(),
-                branch,
-                base,
-            })
+            Ok((
+                ThreadWorkspace::Worktree {
+                    path: path.to_string_lossy().into_owned(),
+                    branch,
+                    base,
+                },
+                start,
+            ))
         })
         .await?;
+        if let (Some((old_path, old_branch, _)), ThreadWorkspace::Worktree { path, branch, .. }) =
+            (&again, &workspace)
+        {
+            let notice = format!("New worktree on {branch} from {start}");
+            let moved = if old_path == path {
+                String::new()
+            } else {
+                format!(" at {path}")
+            };
+            let note = format!(
+                "[Agentloft: this thread's worktree (branch `{old_branch}`) was removed once its work was in {start}. You are in a new worktree{moved} on branch `{branch}`, made from {start} as it is now. Files may differ from what you saw earlier; re-read them before relying on earlier edits.]"
+            );
+            lock(&self.pending_notes).insert(id.clone(), (notice, note));
+        }
         if let ThreadWorkspace::Worktree { path, .. } = &workspace {
             thread.cwd = path.clone();
         }
@@ -241,6 +290,9 @@ impl Core {
         let out =
             blocking(move || wt::squash_merge(&repo, Path::new(&path), &branch, &base2, &message))
                 .await?;
+        // Now in the base: the thread may offer (or do) its cleanup.
+        let (core, tid) = (self.clone(), id.clone());
+        tokio::spawn(async move { core.check_landed(&tid, false).await });
         let short = &out.commit[..out.commit.len().min(7)];
         let files = if out.files == 1 { "file" } else { "files" };
         Ok(Response::Text {
@@ -262,6 +314,12 @@ impl Core {
             return Err(ErrorBody::new(
                 ErrorCode::Conflict,
                 "stop the running turn before reverting",
+            ));
+        }
+        if matches!(thread.workspace, ThreadWorkspace::Released { .. }) {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "this thread's worktree was cleaned up; its next message gets a new one",
             ));
         }
         let turn = self
@@ -351,22 +409,35 @@ impl Core {
         if thread.status != ThreadStatus::Archived {
             return Ok(Response::Thread { thread });
         }
-        if let ThreadWorkspace::Worktree { path, branch, .. } = &thread.workspace
+        if let ThreadWorkspace::Worktree { path, branch, base } = &thread.workspace
             && !Path::new(path).exists()
         {
             let project = self
                 .with_store(|s| s.project(&thread.project_id))?
                 .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
-            let (repo, dir, branch) = (
+            let (repo, dir, b) = (
                 PathBuf::from(project.root_path),
                 PathBuf::from(path),
                 branch.clone(),
             );
-            blocking(move || {
+            let restored = blocking(move || {
                 wt::prune(&repo)?;
-                wt::add_existing(&repo, &dir, &branch)
+                if !wt::has_branch(&repo, &b) {
+                    return Ok(false);
+                }
+                wt::add_existing(&repo, &dir, &b)?;
+                Ok(true)
             })
             .await?;
+            // Its branch is gone: the next message makes a new worktree.
+            if !restored {
+                thread.workspace = ThreadWorkspace::Released {
+                    path: path.clone(),
+                    branch: branch.clone(),
+                    base: base.clone(),
+                    tip: None,
+                };
+            }
         }
         thread.status = ThreadStatus::Idle;
         thread.updated_at_ms = now_ms();
@@ -379,12 +450,9 @@ impl Core {
         id: &ThreadId,
         force: bool,
     ) -> CoreResult<Response> {
-        let mut thread = self.load_thread(id)?;
+        let thread = self.load_thread(id)?;
         // A fork sharing this worktree keeps it alive.
-        let shared = self
-            .with_store(|s| s.threads())?
-            .iter()
-            .any(|t| &t.id != id && t.status != ThreadStatus::Archived && t.cwd == thread.cwd);
+        let shared = self.shares_folder(&thread)?;
         if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace
             && !shared
         {
@@ -399,31 +467,56 @@ impl Core {
                 }
             }
         }
+        // Everything in it is in the base: its branch can go too.
+        let cfg = self.config().worktrees.clone();
+        let drop_branch = cfg.cleans_up() && cfg.delete_branch && !shared;
         // Stop the agent session, then the thread's shell.
-        let handle = lock(&self.threads).remove(id);
-        if let Some(handle) = handle {
-            let (tx, rx) = oneshot::channel();
-            if handle.send(ThreadCmd::Shutdown { done: tx }).is_ok() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
-            }
-        }
-        self.terminals
-            .close_prefix(&format!("thread:{}", id.as_str()));
-        if let ThreadWorkspace::Worktree { path, .. } = &thread.workspace
+        self.stop_thread_actor(id).await;
+        let mut thread = self.load_thread(id)?;
+        if let ThreadWorkspace::Worktree { path, branch, base } = thread.workspace.clone()
             && !shared
         {
             let project = self
                 .with_store(|s| s.project(&thread.project_id))?
                 .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
-            let (repo, dir) = (PathBuf::from(project.root_path), PathBuf::from(path));
-            blocking(move || {
+            let (repo, dir, b) = (
+                PathBuf::from(project.root_path),
+                PathBuf::from(&path),
+                branch.clone(),
+            );
+            let head = thread
+                .pull_request
+                .as_ref()
+                .filter(|pr| pr.state == loft_protocol::PullRequestState::Merged)
+                .and_then(|pr| pr.head.clone());
+            let base2 = base.clone();
+            let tip = blocking(move || {
+                // Looked at again on the spot: nothing new since.
+                let landed = drop_branch
+                    && wt::worktree_landed(&repo, &dir, &b, &base2, head.as_deref(), None)
+                        .unwrap_or(false);
                 if dir.exists() {
                     wt::remove(&repo, &dir, force)?;
                 }
-                wt::prune(&repo)
+                wt::prune(&repo)?;
+                if !landed {
+                    return Ok(None);
+                }
+                let tip = wt::tip(&repo, &b)?;
+                wt::delete_branch(&repo, &b)?;
+                Ok(Some(tip))
             })
             .await?;
+            if tip.is_some() {
+                thread.workspace = ThreadWorkspace::Released {
+                    path,
+                    branch,
+                    base,
+                    tip,
+                };
+            }
         }
+        thread.landed = false;
         thread.status = ThreadStatus::Archived;
         thread.updated_at_ms = now_ms();
         self.save_thread(&thread)?;
@@ -439,12 +532,43 @@ impl Core {
         if thread.status != ThreadStatus::Archived {
             self.archive_thread(id, true).await?;
         }
+        // Archived before, its branch kept: it goes if its work is in the
+        // base (and nobody else is on it).
+        let cfg = self.config().worktrees.clone();
+        let thread = self.load_thread(id)?;
+        let landed_branch = match &thread.workspace {
+            ThreadWorkspace::Worktree { path, branch, base }
+                if cfg.cleans_up() && cfg.delete_branch && !Path::new(path).exists() =>
+            {
+                let head = thread
+                    .pull_request
+                    .as_ref()
+                    .filter(|pr| pr.state == loft_protocol::PullRequestState::Merged)
+                    .and_then(|pr| pr.head.clone());
+                Some((branch.clone(), base.clone(), head))
+            }
+            _ => None,
+        };
+        let others_on_it = landed_branch.as_ref().is_some_and(|(branch, ..)| {
+            self.with_store(|s| s.threads()).is_ok_and(|threads| {
+                threads
+                    .iter()
+                    .any(|t| t.id != *id && t.workspace.branch() == Some(branch.as_str()))
+            })
+        });
         if let Some(project) = self.with_store(|s| s.project(&thread.project_id))? {
             let repo = PathBuf::from(project.root_path);
             let prefix = format!("{}/{}", loft_git::REF_PREFIX, id.as_str());
+            let landed_branch = landed_branch.filter(|_| !others_on_it);
             let _ = blocking(move || {
                 if loft_git::repo_root(&repo).is_some() {
                     loft_git::delete_refs(&repo, &prefix)?;
+                    if let Some((branch, base, head)) = landed_branch
+                        && wt::has_branch(&repo, &branch)
+                        && wt::branch_landed(&repo, &branch, &base, head.as_deref(), None)?
+                    {
+                        wt::delete_branch(&repo, &branch)?;
+                    }
                 }
                 Ok(())
             })
@@ -504,14 +628,22 @@ impl Core {
     }
 
     /// Run [`Self::delete_expired_archived`] now, every hour, and whenever
-    /// the config is reloaded. Ends when the core is dropped (or abort it).
+    /// the config is reloaded; [`Self::check_all_landed`] now and hourly. Ends when the core is dropped (or abort it).
     pub fn spawn_archive_cleanup(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let core = Arc::downgrade(self);
         let mut changes = self.config_changes();
         tokio::spawn(async move {
+            let mut swept: Option<std::time::Instant> = None;
             loop {
                 let Some(c) = core.upgrade() else { return };
                 c.delete_expired_archived().await;
+                // Worktrees whose work went into their base meanwhile
+                // (merged on GitHub, or elsewhere). Hourly, not on every
+                // settings change: it fetches.
+                if swept.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(55 * 60)) {
+                    swept = Some(std::time::Instant::now());
+                    c.check_all_landed().await;
+                }
                 drop(c);
                 tokio::select! {
                     () = tokio::time::sleep(std::time::Duration::from_secs(60 * 60)) => {}

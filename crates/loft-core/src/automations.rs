@@ -287,6 +287,7 @@ impl Core {
             limit: None,
             automation_id: Some(a.id.clone()),
             pull_request: None,
+            landed: false,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

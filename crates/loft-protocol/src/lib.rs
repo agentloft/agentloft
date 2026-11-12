@@ -360,10 +360,34 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
-    /// Delete a thread for good: stop it, remove its worktree (the branch is
-    /// kept) and checkpoints, and erase its history.
+    /// Delete a thread for good: stop it, remove its worktree and
+    /// checkpoints, and erase its history. Its branch is kept unless its
+    /// work is in the base branch and `worktrees.delete_branch` is on.
     DeleteThread {
         thread_id: ThreadId,
+    },
+    /// Remove a worktree thread's worktree (and, per `[worktrees]`, its
+    /// branch) once everything on it is in the base branch. The thread
+    /// stays (`ThreadWorkspace::Released`); its next message gets a new
+    /// worktree. Refused while anything is running there or its work isn't
+    /// in the base yet. Answers `Response::Thread`.
+    CleanUpWorktree {
+        thread_id: ThreadId,
+    },
+    /// Bring back the branch a cleanup deleted, where it was. Answers
+    /// `Response::Thread`.
+    RestoreBranch {
+        thread_id: ThreadId,
+    },
+    /// Worktrees and Agentloft branches that no active thread works in,
+    /// across projects, and whether their work is in the main branch.
+    /// Answers `Response::WorktreeLeftovers`.
+    WorktreeLeftovers,
+    /// Remove these leftovers. Each is checked again first: only clean
+    /// folders, and only branches whose work is in the main branch, go.
+    /// Answers `Response::Text` with a summary.
+    RemoveWorktreeLeftovers {
+        leftovers: Vec<WorktreeLeftover>,
     },
     /// Re-read `config.toml` (harness and worktree settings changed).
     ReloadConfig,
@@ -829,6 +853,9 @@ pub enum Response {
     },
     Branches {
         branches: BranchList,
+    },
+    WorktreeLeftovers {
+        leftovers: Vec<WorktreeLeftover>,
     },
     Json {
         value: serde_json::Value,

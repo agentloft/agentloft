@@ -127,6 +127,7 @@ mod tests {
                 pending: checks.2,
             },
             review: None,
+            head: None,
             refreshed_at_ms: 0,
         }
     }

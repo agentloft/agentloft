@@ -116,6 +116,26 @@ const KEYS: &[Key] = &[
         about: "Worktree branches are <prefix>/<slug>",
     },
     Key {
+        key: "worktrees.cleanup",
+        kind: Kind::OneOf(&["off", "offer", "auto"]),
+        about: "A worktree whose work is already in its base branch: keep it until archive, offer to clean it up, or clean it up automatically",
+    },
+    Key {
+        key: "worktrees.delete_branch",
+        kind: Kind::Bool,
+        about: "Cleaning up a worktree also deletes its local branch (only once its work is in the base branch)",
+    },
+    Key {
+        key: "worktrees.delete_remote_branch",
+        kind: Kind::Bool,
+        about: "Cleaning up also deletes the branch on the remote, once its pull request is merged",
+    },
+    Key {
+        key: "worktrees.archive_after_cleanup",
+        kind: Kind::Bool,
+        about: "Archive a thread once its worktree is cleaned up; false = it stays and gets a new worktree with its next message",
+    },
+    Key {
         key: "browser.search",
         kind: Kind::Text,
         about: "What the browser's address bar searches with: duckduckgo, google, bing, brave, kagi, ecosia, startpage, or an http(s) address with %s where the words go; null = duckduckgo",

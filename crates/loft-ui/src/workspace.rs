@@ -934,6 +934,14 @@ impl WorkspaceView {
                 }
             }
             Some(("settings", section)) => {
+                // `settings:<section>@end`: scrolled to its end.
+                let section = match section.strip_suffix("@end") {
+                    Some(section) => {
+                        crate::settings::dev_scroll_to_end();
+                        section
+                    }
+                    None => section,
+                };
                 let section = crate::settings::Section::parse(section);
                 crate::settings::open(self.store.clone(), section, cx);
                 // `AGENTLOFT_DEV_CLICK=x,y[,after_ms]`: then a click in it.
@@ -4180,6 +4188,10 @@ impl WorkspaceView {
                         "New worktree".to_owned(),
                         p,
                     )),
+                    // Cleaned up; the next message makes a new one.
+                    ThreadWorkspace::Released { base, .. } => {
+                        Some(chip_label(IconName::GitMerge, format!("In {base}"), p))
+                    }
                     ThreadWorkspace::Local => None,
                 };
                 let pr_badge = thread
@@ -7623,6 +7635,13 @@ fn thread_menu_items(
         thread.status,
         ThreadStatus::Running | ThreadStatus::WaitingApproval
     );
+    // Its work is all in the base: the worktree can go.
+    let landed = thread.landed;
+    // Cleaned up, its branch deleted: it can come back.
+    let restorable = matches!(
+        &thread.workspace,
+        ThreadWorkspace::Released { tip: Some(_), .. }
+    );
     move |mut menu, window, cx| {
         let (v1, i1) = (view.clone(), id.clone());
         menu = menu.item(
@@ -7721,6 +7740,28 @@ fn thread_menu_items(
                             ));
                         }),
                 );
+        }
+        if landed && !running {
+            let (s, t) = (store.clone(), id.clone());
+            menu = menu.item(
+                PopupMenuItem::new("Clean up worktree")
+                    .icon(IconName::Trash)
+                    .on_click(move |_, _, cx| {
+                        let t = t.clone();
+                        s.update(cx, |s, cx| s.clean_up_worktree(t, cx));
+                    }),
+            );
+        }
+        if restorable {
+            let (s, t) = (store.clone(), id.clone());
+            menu = menu.separator().item(
+                PopupMenuItem::new("Restore branch")
+                    .icon(IconName::GitBranch)
+                    .on_click(move |_, _, cx| {
+                        let t = t.clone();
+                        s.update(cx, |s, cx| s.restore_branch(t, cx));
+                    }),
+            );
         }
         let (s, t) = (store.clone(), id.clone());
         let (s2, t2, title2) = (store.clone(), id.clone(), title.clone());

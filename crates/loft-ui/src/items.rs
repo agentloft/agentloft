@@ -508,6 +508,10 @@ pub fn render_row(
         Row::Waiting => render_waiting(&model.thread.waiting_on, p),
         Row::Card(ix) => crate::info_cards::render(thread, store, state, *ix, p),
         Row::Limit => render_limit(&state.id, store, model, p),
+        Row::Worktree => {
+            let cfg = store.read(cx).worktrees_config.clone();
+            render_worktree(&state.id, store, model, &cfg, p)
+        }
         Row::Queued(id) => render_queued(&state.id, store, model, *id, p, cx),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
@@ -1189,6 +1193,75 @@ fn render_limit(
             d.child(button("limit-resume-off", "Cancel", false))
         })
         .into_any_element()
+}
+
+/// Its worktree's work is all in the base branch: offer to clean it up.
+/// Or it was: say so, and that the next message makes a new one.
+fn render_worktree(
+    thread_id: &loft_protocol::ThreadId,
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    cfg: &loft_config::WorktreeConfig,
+    p: &Palette,
+) -> AnyElement {
+    use loft_protocol::ThreadWorkspace;
+    let button = |name: &'static str, label: &'static str, restore: bool| {
+        let (store, thread_id) = (store.clone(), thread_id.clone());
+        div()
+            .id(name)
+            .flex_none()
+            .px_2()
+            .py(px(3.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(p.border)
+            .cursor_pointer()
+            .text_xs()
+            .text_color(p.foreground)
+            .hover(|d| d.bg(p.hover))
+            .child(label)
+            .on_click(move |_, _, cx| {
+                let thread_id = thread_id.clone();
+                store.update(cx, |s, cx| {
+                    if restore {
+                        s.restore_branch(thread_id, cx)
+                    } else {
+                        s.clean_up_worktree(thread_id, cx)
+                    }
+                });
+            })
+    };
+    let row = h_flex()
+        .gap_2()
+        .items_center()
+        .text_sm()
+        .text_color(p.muted_foreground)
+        .child(Icon::new(IconName::GitMerge).small());
+    match &model.thread.workspace {
+        ThreadWorkspace::Worktree { base, .. } if model.thread.landed && cfg.cleans_up() => {
+            let label = if cfg.delete_branch {
+                "Clean up worktree and branch"
+            } else {
+                "Clean up worktree"
+            };
+            row.child(
+                div()
+                    .min_w_0()
+                    .child(format!("Everything in this worktree is in {base}.")),
+            )
+            .child(button("worktree-clean-up", label, false))
+            .into_any_element()
+        }
+        ThreadWorkspace::Released { base, tip, .. } => row
+            .child(div().min_w_0().child(format!(
+                "Worktree removed: its work is in {base}. Your next message makes a new one from {base}."
+            )))
+            .when(tip.is_some(), |d| {
+                d.child(button("worktree-restore-branch", "Restore branch", true))
+            })
+            .into_any_element(),
+        _ => div().into_any_element(),
+    }
 }
 
 /// The turn is over, but work the agent started in the background isn't:

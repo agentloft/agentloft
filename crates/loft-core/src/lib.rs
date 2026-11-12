@@ -3,6 +3,7 @@
 //! fans them out on a broadcast bus together with ephemeral streaming deltas.
 
 mod automations;
+mod cleanup;
 mod clients;
 mod forks;
 mod handoff;
@@ -155,6 +156,9 @@ pub struct Core {
     commands: Mutex<CommandCache>,
     /// Worktree setup commands to run before a thread's first prompt.
     pending_setup: Mutex<HashMap<ThreadId, String>>,
+    /// For a thread whose worktree was just made again: a notice for the
+    /// conversation and a note for the agent, with its next prompt.
+    pending_notes: Mutex<HashMap<ThreadId, (String, String)>>,
     /// File lists per directory for `FindFiles`, briefly cached.
     file_index: Mutex<HashMap<PathBuf, FileIndex>>,
     /// Held while a directory is walked for `file_index`, so that the key
@@ -204,6 +208,7 @@ impl Core {
             models: Mutex::new(HashMap::new()),
             commands: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
+            pending_notes: Mutex::new(HashMap::new()),
             file_index: Mutex::new(HashMap::new()),
             file_walk: tokio::sync::Mutex::new(()),
             config_rev: tokio::sync::watch::channel(0).0,
@@ -252,6 +257,10 @@ impl Core {
 
     pub(crate) fn take_pending_setup(&self, thread: &ThreadId) -> Option<String> {
         lock(&self.pending_setup).remove(thread)
+    }
+
+    pub(crate) fn take_pending_note(&self, thread: &ThreadId) -> Option<(String, String)> {
+        lock(&self.pending_notes).remove(thread)
     }
 
     /// Terminal output from stream offset `from` to its current end.
@@ -1321,6 +1330,14 @@ impl Core {
                 self.revert_turn(&thread_id, &turn_id).await
             }
             Request::DeleteThread { thread_id } => self.delete_thread(&thread_id).await,
+            Request::CleanUpWorktree { thread_id } => {
+                self.clean_up_worktree(&thread_id, true).await
+            }
+            Request::RestoreBranch { thread_id } => self.restore_branch(&thread_id).await,
+            Request::WorktreeLeftovers => self.worktree_leftovers().await,
+            Request::RemoveWorktreeLeftovers { leftovers } => {
+                self.remove_worktree_leftovers(leftovers).await
+            }
             Request::AskOnce {
                 prompt,
                 harness,
@@ -1659,6 +1676,7 @@ impl Core {
             limit: None,
             automation_id: None,
             pull_request: None,
+            landed: false,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

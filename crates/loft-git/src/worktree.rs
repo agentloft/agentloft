@@ -47,12 +47,35 @@ pub fn slugify(text: &str, max: usize) -> String {
     slug
 }
 
-/// `prefix/<slug>`, suffixed `-2`, `-3`, … if the branch already exists.
+/// Remotes that have `branch`, as last fetched (`origin/<branch>` …).
+fn remotes_with(repo: &Path, branch: &str) -> Vec<String> {
+    let Ok(remotes) = run(git(repo).arg("remote")) else {
+        return Vec::new();
+    };
+    remotes
+        .lines()
+        .filter(|r| !r.is_empty())
+        .filter(|r| {
+            run(git(repo).args([
+                "show-ref",
+                "--verify",
+                "-q",
+                &format!("refs/remotes/{r}/{branch}"),
+            ]))
+            .is_ok()
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `prefix/<slug>`, suffixed `-2`, `-3`, … if the branch already exists,
+/// here or on a remote (pushing a new branch over an old one there would be
+/// refused).
 pub fn unique_branch(repo: &Path, prefix: &str, slug: &str) -> String {
     let slug = if slug.is_empty() { "thread" } else { slug };
     let mut branch = format!("{prefix}/{slug}");
     let mut n = 2;
-    while branch_exists(repo, &branch) {
+    while branch_exists(repo, &branch) || !remotes_with(repo, &branch).is_empty() {
         branch = format!("{prefix}/{slug}-{n}");
         n += 1;
     }
@@ -258,6 +281,258 @@ pub fn prune(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The commit a branch (or any rev) points at.
+pub fn tip(repo: &Path, rev: &str) -> Result<String> {
+    Ok(
+        run(git(repo).args(["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")]))?
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// Whether a local branch of that name exists.
+pub fn has_branch(repo: &Path, branch: &str) -> bool {
+    branch_exists(repo, branch)
+}
+
+/// `git branch -D`: callers check first that its work is kept elsewhere
+/// ([`landed`]). A squash-merged branch is never "merged" to git, so `-d`
+/// would refuse it.
+pub fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
+    run(git(repo).args(["branch", "-D", branch]))?;
+    Ok(())
+}
+
+/// Bring a deleted branch back at `commit`.
+pub fn restore_branch(repo: &Path, branch: &str, commit: &str) -> Result<()> {
+    run(git(repo).args(["branch", branch, commit]))?;
+    Ok(())
+}
+
+/// Where `branch` was when it was made: the oldest entry of its reflog
+/// (`None` without one).
+fn created_at(repo: &Path, branch: &str) -> Option<String> {
+    let out = run(git(repo).args([
+        "reflog",
+        "show",
+        "--format=%H",
+        &format!("refs/heads/{branch}"),
+        "--",
+    ]))
+    .ok()?;
+    out.lines()
+        .rfind(|l| !l.is_empty())
+        .map(|l| l.trim().to_owned())
+}
+
+/// Whether everything `branch` adds is already in `into` (a rev such as
+/// `main` or `origin/main`) and it did add something: merging it would
+/// change no file. True after a squash merge, a rebase merge or a
+/// cherry-pick, which `git branch --merged` doesn't see, and after a
+/// fast-forward or merge commit. A branch that never moved from where it
+/// was made (no work yet) is not counted.
+pub fn landed(repo: &Path, branch: &str, into: &str) -> Result<bool> {
+    let ahead = run(git(repo).args(["rev-list", "--count", &format!("{into}..{branch}")]))?;
+    if ahead.trim() == "0" {
+        // All of it is in `into`: landed if there was something.
+        let tip = tip(repo, branch)?;
+        return Ok(created_at(repo, branch).is_some_and(|start| start != tip));
+    }
+    let (tree, conflicts) = merge_tree(repo, into, branch)?;
+    if !conflicts.is_empty() {
+        return Ok(false);
+    }
+    let into_tree = run(git(repo).args(["rev-parse", &format!("{into}^{{tree}}")]))?;
+    Ok(tree == into_tree.trim())
+}
+
+/// The remote `base` comes from: the one configured for it, else `origin`.
+pub fn base_remote(repo: &Path, base: &str) -> Option<String> {
+    let remotes = run(git(repo).arg("remote")).ok()?;
+    let configured = run(git(repo).args(["config", &format!("branch.{base}.remote")]))
+        .ok()
+        .map(|r| r.trim().to_owned())
+        .filter(|r| remotes.lines().any(|l| l == r));
+    configured.or_else(|| remotes.lines().find(|r| *r == "origin").map(str::to_owned))
+}
+
+/// The revs `base` can be met at: the remote's copy (fetched first with
+/// `fetch_env`; offline, the last fetched copy), then the local branch.
+pub fn base_revs(
+    repo: &Path,
+    base: &str,
+    fetch_env: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    let mut revs = Vec::new();
+    if let Some(remote) = base_remote(repo, base) {
+        if let Some(env) = fetch_env
+            && let Err(err) = fetch(repo, &remote, base, env)
+        {
+            tracing::debug!("fetch {remote}/{base}: {err:#}");
+        }
+        let rev = format!("{remote}/{base}");
+        if rev_exists(repo, &rev) {
+            revs.push(rev);
+        }
+    }
+    if rev_exists(repo, base) {
+        revs.push(base.to_owned());
+    }
+    revs
+}
+
+/// Whether `branch`'s work is in `base` ([`landed`] in the remote's copy or
+/// the local one), or went in with a merged pull request whose head
+/// (`merged_head`) is where the branch is now.
+pub fn branch_landed(
+    repo: &Path,
+    branch: &str,
+    base: &str,
+    merged_head: Option<&str>,
+    fetch_env: Option<&std::collections::HashMap<String, String>>,
+) -> Result<bool> {
+    if let Some(head) = merged_head
+        && tip(repo, branch).is_ok_and(|t| t == head)
+    {
+        return Ok(true);
+    }
+    for into in base_revs(repo, base, fetch_env) {
+        if landed(repo, branch, &into)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a thread's worktree can go without losing anything: it has
+/// nothing uncommitted and its branch's work is in `base`
+/// ([`branch_landed`]).
+pub fn worktree_landed(
+    repo: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+    merged_head: Option<&str>,
+    fetch_env: Option<&std::collections::HashMap<String, String>>,
+) -> Result<bool> {
+    if !worktree.exists() || is_dirty(worktree)? {
+        return Ok(false);
+    }
+    // The folder must still be on that branch.
+    if current_branch(worktree).as_deref() != Some(branch) {
+        return Ok(false);
+    }
+    branch_landed(repo, branch, base, merged_head, fetch_env)
+}
+
+/// The remote that has `branch` exactly as it is here, if any: everything
+/// on the local branch was pushed.
+pub fn pushed_to(repo: &Path, branch: &str) -> Option<String> {
+    let local = tip(repo, branch).ok()?;
+    remotes_with(repo, branch)
+        .into_iter()
+        .find(|r| tip(repo, &format!("{r}/{branch}")).is_ok_and(|t| t == local))
+}
+
+/// A `git push` in `dir` that signs in like [`commit_and_push`] does.
+fn push_command(
+    dir: &Path,
+    env: &std::collections::HashMap<String, String>,
+    gh: Option<&Path>,
+) -> std::process::Command {
+    let mut cmd = git(dir);
+    cmd.envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C");
+    if let Some(gh) = gh {
+        let quoted = gh.to_string_lossy().replace('\'', "'\\''");
+        cmd.args(["-c", "credential.helper="])
+            .arg("-c")
+            .arg(format!("credential.helper=!'{quoted}' auth git-credential"));
+    }
+    cmd.arg("push");
+    cmd
+}
+
+/// `git push <remote> --delete <branch>`. Already gone there counts as done.
+pub fn delete_remote_branch(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+    env: &std::collections::HashMap<String, String>,
+    gh: Option<&Path>,
+) -> Result<()> {
+    let mut cmd = push_command(repo, env, gh);
+    cmd.args(["-q", remote, "--delete", branch]);
+    match run(&mut cmd) {
+        Ok(_) => Ok(()),
+        Err(err) if err.to_string().contains("remote ref does not exist") => {
+            // Our copy of it is stale; drop it.
+            let _ = run(git(repo).args([
+                "update-ref",
+                "-d",
+                &format!("refs/remotes/{remote}/{branch}"),
+            ]));
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// A worktree of the repository (`git worktree list`), the main checkout
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: std::path::PathBuf,
+    /// The branch checked out there; `None` when detached.
+    pub branch: Option<String>,
+}
+
+pub fn list(repo: &Path) -> Result<Vec<WorktreeEntry>> {
+    let out = run(git(repo).args(["worktree", "list", "--porcelain"]))?;
+    let mut list = Vec::new();
+    let mut current: Option<WorktreeEntry> = None;
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            list.extend(current.take());
+            current = Some(WorktreeEntry {
+                path: path.into(),
+                branch: None,
+            });
+        } else if let Some(name) = line.strip_prefix("branch refs/heads/")
+            && let Some(entry) = current.as_mut()
+        {
+            entry.branch = Some(name.to_owned());
+        }
+    }
+    list.extend(current);
+    Ok(list)
+}
+
+/// Local branches under `prefix/`.
+pub fn branches_under(repo: &Path, prefix: &str) -> Result<Vec<String>> {
+    let out = run(git(repo).args([
+        "for-each-ref",
+        "--format=%(refname:short)",
+        &format!("refs/heads/{prefix}/"),
+    ]))?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// How many commits `branch` has that `into` doesn't.
+pub fn ahead(repo: &Path, branch: &str, into: &str) -> Result<u32> {
+    Ok(
+        run(git(repo).args(["rev-list", "--count", &format!("{into}..{branch}")]))?
+            .trim()
+            .parse()
+            .unwrap_or(0),
+    )
+}
+
 /// The tree a merge of `branch` into `base` would produce, and the files
 /// that would conflict.
 fn merge_tree(repo: &Path, base: &str, branch: &str) -> Result<(String, Vec<String>)> {
@@ -320,17 +595,8 @@ pub fn commit_and_push(
         .or_else(|| remotes.lines().find(|r| *r == "origin").map(str::to_owned))
         .or_else(|| remotes.lines().next().map(str::to_owned))
         .ok_or_else(|| anyhow::anyhow!("this repository has no remote to push to"))?;
-    let mut cmd = git(worktree);
-    cmd.envs(env)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C");
-    if let Some(gh) = gh {
-        let quoted = gh.to_string_lossy().replace('\'', "'\\''");
-        cmd.args(["-c", "credential.helper="])
-            .arg("-c")
-            .arg(format!("credential.helper=!'{quoted}' auth git-credential"));
-    }
-    cmd.args(["push", "-q", "-u", &remote, &format!("{branch}:{branch}")]);
+    let mut cmd = push_command(worktree, env, gh);
+    cmd.args(["-q", "-u", &remote, &format!("{branch}:{branch}")]);
     run(&mut cmd)?;
     Ok(remote)
 }
@@ -546,6 +812,88 @@ mod tests {
         assert_eq!(slugify("  Fix: the BUG in parser.rs  ", 12), "fix-the-bug");
         assert_eq!(slugify("日本語", 20), "");
         assert_eq!(slugify("supercalifragilistic", 5), "super");
+    }
+
+    #[test]
+    fn landed_work_and_cleanup_helpers() {
+        let dir = repo();
+        let root = dir.path();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt");
+        let branch = "agentloft/greet";
+        add(root, &wt, branch, "main").unwrap();
+        assert!(!landed(root, branch, "main").unwrap(), "nothing of its own");
+
+        // Fast-forwarded into main: all of it is there.
+        let ff = "agentloft/ff";
+        let ff_wt = wt_parent.path().join("ff");
+        add(root, &ff_wt, ff, "main").unwrap();
+        std::fs::write(ff_wt.join("ff.txt"), "ff\n").unwrap();
+        commit_all(&ff_wt, "ff work");
+        assert!(!landed(root, ff, "main").unwrap());
+        run(git(root).args(["merge", "-q", "--ff-only", ff])).unwrap();
+        assert!(landed(root, ff, "main").unwrap(), "fast-forwarded");
+        remove(root, &ff_wt, false).unwrap();
+        delete_branch(root, ff).unwrap();
+
+        std::fs::write(wt.join("b.txt"), "new\n").unwrap();
+        commit_all(&wt, "work");
+        assert!(!landed(root, branch, "main").unwrap(), "not in main yet");
+        squash_merge(root, &wt, branch, "main", "Greet").unwrap();
+        assert!(landed(root, branch, "main").unwrap(), "squash-merged");
+
+        // More work after the merge isn't in main.
+        std::fs::write(wt.join("b.txt"), "newer\n").unwrap();
+        commit_all(&wt, "more");
+        assert!(!landed(root, branch, "main").unwrap());
+        run(git(&wt).args(["reset", "-q", "--hard", "HEAD~1"])).unwrap();
+        assert!(landed(root, branch, "main").unwrap());
+
+        // Main moving on elsewhere keeps it landed; main rewriting the same
+        // lines again makes it uncertain, so not landed.
+        std::fs::write(root.join("c.txt"), "other\n").unwrap();
+        commit_all(root, "other work");
+        assert!(landed(root, branch, "main").unwrap());
+        std::fs::write(root.join("b.txt"), "rewritten\n").unwrap();
+        commit_all(root, "rewrite b");
+        assert!(!landed(root, branch, "main").unwrap());
+
+        // Pushed exactly as it is, or not.
+        let remote = tempfile::tempdir().unwrap();
+        run(git(remote.path()).args(["init", "-q", "--bare"])).unwrap();
+        run(git(root).args(["remote", "add", "origin", &remote.path().to_string_lossy()])).unwrap();
+        assert_eq!(pushed_to(root, branch), None);
+        run(git(root).args(["push", "-q", "origin", branch])).unwrap();
+        assert_eq!(pushed_to(root, branch).as_deref(), Some("origin"));
+        assert_eq!(
+            unique_branch(root, "agentloft", "greet"),
+            "agentloft/greet-2"
+        );
+        std::fs::write(wt.join("d.txt"), "d\n").unwrap();
+        commit_all(&wt, "unpushed");
+        assert_eq!(pushed_to(root, branch), None);
+
+        // Listing, removing, deleting and restoring.
+        let entries = list(root).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].branch.as_deref(), Some(branch));
+        assert_eq!(branches_under(root, "agentloft").unwrap(), vec![branch]);
+        let tip_before = tip(root, branch).unwrap();
+        remove(root, &wt, false).unwrap();
+        delete_branch(root, branch).unwrap();
+        assert!(!has_branch(root, branch));
+        // Gone here but still on the remote: a new branch takes another name.
+        assert_eq!(
+            unique_branch(root, "agentloft", "greet"),
+            "agentloft/greet-2"
+        );
+        restore_branch(root, branch, &tip_before).unwrap();
+        assert_eq!(tip(root, branch).unwrap(), tip_before);
+        delete_remote_branch(root, "origin", branch, &Default::default(), None).unwrap();
+        assert!(remotes_with(root, branch).is_empty());
+        // Already gone there is fine.
+        run(git(root).args(["fetch", "-q", "origin"])).unwrap();
+        delete_remote_branch(root, "origin", branch, &Default::default(), None).unwrap();
     }
 
     #[test]

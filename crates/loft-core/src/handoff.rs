@@ -207,6 +207,7 @@ mod tests {
             limit: None,
             automation_id: None,
             pull_request: None,
+            landed: false,
         };
         let items = vec![
             item(ItemBody::UserMessage {

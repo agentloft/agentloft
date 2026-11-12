@@ -103,9 +103,20 @@ impl Core {
                     .root_path
             }
             FsRoot::Thread(id) => {
-                self.with_store(|s| s.thread(id))?
-                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?
-                    .cwd
+                let thread = self
+                    .with_store(|s| s.thread(id))?
+                    .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "thread not found"))?;
+                // Its worktree was cleaned up (the next message makes a new
+                // one): until then its files, terminal and turn diffs are
+                // the project's.
+                let released = matches!(
+                    thread.workspace,
+                    loft_protocol::ThreadWorkspace::Released { .. }
+                ) && !Path::new(&thread.cwd).exists();
+                if released {
+                    return self.root_dir(&FsRoot::Project(thread.project_id));
+                }
+                thread.cwd
             }
         };
         Ok(PathBuf::from(path))

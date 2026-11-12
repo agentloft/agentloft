@@ -165,6 +165,11 @@ pub struct Thread {
     /// The pull request for its branch, as GitHub last described it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequest>,
+    /// Everything on its worktree's branch is in the base branch (merged
+    /// back, or its pull request merged) and nothing is left uncommitted:
+    /// the worktree can be cleaned up without losing anything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub landed: bool,
 }
 
 impl Thread {
@@ -216,6 +221,7 @@ impl Thread {
             limit,
             automation_id,
             pull_request,
+            landed,
         } = self;
         Thread {
             id: id.clone(),
@@ -240,6 +246,7 @@ impl Thread {
             limit: *limit,
             automation_id: automation_id.clone(),
             pull_request: pull_request.clone(),
+            landed: *landed,
         }
     }
 }
@@ -259,6 +266,9 @@ pub struct PullRequest {
     /// someone has reviewed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewDecision>,
+    /// The commit its branch was at on GitHub (what a merge took).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
     /// When GitHub last said something new about it. A look that finds it
     /// unchanged is not recorded.
     #[serde(default)]
@@ -281,6 +291,7 @@ impl PullRequest {
             state,
             checks,
             review,
+            head,
             refreshed_at_ms: _,
         } = self;
         *number == other.number
@@ -289,6 +300,7 @@ impl PullRequest {
             && *state == other.state
             && *checks == other.checks
             && *review == other.review
+            && *head == other.head
     }
 }
 
@@ -444,6 +456,19 @@ pub enum ThreadWorkspace {
         /// Branch (or commit) it was created from; merge-back target.
         base: String,
     },
+    /// Its worktree was cleaned up once its work was in `base`. The next
+    /// message makes a new one at `path` (so the agent's session, kept per
+    /// folder, carries on) on a new branch from `base`.
+    Released {
+        path: String,
+        /// The branch it had.
+        branch: String,
+        base: String,
+        /// Where that branch was when it was deleted (`None`: it was kept),
+        /// to bring it back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tip: Option<String>,
+    },
 }
 
 /// Where a new worktree starts: a branch, as the local copy has it or (with
@@ -453,6 +478,31 @@ pub struct WorktreeBase {
     pub branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+}
+
+/// A worktree folder or an Agentloft branch that no active thread works
+/// in (`WorktreeLeftovers`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeLeftover {
+    pub project_id: ProjectId,
+    /// The worktree's folder, if it still has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Its branch (`agentloft/<slug>`), if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The archived thread it belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ThreadId>,
+    /// Everything on it is in the main branch (and the folder, if any, has
+    /// nothing uncommitted): removing it loses nothing.
+    pub landed: bool,
+    /// Commits on the branch that the main branch doesn't have.
+    #[serde(default)]
+    pub ahead: u32,
+    /// Uncommitted changes in the folder.
+    #[serde(default)]
+    pub dirty: bool,
 }
 
 /// A repository's branches (`ListBranches`).

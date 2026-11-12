@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 /// What `gh pr view` is asked for.
-const FIELDS: &str = "number,url,title,state,isDraft,statusCheckRollup,reviewDecision";
+const FIELDS: &str = "number,url,title,state,isDraft,statusCheckRollup,reviewDecision,headRefOid";
 /// While checks are queued or running.
 const PENDING_EVERY: Duration = Duration::from_secs(60);
 /// While it is open and its checks have settled.
@@ -196,6 +196,7 @@ fn parse(json: &str, now_ms: i64) -> anyhow::Result<PullRequest> {
         state,
         checks: count_checks(v.get("statusCheckRollup").unwrap_or(&Value::Null)),
         review: review_decision(text(&v, "reviewDecision")),
+        head: Some(text(&v, "headRefOid").to_owned()).filter(|h| !h.is_empty()),
         refreshed_at_ms: now_ms,
     })
 }
@@ -411,6 +412,7 @@ impl Core {
                 state: PullRequestState::Open,
                 checks: PullRequestChecks::default(),
                 review: None,
+                head: None,
                 refreshed_at_ms: now_ms(),
             };
             self.set_pull_request(id, pr).await;
@@ -423,6 +425,7 @@ impl Core {
     /// starts no agent session.
     async fn set_pull_request(self: &Arc<Self>, id: &ThreadId, pr: PullRequest) {
         let every = poll_every(&pr, now_ms());
+        let merged = pr.state == PullRequestState::Merged;
         let sent = self
             .thread_call(id, |reply| ThreadCmd::SetPullRequest {
                 pull_request: pr,
@@ -433,15 +436,22 @@ impl Core {
             tracing::debug!(thread = %id.as_str(), err = %err.message, "pull request not saved");
             return;
         }
-        let mut due = lock(&self.pull_requests.due);
-        match every {
-            Some(every) => {
-                due.insert(id.clone(), Instant::now() + every);
-                self.pull_requests.wake.notify_one();
+        {
+            let mut due = lock(&self.pull_requests.due);
+            match every {
+                Some(every) => {
+                    due.insert(id.clone(), Instant::now() + every);
+                    self.pull_requests.wake.notify_one();
+                }
+                None => {
+                    due.remove(id);
+                }
             }
-            None => {
-                due.remove(id);
-            }
+        }
+        // Merged: its work is in the base now (fetched to see it).
+        if merged {
+            let (core, id) = (self.clone(), id.clone());
+            tokio::spawn(async move { core.check_landed(&id, true).await });
         }
     }
 
@@ -699,6 +709,7 @@ mod tests {
                 pending: checks.2,
             },
             review: None,
+            head: None,
             refreshed_at_ms: NOW - age_ms,
         };
         let old = 60 * 60 * 1000;

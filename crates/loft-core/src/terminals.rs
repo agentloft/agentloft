@@ -281,6 +281,19 @@ impl Terminals {
         }
     }
 
+    /// Whether a live terminal whose key starts with `prefix` is running
+    /// something (its shell isn't waiting at the prompt).
+    pub fn busy_prefix(&self, prefix: &str) -> bool {
+        let ids: Vec<TerminalId> = lock(&self.keys)
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(_, id)| id.clone())
+            .collect();
+        ids.iter()
+            .filter_map(|id| self.get(id).ok())
+            .any(|t| lock(&t.info).exited.is_none() && !t.idle())
+    }
+
     /// Live terminals whose key starts with `prefix`, ordered by key.
     pub fn list_prefix(&self, prefix: &str) -> Vec<TerminalInfo> {
         let mut found: Vec<(String, TerminalId)> = lock(&self.keys)
