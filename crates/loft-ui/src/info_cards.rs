@@ -1454,9 +1454,33 @@ pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<Any
     (plan, rows)
 }
 
+/// The most used of an agent's plan limits, in percent (the same reports
+/// as [`plan_limits`]).
+pub(crate) fn peak_percent(info: &Value) -> Option<f32> {
+    let claude = arr(info, "/rate_limits/limits")
+        .into_iter()
+        .map(|l| num(l, "percent"));
+    let codex = ["primary", "secondary"].into_iter().filter_map(|k| {
+        info.pointer(&format!("/rateLimits/rateLimits/{k}/usedPercent"))
+            .and_then(Value::as_f64)
+    });
+    claude.chain(codex).reduce(f64::max).map(|v| v as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peak_percent_is_the_busiest_limit() {
+        let claude: Value = serde_json::json!({"rate_limits": {"limits": [
+            {"percent": 12.0}, {"percent": 61.5}]}});
+        assert_eq!(peak_percent(&claude), Some(61.5));
+        let codex: Value = serde_json::json!({"rateLimits": {"rateLimits": {
+            "primary": {"usedPercent": 40.0}, "secondary": null}}});
+        assert_eq!(peak_percent(&codex), Some(40.0));
+        assert_eq!(peak_percent(&serde_json::json!({})), None);
+    }
 
     #[test]
     fn token_counts_read_short() {

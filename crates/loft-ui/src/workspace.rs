@@ -116,6 +116,8 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 
 pub struct WorkspaceView {
     pub(crate) store: Entity<AppStore>,
+    /// The footer's usage button: each agent's plan limits, on hover.
+    plan_limits: Entity<crate::plan_limits::PlanLimits>,
     /// The Automations page, made the first time it is opened.
     automations_page: Option<Entity<crate::automations::AutomationsPage>>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
@@ -289,6 +291,7 @@ impl WorkspaceView {
             cx.observe_window_activation(window, |_, _, cx| cx.notify()),
         ];
         Self {
+            plan_limits: cx.new(|_| crate::plan_limits::PlanLimits::new(store.clone())),
             store,
             automations_page: None,
             composers: HashMap::new(),
@@ -586,6 +589,31 @@ impl WorkspaceView {
             Some(("click", spec)) => {
                 self.panel_open = false;
                 dev_click(spec.to_owned(), window, cx);
+            }
+            Some(("hover", spec)) => {
+                // `x,y[,after_ms]`: the pointer comes to rest at window
+                // coordinates (hover cards and tooltips, for a screenshot).
+                let n: Vec<f32> = spec
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+                let position = gpui_kit::point(px(at(0, 10.)), px(at(1, 10.)));
+                let after = std::time::Duration::from_millis(at(2, 2500.) as u64);
+                cx.spawn_in(window, async move |_, cx| {
+                    cx.background_executor().timer(after).await;
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                                position,
+                                pressed_button: None,
+                                modifiers: gpui_kit::Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                    });
+                })
+                .detach();
             }
             Some(("viewkeys", spec)) => {
                 // `x,y,after_ms`: click a field of the thread's view, type
@@ -3538,6 +3566,7 @@ impl WorkspaceView {
                     .child(crate::brand::app_icon(px(18.)))
                     .child(div().size(px(6.)).rounded_full().bg(dot))
                     .child(div().flex_1().child(status))
+                    .child(self.usage_button(p, cx))
                     .child(icon_button(
                         "toggle-theme",
                         if dark { IconName::Sun } else { IconName::Moon },
@@ -3551,6 +3580,46 @@ impl WorkspaceView {
                         cx.listener(|this, _, _, cx| this.open_settings(cx)),
                     )),
             )
+            .into_any_element()
+    }
+
+    /// The footer's usage button: plan limits in a card on hover (and the
+    /// busiest one's percent beside the icon once known); a click opens
+    /// Settings ▸ Usage.
+    fn usage_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let limits = self.plan_limits.clone();
+        // Redrawn when the answers arrive (the percent beside the icon).
+        let peak = limits.read(cx).peak();
+        let card = limits.clone();
+        h_flex()
+            .id("sidebar-usage")
+            .h(px(26.))
+            .px(px(6.))
+            .gap_1()
+            .items_center()
+            .rounded(px(7.))
+            .text_color(match peak {
+                Some(pct) if pct >= 80. => p.warning,
+                _ => p.muted_foreground,
+            })
+            .cursor_pointer()
+            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+            .child(Icon::new(IconName::Gauge).small())
+            .children(peak.map(|pct| format!("{}%", pct.round() as i64)))
+            // Asked as the pointer arrives, so the card opens with answers.
+            .on_hover(move |hovered, _, cx| {
+                if *hovered {
+                    limits.update(cx, |l, cx| l.refresh_if_stale(cx));
+                }
+            })
+            .tooltip(move |_, _| card.clone().into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                crate::settings::open(
+                    this.store.clone(),
+                    Some(crate::settings::Section::Usage),
+                    cx,
+                );
+            }))
             .into_any_element()
     }
 

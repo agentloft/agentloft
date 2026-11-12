@@ -4,6 +4,7 @@
 //! through the most recent thread on it, as `/usage` and `/status` do).
 
 use super::{SettingsView, web::heading};
+use crate::plan_limits::LIMIT_AGENTS;
 use crate::spinner::Spinner;
 use crate::theme::Palette;
 use chrono::Datelike as _;
@@ -18,15 +19,9 @@ use gpui_kit::{
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, prelude::FluentBuilder as _, px, relative,
 };
-use loft_protocol::{AgentInfoKind, HarnessId, Request, Response, ThreadStatus};
+use loft_protocol::{HarnessId, Request, Response};
 use serde_json::Value;
 use std::collections::HashMap;
-
-/// The agents whose plan limits can be asked for, and how.
-const LIMIT_AGENTS: [(&str, &str, AgentInfoKind); 2] = [
-    (HarnessId::CLAUDE, "Claude Code", AgentInfoKind::Usage),
-    (HarnessId::CODEX, "Codex", AgentInfoKind::Status),
-];
 
 #[derive(Default)]
 pub(super) struct UsagePage {
@@ -105,13 +100,7 @@ impl SettingsView {
 
     /// The most recently used thread on `agent` that isn't archived.
     fn latest_thread(&self, agent: &str, cx: &Context<Self>) -> Option<loft_protocol::ThreadId> {
-        self.store
-            .read(cx)
-            .workspace
-            .threads
-            .iter()
-            .find(|t| t.harness.as_str() == agent && t.status != ThreadStatus::Archived)
-            .map(|t| t.id.clone())
+        crate::plan_limits::latest_thread(self.store.read(cx), agent)
     }
 
     /// The range picker, made once: the last 30 days to start with.
