@@ -1026,10 +1026,14 @@ impl Core {
                     .map_err(internal)??;
                 Ok(Response::File { file })
             }
-            Request::ReadPath { path, thread_id } => {
+            Request::ReadPath {
+                path,
+                thread_id,
+                offset,
+            } => {
                 let core = self.clone();
                 let file = tokio::task::spawn_blocking(move || {
-                    core.read_path(&path, thread_id.as_ref(), false)
+                    core.read_path(&path, thread_id.as_ref(), false, offset)
                 })
                 .await
                 .map_err(internal)??;
@@ -1042,11 +1046,16 @@ impl Core {
                     .map_err(internal)??;
                 Ok(Response::DirListing { entries })
             }
-            Request::ReadFile { root, rel_path } => {
+            Request::ReadFile {
+                root,
+                rel_path,
+                offset,
+            } => {
                 let core = self.clone();
-                let file = tokio::task::spawn_blocking(move || core.read_file(&root, &rel_path))
-                    .await
-                    .map_err(internal)??;
+                let file =
+                    tokio::task::spawn_blocking(move || core.read_file(&root, &rel_path, offset))
+                        .await
+                        .map_err(internal)??;
                 Ok(Response::File { file })
             }
             Request::GetDiff { thread_id, scope } => Ok(Response::Diff {

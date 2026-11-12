@@ -117,6 +117,7 @@ async fn files_are_listed_and_read_within_the_project_only() {
         .request(Request::ReadFile {
             root: root.clone(),
             rel_path: "src/main.rs".into(),
+            offset: 0,
         })
         .await
         .unwrap()
@@ -125,12 +126,43 @@ async fn files_are_listed_and_read_within_the_project_only() {
     };
     assert_eq!(file.bytes.0, b"fn main() {}\n");
     assert!(!file.binary);
+    assert!(!file.truncated);
+
+    // A file larger than one answer holds comes in pieces, each asked for
+    // from where the last one ended.
+    let big: Vec<u8> = (0..11 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(env.repo.join("big.bin"), &big).unwrap();
+    let mut got = Vec::new();
+    loop {
+        let Response::File { file } = env
+            .client
+            .request(Request::ReadFile {
+                root: root.clone(),
+                rel_path: "big.bin".into(),
+                offset: got.len() as u64,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(file.offset, got.len() as u64);
+        assert_eq!(file.size, big.len() as u64);
+        assert!(!file.bytes.0.is_empty());
+        got.extend(file.bytes.0);
+        if !file.truncated {
+            break;
+        }
+        assert!(got.len() < big.len(), "more was promised");
+    }
+    assert!(got == big, "the pieces make the file");
 
     let err = env
         .client
         .request(Request::ReadFile {
             root,
             rel_path: "../../etc/passwd".into(),
+            offset: 0,
         })
         .await
         .unwrap_err();

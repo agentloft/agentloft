@@ -614,6 +614,7 @@ mod imp {
         picture(key, path.to_path_buf(), || Request::ReadPath {
             path: path.to_string_lossy().into_owned(),
             thread_id: thread.cloned(),
+            offset: 0,
         })
     }
 

@@ -1067,6 +1067,7 @@ async fn a_browser_session_is_held_to_its_limits() {
             Request::ReadPath {
                 path: secret.to_string_lossy().into_owned(),
                 thread_id: None,
+                offset: 0,
             },
         )
         .await;

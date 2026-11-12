@@ -18,13 +18,17 @@ publish.workspace = true
 ### BEGIN HAKARI SECTION
 [dependencies]
 anstyle = { version = "1" }
+arrayvec = { version = "0.7", default-features = false, features = ["std"] }
 base64 = { version = "0.23" }
+bytemuck = { version = "1", default-features = false, features = ["aarch64_simd", "derive", "extern_crate_alloc", "min_const_generics"] }
 byteorder = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 either = { version = "1", default-features = false, features = ["use_std"] }
+euclid = { version = "0.22", features = ["libm"] }
 fallible-iterator = { version = "0.3", features = ["std"] }
+fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
 futures-core = { version = "0.3" }
@@ -32,10 +36,12 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher"] }
+image = { version = "0.25", default-features = false, features = ["dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "pnm", "qoi", "rayon", "tga", "tiff", "webp"] }
 indexmap = { version = "2", features = ["serde"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["serde", "std"] }
 memchr = { version = "2" }
+moxcms = { version = "0.8", features = ["in_place"] }
 num-traits = { version = "0.2", features = ["libm"] }
 once_cell = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
@@ -48,6 +54,7 @@ serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
 stable_deref_trait = { version = "1", default-features = false, features = ["std"] }
+thiserror = { version = "2" }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_edit = { version = "0.25" }
 toml_writer = { version = "1" }
@@ -55,8 +62,9 @@ tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 winnow = { version = "0.7" }
+yoke = { version = "0.8", features = ["derive"] }
 zeroize = { version = "1", features = ["derive"] }
-zlib-rs = { version = "0.6", default-features = false, features = ["std"] }
+zune-jpeg = { version = "0.5" }
 
 [build-dependencies]
 anstyle = { version = "1" }
@@ -64,6 +72,7 @@ base64 = { version = "0.23" }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 either = { version = "1", default-features = false, features = ["use_std"] }
+fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", default-features = false, features = ["default-hasher"] }
@@ -90,7 +99,6 @@ toml_edit = { version = "0.25" }
 toml_writer = { version = "1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 winnow = { version = "0.7" }
-zlib-rs = { version = "0.6", default-features = false, features = ["std"] }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -99,12 +107,15 @@ errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gpui-component = { version = "0.9", default-features = false, features = ["tree-sitter-languages"] }
 gpui-kit = { version = "0.9", features = ["tree-sitter-languages"] }
+gpui-pre-apple = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
+gpui-pre-macos = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", default-features = false, features = ["default-hasher", "serde"] }
 http = { version = "1" }
 httparse = { version = "1" }
 nix = { version = "0.31", features = ["fs"] }
 objc2 = { version = "0.6", features = ["disable-encoding-assertions", "exception"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFNumber", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVBuffer", "CVHostTime", "CVImageBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn", "objc2", "objc2-metal", "std"] }
 objc2-foundation = { version = "0.3" }
 percent-encoding = { version = "2" }
 raw-window-handle = { version = "0.6", default-features = false, features = ["std"] }
@@ -143,12 +154,15 @@ errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gpui-component = { version = "0.9", default-features = false, features = ["tree-sitter-languages"] }
 gpui-kit = { version = "0.9", features = ["tree-sitter-languages"] }
+gpui-pre-apple = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
+gpui-pre-macos = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", default-features = false, features = ["default-hasher", "serde"] }
 http = { version = "1" }
 httparse = { version = "1" }
 nix = { version = "0.31", features = ["fs"] }
 objc2 = { version = "0.6", features = ["disable-encoding-assertions", "exception"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFNumber", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVBuffer", "CVHostTime", "CVImageBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn", "objc2", "objc2-metal", "std"] }
 objc2-foundation = { version = "0.3" }
 percent-encoding = { version = "2" }
 raw-window-handle = { version = "0.6", default-features = false, features = ["std"] }

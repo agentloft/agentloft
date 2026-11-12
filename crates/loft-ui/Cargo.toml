@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# `doc_preview --shot` (examples/): the window's own frame as a picture, which
+# needs GPUI's test support, in GPUI and in its macOS backend. Off otherwise,
+# for the reason loft-terminal gives.
+shots = ["loft-terminal/test-support", "dep:gpui-macos-shots"]
+
 [dependencies]
 # Local times ("Resets Sat 6:00 AM").
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -43,12 +49,21 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 web-sys = { version = "0.3", features = ["Event", "Storage", "Window"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+gpui-macos-shots = { package = "gpui-pre-macos", version = "=0.3.11", features = ["test-support"], optional = true }
 workspace-hack.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = ["NSDockTile", "NSWorkspace", "objc2-core-graphics"] }
 objc2-foundation = { workspace = true, features = ["NSBundle"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
 block2 = "0.6"
+# Video in the chat (video.rs): AVPlayer's frames, drawn by GPUI.
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CMTime"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CVBuffer", "CVImageBuffer", "CVPixelBuffer"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CFString"] }
+# Turned slide text (panel/slides.rs): its letters as outlines, in the fonts
+# macOS keeps for documents. The version GPUI draws SVGs with.
+usvg = { version = "0.46", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 
 [dev-dependencies]
 tempfile.workspace = true

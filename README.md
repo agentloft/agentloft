@@ -31,7 +31,7 @@ A native desktop app for running coding agents side by side: **Claude Code**, **
 - Each fork gets its own worktree, starting from the parent's state.
 
 **A real workbench next to the chat.**
-- A file tree, plus a syntax-highlighted viewer, Markdown, images, and Word/Excel/PowerPoint previews.
+- A file tree, plus a syntax-highlighted viewer, Markdown, images, and previews of Word, Excel, PowerPoint (slides drawn as laid out, charts included) and PDF files, with text you can select, and find in a PDF. Leave notes on a slide's shape, a cell, a passage or a spot on a page, and they go to the agent with your next message.
 - Per-thread diffs.
 - A Ghostty-powered terminal with tabs.
 - A browser that agents drive through Agentloft's built-in MCP server. Agents can also read other threads.
@@ -91,7 +91,7 @@ The same interface runs in a web browser, served by the daemon ([ADR-0016](docs/
 | `loft-git` | Checkpoints, diffs, worktrees |
 | `loft-terminal` | Terminal widget on libghostty-vt |
 | `loft-browser` | Embedded browser |
-| `loft-docs` | Office document previews |
+| `loft-docs` | Office documents and PDFs, read for previews |
 
 ## License
 

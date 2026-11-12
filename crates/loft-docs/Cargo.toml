@@ -1,6 +1,6 @@
 [package]
 name = "loft-docs"
-description = "Pure-Rust parsing of office documents (docx, xlsx/ods/csv, pptx) into a simple renderable model"
+description = "Pure-Rust reading of documents (docx, xlsx/ods/csv, pptx, pdf) into models and pictures a UI can show"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ zip.workspace = true
 quick-xml.workspace = true
 calamine.workspace = true
 csv.workspace = true
+hayro.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

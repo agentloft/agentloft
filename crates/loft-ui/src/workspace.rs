@@ -130,6 +130,9 @@ pub struct WorkspaceView {
     pasted: HashMap<ThreadId, Vec<String>>,
     /// Notes left on the browser page, waiting to be sent.
     page_notes: HashMap<ThreadId, Vec<loft_browser::Annotation>>,
+    /// Notes left on documents open in a thread's panel, not sent yet: the
+    /// file (as its tab has it) and the note.
+    doc_notes: HashMap<ThreadId, Vec<(String, crate::panel::docs::DocNote)>>,
     composer_harness: HashMap<ThreadId, HarnessId>,
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
@@ -224,7 +227,7 @@ pub struct WorkspaceView {
     details_card: Option<Entity<crate::details::DetailsCard>>,
     /// Width of the conversation area (with the dock), to decide docking.
     details_room: std::rc::Rc<std::cell::Cell<f32>>,
-    /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>`
+    /// Dev/test hook: `AGENTLOFT_DEV_TAB=files|changes|agent|file:<path>|docnote:<spec>`
     /// opens a panel tab once the first thread has loaded.
     dev_tab: Option<String>,
     /// Last window title set (the native tab label).
@@ -245,6 +248,9 @@ impl WorkspaceView {
             cx.subscribe_in(&panel, window, |this, _, event, window, cx| match event {
                 crate::panel::PanelEvent::Annotation(thread_id, note) => {
                     this.add_annotation(thread_id, note, window, cx)
+                }
+                crate::panel::PanelEvent::DocNote(thread_id, path, note) => {
+                    this.add_doc_note(thread_id, path, note, cx)
                 }
                 crate::panel::PanelEvent::Maximized(_) => cx.notify(),
                 crate::panel::PanelEvent::ShowPanel => {
@@ -299,6 +305,7 @@ impl WorkspaceView {
             attachments: HashMap::new(),
             pasted: HashMap::new(),
             page_notes: HashMap::new(),
+            doc_notes: HashMap::new(),
             composer_harness: HashMap::new(),
             observed: HashMap::new(),
             search,
@@ -588,7 +595,10 @@ impl WorkspaceView {
             }
             Some(("click", spec)) => {
                 self.panel_open = false;
-                dev_click(spec.to_owned(), window, cx);
+                // Several, one after another: `x,y,after_ms;x,y,after_ms`.
+                for click in spec.split(';') {
+                    dev_click(click.to_owned(), window, cx);
+                }
             }
             Some(("hover", spec)) => {
                 // `x,y[,after_ms]`: the pointer comes to rest at window
@@ -987,6 +997,88 @@ impl WorkspaceView {
                 self.panel
                     .update(cx, |p, cx| p.open_file(&thread_id, path, window, cx));
             }
+            Some(("docnote", spec)) => {
+                // `path|x,y;x,y|note[|send]`: open a document, turn notes on,
+                // click each point (window coordinates) and leave the note
+                // there; with `send`, send the message after.
+                let mut parts = spec.split('|');
+                let path = parts.next().unwrap_or_default().to_owned();
+                let points: Vec<(f32, f32)> = parts
+                    .next()
+                    .unwrap_or_default()
+                    .split(';')
+                    .filter_map(|p| {
+                        let (x, y) = p.split_once(',')?;
+                        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                    })
+                    .collect();
+                let note = parts.next().unwrap_or("A note").to_owned();
+                let send = parts.next() == Some("send");
+                self.panel.update(cx, |p, cx| {
+                    p.open_file(&thread_id, path.clone(), window, cx)
+                });
+                let (tid, thread) = (thread_id.clone(), thread.clone());
+                cx.spawn_in(window, async move |this, cx| {
+                    let executor = cx.background_executor().clone();
+                    let pause = |ms: u64| executor.timer(std::time::Duration::from_millis(ms));
+                    let doc = |this: &Self, cx: &gpui_kit::App| {
+                        this.panel.read(cx).doc_preview(&tid, &path, cx)
+                    };
+                    // The file is read through the daemon, then parsed.
+                    pause(2500).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(doc) = doc(this, cx) {
+                            doc.update(cx, |d, cx| d.set_annotating(true, cx));
+                        }
+                    });
+                    pause(600).await;
+                    for (x, y) in points {
+                        use gpui_kit::{
+                            Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
+                        };
+                        let position = gpui_kit::point(px(x), px(y));
+                        let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+                        let steps = [
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                button,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                            }),
+                        ];
+                        for step in steps {
+                            let _ = cx.update(|window, cx| {
+                                window.dispatch_event(step, cx);
+                            });
+                            pause(60).await;
+                        }
+                        pause(300).await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            if let Some(doc) = doc(this, cx) {
+                                doc.update(cx, |d, cx| d.finish_note(&note, window, cx));
+                            }
+                        });
+                        pause(300).await;
+                    }
+                    tracing::info!("dev: notes left on a document");
+                    if send {
+                        // A PDF's page pictures are drawn first.
+                        pause(2500).await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            let composer = this.composer_for(&thread, window, cx);
+                            this.submit(&tid, &composer, window, cx, false);
+                        });
+                    }
+                })
+                .detach();
+            }
             _ => match dev {
                 "branches" => self.branch_picker_open = true,
                 "work" => {
@@ -1175,16 +1267,148 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Chips for notes left on the page, each removable.
+    /// A note left on a document: it waits as a chip in the composer. For a
+    /// PDF, a picture of each page with notes, pins drawn on, is attached.
+    fn add_doc_note(
+        &mut self,
+        thread_id: &ThreadId,
+        path: &str,
+        note: &crate::panel::docs::DocNote,
+        cx: &mut Context<Self>,
+    ) {
+        self.doc_notes
+            .entry(thread_id.clone())
+            .or_default()
+            .push((path.to_owned(), note.clone()));
+        self.refresh_doc_pictures(thread_id, path, cx);
+        cx.notify();
+    }
+
+    /// The pictures attached for a PDF's notes, made again from the notes
+    /// its preview still shows.
+    fn refresh_doc_pictures(&mut self, thread_id: &ThreadId, path: &str, cx: &mut Context<Self>) {
+        let prefix = doc_notes_image_prefix(path);
+        let task = self
+            .panel
+            .read(cx)
+            .doc_preview(thread_id, path, cx)
+            .and_then(|doc| doc.read(cx).note_pictures(cx));
+        let Some(task) = task else {
+            // No notes on pages left (or not a PDF): no pictures either.
+            if let Some(images) = self.attachments.get_mut(thread_id) {
+                images.retain(|a| !a.name.starts_with(&prefix));
+            }
+            return;
+        };
+        let (thread_id, path) = (thread_id.clone(), path.to_owned());
+        cx.spawn(async move |this, cx| {
+            let pictures = task.await;
+            let _ = this.update(cx, |this, cx| {
+                // Only while notes on this file are still waiting.
+                let waiting = this
+                    .doc_notes
+                    .get(&thread_id)
+                    .is_some_and(|notes| notes.iter().any(|(p, _)| *p == path));
+                let list = this.attachments.entry(thread_id.clone()).or_default();
+                list.retain(|a| !a.name.starts_with(&prefix));
+                if waiting {
+                    for (page, png) in pictures {
+                        if list.len() >= crate::attachments::MAX_IMAGES {
+                            break;
+                        }
+                        let name = format!("{prefix}{page}.png");
+                        if let Some(image) = crate::attachments::PendingImage::png(&name, png) {
+                            list.push(image);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Chips for notes left on the page and on documents, each removable.
     fn note_chips(
         &self,
         thread_id: &ThreadId,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let notes = self.page_notes.get(thread_id).filter(|v| !v.is_empty())?;
+        let page_notes = self
+            .page_notes
+            .get(thread_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let doc_notes = self
+            .doc_notes
+            .get(thread_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if page_notes.is_empty() && doc_notes.is_empty() {
+            return None;
+        }
+        let chip = |id: String, n: u32, what: String, note: String, tooltip: String| {
+            h_flex()
+                .id(SharedString::from(id))
+                .gap_1p5()
+                .items_center()
+                .max_w(px(300.))
+                .pl_1()
+                .pr_1()
+                .py(px(3.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(p.accent.opacity(0.35))
+                .bg(p.accent.opacity(0.08))
+                .text_xs()
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(16.))
+                        .rounded(px(8.))
+                        .bg(p.accent)
+                        .text_color(p.accent_foreground)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(n.max(1).to_string()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(120.))
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.foreground)
+                        .child(what),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(p.muted_foreground)
+                        .child(note),
+                )
+        };
+        let remove = |id: String| {
+            div()
+                .id(SharedString::from(id))
+                .flex_none()
+                .cursor_pointer()
+                .p(px(2.))
+                .rounded(px(5.))
+                .text_color(p.muted_foreground)
+                .hover(|d| d.bg(p.selected).text_color(p.foreground))
+                .child(Icon::new(IconName::X).xsmall())
+        };
         let mut row = h_flex().gap_1p5().flex_wrap().px_3().pt_2();
-        for (ix, note) in notes.iter().enumerate() {
+        for (ix, note) in page_notes.iter().enumerate() {
             let tid = thread_id.clone();
             let what = if note.is_area() {
                 "Area".to_owned()
@@ -1203,72 +1427,57 @@ impl WorkspaceView {
                 note.label.chars().take(24).collect()
             };
             row = row.child(
-                h_flex()
-                    .id(SharedString::from(format!("note-{ix}")))
-                    .gap_1p5()
-                    .items_center()
-                    .max_w(px(300.))
-                    .pl_1()
-                    .pr_1()
-                    .py(px(3.))
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(p.accent.opacity(0.35))
-                    .bg(p.accent.opacity(0.08))
-                    .text_xs()
-                    .tooltip({
-                        let text = describe_note(note);
-                        move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(text.clone())
-                                .build(window, cx)
-                        }
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(16.))
-                            .rounded(px(8.))
-                            .bg(p.accent)
-                            .text_color(p.accent_foreground)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.))
-                            .font_weight(FontWeight::BOLD)
-                            .child(note.n.max(1).to_string()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.foreground)
-                            .child(what),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(p.muted_foreground)
-                            .child(note.note.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("note-remove-{ix}")))
-                            .flex_none()
-                            .cursor_pointer()
-                            .p(px(2.))
-                            .rounded(px(5.))
-                            .text_color(p.muted_foreground)
-                            .hover(|d| d.bg(p.selected).text_color(p.foreground))
-                            .child(Icon::new(IconName::X).xsmall())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_note(&tid, ix, cx);
-                            })),
-                    ),
+                chip(
+                    format!("note-{ix}"),
+                    note.n,
+                    what,
+                    note.note.clone(),
+                    describe_note(note),
+                )
+                .child(remove(format!("note-remove-{ix}")).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_note(&tid, ix, cx);
+                    },
+                ))),
+            );
+        }
+        for (ix, (path, note)) in doc_notes.iter().enumerate() {
+            let tid = thread_id.clone();
+            let file = path.rsplit('/').next().unwrap_or(path);
+            row = row.child(
+                chip(
+                    format!("doc-note-{ix}"),
+                    note.n,
+                    note.chip.clone(),
+                    note.note.clone(),
+                    format!("{file}: {}", note.what),
+                )
+                .child(remove(format!("doc-note-remove-{ix}")).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_doc_note(&tid, ix, cx);
+                    }),
+                )),
             );
         }
         Some(row.into_any_element())
+    }
+
+    fn remove_doc_note(&mut self, thread_id: &ThreadId, ix: usize, cx: &mut Context<Self>) {
+        let Some(list) = self.doc_notes.get_mut(thread_id) else {
+            return;
+        };
+        if ix >= list.len() {
+            return;
+        }
+        let (path, note) = list.remove(ix);
+        // Its pin leaves the document, and its page's picture is made again.
+        if let Some(doc) = self.panel.read(cx).doc_preview(thread_id, &path, cx) {
+            doc.update(cx, |doc, cx| doc.remove_note(note.n, cx));
+        }
+        self.refresh_doc_pictures(thread_id, &path, cx);
+        cx.notify();
     }
 
     fn remove_note(&mut self, thread_id: &ThreadId, ix: usize, cx: &mut Context<Self>) {
@@ -1684,7 +1893,8 @@ impl WorkspaceView {
         let empty = composer.read(cx).value().trim().is_empty()
             && self.attachments.get(thread_id).is_none_or(|a| a.is_empty())
             && self.pasted.get(thread_id).is_none_or(|p| p.is_empty())
-            && self.page_notes.get(thread_id).is_none_or(|n| n.is_empty());
+            && self.page_notes.get(thread_id).is_none_or(|n| n.is_empty())
+            && self.doc_notes.get(thread_id).is_none_or(|n| n.is_empty());
         if empty && self.open_request(cx).is_some() {
             self.answer(loft_protocol::DecisionKind::AllowOnce, cx);
             return;
@@ -1709,6 +1919,7 @@ impl WorkspaceView {
             .is_some_and(|a| !a.is_empty());
         let pasted = self.pasted.get(thread_id).cloned().unwrap_or_default();
         let notes = self.page_notes.get(thread_id).cloned().unwrap_or_default();
+        let doc_notes = self.doc_notes.get(thread_id).cloned().unwrap_or_default();
         // Reports shown as cards, not sent: Claude's `/context` and
         // `/usage`, Codex's `/status`.
         let harness = self
@@ -1730,7 +1941,8 @@ impl WorkspaceView {
             }
         };
         // Codex commands Agentloft runs itself.
-        if harness == loft_protocol::HarnessId::CODEX && pasted.is_empty() && notes.is_empty() {
+        let no_notes = notes.is_empty() && doc_notes.is_empty();
+        if harness == loft_protocol::HarnessId::CODEX && pasted.is_empty() && no_notes {
             let done = match typed.as_str() {
                 "/model" => {
                     let picker = self.model_picker_for(thread_id, window, cx);
@@ -1754,7 +1966,7 @@ impl WorkspaceView {
                 return;
             }
         }
-        if let Some(kind) = report.filter(|_| pasted.is_empty() && notes.is_empty())
+        if let Some(kind) = report.filter(|_| pasted.is_empty() && no_notes)
             && let Some(thread) = self.store.read(cx).threads.get(thread_id).cloned()
         {
             composer.update(cx, |c, cx| c.set_value("", window, cx));
@@ -1762,7 +1974,7 @@ impl WorkspaceView {
             thread.update(cx, |t, cx| t.add_card(kind, client, cx));
             return;
         }
-        if typed.is_empty() && !has_images && pasted.is_empty() && notes.is_empty() {
+        if typed.is_empty() && !has_images && pasted.is_empty() && no_notes {
             return;
         }
         self.pasted.remove(thread_id);
@@ -1776,6 +1988,25 @@ impl WorkspaceView {
                 });
             }
         }
+        if !doc_notes.is_empty() {
+            self.doc_notes.remove(thread_id);
+            // Sent: take the pins off the documents and stop annotating them.
+            let mut files: Vec<&str> = Vec::new();
+            for (path, _) in &doc_notes {
+                if !files.contains(&path.as_str()) {
+                    files.push(path);
+                }
+            }
+            for path in files {
+                if let Some(doc) = self.panel.read(cx).doc_preview(thread_id, path, cx) {
+                    doc.update(cx, |doc, cx| {
+                        doc.clear_notes(cx);
+                        doc.set_annotating(false, cx);
+                    });
+                }
+            }
+        }
+        let images = self.attachments.remove(thread_id).unwrap_or_default();
         // Pasted blocks follow what was typed.
         let mut parts = Vec::new();
         if !typed.is_empty() {
@@ -1785,9 +2016,12 @@ impl WorkspaceView {
         if !notes.is_empty() {
             parts.push(notes_block(&notes));
         }
+        if !doc_notes.is_empty() {
+            let pictured: Vec<&str> = images.iter().map(|a| a.name.as_str()).collect();
+            parts.push(doc_notes_block(&doc_notes, &pictured));
+        }
         let text = parts.join("\n\n");
         composer.update(cx, |c, cx| c.set_value("", window, cx));
-        let images = self.attachments.remove(thread_id).unwrap_or_default();
         let attachments: Vec<loft_protocol::Attachment> =
             images.iter().map(|a| a.to_attachment()).collect();
         let id = thread_id.clone();
@@ -6951,6 +7185,43 @@ fn describe_note(note: &loft_browser::Annotation) -> String {
     }
 }
 
+/// What the pictures attached for a PDF's notes are called: this, the page
+/// number, `.png`.
+fn doc_notes_image_prefix(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    format!("notes-{file}-page-")
+}
+
+/// Notes on documents as part of the message, a block per file, numbered
+/// like the pins on it. `pictured` names the images going with the message.
+fn doc_notes_block(notes: &[(String, crate::panel::docs::DocNote)], pictured: &[&str]) -> String {
+    let mut files: Vec<&str> = Vec::new();
+    for (path, _) in notes {
+        if !files.contains(&path.as_str()) {
+            files.push(path);
+        }
+    }
+    let mut blocks = Vec::new();
+    for file in files {
+        let prefix = doc_notes_image_prefix(file);
+        let pages = pictured.iter().filter(|n| n.starts_with(&prefix)).count();
+        let mut out = match pages {
+            0 => format!("Notes on {file}:"),
+            1 => format!(
+                "Notes on {file} (the attached picture of the page shows them as numbered pins):"
+            ),
+            _ => format!(
+                "Notes on {file} (the attached pictures of its pages show them as numbered pins):"
+            ),
+        };
+        for (_, n) in notes.iter().filter(|(p, _)| p == file) {
+            out.push_str(&format!("\n{}. On {}: {}", n.n, n.what, n.note));
+        }
+        blocks.push(out);
+    }
+    blocks.join("\n\n")
+}
+
 /// Page notes as part of the message, numbered like the pins on the page.
 fn notes_block(notes: &[loft_browser::Annotation]) -> String {
     let mut pages: Vec<&str> = Vec::new();
@@ -7877,6 +8148,9 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
     let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
     let position = gpui_kit::point(px(at(0, 10.)), px(at(1, 10.)));
     let after = std::time::Duration::from_millis(at(2, 2500.) as u64);
+    // `x,y,after_ms,x2,y2`: a drag, pressed at the first place and let go
+    // at the second.
+    let released = gpui_kit::point(px(at(3, at(0, 10.))), px(at(4, at(1, 10.))));
     cx.spawn_in(window, async move |_, cx| {
         use gpui_kit::{
             Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
@@ -7903,13 +8177,23 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
                 click_count: 1,
                 first_mouse: false,
             }),
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: released,
+                pressed_button: Some(button),
+                modifiers,
+            }),
             PlatformInput::MouseUp(MouseUpEvent {
                 button,
-                position,
+                position: released,
                 modifiers,
                 click_count: 1,
             }),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        // (The move with the button down is a drag's only.)
+        .filter_map(|(ix, step)| (ix != 2 || released != position).then_some(step))
+        {
             let _ = cx.update(|window, cx| {
                 // This window is already in hand; another one is asked for.
                 if target == window.window_handle() {
@@ -7931,6 +8215,58 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
 #[cfg(test)]
 mod tests {
     use super::pretty_model;
+
+    #[test]
+    fn doc_notes_are_written_a_block_per_file() {
+        use super::{doc_notes_block, doc_notes_image_prefix};
+        use crate::panel::docs::{DocNote, Place};
+        let note = |n: u32, place: Place, what: &str, text: &str| DocNote {
+            n,
+            place,
+            chip: String::new(),
+            what: what.to_owned(),
+            note: text.to_owned(),
+        };
+        let notes = vec![
+            (
+                "decks/pitch.pptx".to_owned(),
+                note(
+                    1,
+                    Place::Shape { slide: 2, shape: 4 },
+                    "slide 2, the shape “Card” (“Hello”)",
+                    "Make it blue",
+                ),
+            ),
+            (
+                "report.pdf".to_owned(),
+                note(
+                    1,
+                    Place::Page {
+                        page: 2,
+                        x: 0.5,
+                        y: 0.25,
+                    },
+                    "page 3, 50% across and 25% down",
+                    "Wrong total",
+                ),
+            ),
+            (
+                "decks/pitch.pptx".to_owned(),
+                note(2, Place::Text, "slide 5", "Drop this slide"),
+            ),
+        ];
+        let prefix = doc_notes_image_prefix("report.pdf");
+        assert_eq!(prefix, "notes-report.pdf-page-");
+        let picture = format!("{prefix}3.png");
+        assert_eq!(
+            doc_notes_block(&notes, &["screenshot.png", &picture]),
+            "Notes on decks/pitch.pptx:\n\
+             1. On slide 2, the shape “Card” (“Hello”): Make it blue\n\
+             2. On slide 5: Drop this slide\n\n\
+             Notes on report.pdf (the attached picture of the page shows them as numbered pins):\n\
+             1. On page 3, 50% across and 25% down: Wrong total"
+        );
+    }
 
     #[test]
     fn mini_browser_stays_inside_the_conversation() {

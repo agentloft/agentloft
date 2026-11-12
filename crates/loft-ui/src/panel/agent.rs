@@ -248,6 +248,7 @@ impl Render for AgentView {
                 .child(crate::items::reply_text_view(
                     TextView::new(md),
                     cwd.clone(),
+                    Some(model.thread.id.clone()),
                 ))
         });
 

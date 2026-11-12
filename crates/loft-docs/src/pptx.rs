@@ -1,4 +1,5 @@
-//! PresentationML (`.pptx`) → one Markdown body per slide.
+//! PresentationML (`.pptx`) → one Markdown body per slide, plus the slide as
+//! drawn ([`crate::slide_scene`]).
 
 use std::collections::HashMap;
 
@@ -8,6 +9,7 @@ use quick_xml::events::{BytesStart, Event};
 use crate::docx::{is_monospace, safe_url};
 use crate::md::{self, BlockWriter, InlineBuf, ListState, Marks, RenderOpts};
 use crate::opc::{ImageSet, Package, Rels};
+use crate::slide_scene::SceneBuilder;
 use crate::xml::{MAX_DEPTH, Xml, attr, attr_prefixed, local};
 use crate::{Deck, Slide};
 
@@ -26,13 +28,19 @@ pub fn parse(bytes: &[u8]) -> anyhow::Result<Deck> {
         parts = slides_by_name(&pkg);
     }
 
+    let mut scenes = SceneBuilder::new(&pres);
     let mut slides = Vec::new();
     for (i, part) in parts.iter().take(MAX_SLIDES).enumerate() {
-        let slide = parse_slide(&mut pkg, part, i + 1)
+        let mut slide = parse_slide(&mut pkg, &mut scenes.images, part, i + 1)
             .with_context(|| format!("malformed slide {part}"))?;
+        slide.scene = scenes.build(&mut pkg, part, i + 1);
         slides.push(slide);
     }
-    Ok(Deck { slides })
+    Ok(Deck {
+        slides,
+        size: scenes.size,
+        images: scenes.images.images,
+    })
 }
 
 /// Slide parts in presentation order, from `p:sldIdLst`.
@@ -107,12 +115,16 @@ enum Item {
     Image { alt: Option<String>, rel_id: String },
 }
 
-fn parse_slide(pkg: &mut Package<'_>, part: &str, index: usize) -> anyhow::Result<Slide> {
+fn parse_slide(
+    pkg: &mut Package<'_>,
+    images: &mut ImageSet,
+    part: &str,
+    index: usize,
+) -> anyhow::Result<Slide> {
     let xml = pkg.read_xml(part)?;
     let rels = pkg.rels_for(part)?;
     let items = parse_shapes(&xml, &rels)?;
 
-    let mut images = ImageSet::default();
     let mut title: Option<String> = None;
     let mut w = BlockWriter::default();
     // Lists from different text frames alternate `-` and `*` bullets so
@@ -179,7 +191,7 @@ fn parse_slide(pkg: &mut Package<'_>, part: &str, index: usize) -> anyhow::Resul
         title,
         markdown: w.finish(),
         notes,
-        images: images.images,
+        scene: None,
     })
 }
 

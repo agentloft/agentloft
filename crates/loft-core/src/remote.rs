@@ -180,6 +180,7 @@ impl Core {
         path: &str,
         thread_id: Option<&ThreadId>,
         confined: bool,
+        offset: u64,
     ) -> CoreResult<FileContent> {
         let not_found = || ErrorBody::new(ErrorCode::NotFound, "no such file");
         let given = path.strip_prefix("file://").unwrap_or(path);
@@ -199,7 +200,7 @@ impl Core {
         if !meta.is_file() {
             return Err(not_found());
         }
-        self.read_file_at(&full, path)
+        self.read_file_at(&full, path, offset)
     }
 
     /// Refuse what a remote session may not ask for; `Ok` means "go on".
@@ -373,10 +374,14 @@ impl Core {
     ) -> CoreResult<Response> {
         self.check_remote(&req, policy)?;
         match req {
-            Request::ReadPath { path, thread_id } => {
+            Request::ReadPath {
+                path,
+                thread_id,
+                offset,
+            } => {
                 let core = self.clone();
                 let file = tokio::task::spawn_blocking(move || {
-                    core.read_path(&path, thread_id.as_ref(), true)
+                    core.read_path(&path, thread_id.as_ref(), true, offset)
                 })
                 .await
                 .map_err(internal)??;
@@ -527,6 +532,7 @@ mod tests {
         Request::ReadPath {
             path: path.into(),
             thread_id: thread_id.cloned(),
+            offset: 0,
         }
     }
 

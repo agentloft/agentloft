@@ -8,7 +8,8 @@ use loft_protocol::{
 };
 use std::path::{Component, Path, PathBuf};
 
-/// Largest file `ReadFile` returns (the frame limit is 16 MiB after base64).
+/// The most of a file one `ReadFile` answer holds (the frame limit is 16 MiB
+/// after base64); the rest is asked for from an offset.
 const MAX_READ: u64 = 10 * 1024 * 1024;
 const MAX_DIR_ENTRIES: usize = 5_000;
 
@@ -166,9 +167,14 @@ impl Core {
         Ok(entries)
     }
 
-    pub(crate) fn read_file(&self, root: &FsRoot, rel: &str) -> CoreResult<FileContent> {
+    pub(crate) fn read_file(
+        &self,
+        root: &FsRoot,
+        rel: &str,
+        offset: u64,
+    ) -> CoreResult<FileContent> {
         let (_, path) = self.resolve(root, rel)?;
-        self.read_file_at(&path, rel)
+        self.read_file_at(&path, rel, offset)
     }
 
     /// A project's icon: the image chosen for it, else the one found in
@@ -185,18 +191,29 @@ impl Core {
             .or_else(|| loft_config::icons::find(Path::new(&project.root_path)))
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "no icon"))?;
         let name = icon.to_string_lossy().into_owned();
-        self.read_file_at(&icon, &name)
+        self.read_file_at(&icon, &name, 0)
     }
 
-    /// Read `path` (already checked by the caller), reported under `name`.
-    pub(crate) fn read_file_at(&self, path: &Path, name: &str) -> CoreResult<FileContent> {
-        use std::io::Read as _;
+    /// Read `path` (already checked by the caller) from `offset` on, as much
+    /// as one answer holds, reported under `name`.
+    pub(crate) fn read_file_at(
+        &self,
+        path: &Path,
+        name: &str,
+        offset: u64,
+    ) -> CoreResult<FileContent> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
         let meta = std::fs::metadata(path).map_err(|e| bad(format!("{name}: {e}")))?;
         if meta.is_dir() {
             return Err(bad(format!("{name} is a directory")));
         }
-        let file = std::fs::File::open(path).map_err(|e| bad(format!("{name}: {e}")))?;
-        let mut bytes = Vec::with_capacity(meta.len().min(MAX_READ) as usize);
+        let mut file = std::fs::File::open(path).map_err(|e| bad(format!("{name}: {e}")))?;
+        let offset = offset.min(meta.len());
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset)).map_err(internal)?;
+        }
+        let left = meta.len() - offset;
+        let mut bytes = Vec::with_capacity(left.min(MAX_READ) as usize);
         file.take(MAX_READ)
             .read_to_end(&mut bytes)
             .map_err(internal)?;
@@ -206,7 +223,8 @@ impl Core {
             abs_path: path.to_string_lossy().into_owned(),
             size: meta.len(),
             binary: sniff.contains(&0),
-            truncated: meta.len() > MAX_READ,
+            truncated: offset + (bytes.len() as u64) < meta.len(),
+            offset,
             bytes: bytes.into(),
         })
     }

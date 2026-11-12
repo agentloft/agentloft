@@ -21,7 +21,7 @@ use loft_protocol::{
 
 const OUTPUT_PREVIEW_LINES: usize = 14;
 /// Long messages fold to this height until "Show more".
-const FOLDED_HEIGHT: f32 = 220.;
+const FOLDED_HEIGHT: f32 = 240.;
 
 /// The file on this Mac a reply image points at: `/abs`, `~/…`,
 /// `file://…`, or a path relative to the thread's folder. `None` for web
@@ -118,14 +118,23 @@ fn reply_image_block(node: &gpui_kit::component::text::markdown_ast::Node) -> Op
     }
 }
 
-/// A reply's Markdown view: local images load from disk, and an image on
-/// its own is drawn by us so it can be clicked for a large preview and
-/// right-clicked to copy or save.
-pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
+/// A reply's Markdown view: local images load from disk, an image on its
+/// own is drawn by us so it can be clicked for a large preview and
+/// right-clicked to copy or save, and a file's path in backticks is a link
+/// that opens the file in `thread`'s side panel.
+pub(crate) fn reply_text_view(
+    view: TextView,
+    cwd: String,
+    thread: Option<loft_protocol::ThreadId>,
+) -> TextView {
     use gpui_kit::component::menu::ContextMenuExt as _;
     use gpui_kit::component::text::MarkdownNode;
     let render_cwd = cwd.clone();
     code_blocks(view)
+        .plugin(crate::file_links::FileLinks {
+            cwd: cwd.clone(),
+            thread,
+        })
         .image_source(local_images(cwd))
         .markdown_block_parser(|node, _| {
             let image = reply_image_block(node)?;
@@ -136,7 +145,7 @@ pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
                     .markdown(markdown),
             )
         })
-        .markdown_block_renderer(REPLY_IMAGE_NODE, move |node, _, cx| {
+        .markdown_block_renderer(REPLY_IMAGE_NODE, move |node, window, cx| {
             let Some(image) = node.data::<ReplyImage>() else {
                 return div().into_any_element();
             };
@@ -145,6 +154,12 @@ pub(crate) fn reply_text_view(view: TextView, cwd: String) -> TextView {
                 "reply-image-{}",
                 node.source_range().map(|r| r.start).unwrap_or_default()
             ));
+            // A video plays where it stands.
+            if let Some(path) = local_image_path(&image.src, &render_cwd)
+                && crate::video::is_video(&path)
+            {
+                return crate::video::player(id, path, window, cx);
+            }
             let frame = div()
                 .id(id)
                 .w(px(REPLY_IMAGE_WIDTH as f32))
@@ -326,7 +341,75 @@ fn nested_line(line: &str) -> bool {
 
 /// Long enough to fold: many lines, or a lot of text.
 pub(crate) fn is_long_message(text: &str) -> bool {
-    text.lines().count() > 10 || text.len() > 900
+    text.lines().count() > 18 || text.len() > 1500
+}
+
+/// A message the user typed, as Markdown that keeps what typing means: a
+/// new line stays a new line, and `<…>` shows as typed instead of being
+/// read as HTML. Code (fenced, indented, or in backticks) is left alone.
+pub(crate) fn user_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 16 + 8);
+    let mut in_fence = false;
+    // A list is open: indented lines belong to its items, not to code.
+    let mut in_list = false;
+    // The line before was blank, or code: an indented line after it is code.
+    let mut code_may_start = true;
+    for line in text.split_inclusive('\n') {
+        let (body, ending) = match line.strip_suffix('\n') {
+            Some(body) => (body.strip_suffix('\r').unwrap_or(body), "\n"),
+            None => (line, ""),
+        };
+        let trimmed = body.trim_start();
+        let indent = body.len() - trimmed.len();
+        let fence = indent < 4 && (trimmed.starts_with("```") || trimmed.starts_with("~~~"));
+        if fence || in_fence {
+            in_fence ^= fence;
+            out.push_str(body);
+            out.push_str(ending);
+            code_may_start = false;
+            continue;
+        }
+        if trimmed.is_empty() {
+            out.push_str(ending);
+            code_may_start = true;
+            continue;
+        }
+        if nested_line(trimmed) && !trimmed.starts_with('>') {
+            in_list = true;
+        } else if indent < 2 {
+            in_list = false;
+        }
+        if (indent >= 4 || body.starts_with('\t')) && !in_list && code_may_start {
+            out.push_str(body);
+            out.push_str(ending);
+            continue;
+        }
+        code_may_start = false;
+        let mut rest = body;
+        let mut in_code = false;
+        while let Some(ch) = rest.chars().next() {
+            let after = &rest[ch.len_utf8()..];
+            if ch == '`' {
+                in_code = !in_code;
+            } else if ch == '<'
+                && !in_code
+                && after.starts_with(|c: char| c.is_ascii_alphabetic() || "/!?".contains(c))
+                && !["http://", "https://", "mailto:"]
+                    .iter()
+                    .any(|scheme| after.starts_with(scheme))
+            {
+                out.push('\\');
+            }
+            out.push(ch);
+            rest = after;
+        }
+        // Two spaces at the end of a line: the next line starts a new one.
+        if !ending.is_empty() && !body.ends_with("  ") {
+            out.push_str("  ");
+        }
+        out.push_str(ending);
+    }
+    out
 }
 
 /// Text that renders as itself in the Markdown view: punctuation escaped,
@@ -525,13 +608,26 @@ pub(crate) fn render_item(
                     let fold_key = loft_protocol::ItemId(format!("fold:{}", item.id.0));
                     let open = state.is_expanded(&fold_key, false);
                     let folded = long && !open;
-                    // Selectable: the text goes through the Markdown view,
-                    // escaped so it shows exactly as typed.
-                    let body = TextView::markdown(
-                        SharedString::from(format!("user-md-{}", item.id)),
-                        plain_markdown(text),
+                    // Markdown, as in a reply: what was pasted from one
+                    // (lists, code, pictures) looks the way it did there.
+                    let cwd = state
+                        .model
+                        .as_ref()
+                        .map(|m| m.thread.cwd.clone())
+                        .unwrap_or_default();
+                    let body = reply_text_view(
+                        TextView::markdown(
+                            SharedString::from(format!("user-md-{}", item.id)),
+                            sized_images(&user_markdown(text)).into_owned(),
+                        )
+                        .selectable(true),
+                        cwd,
+                        state.model.as_ref().map(|m| m.thread.id.clone()),
                     )
-                    .selectable(true);
+                    // The bubble is the colour code has elsewhere.
+                    .inline_code_style(
+                        gpui_kit::StyleRefinement::default().bg(p.foreground.opacity(0.09)),
+                    );
                     let toggle = long.then(|| {
                         let (thread, key) = (thread.clone(), fold_key.clone());
                         div()
@@ -612,16 +708,17 @@ pub(crate) fn render_item(
                 .as_ref()
                 .map(|m| m.thread.cwd.clone())
                 .unwrap_or_default();
+            let thread_id = state.model.as_ref().map(|m| m.thread.id.clone());
             match state.markdown.get(&item.id) {
-                Some(md) => {
-                    reply_text_view(TextView::new(md).stream_fade(true), cwd).into_any_element()
-                }
+                Some(md) => reply_text_view(TextView::new(md).stream_fade(true), cwd, thread_id)
+                    .into_any_element(),
                 None => reply_text_view(
                     TextView::markdown(
                         SharedString::from(format!("md-{}", item.id)),
                         sized_images(text).into_owned(),
                     ),
                     cwd,
+                    thread_id,
                 )
                 .into_any_element(),
             }
@@ -2520,6 +2617,25 @@ mod tests {
             parent_id: None,
             started_at_ms: None,
         }
+    }
+
+    #[test]
+    fn typed_messages_keep_their_lines_and_angle_brackets() {
+        // A new line stays one; Markdown stays Markdown.
+        assert_eq!(user_markdown("a\n**b**\n\nc"), "a  \n**b**  \n\nc");
+        assert_eq!(user_markdown("- one\n- two\n"), "- one  \n- two  \n");
+        // What would be read as HTML shows as typed; links and code don't change.
+        assert_eq!(
+            user_markdown("a <div> `<b>` Vec<String> 1 < 2 <https://x.dev>"),
+            "a \\<div> `<b>` Vec\\<String> 1 < 2 <https://x.dev>"
+        );
+        assert_eq!(
+            user_markdown("```html\n<p>\n```\n<p>"),
+            "```html\n<p>\n```\n\\<p>"
+        );
+        // Indented code after a blank line is code; under a list item it is text.
+        assert_eq!(user_markdown("x\n\n    <p>\n"), "x  \n\n    <p>\n");
+        assert_eq!(user_markdown("- a\n\n    <p>\n"), "- a  \n\n    \\<p>  \n");
     }
 
     #[test]

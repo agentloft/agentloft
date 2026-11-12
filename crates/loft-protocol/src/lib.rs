@@ -18,6 +18,11 @@ pub use workbench::*;
 
 use serde::{Deserialize, Serialize};
 
+/// For `skip_serializing_if`: an offset of 0 is left off the wire.
+pub(crate) fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Bumped on any incompatible wire change. The daemon accepts `N` and `N-1`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -351,9 +356,13 @@ pub enum Request {
         #[serde(default)]
         rel_path: String,
     },
+    /// Answers `Response::File` with the file from `offset` on, as much as
+    /// one answer holds; `FileContent::truncated` says there is more.
     ReadFile {
         root: FsRoot,
         rel_path: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u64,
     },
     GetDiff {
         thread_id: ThreadId,
@@ -520,6 +529,9 @@ pub enum Request {
         path: String,
         #[serde(default)]
         thread_id: Option<ThreadId>,
+        /// Where in the file to start, as for `ReadFile`.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u64,
     },
     // -- what the desktop app reads from disk, for clients that can't -------
     /// The settings files a UI needs (config.toml, colour themes, sidebar

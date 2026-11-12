@@ -1,7 +1,8 @@
 //! File viewer: syntax-highlighted code, rendered Markdown (with a source
-//! toggle), images, office documents, and an external-open fallback.
+//! toggle), images, office documents and PDFs (with notes for the agent), and
+//! an external-open fallback.
 
-use crate::panel::docs::{DocPreview, doc_kind};
+use crate::panel::docs::{DocEvent, DocNote, DocPreview, doc_kind};
 use crate::spinner::Spinner;
 use crate::store::AppStore;
 use crate::theme::Palette;
@@ -12,10 +13,10 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, AsyncWindowContext, Context, Entity, FontWeight, Image, ImageFormat,
-    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Task, WeakEntity, Window, div,
-    img, prelude::FluentBuilder as _, px,
+    AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter, FontWeight, Image,
+    ImageFormat, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    Task, WeakEntity, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use loft_protocol::{FileContent, FsRoot, Request, Response};
 use std::sync::Arc;
@@ -30,6 +31,8 @@ enum Content {
         text: Arc<str>,
     },
     Image(Arc<Image>),
+    /// A video, played from where it is on this machine.
+    Video(std::path::PathBuf),
     Doc(Entity<DocPreview>),
     External(String),
     Error(String),
@@ -48,7 +51,18 @@ pub struct FileViewer {
     pending: Option<Task<()>>,
     /// What `content` was made from: the length and a hash of the bytes.
     shown: Option<(usize, u64)>,
+    /// Listening to the document shown: for notes left on it, and to draw
+    /// the header again when it changes (its Annotate button comes and goes).
+    doc_events: Vec<Subscription>,
 }
+
+/// What a viewer tells the panel.
+pub enum ViewerEvent {
+    /// A note left on the document it shows.
+    Note(DocNote),
+}
+
+impl EventEmitter<ViewerEvent> for FileViewer {}
 
 impl FileViewer {
     pub fn new(
@@ -69,26 +83,100 @@ impl FileViewer {
             show_source: false,
             pending: None,
             shown: None,
+            doc_events: Vec::new(),
         };
         this.reload(window, cx);
         this
     }
 
+    /// The document preview, when the file is one.
+    pub fn doc(&self) -> Option<Entity<DocPreview>> {
+        match &self.content {
+            Content::Doc(doc) => Some(doc.clone()),
+            _ => None,
+        }
+    }
+
+    /// Where the file is, if it is a video that plays here.
+    fn video(&self, cx: &Context<Self>) -> Option<std::path::PathBuf> {
+        if !crate::video::is_video(std::path::Path::new(&self.rel_path)) {
+            return None;
+        }
+        let cwd = match &self.root {
+            FsRoot::Thread(thread) => self.store.read(cx).thread_cwd(thread, cx),
+            FsRoot::Project(_) => None,
+        };
+        let relative = !self.rel_path.starts_with('/') && !self.rel_path.starts_with("~/");
+        if relative && cwd.is_none() {
+            return None;
+        }
+        crate::items::local_image_path(&self.rel_path, &cwd.unwrap_or_default())
+    }
+
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A video is played from its file: nothing of it is read here.
+        if let Some(path) = self.video(cx) {
+            self.size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            self.abs_path = Some(path.to_string_lossy().into_owned());
+            if !matches!(&self.content, Content::Video(showing) if *showing == path) {
+                self.content = Content::Video(path);
+                self.shown = None;
+                cx.notify();
+            }
+            return;
+        }
         let Some(client) = self.store.read(cx).client() else {
             self.content = Content::Error("Not connected to agentloftd.".into());
             self.shown = None;
             cx.notify();
             return;
         };
-        let fut = client.request(Request::ReadFile {
-            root: self.root.clone(),
-            rel_path: self.rel_path.clone(),
-        });
+        // A file outside the thread's folder is asked for by its own path.
+        let anywhere = self.rel_path.starts_with('/') || self.rel_path.starts_with("~/");
+        let (root, rel_path) = (self.root.clone(), self.rel_path.clone());
+        let ask = move |offset: u64| {
+            if anywhere {
+                Request::ReadPath {
+                    path: rel_path.clone(),
+                    thread_id: match &root {
+                        FsRoot::Thread(thread) => Some(thread.clone()),
+                        FsRoot::Project(_) => None,
+                    },
+                    offset,
+                }
+            } else {
+                Request::ReadFile {
+                    root: root.clone(),
+                    rel_path: rel_path.clone(),
+                    offset,
+                }
+            }
+        };
+        // A document or a picture is no use in part: one answer holds only
+        // so much of a file, so the rest is asked for, up to what a preview
+        // reads at all.
+        let whole = doc_kind(&self.rel_path).is_some()
+            || image_format(&extension(&self.rel_path)).is_some();
         cx.spawn_in(
             window,
             async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-                let result = fut.await;
+                let mut result = client.request(ask(0)).await;
+                if whole && let Ok(Response::File { file }) = &mut result {
+                    while file.truncated && file.size <= loft_docs::MAX_FILE_BYTES {
+                        let next = file.bytes.0.len() as u64;
+                        match client.request(ask(next)).await {
+                            // A daemon that cannot start anywhere but the
+                            // beginning answers from 0: leave it cut short.
+                            Ok(Response::File { file: more })
+                                if more.offset == next && !more.bytes.0.is_empty() =>
+                            {
+                                file.bytes.0.extend(more.bytes.0);
+                                file.truncated = more.truncated;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
                 let _ = this.update_in(cx, |this, window, cx| match result {
                     Ok(Response::File { file }) => this.show(file, window, cx),
                     Ok(other) => {
@@ -130,9 +218,15 @@ impl FileViewer {
             Content::Image(Arc::new(Image::from_bytes(format, bytes)))
         } else if let Some(kind) = doc_kind(&self.rel_path) {
             let name = self.rel_path.clone();
-            Content::Doc(cx.new(|cx| DocPreview::new(kind, &name, bytes, window, cx)))
-        } else if ext == "pdf" {
-            Content::External("PDF preview opens in your default viewer.".into())
+            let doc = cx.new(|cx| DocPreview::new(kind, &name, bytes, window, cx));
+            self.doc_events = vec![
+                cx.subscribe(&doc, |_, _, event: &DocEvent, cx| {
+                    let DocEvent::Note(note) = event;
+                    cx.emit(ViewerEvent::Note(note.clone()));
+                }),
+                cx.observe(&doc, |_, _, cx| cx.notify()),
+            ];
+            Content::Doc(doc)
         } else if file.binary {
             Content::External(format!("Binary file ({}).", human_size(file.size)))
         } else {
@@ -482,7 +576,7 @@ fn header_icon(
 }
 
 impl Render for FileViewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
         let is_markdown = matches!(self.content, Content::Markdown { .. });
         let (dir, file) = match self.rel_path.rsplit_once('/') {
@@ -553,6 +647,40 @@ impl Render for FileViewer {
                     })),
                 )
             })
+            .when_some(self.doc().filter(|d| d.read(cx).can_find()), |d, doc| {
+                let on = doc.read(cx).finding();
+                d.child(
+                    header_icon("find", IconName::Search, "Find in document", &p)
+                        .when(on, |d| d.bg(p.accent.opacity(0.16)).text_color(p.accent))
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            doc.update(cx, |doc, cx| doc.set_finding(!on, window, cx));
+                            cx.notify();
+                        })),
+                )
+            })
+            .when_some(
+                self.doc().filter(|d| d.read(cx).can_annotate()),
+                |d, doc| {
+                    let on = doc.read(cx).annotating();
+                    d.child(
+                        header_icon(
+                            "annotate",
+                            IconName::MessageSquarePlus,
+                            if on {
+                                "Stop annotating"
+                            } else {
+                                "Annotate: leave notes on this document for the agent"
+                            },
+                            &p,
+                        )
+                        .when(on, |d| d.bg(p.accent.opacity(0.16)).text_color(p.accent))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            doc.update(cx, |doc, cx| doc.set_annotating(!on, cx));
+                            cx.notify();
+                        })),
+                    )
+                },
+            )
             .child(
                 header_icon("reload", IconName::RefreshCw, "Reload", &p)
                     .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
@@ -649,6 +777,17 @@ impl Render for FileViewer {
                 .min_h_0()
                 .relative()
                 .child(div().absolute().inset_0().child(doc.clone()))
+                .into_any_element(),
+            Content::Video(path) => div()
+                .flex_1()
+                .min_h_0()
+                .p_4()
+                .child(crate::video::player_filling(
+                    SharedString::from("viewer-video"),
+                    path.clone(),
+                    window,
+                    cx,
+                ))
                 .into_any_element(),
             Content::External(reason) => v_flex()
                 .flex_1()

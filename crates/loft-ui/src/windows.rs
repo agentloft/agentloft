@@ -35,6 +35,16 @@ pub fn init(runtime: crate::host::Runtime, paths: Paths, cx: &mut App) {
     .detach();
 }
 
+/// The store of the workspace in `window`.
+pub(crate) fn store_of(window: &gpui_kit::Window, cx: &App) -> Option<gpui_kit::Entity<AppStore>> {
+    let handle = window.window_handle();
+    cx.try_global::<AppEnv>()?
+        .open
+        .iter()
+        .find(|(open, _)| *open == handle)
+        .and_then(|(_, store)| store.upgrade())
+}
+
 /// Re-render every workspace window (e.g. a tab's title changed).
 pub fn refresh_all(cx: &mut App) {
     let handles: Vec<AnyWindowHandle> = cx

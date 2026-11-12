@@ -55,8 +55,13 @@ pub struct FileContent {
     pub size: u64,
     /// Heuristic: contains NUL bytes in the first 8 KiB.
     pub binary: bool,
-    /// Content was cut at the read limit.
+    /// The file goes on after `bytes`: one answer holds only so much. Ask
+    /// again from `offset + bytes.len()` for the rest.
     pub truncated: bool,
+    /// Where in the file `bytes` starts. A daemon from before reads could
+    /// start anywhere always answers from 0, and says so here.
+    #[serde(default, skip_serializing_if = "crate::is_zero")]
+    pub offset: u64,
     pub bytes: Bytes,
 }
 

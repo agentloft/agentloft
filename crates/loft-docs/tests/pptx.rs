@@ -184,9 +184,11 @@ fn two_slides_in_presentation_order() {
         s.notes.as_deref(),
         Some("Remember to smile.\nThank *everyone*")
     );
-    assert_eq!(s.images.len(), 1);
-    assert_eq!(s.images[0].name, "image1.png");
-    assert_eq!(s.images[0].bytes, PNG);
+    assert_eq!(deck.images.len(), 1);
+    assert_eq!(deck.images[0].name, "image1.png");
+    assert_eq!(deck.images[0].bytes, PNG);
+    // No layout to place the shapes by: the Markdown is what there is.
+    assert!(s.scene.is_none());
 
     let s = &deck.slides[1];
     println!("{}", s.markdown);
@@ -199,7 +201,6 @@ fn two_slides_in_presentation_order() {
          - Grouped note"
     );
     assert_eq!(s.notes, None);
-    assert!(s.images.is_empty());
 
     let all = deck.to_markdown();
     assert!(

@@ -78,6 +78,8 @@ zip = { version = "9.5", default-features = false, features = ["deflate"] }
 quick-xml = "0.42"
 calamine = { version = "0.38", default-features = false }
 csv = "1.4"
+# PDF pages as pictures, drawn on the CPU (also in the browser build)
+hayro = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

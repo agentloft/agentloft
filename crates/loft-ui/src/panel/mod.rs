@@ -8,6 +8,7 @@ pub mod dock;
 pub mod docs;
 pub mod files;
 pub mod page;
+pub mod slides;
 pub mod terminal;
 pub mod viewer;
 
@@ -148,6 +149,9 @@ pub enum PanelEvent {
     HideDock,
     /// `thread`'s browser left annotation mode.
     AnnotatingStopped(ThreadId),
+    /// A note left on a document open in `thread`'s panel: the file's path
+    /// as its tab has it, and the note.
+    DocNote(ThreadId, String, docs::DocNote),
 }
 
 pub struct WorkbenchPanel {
@@ -401,6 +405,23 @@ impl WorkbenchPanel {
         _cx: &gpui_kit::App,
     ) -> Option<Entity<BrowserView>> {
         self.threads.get(thread_id)?.browser()
+    }
+
+    /// The preview of the document `path` open in `thread_id`'s panel.
+    pub fn doc_preview(
+        &self,
+        thread_id: &ThreadId,
+        path: &str,
+        cx: &gpui_kit::App,
+    ) -> Option<Entity<docs::DocPreview>> {
+        self.threads
+            .get(thread_id)?
+            .tabs
+            .iter()
+            .find_map(|tab| match tab {
+                Open::File { path: p, viewer } if p == path => viewer.read(cx).doc(),
+                _ => None,
+            })
     }
 
     fn new_browser(
@@ -713,6 +734,16 @@ impl WorkbenchPanel {
                 let root = FsRoot::Thread(thread_id.clone());
                 let path = rel_path.clone();
                 let viewer = cx.new(|cx| FileViewer::new(store, root, path, window, cx));
+                let (thread, file) = (thread_id.clone(), rel_path.clone());
+                cx.subscribe(&viewer, move |_, _, event: &viewer::ViewerEvent, cx| {
+                    let viewer::ViewerEvent::Note(note) = event;
+                    cx.emit(PanelEvent::DocNote(
+                        thread.clone(),
+                        file.clone(),
+                        note.clone(),
+                    ));
+                })
+                .detach();
                 panel.tabs.push(Open::File {
                     path: rel_path,
                     viewer,
