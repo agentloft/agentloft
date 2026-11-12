@@ -9,6 +9,7 @@ Final icon: **"Loft floors"**, three separated mint and teal isometric panes sta
 | `AppIcon.iconset/` | Source for the `.icns` (`iconutil -c icns AppIcon.iconset`) |
 | `agentloft.ico` | Windows (16, 24, 32, 48, 64, 128, 256) |
 | `png/agentloft-{16,24,32,48,64,128,256,512,1024}.png` | Linux hicolor theme, docs/README, in-app use (e.g. About window, sidebar header) |
+| `dev/` | The same icon in blue (hue turned 50°), for dev bundles and `cargo run`, so they can't be taken for the installed app in the Dock |
 
 `exploration/` holds earlier concepts for reference only. Don't ship it.
 

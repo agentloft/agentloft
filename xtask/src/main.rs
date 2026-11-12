@@ -8,8 +8,12 @@
 //!   (wasm + JS glue + static shell); `agentloftd` serves that folder.
 //! - `ci`: fmt check, clippy, tests, workspace-hack check, cargo-deny — what
 //!   CI runs (needs `cargo-hakari` and `cargo-deny` installed).
-//! - `bundle [--debug] [--open]`: build `target/bundle/Agentloft.app`
-//!   (macOS; both binaries, `AppIcon.icns`, Info.plist, ad-hoc signature).
+//! - `bundle [--debug] [--open] [--stable]`: build
+//!   `target/bundle/Agentloft.app` (macOS; both binaries, the icon,
+//!   Info.plist, signature). A dev build: its icon is blue and its data
+//!   is in `~/.agentloft-dev`, apart from the installed app's; `--stable` builds
+//!   `target/bundle/stable/Agentloft.app` with the real icon instead.
+//! - `install`: build the stable bundle and put it in `/Applications`.
 
 use anyhow::{Context as _, Result, bail};
 use std::path::PathBuf;
@@ -19,7 +23,11 @@ fn main() -> Result<()> {
     let task = std::env::args().nth(1).unwrap_or_default();
     match task.as_str() {
         "dev" => dev(),
-        "bundle" => bundle(),
+        "bundle" => {
+            let stable = std::env::args().any(|a| a == "--stable");
+            bundle(stable).map(|_| ())
+        }
+        "install" => install(),
         "stop-dev" => stop_dev(),
         "web" => web(),
         "signing-identity" => make_signing_identity(),
@@ -55,7 +63,7 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|web|signing-identity>"
+                "usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|install|web|signing-identity>"
             );
             Ok(())
         }
@@ -177,7 +185,27 @@ fn dev() -> Result<()> {
 
 const BUNDLE_ID: &str = "dev.agentloft.Agentloft";
 
-fn bundle() -> Result<()> {
+/// `cargo xtask install`: the stable bundle, copied to `/Applications`
+/// (swapped in by rename, so a running copy keeps its files until it quits).
+fn install() -> Result<()> {
+    let app = bundle(true)?;
+    let dest = PathBuf::from("/Applications/Agentloft.app");
+    let staged = PathBuf::from("/Applications/Agentloft.app.new");
+    let old = PathBuf::from("/Applications/Agentloft.app.old");
+    let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(&old);
+    // `ditto` keeps the signature's extended attributes.
+    run(Command::new("ditto").arg(&app).arg(&staged))?;
+    if dest.exists() {
+        std::fs::rename(&dest, &old).context("move the installed app aside")?;
+    }
+    std::fs::rename(&staged, &dest).context("install the app")?;
+    let _ = std::fs::remove_dir_all(&old);
+    println!("{}", dest.display());
+    Ok(())
+}
+
+fn bundle(stable: bool) -> Result<PathBuf> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let debug = args.iter().any(|a| a == "--debug");
     let profile = if debug { "debug" } else { "release" };
@@ -189,7 +217,11 @@ fn bundle() -> Result<()> {
     run(&mut build)?;
 
     let target = root().join("target");
-    let app = target.join("bundle/Agentloft.app");
+    let app = target.join(if stable {
+        "bundle/stable/Agentloft.app"
+    } else {
+        "bundle/Agentloft.app"
+    });
     let contents = app.join("Contents");
     let _ = std::fs::remove_dir_all(&app);
     std::fs::create_dir_all(contents.join("MacOS"))?;
@@ -202,7 +234,12 @@ fn bundle() -> Result<()> {
         .with_context(|| format!("copy {bin}"))?;
     }
     std::fs::copy(
-        root().join("assets/icon/AppIcon.icns"),
+        // Blue for a dev bundle, so it can't be taken for the installed app.
+        root().join(if stable {
+            "assets/icon/AppIcon.icns"
+        } else {
+            "assets/icon/dev/AppIcon.icns"
+        }),
         contents.join("Resources/AppIcon.icns"),
     )
     .context("copy AppIcon.icns")?;
@@ -211,6 +248,12 @@ fn bundle() -> Result<()> {
         info_plist(env!("CARGO_PKG_VERSION")),
     )?;
     std::fs::write(contents.join("PkgInfo"), "APPL????")?;
+    if !stable {
+        // What tells the binaries they are a dev build: their own data
+        // home (~/.agentloft-dev), never the installed app's
+        // (`loft_config::is_dev_build`).
+        std::fs::write(contents.join("Resources/dev-build"), "")?;
+    }
     // The web client (`cargo xtask web --release`), if it has been built:
     // agentloftd looks for it in Resources/web.
     let web = target.join("web");
@@ -242,7 +285,7 @@ fn bundle() -> Result<()> {
     if args.iter().any(|a| a == "--open") {
         run(Command::new("open").arg(&app))?;
     }
-    Ok(())
+    Ok(app)
 }
 
 /// The name of the self-signed certificate local builds are signed with.

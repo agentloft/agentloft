@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "agentloftd", version, about = "Agentloft core daemon")]
 struct Cli {
-    /// Data home (defaults to $AGENTLOFT_HOME or ~/.agentloft).
+    /// Data home (defaults to $AGENTLOFT_HOME or ~/.agentloft; ~/.agentloft-dev for a dev build).
     #[arg(long, global = true)]
     home: Option<PathBuf>,
     /// Also log to stderr.

@@ -13,6 +13,23 @@ use std::time::Duration;
 /// Environment variable that relocates the whole data home (tests, dev).
 pub const HOME_ENV: &str = "AGENTLOFT_HOME";
 
+/// The file `cargo xtask bundle` puts in a dev bundle's `Resources`.
+pub const DEV_MARKER: &str = "dev-build";
+
+/// Whether this is a developer's build rather than the app someone
+/// installed: a debug build, or a dev bundle (`cargo xtask bundle` without
+/// `--stable`, marked by [`DEV_MARKER`] in its `Resources`). Dev builds get
+/// their own data home and a blue icon.
+pub fn is_dev_build() -> bool {
+    cfg!(debug_assertions)
+        || std::env::current_exe().is_ok_and(|exe| {
+            // …/Contents/MacOS/<binary> → …/Contents/Resources/dev-build
+            exe.parent()
+                .and_then(Path::parent)
+                .is_some_and(|contents| contents.join("Resources").join(DEV_MARKER).is_file())
+        })
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub home: PathBuf,
@@ -23,13 +40,19 @@ impl Paths {
         Self { home: home.into() }
     }
 
-    /// `$AGENTLOFT_HOME`, else `~/.agentloft`.
+    /// `$AGENTLOFT_HOME`, else `~/.agentloft` (`~/.agentloft-dev` for a
+    /// dev build, see [`is_dev_build`]: it never opens the installed
+    /// app's database or talks to its daemon).
     pub fn from_env() -> Result<Self> {
         if let Some(home) = std::env::var_os(HOME_ENV).filter(|v| !v.is_empty()) {
             return Ok(Self::new(PathBuf::from(home)));
         }
         let user_home = std::env::home_dir().context("cannot determine home directory")?;
-        Ok(Self::new(user_home.join(".agentloft")))
+        Ok(Self::new(user_home.join(if is_dev_build() {
+            ".agentloft-dev"
+        } else {
+            ".agentloft"
+        })))
     }
 
     pub fn config_file(&self) -> PathBuf {

@@ -49,8 +49,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// In a bundle the Dock icon comes from Info.plist (`CFBundleIconFile`);
-/// dev runs (`cargo run`) set it at runtime so the Dock shows the real icon.
+/// In a bundle the Dock icon comes from Info.plist (`CFBundleIconFile`:
+/// blue for a dev bundle, the real one for an installed app, see `cargo
+/// xtask bundle`); a run without a bundle (`cargo run`) sets it at runtime,
+/// blue for a dev build.
 mod dock_icon {
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
@@ -60,10 +62,20 @@ mod dock_icon {
         use objc2_foundation::{MainThreadMarker, NSData};
 
         const PNG: &[u8] = include_bytes!("../../../assets/icon/png/agentloft-512.png");
+        const DEV_PNG: &[u8] = include_bytes!("../../../assets/icon/dev/agentloft-512.png");
+        let bundled = std::env::current_exe()
+            .is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"));
+        if bundled {
+            return;
+        }
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
-        let data = NSData::with_bytes(PNG);
+        let data = NSData::with_bytes(if loft_config::is_dev_build() {
+            DEV_PNG
+        } else {
+            PNG
+        });
         let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
             return;
         };
