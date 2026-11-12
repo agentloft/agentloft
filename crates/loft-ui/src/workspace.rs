@@ -808,8 +808,15 @@ impl WorkspaceView {
                         cx.new(|_| crate::automations::AutomationsPage::new(store))
                     })
                     .clone();
-                let what = what.to_owned();
+                // `automations:new;click:x,y`: then a click in the window.
+                let (what, click) = match what.split_once(";click:") {
+                    Some((w, c)) => (w.to_owned(), Some(c.to_owned())),
+                    None => (what.to_owned(), None),
+                };
                 page.update(cx, |page, cx| page.dev_open(&what, window, cx));
+                if let Some(spec) = click {
+                    dev_click(spec, window, cx);
+                }
             }
             Some(("settings", section)) => {
                 let section = crate::settings::Section::parse(section);

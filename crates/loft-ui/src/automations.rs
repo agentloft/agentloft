@@ -10,6 +10,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -74,7 +76,8 @@ struct Editor {
     id: Option<AutomationId>,
     name: Entity<InputState>,
     prompt: Entity<TextareaState>,
-    project: Option<ProjectId>,
+    /// Which project: a list you can type in to search.
+    project: Entity<SelectState<SearchableVec<ProjectItem>>>,
     kind: Kind,
     every: Entity<InputState>,
     unit: Unit,
@@ -124,6 +127,23 @@ impl AutomationsPage {
                     .map(|p| p.id.clone())
             });
         let default_harness = store.default_harness.clone();
+        // Projects by name, a chat last.
+        let mut items: Vec<ProjectItem> = store
+            .workspace
+            .projects
+            .iter()
+            .map(|pr| ProjectItem {
+                id: pr.id.clone(),
+                name: if store.is_chats(pr) {
+                    "No project (a chat)".into()
+                } else {
+                    pr.name.clone().into()
+                },
+                path: crate::workspace::tilde_path_str(&pr.root_path).to_string(),
+                chat: store.is_chats(pr),
+            })
+            .collect();
+        items.sort_by_key(|i| (i.chat, i.name.to_lowercase()));
         let input = |value: String,
                      placeholder: &'static str,
                      window: &mut Window,
@@ -193,6 +213,16 @@ impl AutomationsPage {
                 String::new(),
             ),
         };
+        let want = spec
+            .as_ref()
+            .map(|s| s.project_id.clone())
+            .or(default_project);
+        let at = want
+            .as_ref()
+            .and_then(|w| items.iter().position(|i| &i.id == w))
+            .map(|row| gpui_kit::component::IndexPath::default().row(row));
+        let project = cx
+            .new(|cx| SelectState::new(SearchableVec::new(items), at, window, cx).searchable(true));
         let prompt_text = spec.as_ref().map(|s| s.prompt.clone()).unwrap_or_default();
         let prompt = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
@@ -210,10 +240,7 @@ impl AutomationsPage {
                 cx,
             ),
             prompt,
-            project: spec
-                .as_ref()
-                .map(|s| s.project_id.clone())
-                .or(default_project),
+            project,
             kind,
             every: input(every, "1", window, cx),
             unit,
@@ -279,7 +306,12 @@ impl AutomationsPage {
             AutomationSpec {
                 name: text(&e.name),
                 prompt: e.prompt.read(cx).value().trim().to_owned(),
-                project_id: e.project.clone().ok_or("Pick a project")?,
+                project_id: e
+                    .project
+                    .read(cx)
+                    .selected_value()
+                    .cloned()
+                    .ok_or("Pick a project")?,
                 schedule,
                 enabled: e.enabled,
                 harness: e.harness.clone(),
@@ -428,6 +460,7 @@ impl Render for AutomationsPage {
                             div().flex_none().child(
                             Button::new("automation-new")
                                 .small()
+                                .cursor_pointer()
                                 .primary()
                                 .icon(IconName::Plus)
                                 .label("New automation")
@@ -568,6 +601,7 @@ impl AutomationsPage {
                 .child(
                     Button::new(SharedString::from(format!("automation-del-no-{card_key}")))
                         .xsmall()
+                        .cursor_pointer()
                         .ghost()
                         .label("Cancel")
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -579,6 +613,7 @@ impl AutomationsPage {
                 .child(
                     Button::new(SharedString::from(format!("automation-del-yes-{card_key}")))
                         .xsmall()
+                        .cursor_pointer()
                         .danger()
                         .label("Delete")
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -598,6 +633,7 @@ impl AutomationsPage {
                 .child(
                     Button::new(SharedString::from(format!("automation-run-{card_key}")))
                         .xsmall()
+                        .cursor_pointer()
                         .outline()
                         .loading(starting)
                         .label(if starting { "Starting…" } else { "Run now" })
@@ -608,6 +644,7 @@ impl AutomationsPage {
                 .child(
                     Button::new(SharedString::from(format!("automation-edit-{card_key}")))
                         .xsmall()
+                        .cursor_pointer()
                         .ghost()
                         .icon(IconName::SquarePen)
                         .tooltip("Edit")
@@ -619,6 +656,7 @@ impl AutomationsPage {
                 .child(
                     Button::new(SharedString::from(format!("automation-delete-{card_key}")))
                         .xsmall()
+                        .cursor_pointer()
                         .ghost()
                         .icon(IconName::Trash)
                         .tooltip("Delete")
@@ -630,6 +668,7 @@ impl AutomationsPage {
                 .child(
                     div().pl_1().child(
                         Switch::new(SharedString::from(format!("automation-on-{card_key}")))
+                            .cursor_pointer()
                             .checked(on)
                             .tooltip(if on { "Pause" } else { "Resume" })
                             .on_click(cx.listener(move |this, checked: &bool, _, cx| {
@@ -792,24 +831,8 @@ impl AutomationsPage {
             return div().into_any_element();
         };
         let view = cx.entity();
-        let (projects, agents, models) = {
+        let (agents, models) = {
             let store = self.store.read(cx);
-            let mut projects: Vec<(ProjectId, String)> = store
-                .workspace
-                .projects
-                .iter()
-                .map(|pr| {
-                    (
-                        pr.id.clone(),
-                        if store.is_chats(pr) {
-                            "No project (a chat)".to_owned()
-                        } else {
-                            pr.name.clone()
-                        },
-                    )
-                })
-                .collect();
-            projects.sort_by_key(|(_, n)| (n.starts_with("No project"), n.to_lowercase()));
             let models: Vec<(String, String)> = e
                 .harness
                 .as_ref()
@@ -820,7 +843,7 @@ impl AutomationsPage {
                         .collect()
                 })
                 .unwrap_or_default();
-            (projects, store.available_harnesses(), models)
+            (store.available_harnesses(), models)
         };
         let label = |text: &'static str| {
             div()
@@ -833,37 +856,16 @@ impl AutomationsPage {
             v_flex().gap_1p5().child(label(name)).child(body)
         };
 
-        // Project.
-        let project_label = e
-            .project
-            .as_ref()
-            .and_then(|id| projects.iter().find(|(p, _)| p == id))
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| "Pick a project".into());
-        let project_btn = {
-            let (view, current) = (view.clone(), e.project.clone());
-            Button::new("automation-project")
-                .small()
-                .outline()
-                .icon(IconName::Folder)
-                .label(project_label)
-                .dropdown_menu(move |mut menu, _, _| {
-                    for (id, name) in &projects {
-                        let (v, id) = (view.clone(), id.clone());
-                        let checked = current.as_ref() == Some(&id);
-                        menu =
-                            menu.item(PopupMenuItem::new(name.clone()).checked(checked).on_click(
-                                move |_, _, cx| {
-                                    let id = id.clone();
-                                    v.update(cx, |this, cx| {
-                                        this.editor_mut(|e| e.project = Some(id), cx)
-                                    })
-                                },
-                            ));
-                    }
-                    menu
-                })
-        };
+        // Project: type to search by name or folder.
+        let project_btn = Select::new(&e.project)
+            .small()
+            .cursor_pointer()
+            .w(px(220.))
+            .icon(IconName::Folder)
+            .placeholder("Pick a project")
+            .search_placeholder("Search projects")
+            .menu_width(px(320.))
+            .menu_max_h(px(320.));
 
         // Schedule.
         let kinds = [
@@ -952,6 +954,7 @@ impl AutomationsPage {
                     .child(
                         Button::new("automation-unit")
                             .small()
+                            .cursor_pointer()
                             .outline()
                             .label(unit.label())
                             .dropdown_menu(move |mut menu, _, _| {
@@ -1005,6 +1008,7 @@ impl AutomationsPage {
             let agents = agents.clone();
             Button::new("automation-agent")
                 .small()
+                .cursor_pointer()
                 .outline()
                 .label(agent_label)
                 .dropdown_menu(move |mut menu, _, _| {
@@ -1046,6 +1050,7 @@ impl AutomationsPage {
             let (view, current) = (view.clone(), e.model.clone());
             Button::new("automation-model")
                 .small()
+                .cursor_pointer()
                 .outline()
                 .label(model_label)
                 .dropdown_menu(move |mut menu, _, _| {
@@ -1093,6 +1098,7 @@ impl AutomationsPage {
             let (view, current) = (view.clone(), e.permission);
             Button::new("automation-permission")
                 .small()
+                .cursor_pointer()
                 .outline()
                 .icon(IconName::ShieldCheck)
                 .label(crate::workspace::mode_label(e.permission))
@@ -1203,6 +1209,7 @@ impl AutomationsPage {
                     .flex_wrap()
                     .child(
                         Switch::new("automation-worktree")
+                            .cursor_pointer()
                             .checked(worktree)
                             .label("Each run in a new worktree")
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -1212,6 +1219,7 @@ impl AutomationsPage {
                     )
                     .child(
                         Switch::new("automation-enabled")
+                            .cursor_pointer()
                             .checked(enabled)
                             .label("On")
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -1235,6 +1243,7 @@ impl AutomationsPage {
                     .child(
                         Button::new("automation-cancel")
                             .small()
+                            .cursor_pointer()
                             .ghost()
                             .label("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1245,6 +1254,7 @@ impl AutomationsPage {
                     .child(
                         Button::new("automation-save")
                             .small()
+                            .cursor_pointer()
                             .primary()
                             .loading(saving)
                             .label(if self.editor.as_ref().is_some_and(|e| e.id.is_some()) {
@@ -1322,5 +1332,49 @@ fn started_text(ms: i64) -> String {
         ..=0 => "just now".into(),
         1..=59 => format!("{mins} min ago"),
         _ => when_text(ms),
+    }
+}
+
+/// A project in the editor's project list.
+#[derive(Clone)]
+struct ProjectItem {
+    id: ProjectId,
+    name: SharedString,
+    /// Its folder (`~/…`): searched too, and shown under the name.
+    path: String,
+    chat: bool,
+}
+
+impl SearchableListItem for ProjectItem {
+    type Value = ProjectId;
+
+    fn title(&self) -> SharedString {
+        self.name.clone()
+    }
+
+    fn value(&self) -> &ProjectId {
+        &self.id
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let q = query.to_lowercase();
+        self.name.to_lowercase().contains(&q)
+            || (!self.chat && self.path.to_lowercase().contains(&q))
+    }
+
+    fn render(&self, _: &mut Window, cx: &mut gpui_kit::App) -> impl IntoElement {
+        let p = Palette::of(cx);
+        v_flex()
+            .min_w_0()
+            .child(div().truncate().child(self.name.clone()))
+            .when(!self.chat, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .text_color(p.muted_foreground)
+                        .child(self.path.clone()),
+                )
+            })
     }
 }
