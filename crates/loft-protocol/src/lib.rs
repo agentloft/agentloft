@@ -4,11 +4,13 @@
 //! length-delimited JSON (`u32` big-endian length prefix) carrying [`ClientMsg`]
 //! and [`ServerMsg`].
 
+pub mod automation;
 pub mod ids;
 pub mod model;
 pub mod pages;
 pub mod workbench;
 
+pub use automation::*;
 pub use ids::*;
 pub use model::*;
 pub use pages::*;
@@ -567,6 +569,31 @@ pub enum Request {
         #[serde(default)]
         detail: ReadDetail,
     },
+    // -- automations -------------------------------------------------------
+    /// Every automation (`Response::Json`: a list of [`Automation`]s).
+    ListAutomations,
+    /// Create an automation (`id: None`) or replace one's spec. `from`: the
+    /// thread whose agent asks. Answers `Response::Automation`.
+    SaveAutomation {
+        #[serde(default)]
+        id: Option<AutomationId>,
+        spec: AutomationSpec,
+        #[serde(default)]
+        from: Option<ThreadId>,
+    },
+    /// Pause or resume one.
+    SetAutomationEnabled {
+        id: AutomationId,
+        enabled: bool,
+    },
+    DeleteAutomation {
+        id: AutomationId,
+    },
+    /// Run one now, whatever its schedule (`Response::Thread`: the run's
+    /// thread).
+    RunAutomation {
+        id: AutomationId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -771,6 +798,9 @@ pub enum Response {
         #[serde(default)]
         draft: Option<String>,
     },
+    Automation {
+        automation: Automation,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -819,6 +849,8 @@ pub enum Snapshot {
         seq: u64,
         projects: Vec<Project>,
         threads: Vec<Thread>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        automations: Vec<Automation>,
     },
     Thread {
         seq: u64,
@@ -893,6 +925,13 @@ pub enum Event {
     ThreadDeleted {
         thread_id: ThreadId,
     },
+    /// Created, changed, or run (its state carries the run's outcome).
+    AutomationUpdated {
+        automation: Automation,
+    },
+    AutomationDeleted {
+        automation_id: AutomationId,
+    },
 }
 
 impl Event {
@@ -901,7 +940,9 @@ impl Event {
         match self {
             Event::ProjectAdded { .. }
             | Event::ProjectUpdated { .. }
-            | Event::ProjectRemoved { .. } => None,
+            | Event::ProjectRemoved { .. }
+            | Event::AutomationUpdated { .. }
+            | Event::AutomationDeleted { .. } => None,
             Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => Some(&thread.id),
             Event::TurnStarted { turn } | Event::TurnUpdated { turn } => Some(&turn.thread_id),
             Event::ItemUpserted { item } => Some(&item.thread_id),
@@ -922,6 +963,8 @@ impl Event {
                 | Event::ThreadCreated { .. }
                 | Event::ThreadUpdated { .. }
                 | Event::ThreadDeleted { .. }
+                | Event::AutomationUpdated { .. }
+                | Event::AutomationDeleted { .. }
         )
     }
 }

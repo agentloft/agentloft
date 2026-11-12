@@ -238,6 +238,12 @@ impl Core {
             | Request::DeleteThread { .. }
             | Request::SearchThreads { .. }
             | Request::UsageReport { .. }
+            // Automations start threads, as a browser can itself.
+            | Request::ListAutomations
+            | Request::SaveAutomation { .. }
+            | Request::SetAutomationEnabled { .. }
+            | Request::DeleteAutomation { .. }
+            | Request::RunAutomation { .. }
             // Projects that already exist.
             | Request::RenameProject { .. }
             | Request::SetProjectDefaults { .. }

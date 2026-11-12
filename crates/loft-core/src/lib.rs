@@ -2,6 +2,7 @@
 //! active thread that drives its harness session, persists domain events and
 //! fans them out on a broadcast bus together with ephemeral streaming deltas.
 
+mod automations;
 mod clients;
 mod forks;
 mod handoff;
@@ -15,6 +16,7 @@ mod usage;
 mod workbench;
 mod worktrees;
 
+pub use automations::{describe as describe_schedule, local_text, parse_local};
 pub use clients::{ClientRegistry, OutgoingCall};
 
 use anyhow::Result;
@@ -159,6 +161,8 @@ pub struct Core {
     config_rev: tokio::sync::watch::Sender<u64>,
     /// Model prices fetched from models.dev (the daemon refreshes them).
     price_catalog: std::sync::RwLock<Option<Arc<loft_config::pricing::Catalog>>>,
+    /// Wakes the automation scheduler when an automation changes.
+    automation_wake: Arc<tokio::sync::Notify>,
     opts: CoreOptions,
 }
 
@@ -193,6 +197,7 @@ impl Core {
             file_walk: tokio::sync::Mutex::new(()),
             config_rev: tokio::sync::watch::channel(0).0,
             price_catalog: std::sync::RwLock::new(None),
+            automation_wake: Arc::new(tokio::sync::Notify::new()),
             opts,
         })
     }
@@ -573,6 +578,7 @@ impl Core {
                     seq,
                     projects: s.projects()?,
                     threads: s.threads()?,
+                    automations: s.automations()?,
                 }),
                 Topic::Terminal(_) | Topic::Page(_) => None,
                 Topic::Thread(id) => match s.thread(id)? {
@@ -1296,6 +1302,15 @@ impl Core {
             Request::ReadThread { thread_id, detail } => Ok(Response::Text {
                 text: self.read_thread_text(&thread_id, detail)?,
             }),
+            Request::ListAutomations => Ok(Response::Json {
+                value: self.automations_json()?,
+            }),
+            Request::SaveAutomation { id, spec, from } => self.save_automation(id, spec, from),
+            Request::SetAutomationEnabled { id, enabled } => {
+                self.set_automation_enabled(&id, enabled)
+            }
+            Request::DeleteAutomation { id } => self.delete_automation(&id),
+            Request::RunAutomation { id } => self.run_automation_now(&id).await,
         }
     }
 
@@ -1338,10 +1353,20 @@ impl Core {
     /// Delete every thread of the project (stopping them, removing their
     /// worktrees and checkpoints), then its entry. Files stay on disk.
     async fn remove_project(self: &Arc<Self>, id: &ProjectId) -> CoreResult<Response> {
-        let threads = self.with_store(|s| s.threads())?;
         if self.with_store(|s| s.project(id))?.is_none() {
             return Err(ErrorBody::new(ErrorCode::NotFound, "project not found"));
         }
+        // Its automations first: they would start threads in it.
+        let gone: Vec<Event> = self
+            .with_store(|s| s.automations())?
+            .into_iter()
+            .filter(|a| &a.spec.project_id == id)
+            .map(|a| Event::AutomationDeleted {
+                automation_id: a.id,
+            })
+            .collect();
+        self.commit(gone)?;
+        let threads = self.with_store(|s| s.threads())?;
         for t in threads.iter().filter(|t| &t.project_id == id) {
             self.delete_thread(&t.id).await?;
         }
@@ -1547,6 +1572,7 @@ impl Core {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            automation_id: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

@@ -155,6 +155,9 @@ pub struct Thread {
     /// is): with no turn running, the thread is waiting on these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on: Vec<String>,
+    /// Started by this automation (one of its runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<AutomationId>,
 }
 
 impl Thread {
@@ -203,6 +206,7 @@ impl Thread {
             started_at_ms,
             draft,
             waiting_on,
+            automation_id,
         } = self;
         Thread {
             id: id.clone(),
@@ -224,6 +228,7 @@ impl Thread {
             started_at_ms: *started_at_ms,
             draft: draft.clone(),
             waiting_on: waiting_on.clone(),
+            automation_id: automation_id.clone(),
         }
     }
 }

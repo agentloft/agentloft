@@ -2,8 +2,8 @@
 //! GPUI entities.
 
 use loft_protocol::{
-    Delta, Event, EventEnvelope, Item, ItemId, Project, RequestStatus, RuntimeRequest, Snapshot,
-    Thread, ThreadId, Turn, TurnStatus,
+    Automation, Delta, Event, EventEnvelope, Item, ItemId, Project, RequestStatus, RuntimeRequest,
+    Snapshot, Thread, ThreadId, Turn, TurnStatus,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -12,6 +12,8 @@ pub struct WorkspaceModel {
     pub projects: Vec<Project>,
     /// Most recently updated first.
     pub threads: Vec<Thread>,
+    /// Oldest first.
+    pub automations: Vec<Automation>,
     pub loaded: bool,
 }
 
@@ -21,11 +23,13 @@ impl WorkspaceModel {
             seq,
             projects,
             threads,
+            automations,
         } = snapshot
         {
             self.seq = seq;
             self.projects = projects;
             self.threads = threads;
+            self.automations = automations;
             self.loaded = true;
             self.sort();
         }
@@ -52,6 +56,17 @@ impl WorkspaceModel {
             Event::ProjectRemoved { project_id } => {
                 self.projects.retain(|p| &p.id != project_id);
                 self.threads.retain(|t| &t.project_id != project_id);
+                self.automations
+                    .retain(|a| &a.spec.project_id != project_id);
+            }
+            Event::AutomationUpdated { automation } => {
+                match self.automations.iter_mut().find(|a| a.id == automation.id) {
+                    Some(a) => *a = automation.clone(),
+                    None => self.automations.push(automation.clone()),
+                }
+            }
+            Event::AutomationDeleted { automation_id } => {
+                self.automations.retain(|a| &a.id != automation_id);
             }
             Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => {
                 match self.threads.iter_mut().find(|t| t.id == thread.id) {
@@ -139,7 +154,9 @@ impl ThreadModel {
             Event::ProjectAdded { .. }
             | Event::ProjectUpdated { .. }
             | Event::ProjectRemoved { .. }
-            | Event::ThreadDeleted { .. } => return false,
+            | Event::ThreadDeleted { .. }
+            | Event::AutomationUpdated { .. }
+            | Event::AutomationDeleted { .. } => return false,
         }
         true
     }
@@ -234,6 +251,7 @@ mod tests {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            automation_id: None,
         };
         let item = Item {
             id: ItemId::new(),

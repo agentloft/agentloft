@@ -116,6 +116,8 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
 
 pub struct WorkspaceView {
     pub(crate) store: Entity<AppStore>,
+    /// The Automations page, made the first time it is opened.
+    automations_page: Option<Entity<crate::automations::AutomationsPage>>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
     /// Threads whose composer has something typed in it right now (a
     /// draft is saved a moment later).
@@ -288,6 +290,7 @@ impl WorkspaceView {
         ];
         Self {
             store,
+            automations_page: None,
             composers: HashMap::new(),
             typed: Default::default(),
             attachments: HashMap::new(),
@@ -792,6 +795,21 @@ impl WorkspaceView {
                     let picker = this.add_project(window, cx);
                     picker.update(cx, |p, cx| p.type_text(&text, window, cx));
                 });
+            }
+            Some(("automations", what)) => {
+                // `automations:list|new|edit`: the Automations page, its
+                // editor on a new one or on the first.
+                self.panel_open = false;
+                self.store.update(cx, |s, _| s.automations_open = true);
+                let store = self.store.clone();
+                let page = self
+                    .automations_page
+                    .get_or_insert_with(|| {
+                        cx.new(|_| crate::automations::AutomationsPage::new(store))
+                    })
+                    .clone();
+                let what = what.to_owned();
+                page.update(cx, |page, cx| page.dev_open(&what, window, cx));
             }
             Some(("settings", section)) => {
                 let section = crate::settings::Section::parse(section);
@@ -3439,7 +3457,8 @@ impl WorkspaceView {
                         }),
                     )),
             )
-            .children(search_below.map(|search| div().px_3().pb_3().child(search)))
+            .children(search_below.map(|search| div().px_3().pb_2().child(search)))
+            .child(self.automations_entry(p, cx))
             .child(
                 h_flex()
                     .px_4()
@@ -3524,6 +3543,66 @@ impl WorkspaceView {
                         p,
                         cx.listener(|this, _, _, cx| this.open_settings(cx)),
                     )),
+            )
+            .into_any_element()
+    }
+
+    /// The sidebar's way to the Automations page: how many are on, and
+    /// whether one of their runs is going.
+    fn automations_entry(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let open = store.automations_open;
+        let on = store
+            .workspace
+            .automations
+            .iter()
+            .filter(|a| a.spec.enabled)
+            .count();
+        let running = store.workspace.threads.iter().any(|t| {
+            t.automation_id.is_some()
+                && (matches!(
+                    t.status,
+                    ThreadStatus::Running | ThreadStatus::WaitingApproval
+                ) || t.is_waiting())
+        });
+        div()
+            .px_2()
+            .pb_2()
+            .child(
+                h_flex()
+                    .id("sidebar-automations")
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .py(px(5.))
+                    .rounded(px(7.))
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(open, |d| d.bg(p.selected).text_color(p.foreground))
+                    .when(!open, |d| {
+                        d.text_color(p.muted_foreground)
+                            .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                    })
+                    .child(Icon::new(IconName::Clock).small())
+                    .child(div().flex_1().child("Automations"))
+                    .when(running, |d| {
+                        d.child(Spinner::new().xsmall().color(p.accent))
+                    })
+                    .when(on > 0, |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.faint_foreground)
+                                .child(on.to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.store.update(cx, |s, cx| {
+                            s.automations_open = !s.automations_open;
+                            cx.notify();
+                        });
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -5214,7 +5293,13 @@ impl Render for WorkspaceView {
                 this.add_project(window, cx);
             });
         }
-        let selected = self.store.read(cx).selected_thread();
+        let automations_open = self.store.read(cx).automations_open;
+        // The Automations page takes the thread's place until one is picked.
+        let selected = self
+            .store
+            .read(cx)
+            .selected_thread()
+            .filter(|_| !automations_open);
         if let Some(thread) = &selected
             && thread.read(cx).model.is_some()
             && let Some(dev) = self.dev_tab.take()
@@ -5241,6 +5326,15 @@ impl Render for WorkspaceView {
             .update(self.details_open && self.can_dock(), window);
         self.details_inset = 0.;
         let body = match selected {
+            _ if automations_open => {
+                let store = self.store.clone();
+                self.automations_page
+                    .get_or_insert_with(|| {
+                        cx.new(|_| crate::automations::AutomationsPage::new(store))
+                    })
+                    .clone()
+                    .into_any_element()
+            }
             Some(thread) => self.render_panes(thread, &p, window, cx),
             None => self.render_welcome(&p, cx),
         };
@@ -6318,6 +6412,14 @@ fn thread_row(
                 })
                 .when_some(hit, |d, hit| d.child(search_snippet(hit, p)))
                 .into_any_element(),
+        })
+        // A run of an automation.
+        .when(thread.automation_id.is_some(), |d| {
+            d.child(
+                Icon::new(IconName::Clock)
+                    .xsmall()
+                    .text_color(p.faint_foreground),
+            )
         })
         .when(
             thread.workspace.branch().is_some() && subtitle.is_none(),

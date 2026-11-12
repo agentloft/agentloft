@@ -310,6 +310,9 @@ pub struct AppStore {
     pub commands: HashMap<(String, String), Option<Vec<loft_protocol::SlashCommandInfo>>>,
     /// Harness for new threads (the last one the user picked).
     pub default_harness: HarnessId,
+    /// The Automations page is showing in this window's main area (until
+    /// a thread is picked).
+    pub automations_open: bool,
     /// Messages typed while a turn was running, sent when it ends.
     pub queued: HashMap<ThreadId, std::collections::VecDeque<Queued>>,
     /// Threads with a queued message on its way (sent, not yet answered):
@@ -378,6 +381,7 @@ impl AppStore {
             next_in_new_pane: false,
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
+            automations_open: false,
             queued: HashMap::new(),
             flushing: HashSet::new(),
             drafts: HashMap::new(),
@@ -1035,6 +1039,7 @@ impl AppStore {
     }
 
     pub fn select_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.automations_open = false;
         self.ensure_thread(&id, cx);
         self.unread.remove(&id);
         // Into a pane: its own if open, else a new one when asked (beside
@@ -1318,7 +1323,7 @@ impl AppStore {
     }
 
     /// Tell the user something went wrong (an error toast).
-    fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+    pub(crate) fn fail(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         cx.emit(StoreEvent::Notify {
             message: message.into(),
             error: true,

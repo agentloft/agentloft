@@ -48,6 +48,7 @@ ids_uuid!(ItemId);
 ids_uuid!(RequestId);
 ids_uuid!(TerminalId);
 ids_uuid!(PageId);
+ids_uuid!(AutomationId);
 
 /// Which harness drives a thread: `claude`, `codex`, `acp:gemini`, …
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

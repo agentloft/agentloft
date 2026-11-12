@@ -1958,3 +1958,174 @@ async fn a_background_subagent_ends_with_its_session() {
         && matches!(&i.body, ItemBody::ToolCall { tool_kind, .. }
             if *tool_kind == loft_protocol::ToolKind::Subagent)));
 }
+
+fn automation_of(core: &Core, id: &loft_protocol::AutomationId) -> loft_protocol::Automation {
+    core.with_store(|s| s.automation(id)).unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn automations_start_threads_on_schedule() {
+    use loft_protocol::{AutomationSpec, Schedule};
+    let f = fixture();
+    let project = new_thread(&f.core, f._dir.path()).await.project_id;
+    let spec = |schedule: Schedule| AutomationSpec {
+        name: "Nightly check".into(),
+        prompt: "check the build".into(),
+        project_id: project.clone(),
+        schedule,
+        enabled: true,
+        harness: Some(HarnessId(HarnessId::FAKE.into())),
+        model: None,
+        effort: None,
+        permission_mode: Some(PermissionMode::FullAccess),
+        worktree: false,
+    };
+    let save = |spec: AutomationSpec| {
+        f.core.handle(Request::SaveAutomation {
+            id: None,
+            spec,
+            from: None,
+        })
+    };
+
+    // Checked before it is kept.
+    let mut empty = spec(Schedule::Interval { minutes: 5 });
+    empty.prompt = "  ".into();
+    assert!(save(empty).await.is_err());
+    assert!(
+        save(spec(Schedule::Cron {
+            expr: "0 25 * * *".into()
+        }))
+        .await
+        .is_err()
+    );
+
+    let before = now_ms();
+    let Response::Automation { automation: a } =
+        save(spec(Schedule::Interval { minutes: 5 })).await.unwrap()
+    else {
+        panic!()
+    };
+    let next = a.next_run_at_ms.unwrap();
+    assert!(next >= before + 5 * 60_000 && next <= now_ms() + 5 * 60_000);
+    let Snapshot::Workspace { automations, .. } = f.core.snapshot(&Topic::Workspace).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(automations, vec![a.clone()]);
+
+    // Run now: a thread of its own, named after it, sent its prompt.
+    let Response::Thread { thread } = f
+        .core
+        .handle(Request::RunAutomation { id: a.id.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(thread.automation_id.as_ref(), Some(&a.id));
+    assert_eq!(thread.title, "Nightly check");
+    assert_eq!(thread.permission_mode, Some(PermissionMode::FullAccess));
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    assert!(
+        matches!(&items[1].body, ItemBody::AssistantMessage { text } if text == "echo: check the build")
+    );
+    let ran = automation_of(&f.core, &a.id);
+    assert_eq!(ran.last_thread_id.as_ref(), Some(&thread.id));
+    assert_eq!(
+        ran.next_run_at_ms,
+        Some(next),
+        "run now leaves the schedule"
+    );
+
+    // Due (as after a night with the Mac shut): the scheduler runs it once.
+    let mut due = ran.clone();
+    due.next_run_at_ms = Some(now_ms() - 3 * 60 * 60_000);
+    f.core
+        .commit(vec![Event::AutomationUpdated { automation: due }])
+        .unwrap();
+    let upcoming = f.core.run_due().await.unwrap();
+    assert!(upcoming > now_ms() + 4 * 60_000);
+    let mut second = None;
+    for _ in 0..300 {
+        let a = automation_of(&f.core, &a.id);
+        if a.last_thread_id.as_ref().is_some_and(|t| t != &thread.id) {
+            second = a.last_thread_id;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = second.expect("a second run");
+    wait_for(&f.core, &second, turn_done).await;
+    // Not due again until its next time.
+    f.core.run_due().await;
+    let runs = f
+        .core
+        .with_store(|s| s.threads())
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.automation_id.as_ref() == Some(&a.id))
+        .count();
+    assert_eq!(runs, 2);
+
+    // Paused: no next run; resumed: one again.
+    f.core
+        .handle(Request::SetAutomationEnabled {
+            id: a.id.clone(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(automation_of(&f.core, &a.id).next_run_at_ms, None);
+    f.core
+        .handle(Request::SetAutomationEnabled {
+            id: a.id.clone(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    assert!(automation_of(&f.core, &a.id).next_run_at_ms.is_some());
+
+    // A one-off pauses itself once it has run.
+    let Response::Automation { automation: once } = save(spec(Schedule::Once {
+        at_ms: now_ms() + 60_000,
+    }))
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    let mut due = once.clone();
+    due.next_run_at_ms = Some(now_ms() - 1);
+    f.core
+        .commit(vec![Event::AutomationUpdated { automation: due }])
+        .unwrap();
+    f.core.run_due().await;
+    let once = automation_of(&f.core, &once.id);
+    assert!(!once.spec.enabled && once.next_run_at_ms.is_none());
+    for _ in 0..300 {
+        if automation_of(&f.core, &once.id).last_thread_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Deleted with its project (its runs' threads too).
+    f.core
+        .handle(Request::DeleteAutomation { id: a.id.clone() })
+        .await
+        .unwrap();
+    assert!(
+        f.core
+            .with_store(|s| s.automation(&a.id))
+            .unwrap()
+            .is_none()
+    );
+    f.core
+        .handle(Request::RemoveProject {
+            project_id: project.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(f.core.with_store(|s| s.automations()).unwrap().is_empty());
+}

@@ -20,6 +20,7 @@ publish.workspace = true
 anstyle = { version = "1" }
 base64 = { version = "0.23" }
 byteorder = { version = "1" }
+chrono = { version = "0.4", features = ["serde"] }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 either = { version = "1", default-features = false, features = ["use_std"] }

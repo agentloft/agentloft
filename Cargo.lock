@@ -4324,6 +4324,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "command-fds",
  "ignore",
  "loft-config",
@@ -10461,6 +10462,7 @@ dependencies = [
  "bitflags 2.13.2",
  "block2 0.6.2",
  "byteorder",
+ "chrono",
  "crc32fast",
  "crossbeam-utils",
  "either",

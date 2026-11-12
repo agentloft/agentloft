@@ -25,6 +25,7 @@ tracing.workspace = true
 uuid.workspace = true
 command-fds = { version = "0.3.3", features = ["tokio"] }
 base64.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tempfile.workspace = true

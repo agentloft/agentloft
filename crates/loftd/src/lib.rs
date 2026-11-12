@@ -3,6 +3,7 @@
 
 mod conn;
 pub mod mcp;
+mod mcp_automations;
 mod prices;
 mod reaper;
 pub mod web;
@@ -48,6 +49,8 @@ pub struct Daemon {
     cleanup_task: tokio::task::JoinHandle<()>,
     /// Keeps the model prices for cost estimates a day fresh at most.
     prices_task: tokio::task::JoinHandle<()>,
+    /// Starts automations' runs when they are due.
+    automations_task: tokio::task::JoinHandle<()>,
     _lock: File,
 }
 
@@ -115,6 +118,7 @@ impl Daemon {
         let task = tokio::spawn(accept_loop(listener, hub, shutdown_rx, paths.clone()));
         let cleanup_task = core.spawn_archive_cleanup();
         let prices_task = prices::spawn(core.clone(), paths.clone());
+        let automations_task = core.spawn_automations();
         Ok(Self {
             core,
             web,
@@ -123,6 +127,7 @@ impl Daemon {
             web_task,
             cleanup_task,
             prices_task,
+            automations_task,
             _lock: lock,
         })
     }
@@ -137,6 +142,7 @@ impl Daemon {
         let _ = self.shutdown_tx.send(true);
         self.cleanup_task.abort();
         self.prices_task.abort();
+        self.automations_task.abort();
         let _ = self.web_task.await;
         self.core.shutdown().await;
         let _ = self.task.await;

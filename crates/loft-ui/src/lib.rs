@@ -7,6 +7,7 @@ mod ask;
 pub mod assets;
 mod attachments;
 mod attention;
+mod automations;
 mod branch_picker;
 pub mod brand;
 mod completion;

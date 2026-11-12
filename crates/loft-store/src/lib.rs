@@ -6,7 +6,8 @@
 
 use anyhow::{Context as _, Result};
 use loft_protocol::{
-    Event, EventEnvelope, Item, ItemId, Project, ProjectId, RuntimeRequest, Thread, ThreadId, Turn,
+    Automation, AutomationId, Event, EventEnvelope, Item, ItemId, Project, ProjectId,
+    RuntimeRequest, Thread, ThreadId, Turn,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -75,6 +76,14 @@ const MIGRATIONS: &[&str] = &[
         updated_at_ms INTEGER NOT NULL,
         data          TEXT NOT NULL,
         PRIMARY KEY (thread_id, item_id)
+    );
+    "#,
+    // 3: automations (prompts run on a schedule).
+    r#"
+    CREATE TABLE automations (
+        id            TEXT PRIMARY KEY,
+        created_at_ms INTEGER NOT NULL,
+        data          TEXT NOT NULL
     );
     "#,
 ];
@@ -249,6 +258,15 @@ impl Store {
              ORDER BY json_extract(data, '$.started_at_ms')",
             [],
         )
+    }
+
+    /// Every automation, oldest first.
+    pub fn automations(&self) -> Result<Vec<Automation>> {
+        self.query_data("SELECT data FROM automations ORDER BY created_at_ms", [])
+    }
+
+    pub fn automation(&self, id: &AutomationId) -> Result<Option<Automation>> {
+        self.query_one("SELECT data FROM automations WHERE id = ?1", [id.as_str()])
     }
 
     pub fn threads(&self) -> Result<Vec<Thread>> {
@@ -537,6 +555,8 @@ fn event_type(event: &Event) -> &'static str {
         Event::RequestOpened { .. } => "request_opened",
         Event::RequestUpdated { .. } => "request_updated",
         Event::ThreadDeleted { .. } => "thread_deleted",
+        Event::AutomationUpdated { .. } => "automation_updated",
+        Event::AutomationDeleted { .. } => "automation_deleted",
     }
 }
 
@@ -615,6 +635,23 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
                 ],
             )?;
         }
+        Event::AutomationUpdated { automation } => {
+            conn.execute(
+                "INSERT INTO automations(id, created_at_ms, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                params![
+                    automation.id.as_str(),
+                    automation.created_at_ms,
+                    json(automation)?
+                ],
+            )?;
+        }
+        Event::AutomationDeleted { automation_id } => {
+            conn.execute(
+                "DELETE FROM automations WHERE id = ?1",
+                params![automation_id.as_str()],
+            )?;
+        }
     }
     Ok(())
 }
@@ -670,6 +707,7 @@ mod tests {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            automation_id: None,
         }
     }
 

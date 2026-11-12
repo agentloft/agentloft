@@ -93,6 +93,9 @@ available. Agentloft itself: when the user asks to change its settings (theme, c
 sidebar, agent defaults, folders…), use `get_settings` then `change_setting`; `save_theme` adds a \
 colour theme; `create_project`, `clone_project`, `add_project`, `update_project` (name, icon, \
 new-thread defaults) and `remove_project` manage projects. Changes show in the app at once. \
+Automations: `create_automation` has Agentloft start a new thread with a prompt on a schedule \
+(every N minutes, daily at a time, cron, or once); `list_automations`, `update_automation` (also \
+pauses and resumes), `run_automation` and `delete_automation` manage them. \
 `show_ui` shows a live page you write (HTML, CSS, JavaScript) in the chat: use it when something \
 is better seen or tried than read, such as results, a diagram, options to pick from, a small tool; \
 plain answers stay text.";
@@ -129,11 +132,11 @@ fn error_reply(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn text_result(text: impl Into<String>, is_error: bool) -> Value {
+pub(crate) fn text_result(text: impl Into<String>, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text.into() }], "isError": is_error })
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+pub(crate) fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "name": name,
         "description": description,
@@ -142,7 +145,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 }
 
 pub fn tools() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         tool(
             "browser_navigate",
             "Open a URL in the user's Agentloft browser panel and wait for it to load. Returns the final URL and title.",
@@ -357,7 +360,9 @@ pub fn tools() -> Vec<Value> {
             }),
             &[],
         ),
-    ]
+    ];
+    tools.extend(crate::mcp_automations::tools());
+    tools
 }
 
 /// Translate a browser tool call into a `BrowserCommand` JSON value.
@@ -400,6 +405,9 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
         return show_ui(client, thread, args).await;
     }
     if let Some(result) = orchestrate(client, thread, name, args).await {
+        return result;
+    }
+    if let Some(result) = crate::mcp_automations::call(client, thread, name, args).await {
         return result;
     }
     let request = match name {
@@ -532,7 +540,7 @@ const AGENTS: [&str; 4] = [
     HarnessId::GEMINI,
 ];
 
-async fn outcome(client: &Client, id: &ThreadId) -> Result<Value, String> {
+pub(crate) async fn outcome(client: &Client, id: &ThreadId) -> Result<Value, String> {
     match client
         .request(Request::ThreadOutcome {
             thread_id: id.clone(),
@@ -545,7 +553,7 @@ async fn outcome(client: &Client, id: &ThreadId) -> Result<Value, String> {
     }
 }
 
-fn json_result(v: &Value) -> Value {
+pub(crate) fn json_result(v: &Value) -> Value {
     text_result(serde_json::to_string_pretty(v).unwrap_or_default(), false)
 }
 
@@ -582,7 +590,7 @@ async fn projects(client: &Client) -> Result<Vec<Value>, String> {
 }
 
 /// A project by id, name (any case) or root path.
-async fn find_project(client: &Client, want: &str) -> Result<Value, String> {
+pub(crate) async fn find_project(client: &Client, want: &str) -> Result<Value, String> {
     let list = projects(client).await?;
     let want = want.trim();
     list.iter()
