@@ -23,6 +23,7 @@ use crate::backend::{
 use crate::element::{CellMetrics, FontConfig, RowLayout, TerminalElement};
 use crate::input::{self, KeyRoute, RouteContext};
 use crate::theme;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     Global, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke,
@@ -45,7 +46,11 @@ gpui_kit::actions!(
         /// Paste the clipboard into the terminal.
         Paste,
         /// Select all scrollback and screen text.
-        SelectAll
+        SelectAll,
+        /// Hand the selection to the host, for the message being written
+        /// ([`TerminalEvent::AddToMessage`]). Unbound here: the host binds
+        /// the keys it wants in [`KEY_CONTEXT`].
+        AddSelectionToMessage
     ]
 );
 
@@ -80,6 +85,10 @@ pub enum TerminalEvent {
     Bell,
     /// ⌘-click on a URL in the grid.
     OpenUrl(String),
+    /// The selected text, asked to go into the message the user is writing
+    /// ([`AddSelectionToMessage`]). The terminal doesn't know what a
+    /// message is; the host puts it there.
+    AddToMessage(String),
 }
 
 const CTRL_LETTERS: [&str; 26] = [
@@ -712,7 +721,26 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn add_selection_to_message(
+        &mut self,
+        _: &AddSelectionToMessage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.backend.selection_text() {
+            Some(text) if !text.trim().is_empty() => cx.emit(TerminalEvent::AddToMessage(text)),
+            // Nothing selected here: the keys may mean something further up.
+            _ => cx.propagate(),
+        }
+    }
+
     // ----- mouse (called from the element's listeners) -----
+
+    /// Whether a press is the terminal's alone. A right click the program
+    /// didn't ask for goes on to the context menu.
+    pub(crate) fn keeps_press(&self, event: &MouseDownEvent) -> bool {
+        event.button != MouseButton::Right || self.reporting_mouse(&event.modifiers)
+    }
 
     fn reporting_mouse(&self, modifiers: &Modifiers) -> bool {
         // Shift is the conventional override to select text in mouse apps.
@@ -948,9 +976,35 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste_clipboard))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::add_selection_to_message))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .child(TerminalElement::new(cx.entity()))
+            // Right click (Shift with it while a program has the mouse).
+            // The items are this view's own actions, with their keys shown.
+            .context_menu({
+                let view = cx.entity().downgrade();
+                move |menu, _, cx| {
+                    let nothing_selected = view
+                        .upgrade()
+                        .is_none_or(|view| view.read(cx).selection_text().is_none());
+                    let menu = menu.menu_with_disabled("Copy", Box::new(Copy), nothing_selected);
+                    // A page can't read the clipboard on its own: in a
+                    // browser, pasting is the browser's (see `init`).
+                    let menu = if cfg!(target_arch = "wasm32") {
+                        menu
+                    } else {
+                        menu.menu("Paste", Box::new(Paste))
+                    };
+                    menu.menu("Select All", Box::new(SelectAll))
+                        .separator()
+                        .menu_with_disabled(
+                            "Add Selection to Message",
+                            Box::new(AddSelectionToMessage),
+                            nothing_selected,
+                        )
+                }
+            })
     }
 }
 

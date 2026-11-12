@@ -193,6 +193,42 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
     },
+    /// Hold a message in the thread's queue: it is sent when the running
+    /// turn completes (after those ahead of it). With no turn running and
+    /// nothing ahead, it is sent at once. Answers `Response::Ok`.
+    Enqueue {
+        thread_id: ThreadId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
+    /// Take a queued message out: dropped, or back to the composer.
+    Dequeue {
+        thread_id: ThreadId,
+        id: u64,
+    },
+    /// Move queued message `id` to where `to` is: after it when moving
+    /// down, before it when moving up. The first in line goes next.
+    MoveQueued {
+        thread_id: ThreadId,
+        id: u64,
+        to: u64,
+    },
+    /// Send a queued message now: into the running turn (the agent takes it
+    /// in at its next step), or as the next turn when none is running. The
+    /// rest stay queued.
+    SendQueued {
+        thread_id: ThreadId,
+        id: u64,
+    },
+    /// For a thread its agent's usage limit stopped (`Thread::limit`):
+    /// carry on by itself when the limit resets (`on`), or don't.
+    ResumeAtReset {
+        thread_id: ThreadId,
+        on: bool,
+    },
+    /// Stops the running turn, and the turns of threads this one's agent
+    /// started (and theirs).
     Interrupt {
         thread_id: ThreadId,
     },
@@ -311,6 +347,12 @@ pub enum Request {
     CreatePullRequest {
         thread_id: ThreadId,
     },
+    /// Ask GitHub about the thread's pull request now (its state, checks and
+    /// review), or look for one on its branch when none is known. What is
+    /// new arrives as a thread update; answers `Response::Ok` either way.
+    RefreshPullRequest {
+        thread_id: ThreadId,
+    },
     /// Stop the thread's agent and terminal and remove its worktree (the
     /// branch is kept). A dirty worktree needs `force`.
     ArchiveThread {
@@ -370,13 +412,17 @@ pub enum Request {
     },
     /// Open a shell. With `key`, a live terminal opened earlier with the same
     /// key is returned (resized, unless `cols`/`rows` are 0) instead, so a UI
-    /// restart reattaches.
+    /// restart reattaches. `command` is typed into the shell as its user
+    /// would (so it can be stopped and run again there): into a new one
+    /// once it is ready, into a live one only if nothing is running in it.
     TerminalOpen {
         root: FsRoot,
         cols: u16,
         rows: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
     },
     TerminalInput {
         id: TerminalId,
@@ -554,6 +600,12 @@ pub enum Request {
     /// A project's icon: the image chosen for it, else the one found in its
     /// folder (answers `Response::File`; `NotFound` when it has none).
     ProjectIcon {
+        project_id: ProjectId,
+    },
+    /// The commands a project runs often (`[[actions]]` in its
+    /// `.agentloft/config.toml`), read from the file as it is now. Answers
+    /// `Response::Actions`: none when it has no such file.
+    ProjectActions {
         project_id: ProjectId,
     },
     // -- web access (ADR-0016); local clients only -------------------------
@@ -769,6 +821,9 @@ pub enum Response {
     Terminals {
         terminals: Vec<TerminalInfo>,
     },
+    Actions {
+        actions: Vec<ProjectAction>,
+    },
     Page {
         page: PageInfo,
     },
@@ -870,6 +925,9 @@ pub enum Snapshot {
         turns: Vec<Turn>,
         items: Vec<Item>,
         requests: Vec<RuntimeRequest>,
+        /// Messages waiting for the running turn to end, in order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        queue: Vec<QueuedMessage>,
     },
     Terminal {
         seq: u64,
@@ -937,6 +995,11 @@ pub enum Event {
     ThreadDeleted {
         thread_id: ThreadId,
     },
+    /// A thread's queue as it is now (empty: nothing waits).
+    QueueUpdated {
+        thread_id: ThreadId,
+        queue: Vec<QueuedMessage>,
+    },
     /// Created, changed, or run (its state carries the run's outcome).
     AutomationUpdated {
         automation: Automation,
@@ -961,7 +1024,9 @@ impl Event {
             Event::RequestOpened { request } | Event::RequestUpdated { request } => {
                 Some(&request.thread_id)
             }
-            Event::ThreadDeleted { thread_id } => Some(thread_id),
+            Event::ThreadDeleted { thread_id } | Event::QueueUpdated { thread_id, .. } => {
+                Some(thread_id)
+            }
         }
     }
 

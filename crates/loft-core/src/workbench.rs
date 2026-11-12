@@ -194,6 +194,29 @@ impl Core {
         self.read_file_at(&icon, &name, 0)
     }
 
+    /// A project's actions (`Request::ProjectActions`), from its
+    /// `.agentloft/config.toml` as it is now: the file the worktree setup
+    /// is read from, and like it never kept between requests.
+    pub(crate) fn project_actions(
+        &self,
+        id: &ProjectId,
+    ) -> CoreResult<Vec<loft_protocol::ProjectAction>> {
+        let project = self
+            .with_store(|s| s.project(id))?
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "project not found"))?;
+        let config = loft_config::ProjectConfig::load(Path::new(&project.root_path));
+        Ok(config
+            .actions
+            .into_iter()
+            .map(|a| loft_protocol::ProjectAction {
+                name: a.name,
+                command: a.command,
+                icon: a.icon,
+                preview_url: a.preview_url,
+            })
+            .collect())
+    }
+
     /// Read `path` (already checked by the caller) from `offset` on, as much
     /// as one answer holds, reported under `name`.
     pub(crate) fn read_file_at(

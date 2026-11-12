@@ -101,6 +101,13 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// A turn stopped by a usage limit, and when that limit resets if the
+/// agent said (`HarnessEvent::LimitReached`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimitHit {
+    pub resets_at_ms: Option<i64>,
+}
+
 /// Canonical events every adapter emits (PLAN §2.2).
 #[derive(Debug, Clone)]
 pub enum HarnessEvent {
@@ -171,6 +178,9 @@ pub enum HarnessEvent {
     TurnMarker {
         native_turn: String,
     },
+    /// The usage limit of the user's plan is what ends this turn: sent just
+    /// before the `TurnCompleted` that fails it.
+    LimitReached(LimitHit),
     TurnCompleted {
         status: TurnStatus,
         usage: Option<Usage>,

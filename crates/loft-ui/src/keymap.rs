@@ -133,6 +133,14 @@ pub const SHORTCUTS: &[Shortcut] = &[
         SteerMessage
     ),
     shortcut!(
+        "quote",
+        "Quote the selection in your message",
+        "Conversation",
+        "secondary-'",
+        WORKSPACE,
+        crate::workspace::QuoteSelection
+    ),
+    shortcut!(
         "stop",
         "Stop the turn",
         "Conversation",
@@ -412,7 +420,8 @@ pub fn clashes(id: &str, keys: &str, cx: &App) -> Vec<&'static str> {
 /// Bind every shortcut to its current keys, replacing what was bound
 /// before (other bindings — text fields, the terminal — stay as they are).
 pub fn apply(cx: &mut App) {
-    let names: Vec<&'static str> = SHORTCUTS.iter().map(|s| (s.action)().name()).collect();
+    let mut names: Vec<&'static str> = SHORTCUTS.iter().map(|s| (s.action)().name()).collect();
+    names.push(loft_terminal::AddSelectionToMessage.name());
     let kept: Vec<KeyBinding> = cx
         .key_bindings()
         .borrow()
@@ -435,6 +444,17 @@ pub fn apply(cx: &mut App) {
         match KeyBinding::load(&keys, (s.action)(), context, false, None, cx) {
             Ok(binding) => ours.push(binding),
             Err(err) => tracing::warn!(shortcut = s.id, keys, "invalid shortcut: {err}"),
+        }
+        // In a terminal the Quote keys add its selection to the message
+        // (a code block): the terminal's own action, on the same keys.
+        if s.id == "quote" {
+            let terminal = KeyBindingContextPredicate::parse(loft_terminal::KEY_CONTEXT)
+                .ok()
+                .map(Rc::new);
+            let action = Box::new(loft_terminal::AddSelectionToMessage);
+            if let Ok(binding) = KeyBinding::load(&keys, action, terminal, false, None, cx) {
+                ours.push(binding);
+            }
         }
     }
     cx.clear_key_bindings();

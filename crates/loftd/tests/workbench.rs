@@ -287,6 +287,7 @@ async fn terminals_stream_output_and_accept_input() {
             cols: 80,
             rows: 24,
             key: Some("main".into()),
+            command: None,
         })
         .await
         .unwrap()
@@ -355,6 +356,7 @@ async fn terminals_stream_output_and_accept_input() {
             cols: 90,
             rows: 20,
             key: Some("main".into()),
+            command: None,
         })
         .await
         .unwrap()
@@ -371,6 +373,7 @@ async fn terminals_stream_output_and_accept_input() {
             cols: 80,
             rows: 24,
             key: Some("main#2".into()),
+            command: None,
         })
         .await
         .unwrap()
@@ -389,6 +392,129 @@ async fn terminals_stream_output_and_accept_input() {
     let keys: Vec<_> = terminals.iter().map(|t| t.key.clone().unwrap()).collect();
     assert_eq!(keys, vec!["main", "main#2"]);
     assert_eq!(terminals[1].id, second.id);
+
+    env.client
+        .request(Request::TerminalClose { id: terminal.id })
+        .await
+        .unwrap();
+    env.daemon.shutdown().await;
+}
+
+/// A terminal opened with a command (a project action) types it into the
+/// login shell; asking again under the same key leaves it alone while it
+/// runs, and types it again once it has ended.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_terminal_runs_its_command_and_not_a_second_copy() {
+    let mut env = setup().await;
+    let key = action_terminal_key("thread:t", "Dev");
+    assert_eq!(action_of_terminal_key(&key), Some("Dev"));
+    let open = |command: &str| Request::TerminalOpen {
+        root: FsRoot::Project(env.project.id.clone()),
+        cols: 80,
+        rows: 24,
+        key: Some(key.clone()),
+        command: Some(command.into()),
+    };
+    // `$((…))` so that only the command's output matches, never its echo.
+    let Response::Terminal { terminal } = env
+        .client
+        .request(open("echo started-$((40+2)) && sleep 600"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    env.client.subscribe(Topic::Terminal(terminal.id.clone()));
+    let mut seen = Vec::new();
+    match next(&mut env.rx).await {
+        ClientEvent::Snapshot {
+            snapshot: Snapshot::Terminal { replay, .. },
+            ..
+        } => seen.extend(replay.0),
+        other => panic!("{other:?}"),
+    }
+    // Output until `needle` shows, or for `wait` at most.
+    async fn read(
+        rx: &mut UnboundedReceiver<ClientEvent>,
+        seen: &mut Vec<u8>,
+        needle: &str,
+        wait: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        while !String::from_utf8_lossy(seen).contains(needle) {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(ClientEvent::TerminalOutput { data, .. })) => seen.extend(data),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return false,
+            }
+        }
+        true
+    }
+    let long = Duration::from_secs(15);
+    assert!(
+        read(&mut env.rx, &mut seen, "started-42", long).await,
+        "the command didn't run: {}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // Still running (and no longer just started): the same shell is
+    // answered with, nothing typed.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let Response::Terminal { terminal: again } = env
+        .client
+        .request(open("echo second-$((20+1))"))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(again.id, terminal.id);
+    assert!(
+        !read(
+            &mut env.rx,
+            &mut seen,
+            "second-",
+            Duration::from_millis(700)
+        )
+        .await
+    );
+
+    // Stopped (Ctrl-C): once the shell is back at its prompt, it runs.
+    env.client
+        .request(Request::TerminalInput {
+            id: terminal.id.clone(),
+            data: vec![0x03].into(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + long;
+    loop {
+        let Response::Terminal { terminal: again } = env
+            .client
+            .request(open("echo third-$((30+3))"))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(again.id, terminal.id);
+        if read(
+            &mut env.rx,
+            &mut seen,
+            "third-33",
+            Duration::from_millis(500),
+        )
+        .await
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not run again: {}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
 
     env.client
         .request(Request::TerminalClose { id: terminal.id })

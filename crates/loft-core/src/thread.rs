@@ -6,8 +6,8 @@ use crate::{Core, CoreResult, internal};
 use loft_harness::{HarnessEvent, SessionCommand, SessionConfig, SessionHandle, TurnInput};
 use loft_protocol::{
     AttachmentRef, DecisionKind, Delta, DeltaChannel, ErrorBody, ErrorCode, Event, ForkKind, Item,
-    ItemBody, ItemId, ItemStatus, PermissionMode, RequestId, RequestKind, RequestStatus, Response,
-    RuntimeRequest, Thread, ThreadStatus, Turn, TurnId, TurnStatus,
+    ItemBody, ItemId, ItemStatus, LimitStop, PermissionMode, QueuedMessage, RequestId, RequestKind,
+    RequestStatus, Response, RuntimeRequest, Thread, ThreadStatus, Turn, TurnId, TurnStatus,
 };
 use loft_store::now_ms;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +30,33 @@ pub(crate) enum ThreadCmd {
     Interrupt {
         reply: Reply,
     },
+    /// Hold a message until the running turn completes (see
+    /// `Request::Enqueue`).
+    Enqueue {
+        text: String,
+        attachments: Vec<AttachmentRef>,
+        reply: Reply,
+    },
+    Dequeue {
+        id: u64,
+        reply: Reply,
+    },
+    MoveQueued {
+        id: u64,
+        to: u64,
+        reply: Reply,
+    },
+    SendQueued {
+        id: u64,
+        reply: Reply,
+    },
+    /// Carry on when the usage limit resets, or don't.
+    ResumeAtReset {
+        on: bool,
+        reply: Reply,
+    },
+    /// Internal: the usage limit that stopped this thread has reset.
+    LimitReset,
     /// The agent's `show_ui` call, as its bridge saw it: answer with the
     /// item that holds it (`{ item_id }`). `make`: if the harness reported
     /// no call of its own (it ran inside some other tool), add an item for
@@ -106,13 +133,24 @@ pub(crate) enum ThreadCmd {
         /// After a turn: the files it changed.
         changes: Option<Vec<loft_protocol::DiffFileStat>>,
     },
+    /// Internal: what GitHub says about the thread's pull request
+    /// (`crate::pull_requests`). Saved only if it differs.
+    SetPullRequest {
+        pull_request: loft_protocol::PullRequest,
+        reply: Reply,
+    },
 }
 
 pub(crate) type ThreadHandle = mpsc::UnboundedSender<ThreadCmd>;
 
 pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
     let (tx, rx) = mpsc::unbounded_channel();
+    let queue = core.with_store(|s| s.queue(&thread.id)).unwrap_or_default();
     let actor = ThreadActor {
+        queue,
+        limit_hit: None,
+        resumed: false,
+        send_next: false,
         self_tx: tx.downgrade(),
         pending_start: None,
         after_compact: None,
@@ -134,6 +172,15 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
 }
 
 struct ThreadActor {
+    /// Messages waiting for the running turn to complete, in order
+    /// (mirrored in the store on every change).
+    queue: Vec<QueuedMessage>,
+    /// The agent said its usage limit is what ends the running turn.
+    limit_hit: Option<loft_harness::LimitHit>,
+    /// The running turn is one started by a limit's reset.
+    resumed: bool,
+    /// A turn completed with messages queued: send the first.
+    send_next: bool,
     self_tx: mpsc::WeakUnboundedSender<ThreadCmd>,
     /// Prompt waiting for the "before" checkpoint before it is sent.
     pending_start: Option<(String, Vec<AttachmentRef>)>,
@@ -195,6 +242,9 @@ impl ThreadActor {
                 self.restart_session = false;
                 self.stop_session().await;
             }
+            if std::mem::take(&mut self.send_next) {
+                self.send_next_queued();
+            }
         }
     }
 
@@ -216,6 +266,32 @@ impl ThreadActor {
             } => {
                 let _ = reply.send(self.steer(text, attachments));
             }
+            ThreadCmd::Enqueue {
+                text,
+                attachments,
+                reply,
+            } => {
+                let _ = reply.send(self.enqueue(text, attachments));
+            }
+            ThreadCmd::Dequeue { id, reply } => {
+                self.queue.retain(|m| m.id != id);
+                let _ = reply.send(self.save_queue().map(|_| Response::Ok));
+            }
+            ThreadCmd::MoveQueued { id, to, reply } => {
+                let res = if move_in_line(&mut self.queue, id, to) {
+                    self.save_queue()
+                } else {
+                    Ok(())
+                };
+                let _ = reply.send(res.map(|_| Response::Ok));
+            }
+            ThreadCmd::SendQueued { id, reply } => {
+                let _ = reply.send(self.send_queued(id));
+            }
+            ThreadCmd::ResumeAtReset { on, reply } => {
+                let _ = reply.send(self.resume_at_reset(on));
+            }
+            ThreadCmd::LimitReset => self.on_limit_reset(),
             ThreadCmd::Interrupt { reply } if self.pending_start.is_some() => {
                 // The prompt never reached the agent; just end the turn.
                 self.pending_start = None;
@@ -418,7 +494,124 @@ impl ThreadActor {
                     .map(|_| Response::Text { text });
                 let _ = reply.send(res);
             }
+            ThreadCmd::SetPullRequest {
+                pull_request,
+                reply,
+            } => {
+                let res = crate::pull_requests::apply(&self.core, &mut self.thread, pull_request);
+                let _ = reply.send(res);
+            }
             ThreadCmd::Shutdown { .. } => unreachable!("handled in run loop"),
+        }
+    }
+
+    // -- the queue ----------------------------------------------------------
+
+    /// Tell the store and whoever watches the thread what the queue is now.
+    fn save_queue(&self) -> CoreResult<()> {
+        self.core
+            .commit(vec![Event::QueueUpdated {
+                thread_id: self.thread.id.clone(),
+                queue: self.queue.clone(),
+            }])
+            .map(|_| ())
+    }
+
+    fn enqueue(&mut self, text: String, attachments: Vec<AttachmentRef>) -> CoreResult<Response> {
+        // Nothing to wait for (the turn ended as this was on its way).
+        if self.turn.is_none() && self.queue.is_empty() {
+            return self.send_message(text, attachments);
+        }
+        self.queue.push(QueuedMessage {
+            id: self.core.next_queued_id(),
+            text,
+            attachments,
+            queued_at_ms: now_ms(),
+        });
+        self.save_queue().map(|_| Response::Ok)
+    }
+
+    /// A queued message, now: into the running turn if there is one (it
+    /// stays queued if the agent can't take it), else as the next turn.
+    fn send_queued(&mut self, id: u64) -> CoreResult<Response> {
+        let Some(index) = self.queue.iter().position(|m| m.id == id) else {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                "that message is no longer queued",
+            ));
+        };
+        let message = self.queue.remove(index);
+        let sent = if self.turn.is_some() {
+            self.steer(message.text.clone(), message.attachments.clone())
+        } else {
+            self.send_message(message.text.clone(), message.attachments.clone())
+        };
+        if sent.is_err() {
+            self.queue.insert(index, message);
+            return sent;
+        }
+        self.save_queue()?;
+        sent
+    }
+
+    /// A turn completed: the first message in line starts the next one.
+    /// (After one that failed or was stopped the queue waits: the user
+    /// sends the next when they have seen what happened.)
+    fn send_next_queued(&mut self) {
+        if self.turn.is_some() || self.queue.is_empty() {
+            return;
+        }
+        let next = self.queue.remove(0);
+        match self.send_message(next.text.clone(), next.attachments.clone()) {
+            Ok(_) => {
+                if let Err(err) = self.save_queue() {
+                    tracing::error!(thread = %self.thread.id, err = %err.message, "save queue");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(thread = %self.thread.id, err = %err.message, "queued message not sent");
+                self.queue.insert(0, next);
+            }
+        }
+    }
+
+    // -- usage limits -------------------------------------------------------
+
+    fn resume_at_reset(&mut self, on: bool) -> CoreResult<Response> {
+        let Some(limit) = self.thread.limit.as_mut() else {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "this thread isn't stopped by a usage limit",
+            ));
+        };
+        if on && limit.resets_at_ms.is_none() {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "the agent didn't say when the limit resets",
+            ));
+        }
+        if limit.resume != on {
+            limit.resume = on;
+            let limit = *limit;
+            // Not activity: keep `updated_at_ms` (sidebar order).
+            self.core.commit(vec![Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            }])?;
+            self.core.limit_changed(&self.thread.id, Some(limit));
+        }
+        Ok(Response::Ok)
+    }
+
+    /// The limit reset and the thread was to carry on: do, unless the user
+    /// got there first (a turn since clears the limit).
+    fn on_limit_reset(&mut self) {
+        if self.turn.is_some() || !self.thread.limit.is_some_and(|l| l.resume) {
+            return;
+        }
+        self.resumed = true;
+        if let Err(err) = self.send_message("Continue where you left off.".to_owned(), Vec::new()) {
+            self.resumed = false;
+            tracing::warn!(thread = %self.thread.id, err = %err.message, "resume after limit reset");
         }
     }
 
@@ -480,6 +673,10 @@ impl ThreadActor {
         }
         self.thread.status = ThreadStatus::Running;
         self.thread.updated_at_ms = now;
+        self.limit_hit = None;
+        if self.thread.limit.take().is_some() {
+            self.core.limit_changed(&self.thread.id, None);
+        }
         self.core.commit(vec![
             Event::TurnStarted { turn: turn.clone() },
             Event::ItemUpserted { item: user_item },
@@ -1305,6 +1502,7 @@ impl ThreadActor {
                 usage,
                 error,
             } => self.finish_turn(status, usage, error)?,
+            HarnessEvent::LimitReached(hit) => self.limit_hit = Some(hit),
             HarnessEvent::Notice { level, text } => {
                 let item = self.new_item(
                     self.turn_id(),
@@ -1488,13 +1686,34 @@ impl ThreadActor {
         }
         self.thread.status = ThreadStatus::Idle;
         self.thread.updated_at_ms = now_ms();
+        // Stopped by the usage limit: say so on the thread, and carry on at
+        // the reset if that is wanted (the setting, or a turn that was
+        // itself such a carrying-on and met the next limit).
+        let resumed = std::mem::take(&mut self.resumed);
+        let limit = self
+            .limit_hit
+            .take()
+            .filter(|_| status == TurnStatus::Failed)
+            .map(|hit| LimitStop {
+                resets_at_ms: hit.resets_at_ms,
+                resume: hit.resets_at_ms.is_some_and(|at| at > now_ms())
+                    && (resumed || self.core.config().threads.resume_at_reset),
+            });
+        if limit != self.thread.limit {
+            self.thread.limit = limit;
+            self.core.limit_changed(&self.thread.id, limit);
+        }
         events.push(Event::ThreadUpdated {
             thread: self.thread.clone(),
         });
         self.core.commit(events)?;
+        crate::pull_requests::turn_ended(&self.core, &self.thread);
         if let Some(turn) = finished.filter(|t| t.checkpoint_before.is_some()) {
             self.capture_checkpoint(&turn, false);
         }
+        // The run loop sends it, after a session restart that was waiting
+        // for the thread to be idle.
+        self.send_next = status == TurnStatus::Completed && !self.queue.is_empty();
         Ok(())
     }
 
@@ -1739,4 +1958,21 @@ pub(crate) fn file_stat(f: loft_git::FileStat) -> loft_protocol::DiffFileStat {
         removed: f.removed,
         binary: f.binary,
     }
+}
+
+/// Move message `id` to where `to` is: after it when moving down, before
+/// it when moving up. Whether anything moved.
+fn move_in_line(queue: &mut Vec<QueuedMessage>, id: u64, to: u64) -> bool {
+    let (Some(from), Some(at)) = (
+        queue.iter().position(|m| m.id == id),
+        queue.iter().position(|m| m.id == to),
+    ) else {
+        return false;
+    };
+    if from == at {
+        return false;
+    }
+    let message = queue.remove(from);
+    queue.insert(at, message);
+    true
 }

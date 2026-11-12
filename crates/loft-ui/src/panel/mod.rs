@@ -153,6 +153,8 @@ pub enum PanelEvent {
     /// A note left on a document open in `thread`'s panel: the file's path
     /// as its tab has it, and the note.
     DocNote(ThreadId, String, docs::DocNote),
+    /// Text selected in one of `thread`'s terminals, for its composer.
+    AddToMessage(ThreadId, String),
 }
 
 pub struct WorkbenchPanel {
@@ -508,8 +510,13 @@ impl WorkbenchPanel {
         let root = FsRoot::Thread(thread_id.clone());
         let pane = cx.new(|cx| TerminalPane::new(store, root, key, window, cx));
         let sub = cx.observe(&pane, |_, _, cx| cx.notify());
+        let id = thread_id.clone();
+        let to_message = cx.subscribe(&pane, move |_, _, event: &terminal::AddToMessage, cx| {
+            cx.emit(PanelEvent::AddToMessage(id.clone(), event.0.clone()))
+        });
         if let Some(panel) = self.threads.get_mut(thread_id) {
             panel._subs.push(sub);
+            panel._subs.push(to_message);
         }
         pane
     }

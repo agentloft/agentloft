@@ -217,6 +217,30 @@ fn mouse_drag_selects_text(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_selection_is_handed_to_the_host_for_its_message(cx: &mut TestAppContext) {
+    let (view, cx, events) = setup(cx);
+    feed(&view, cx, b"$ cargo test\r\ntest result: ok");
+    let asked = |events: &Events| -> Vec<String> {
+        events
+            .borrow()
+            .iter()
+            .filter_map(|e| match e {
+                TerminalEvent::AddToMessage(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // Nothing selected: nothing to hand over.
+    cx.dispatch_action(loft_terminal::AddSelectionToMessage);
+    assert!(asked(&events).is_empty());
+    cx.simulate_keystrokes("cmd-a");
+    cx.dispatch_action(loft_terminal::AddSelectionToMessage);
+    assert_eq!(asked(&events), vec!["$ cargo test\ntest result: ok"]);
+    // The selection stays, as after a copy.
+    assert!(view.read_with(cx, |t, _| t.selection_text()).is_some());
+}
+
+#[gpui_kit::test]
 fn mouse_reporting_when_the_program_asks(cx: &mut TestAppContext) {
     let (view, cx, events) = setup(cx);
     feed(&view, cx, b"\x1b[?1000h\x1b[?1006h");

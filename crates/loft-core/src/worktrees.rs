@@ -334,13 +334,16 @@ impl Core {
             &items,
             &files,
         );
-        blocking(move || {
+        let pr_title = title.clone();
+        let url = blocking(move || {
             let dir = Path::new(&path);
             wt::commit_and_push(dir, &branch, &base, &message, &env, Some(&gh))?;
             gh_pr_create(&gh, dir, &branch, &base, &title, &body, &env)
         })
-        .await
-        .map(|url| Response::Text { text: url })
+        .await?;
+        // On the thread before the answer; its checks and review follow.
+        self.pull_request_created(id, &url, &pr_title).await;
+        Ok(Response::Text { text: url })
     }
 
     pub(crate) async fn unarchive_thread(self: &Arc<Self>, id: &ThreadId) -> CoreResult<Response> {

@@ -86,6 +86,13 @@ const MIGRATIONS: &[&str] = &[
         data          TEXT NOT NULL
     );
     "#,
+    // 4: each thread's queue (messages waiting for the running turn to end).
+    r#"
+    CREATE TABLE queues (
+        thread_id TEXT PRIMARY KEY,
+        data      TEXT NOT NULL
+    );
+    "#,
 ];
 
 pub struct Store {
@@ -162,6 +169,15 @@ impl Store {
                 ],
             )?;
             let seq = tx.last_insert_rowid() as u64;
+            // A queue update says the whole queue: the ones before it tell
+            // a reader catching up nothing (and each holds every message).
+            if let Event::QueueUpdated { thread_id, .. } = &event {
+                tx.execute(
+                    "DELETE FROM events
+                     WHERE thread_id = ?1 AND type = 'queue_updated' AND seq < ?2",
+                    params![thread_id.as_str(), seq as i64],
+                )?;
+            }
             apply(&tx, &event)?;
             out.push(EventEnvelope { seq, at_ms, event });
         }
@@ -363,6 +379,16 @@ impl Store {
         )
     }
 
+    /// The messages waiting in a thread's queue, in order.
+    pub fn queue(&self, thread: &ThreadId) -> Result<Vec<loft_protocol::QueuedMessage>> {
+        Ok(self
+            .query_one(
+                "SELECT data FROM queues WHERE thread_id = ?1",
+                [thread.as_str()],
+            )?
+            .unwrap_or_default())
+    }
+
     /// All turns that were left running (crash recovery).
     pub fn running_turns(&self) -> Result<Vec<Turn>> {
         self.query_data(
@@ -555,6 +581,7 @@ fn event_type(event: &Event) -> &'static str {
         Event::RequestOpened { .. } => "request_opened",
         Event::RequestUpdated { .. } => "request_updated",
         Event::ThreadDeleted { .. } => "thread_deleted",
+        Event::QueueUpdated { .. } => "queue_updated",
         Event::AutomationUpdated { .. } => "automation_updated",
         Event::AutomationDeleted { .. } => "automation_deleted",
     }
@@ -617,6 +644,7 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
                 "DELETE FROM turns WHERE thread_id = ?1",
                 "DELETE FROM requests WHERE thread_id = ?1",
                 "DELETE FROM view_state WHERE thread_id = ?1",
+                "DELETE FROM queues WHERE thread_id = ?1",
                 "DELETE FROM threads WHERE id = ?1",
                 // The log keeps only the deletion itself.
                 "DELETE FROM events WHERE thread_id = ?1 AND type != 'thread_deleted'",
@@ -634,6 +662,20 @@ fn apply(conn: &Connection, event: &Event) -> Result<()> {
                     json(request)?
                 ],
             )?;
+        }
+        Event::QueueUpdated { thread_id, queue } => {
+            if queue.is_empty() {
+                conn.execute(
+                    "DELETE FROM queues WHERE thread_id = ?1",
+                    params![thread_id.as_str()],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO queues(thread_id, data) VALUES (?1, ?2)
+                     ON CONFLICT(thread_id) DO UPDATE SET data = excluded.data",
+                    params![thread_id.as_str(), json(queue)?],
+                )?;
+            }
         }
         Event::AutomationUpdated { automation } => {
             conn.execute(
@@ -707,7 +749,9 @@ mod tests {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            limit: None,
             automation_id: None,
+            pull_request: None,
         }
     }
 
@@ -947,5 +991,52 @@ mod tests {
             }])
             .unwrap();
         assert_eq!(store.view_state(&thread.id, &item).unwrap(), None);
+    }
+
+    #[test]
+    fn a_queue_is_kept_as_it_last_was() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let t = thread(&p);
+        store
+            .commit(vec![
+                Event::ProjectAdded { project: p },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        assert!(store.queue(&t.id).unwrap().is_empty());
+        let message = |id: u64, text: &str| loft_protocol::QueuedMessage {
+            id,
+            text: text.into(),
+            attachments: vec![],
+            queued_at_ms: 1,
+        };
+        let update = |queue: Vec<loft_protocol::QueuedMessage>| Event::QueueUpdated {
+            thread_id: t.id.clone(),
+            queue,
+        };
+        store.commit(vec![update(vec![message(1, "a")])]).unwrap();
+        let two = vec![message(1, "a"), message(2, "b")];
+        store.commit(vec![update(two.clone())]).unwrap();
+        assert_eq!(store.queue(&t.id).unwrap(), two);
+        // The log keeps the latest only: each says the whole queue.
+        let logged: Vec<Event> = store
+            .events_after(0, Some(&t.id))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event)
+            .filter(|e| matches!(e, Event::QueueUpdated { .. }))
+            .collect();
+        assert_eq!(logged, [update(two)]);
+        store.commit(vec![update(vec![])]).unwrap();
+        assert!(store.queue(&t.id).unwrap().is_empty());
+        // Gone with its thread.
+        store.commit(vec![update(vec![message(3, "c")])]).unwrap();
+        store
+            .commit(vec![Event::ThreadDeleted {
+                thread_id: t.id.clone(),
+            }])
+            .unwrap();
+        assert!(store.queue(&t.id).unwrap().is_empty());
     }
 }

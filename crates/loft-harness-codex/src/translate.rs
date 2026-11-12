@@ -120,6 +120,9 @@ pub struct Translator {
     approvals: HashMap<String, OpenApproval>,
     usage: Option<Usage>,
     interrupted: bool,
+    /// The plan's limits as Codex last reported them
+    /// (`account/rateLimits/updated`).
+    rate_limits: Option<Value>,
     /// The compaction under way (its item id), shown as "Compacting…".
     compacting: Option<String>,
     /// MCP servers whose tool calls are approved automatically.
@@ -1258,6 +1261,10 @@ impl Translator {
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
                 delta(p, DeltaChannel::Output)
             }
+            "account/rateLimits/updated" => {
+                self.rate_limits = p.get("rateLimits").cloned();
+                vec![]
+            }
             "thread/tokenUsage/updated" => {
                 self.token_usage = p.get("tokenUsage").cloned();
                 if let Some(last) = p.pointer("/tokenUsage/last") {
@@ -1329,6 +1336,19 @@ impl Translator {
                 self.turn_id = None;
                 self.interrupted = false;
                 out.extend(marker);
+                if status == TurnStatus::Failed
+                    && matches!(
+                        turn.pointer("/error/codexErrorInfo")
+                            .and_then(Value::as_str),
+                        Some("usageLimitExceeded" | "rateLimitExceeded")
+                    )
+                {
+                    out.push(Out::Event(HarnessEvent::LimitReached(
+                        loft_harness::LimitHit {
+                            resets_at_ms: limit_resets_at(self.rate_limits.as_ref()),
+                        },
+                    )));
+                }
                 out.push(Out::Event(HarnessEvent::TurnCompleted {
                     status,
                     usage,
@@ -1961,6 +1981,22 @@ pub fn models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
         .collect()
 }
 
+/// When a used-up plan can be used again: every window that is full has
+/// to reset first, so the latest of them (unknown if any is, or if none
+/// is full).
+fn limit_resets_at(limits: Option<&Value>) -> Option<i64> {
+    let limits = limits?;
+    let full: Vec<Option<i64>> = ["primary", "secondary"]
+        .iter()
+        .filter_map(|k| limits.get(*k).filter(|w| !w.is_null()))
+        .filter(|w| w.get("usedPercent").and_then(Value::as_f64).unwrap_or(0.) >= 100.)
+        .map(|w| w.get("resetsAt").and_then(Value::as_i64).filter(|s| *s > 0))
+        .collect();
+    let all = full.into_iter().collect::<Option<Vec<i64>>>()?;
+    // Seconds since the epoch.
+    all.into_iter().max().map(|s| s.saturating_mul(1000))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1993,6 +2029,59 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_turn_the_plan_limit_ends_says_so_and_when_it_resets() {
+        // Shapes from codex-cli 0.167.1's app-server schema (`TurnError`,
+        // `RateLimitSnapshot`).
+        let limit_of = |out: &[Out]| {
+            events(out).into_iter().find_map(|e| match e {
+                HarnessEvent::LimitReached(hit) => Some(*hit),
+                _ => None,
+            })
+        };
+        let failed = |info: &str| {
+            format!(
+                r#"{{"method":"turn/completed","params":{{"turn":{{"id":"T","status":"failed","error":{{"message":"You've hit your usage limit.","codexErrorInfo":{info}}}}}}}}}"#
+            )
+        };
+        let limits = |primary: (u32, i64), secondary: (u32, i64)| {
+            format!(
+                r#"{{"method":"account/rateLimits/updated","params":{{"rateLimits":{{"primary":{{"usedPercent":{},"resetsAt":{},"windowDurationMins":300}},"secondary":{{"usedPercent":{},"resetsAt":{},"windowDurationMins":10080}}}}}}}}"#,
+                primary.0, primary.1, secondary.0, secondary.1
+            )
+        };
+        let mut t = Translator::new("/tmp/probe".into(), None, None, None);
+        // Only the five-hour window is full: its reset is the one to wait for.
+        let mut out = t.start_turn("x");
+        out.extend(t.on_line(&limits((100, 1_800_000_000), (40, 1_800_500_000))));
+        out.extend(t.on_line(&failed(r#""usageLimitExceeded""#)));
+        assert_eq!(
+            limit_of(&out).unwrap().resets_at_ms,
+            Some(1_800_000_000_000)
+        );
+        // Both full: the later.
+        let mut out = t.start_turn("x");
+        out.extend(t.on_line(&limits((100, 1_800_000_000), (100, 1_800_500_000))));
+        out.extend(t.on_line(&failed(r#""usageLimitExceeded""#)));
+        assert_eq!(
+            limit_of(&out).unwrap().resets_at_ms,
+            Some(1_800_500_000_000)
+        );
+        // Nothing reported as full: a limit, reset unknown.
+        let mut out = t.start_turn("x");
+        out.extend(t.on_line(&limits((20, 1_800_000_000), (40, 1_800_500_000))));
+        out.extend(t.on_line(&failed(r#""rateLimitExceeded""#)));
+        assert_eq!(limit_of(&out).unwrap().resets_at_ms, None);
+        // Another failure isn't a limit, full window or not.
+        let mut out = t.start_turn("x");
+        out.extend(t.on_line(&limits((100, 1_800_000_000), (40, 1_800_500_000))));
+        out.extend(t.on_line(&failed(r#""serverOverloaded""#)));
+        out.extend(t.on_line(&failed(
+            r#"{"httpConnectionFailed":{"httpStatusCode":502}}"#,
+        )));
+        assert_eq!(limit_of(&out), None);
     }
 
     #[test]

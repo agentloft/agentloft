@@ -43,6 +43,11 @@ impl PendingImage {
         })
     }
 
+    /// An image the daemon stored (a queued message's), read back.
+    pub fn stored(name: String, path: &Path, data: Vec<u8>) -> Option<Self> {
+        Self::new(name, format_for_path(path)?, data)
+    }
+
     /// A PNG made by the app (e.g. a page screenshot).
     pub fn png(name: &str, data: Vec<u8>) -> Option<Self> {
         Self::new(name.to_owned(), ImageFormat::Png, data)

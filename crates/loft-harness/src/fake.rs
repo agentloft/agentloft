@@ -14,7 +14,10 @@
 //! - contains `bgagents`: starts three subagents in the background first.
 //!   They work on after the turn, a step at a time with a pause between
 //!   steps (short ones with `quick` in the text), then finish;
-//! - contains `fail`: completes the turn as failed.
+//! - contains `fail`: completes the turn as failed;
+//! - contains `limit`: fails the turn the way a used-up plan does.
+//!   `limit:<seconds>` says the limit resets that many seconds from now
+//!   (`limit:-5`: five seconds ago); bare, it doesn't say when.
 
 use crate::{
     Capabilities, Harness, HarnessEvent, SessionCommand, SessionConfig, SessionEnds, SessionHandle,
@@ -498,11 +501,27 @@ async fn run_turn(
             status: ItemStatus::Completed,
         });
     }
-    let failed = script.contains("fail");
+    let limit = script.contains("limit").then(|| crate::LimitHit {
+        resets_at_ms: script
+            .split("limit:")
+            .nth(1)
+            .and_then(|rest| {
+                let end = rest
+                    .char_indices()
+                    .find(|(i, c)| !(c.is_ascii_digit() || (*i == 0 && *c == '-')))
+                    .map_or(rest.len(), |(i, _)| i);
+                rest[..end].parse::<i64>().ok()
+            })
+            .map(|secs| now_ms() + secs * 1000),
+    });
+    let failed = script.contains("fail") || limit.is_some();
     ends.emit(HarnessEvent::ContextUsed(loft_protocol::ContextUse {
         tokens: 1_234,
         window: Some(200_000),
     }));
+    if let Some(limit) = limit {
+        ends.emit(HarnessEvent::LimitReached(limit));
+    }
     ends.emit(HarnessEvent::TurnCompleted {
         status: if failed {
             TurnStatus::Failed
@@ -514,9 +533,19 @@ async fn run_turn(
             output_tokens: reply.len() as u64,
             ..Default::default()
         }),
-        error: failed.then(|| "fake failure".into()),
+        error: failed.then(|| match limit {
+            Some(_) => "You've hit your usage limit (fake).".into(),
+            None => "fake failure".into(),
+        }),
     });
     true
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The views a prompt asks for, and whether to write them out slowly:

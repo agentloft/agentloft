@@ -507,7 +507,8 @@ pub fn render_row(
         Row::Pending => render_pending(p),
         Row::Waiting => render_waiting(&model.thread.waiting_on, p),
         Row::Card(ix) => crate::info_cards::render(thread, store, state, *ix, p),
-        Row::Queued(id) => render_queued(&state.id, store, *id, p, cx),
+        Row::Limit => render_limit(&state.id, store, model, p),
+        Row::Queued(id) => render_queued(&state.id, store, model, *id, p, cx),
         Row::TurnFooter { turn_ix } => {
             let agents = store.read(cx).available_harnesses();
             let changes = render_turn_changes(thread, store, state, model, *turn_ix, p);
@@ -563,6 +564,11 @@ pub(crate) fn render_item(
         ItemBody::UserMessage { text, attachments } => {
             use gpui_kit::StyledImage as _;
             use gpui_kit::component::menu::ContextMenuExt as _;
+            // Threads sent along as context: chips again, not the lines
+            // written for the agent (Copy still gives the message as sent).
+            let sent = text;
+            let (text, threads) = crate::thread_ref::split(sent);
+            let text: &str = &text;
             let mut images = h_flex().gap_2().justify_end().flex_wrap();
             for (ix, a) in attachments.iter().enumerate() {
                 let path = std::path::PathBuf::from(&a.path);
@@ -600,6 +606,16 @@ pub(crate) fn render_item(
                 .gap_1p5()
                 .pt_5()
                 .when(!attachments.is_empty(), |d| d.child(images))
+                .when(!threads.is_empty(), |d| {
+                    d.child(
+                        h_flex()
+                            .max_w(relative(0.82))
+                            .gap_2()
+                            .justify_end()
+                            .flex_wrap()
+                            .children(threads.iter().map(|t| crate::thread_ref::chip(t, p))),
+                    )
+                })
                 .when(!text.is_empty(), |d| {
                     let group = SharedString::from(format!("user-{}", item.id));
                     let copy_id = format!("copy-user-{}", item.id);
@@ -691,7 +707,7 @@ pub(crate) fn render_item(
                                         .group_hover(group, |d| d.visible())
                                         .child(copy_button(
                                             copy_id,
-                                            text.clone(),
+                                            sent.clone(),
                                             "Copy message",
                                             p,
                                         )),
@@ -908,6 +924,7 @@ fn render_doing(icon: IconName, what: String, p: &Palette) -> AnyElement {
 fn render_queued(
     thread_id: &loft_protocol::ThreadId,
     store: &Entity<AppStore>,
+    model: &ThreadModel,
     id: u64,
     p: &Palette,
     cx: &App,
@@ -915,18 +932,18 @@ fn render_queued(
     use crate::store::StoreEvent;
     use crate::workspace::DraggedQueued;
     use gpui_kit::{AppContext as _, StyledImage as _};
-    let Some(queue) = store.read(cx).queued.get(thread_id) else {
-        return div().into_any_element();
-    };
+    let queue = &model.queue;
     let Some(ix) = queue.iter().position(|m| m.id == id) else {
         return div().into_any_element();
     };
     let q = &queue[ix];
     let count = queue.len();
+    // The queue moves on by itself only after a turn that completed.
+    let running = model.running_turn().is_some();
     let prev_id = ix.checked_sub(1).map(|i| queue[i].id);
     let next_id = queue.get(ix + 1).map(|m| m.id);
     let mut thumbs = h_flex().gap_1p5().flex_wrap().justify_end();
-    for (n, image) in q.images.iter().enumerate() {
+    for (n, image) in q.attachments.iter().enumerate() {
         thumbs = thumbs.child(
             div()
                 .id(SharedString::from(format!("queued-{id}-img-{n}")))
@@ -936,13 +953,18 @@ fn render_queued(
                 .border_1()
                 .border_color(p.border)
                 .child(
-                    gpui_kit::img(image.preview.clone())
-                        .size_full()
-                        .object_fit(gpui_kit::ObjectFit::Cover),
+                    gpui_kit::img(crate::host::image_or_blank(
+                        std::path::Path::new(&image.path),
+                        None,
+                    ))
+                    .size_full()
+                    .object_fit(gpui_kit::ObjectFit::Cover),
                 ),
         );
     }
-    let preview: String = q.text.chars().take(400).collect();
+    // Threads attached as context show as chips, as in a sent message.
+    let (said, threads) = crate::thread_ref::split(&q.text);
+    let preview: String = said.chars().take(400).collect();
     let action = |name: &str, icon: Option<IconName>, label: Option<&'static str>| {
         h_flex()
             .id(SharedString::from(format!("{name}-{id}")))
@@ -966,15 +988,19 @@ fn render_queued(
     let drag = DraggedQueued {
         thread_id: thread_id.clone(),
         id,
-        text: q
-            .text
+        text: said
             .lines()
             .find(|l| !l.trim().is_empty())
-            .unwrap_or("Image")
+            .unwrap_or(if threads.is_empty() {
+                "Image"
+            } else {
+                "Thread"
+            })
             .to_owned(),
     };
     let drop_accent = p.accent;
     let steer_tip = match crate::keymap::hint("steer", cx) {
+        _ if !running => "Send it now; the rest follow as each turn completes".to_owned(),
         k if k.is_empty() => "Send into the running turn now".to_owned(),
         k => format!("Send into the running turn now ({k} while typing)"),
     };
@@ -1024,7 +1050,16 @@ fn render_queued(
                             }
                         })
                 })
-                .when(!q.images.is_empty(), |d| d.child(thumbs))
+                .when(!q.attachments.is_empty(), |d| d.child(thumbs))
+                .when(!threads.is_empty(), |d| {
+                    d.child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .flex_wrap()
+                            .children(threads.iter().map(|t| crate::thread_ref::chip(t, p))),
+                    )
+                })
                 .when(!preview.is_empty(), |d| {
                     d.child(div().line_clamp(4).child(preview))
                 }),
@@ -1038,10 +1073,12 @@ fn render_queued(
                         .px_1p5()
                         .text_xs()
                         .text_color(p.faint_foreground)
-                        .child(if count > 1 && ix == 0 {
-                            "Queued · next"
-                        } else {
-                            "Queued"
+                        .child(match (running, ix) {
+                            // The last turn was stopped or failed (or the
+                            // daemon restarted): nothing goes by itself.
+                            (false, 0) => "Queued · waiting for you",
+                            (true, 0) if count > 1 => "Queued · next",
+                            _ => "Queued",
                         }),
                 )
                 .when_some(prev_id, |d, prev_id| {
@@ -1091,6 +1128,66 @@ fn render_queued(
                         .on_click(on(|s, thread, id, _, cx| s.dequeue(&thread, id, cx), 0)),
                 ),
         )
+        .into_any_element()
+}
+
+/// The agent's usage limit stopped the thread: say when it resets, and
+/// offer to carry on then (or show that it will, with a way out).
+fn render_limit(
+    thread_id: &loft_protocol::ThreadId,
+    store: &Entity<AppStore>,
+    model: &ThreadModel,
+    p: &Palette,
+) -> AnyElement {
+    let Some(limit) = model.thread.limit else {
+        return div().into_any_element();
+    };
+    let resets = limit
+        .resets_at_ms
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(crate::info_cards::local_time);
+    let past = limit
+        .resets_at_ms
+        .is_some_and(|at| at <= chrono::Utc::now().timestamp_millis());
+    let what = match (&resets, limit.resume, past) {
+        (Some(at), true, _) => format!("Usage limit reached. Carries on by itself at {at}."),
+        (Some(at), false, true) => format!("Usage limit reached. It reset at {at}."),
+        (Some(at), false, false) => format!("Usage limit reached. Resets {at}."),
+        (None, ..) => "Usage limit reached.".to_owned(),
+    };
+    let button = |name: &'static str, label: &'static str, on: bool| {
+        let (store, thread_id) = (store.clone(), thread_id.clone());
+        div()
+            .id(name)
+            .flex_none()
+            .px_2()
+            .py(px(3.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(p.border)
+            .cursor_pointer()
+            .text_xs()
+            .text_color(p.foreground)
+            .hover(|d| d.bg(p.hover))
+            .child(label)
+            .on_click(move |_, _, cx| {
+                let thread_id = thread_id.clone();
+                store.update(cx, |s, cx| s.resume_at_reset(thread_id, on, cx));
+            })
+    };
+    h_flex()
+        .gap_2()
+        .items_center()
+        .text_sm()
+        .text_color(p.muted_foreground)
+        .child(Icon::new(IconName::Hourglass).small())
+        .child(div().min_w_0().child(what))
+        .when(resets.is_some() && !limit.resume && !past, |d| {
+            d.child(button("limit-resume", "Carry on at reset", true))
+        })
+        .when(limit.resume, |d| {
+            d.child(button("limit-resume-off", "Cancel", false))
+        })
         .into_any_element()
 }
 

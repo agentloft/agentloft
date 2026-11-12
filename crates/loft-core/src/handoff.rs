@@ -204,7 +204,9 @@ mod tests {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            limit: None,
             automation_id: None,
+            pull_request: None,
         };
         let items = vec![
             item(ItemBody::UserMessage {

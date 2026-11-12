@@ -19,43 +19,22 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 pub const BUILD: &str = env!("CARGO_PKG_VERSION");
 
-/// A message typed while a turn was running.
+/// A message on its way out of the composer: what was typed, and the
+/// images with it.
 #[derive(Clone)]
-pub struct Queued {
-    /// Stays the same while others are sent or moved around it.
-    pub id: u64,
+pub struct Outgoing {
     pub text: String,
     pub images: Vec<crate::attachments::PendingImage>,
 }
 
-impl Queued {
+impl Outgoing {
     pub fn new(text: String, images: Vec<crate::attachments::PendingImage>) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self {
-            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            text,
-            images,
-        }
+        Self { text, images }
     }
-}
 
-/// Move message `id` to where `to` is: after it when moving down, before
-/// it when moving up. Whether anything moved.
-fn move_in_line(q: &mut std::collections::VecDeque<Queued>, id: u64, to: u64) -> bool {
-    let (Some(from), Some(at)) = (
-        q.iter().position(|m| m.id == id),
-        q.iter().position(|m| m.id == to),
-    ) else {
-        return false;
-    };
-    if from == at {
-        return false;
+    fn attachments(&self) -> Vec<Attachment> {
+        self.images.iter().map(|i| i.to_attachment()).collect()
     }
-    let Some(message) = q.remove(from) else {
-        return false;
-    };
-    q.insert(at, message);
-    true
 }
 
 /// Something the user said (as opposed to the agent's work).
@@ -165,42 +144,6 @@ mod steer_tests {
     }
 }
 
-#[cfg(test)]
-mod queue_tests {
-    use super::*;
-
-    fn texts(q: &std::collections::VecDeque<Queued>) -> Vec<&str> {
-        q.iter().map(|m| m.text.as_str()).collect()
-    }
-
-    #[test]
-    fn queued_messages_move_by_id() {
-        let mut q: std::collections::VecDeque<Queued> = ["a", "b", "c", "d"]
-            .into_iter()
-            .map(|t| Queued::new(t.into(), vec![]))
-            .collect();
-        let id = |q: &std::collections::VecDeque<Queued>, t: &str| {
-            q.iter().find(|m| m.text == t).unwrap().id
-        };
-        // Down onto "c": lands after it.
-        let (a, c) = (id(&q, "a"), id(&q, "c"));
-        assert!(move_in_line(&mut q, a, c));
-        assert_eq!(texts(&q), ["b", "c", "a", "d"]);
-        // Up onto "b": lands before it, first in line.
-        let (d, b) = (id(&q, "d"), id(&q, "b"));
-        assert!(move_in_line(&mut q, d, b));
-        assert_eq!(texts(&q), ["d", "b", "c", "a"]);
-        // One sent meanwhile: the ids still find the right ones.
-        q.pop_front();
-        let (a, b) = (id(&q, "a"), id(&q, "b"));
-        assert!(move_in_line(&mut q, a, b));
-        assert_eq!(texts(&q), ["a", "b", "c"]);
-        // Gone, or onto itself: nothing moves.
-        assert!(!move_in_line(&mut q, d, a));
-        assert!(!move_in_line(&mut q, a, a));
-    }
-}
-
 /// App-wide UI events (e.g. a timeline row asking the panel to open a file).
 #[derive(Debug, Clone)]
 pub enum StoreEvent {
@@ -235,6 +178,9 @@ pub enum StoreEvent {
     ConfirmArchive { thread_id: ThreadId, reason: String },
     /// Put queued message `id` back in the composer to edit it.
     EditQueued { thread_id: ThreadId, id: u64 },
+    /// A message couldn't be handed to the daemon: it is back in
+    /// `AppStore::unsent` for the composer to take.
+    Unsent { thread_id: ThreadId },
 }
 
 impl gpui_kit::EventEmitter<StoreEvent> for AppStore {}
@@ -313,11 +259,11 @@ pub struct AppStore {
     /// The Automations page is showing in this window's main area (until
     /// a thread is picked).
     pub automations_open: bool,
-    /// Messages typed while a turn was running, sent when it ends.
-    pub queued: HashMap<ThreadId, std::collections::VecDeque<Queued>>,
-    /// Threads with a queued message on its way (sent, not yet answered):
-    /// the next one waits for it, so two never race for the same turn.
-    flushing: HashSet<ThreadId>,
+    /// Each project's actions (`.agentloft/config.toml`) as last read.
+    pub(crate) actions: crate::actions::ActionCache,
+    /// Messages the daemon didn't take (it couldn't be reached, say), for
+    /// the composer to take back so nothing typed is lost.
+    pub unsent: HashMap<ThreadId, Vec<Outgoing>>,
     /// Text to prefill a thread's composer with (a fork's handoff digest).
     pub drafts: HashMap<ThreadId, String>,
     /// Threads that finished a turn while not selected (sidebar dot).
@@ -382,8 +328,8 @@ impl AppStore {
             commands: HashMap::new(),
             default_harness: HarnessId::claude(),
             automations_open: false,
-            queued: HashMap::new(),
-            flushing: HashSet::new(),
+            actions: Default::default(),
+            unsent: HashMap::new(),
             drafts: HashMap::new(),
             unread: Default::default(),
             models: HashMap::new(),
@@ -835,7 +781,6 @@ impl AppStore {
                     && let Some(entity) = self.threads.get(&id).cloned()
                 {
                     entity.update(cx, |t, cx| t.apply_event(&event, cx));
-                    self.flush_queue(&id, &entity, cx);
                 }
             }
             ClientEvent::Delta { sub_id, delta } => {
@@ -1001,7 +946,6 @@ impl AppStore {
         let live = self.live_spawned(id);
         entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
         self.threads.insert(id.clone(), entity.clone());
-        self.queue_changed(id, cx);
         if self.ws_ready
             && let Some(client) = &self.client
         {
@@ -1750,8 +1694,16 @@ impl AppStore {
         });
     }
 
+    /// Have Agentloft ask GitHub about the thread's pull request now (or
+    /// look for one on its branch). What is new comes as a thread update;
+    /// no pull request, or no `gh`, is nothing to tell the user.
+    pub fn refresh_pull_request(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.request_result(Request::RefreshPullRequest { thread_id }, cx, |_, _, _| {});
+    }
+
     /// Push the worktree branch and open a PR with `gh`; opens it in the
-    /// browser when done.
+    /// browser when done. The thread shows it from then on (it comes with
+    /// the thread's update).
     pub fn create_pull_request(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         cx.emit(StoreEvent::Progress {
             message: Some("Pushing and opening a pull request…".into()),
@@ -1814,8 +1766,7 @@ impl AppStore {
         self.threads.remove(thread_id);
         self.unread.remove(thread_id);
         self.drafts.remove(thread_id);
-        self.queued.remove(thread_id);
-        self.flushing.remove(thread_id);
+        self.unsent.remove(thread_id);
         let subs: Vec<u64> = self
             .subs
             .iter()
@@ -1862,171 +1813,121 @@ impl AppStore {
         cx.notify();
     }
 
-    /// The queue of `thread_id` changed: its timeline shows it.
-    fn queue_changed(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
-        let ids: Vec<u64> = self
-            .queued
-            .get(thread_id)
-            .map(|q| q.iter().map(|m| m.id).collect())
-            .unwrap_or_default();
-        if let Some(thread) = self.threads.get(thread_id) {
-            thread.update(cx, |t, cx| t.set_queued(ids, cx));
-        }
-        cx.notify();
-    }
+    // -- the queue (the daemon holds it; `ThreadModel::queue` mirrors it) ----
 
-    /// Queue a message for when the current turn ends.
-    pub fn enqueue(&mut self, thread_id: ThreadId, message: Queued, cx: &mut Context<Self>) {
-        self.queued
-            .entry(thread_id.clone())
-            .or_default()
-            .push_back(message);
-        self.queue_changed(&thread_id, cx);
-    }
-
-    /// Where queued message `id` is in line now.
-    fn queued_index(&self, thread_id: &ThreadId, id: u64) -> Option<usize> {
-        self.queued.get(thread_id)?.iter().position(|m| m.id == id)
-    }
-
-    pub fn dequeue(&mut self, thread_id: &ThreadId, id: u64, cx: &mut Context<Self>) {
-        if let Some(index) = self.queued_index(thread_id, id)
-            && let Some(q) = self.queued.get_mut(thread_id)
-        {
-            q.remove(index);
-        }
-        self.queue_changed(thread_id, cx);
-    }
-
-    /// Send a queued message now, into the running turn (the agent reads
-    /// it at its next step; nothing stops). The rest stay queued.
-    pub fn send_queued_now(&mut self, thread_id: ThreadId, id: u64, cx: &mut Context<Self>) {
-        let Some(index) = self.queued_index(&thread_id, id) else {
-            return;
+    /// Hold a message until the running turn completes (the daemon sends
+    /// it then, whether or not this window is still open). If the daemon
+    /// doesn't take it, it goes back to the composer.
+    pub fn enqueue(&mut self, thread_id: ThreadId, message: Outgoing, cx: &mut Context<Self>) {
+        let body = Request::Enqueue {
+            thread_id: thread_id.clone(),
+            text: message.text.clone(),
+            attachments: message.attachments(),
         };
-        let Some(message) = self
-            .queued
-            .get_mut(&thread_id)
-            .and_then(|q| q.remove(index))
-        else {
-            return;
-        };
-        self.queue_changed(&thread_id, cx);
-        self.steer(thread_id, message, Some(index), cx);
+        self.hand_over(thread_id, message, body, cx, |_, _, _, _| false);
     }
 
     /// A message into the running turn. If it can't go in (the agent can't
-    /// take one mid-turn, say), it waits in the queue instead — at `back_at`
-    /// if it came from there — and nothing is lost.
-    pub fn steer(
-        &mut self,
-        thread_id: ThreadId,
-        message: Queued,
-        back_at: Option<usize>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.client.clone() else {
-            self.requeue(thread_id, message, back_at, cx);
-            return;
-        };
-        let attachments = message.images.iter().map(|i| i.to_attachment()).collect();
-        let fut = client.request(Request::Steer {
+    /// take one mid-turn, say), it waits in the queue instead, and nothing
+    /// is lost.
+    pub fn steer(&mut self, thread_id: ThreadId, message: Outgoing, cx: &mut Context<Self>) {
+        let body = Request::Steer {
             thread_id: thread_id.clone(),
             text: message.text.clone(),
-            attachments,
-        });
+            attachments: message.attachments(),
+        };
+        self.hand_over(
+            thread_id,
+            message,
+            body,
+            cx,
+            |store, thread_id, message, cx| {
+                store.enqueue(thread_id, message, cx);
+                true
+            },
+        );
+    }
+
+    /// Send `body`, which carries `message`. Refused: `otherwise` may deal
+    /// with it (and say so); if it doesn't, the message goes back to the
+    /// composer.
+    fn hand_over(
+        &mut self,
+        thread_id: ThreadId,
+        message: Outgoing,
+        body: Request,
+        cx: &mut Context<Self>,
+        otherwise: fn(&mut Self, ThreadId, Outgoing, &mut Context<Self>) -> bool,
+    ) {
+        let Some(client) = self.client.clone() else {
+            self.give_back(thread_id, message, cx);
+            return;
+        };
+        let fut = client.request(body);
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = fut.await;
             let _ = this.update(cx, |store, cx| {
                 if let Err(err) = result {
                     store.fail(err.message, cx);
-                    store.requeue(thread_id, message, back_at, cx);
+                    if !otherwise(store, thread_id.clone(), message.clone(), cx) {
+                        store.give_back(thread_id, message, cx);
+                    }
                 }
             });
         })
         .detach();
     }
 
-    fn requeue(
-        &mut self,
-        thread_id: ThreadId,
-        message: Queued,
-        at: Option<usize>,
-        cx: &mut Context<Self>,
-    ) {
-        let q = self.queued.entry(thread_id.clone()).or_default();
-        let at = at.unwrap_or(q.len()).min(q.len());
-        q.insert(at, message);
-        self.queue_changed(&thread_id, cx);
-        if let Some(thread) = self.threads.get(&thread_id).cloned() {
-            self.flush_queue(&thread_id, &thread, cx);
-        }
+    fn give_back(&mut self, thread_id: ThreadId, message: Outgoing, cx: &mut Context<Self>) {
+        self.unsent
+            .entry(thread_id.clone())
+            .or_default()
+            .push(message);
+        cx.emit(StoreEvent::Unsent { thread_id });
+    }
+
+    /// A queued message as the daemon holds it.
+    pub fn queued(
+        &self,
+        thread_id: &ThreadId,
+        id: u64,
+        cx: &gpui_kit::App,
+    ) -> Option<loft_protocol::QueuedMessage> {
+        let thread = self.threads.get(thread_id)?.read(cx);
+        thread
+            .model
+            .as_ref()?
+            .queue
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+    }
+
+    /// Take a queued message out of line.
+    pub fn dequeue(&mut self, thread_id: &ThreadId, id: u64, cx: &mut Context<Self>) {
+        let thread_id = thread_id.clone();
+        self.request(Request::Dequeue { thread_id, id }, cx, |_, _, _| {});
+    }
+
+    /// Send a queued message now: into the running turn (the agent reads
+    /// it at its next step; nothing stops), or as the next turn when none
+    /// is running. The rest stay queued.
+    pub fn send_queued_now(&mut self, thread_id: ThreadId, id: u64, cx: &mut Context<Self>) {
+        self.request(Request::SendQueued { thread_id, id }, cx, |_, _, _| {});
     }
 
     /// Move queued message `id` to where message `to` is (moving down, it
     /// lands after it; up, before). The first in line goes next. By id, so
     /// a message sent meanwhile doesn't shift the wrong one.
     pub fn move_queued(&mut self, thread_id: &ThreadId, id: u64, to: u64, cx: &mut Context<Self>) {
-        if let Some(q) = self.queued.get_mut(thread_id)
-            && move_in_line(q, id, to)
-        {
-            self.queue_changed(thread_id, cx);
-        }
+        let thread_id = thread_id.clone();
+        self.request(Request::MoveQueued { thread_id, id, to }, cx, |_, _, _| {});
     }
 
-    /// Take a queued message back out (to edit it).
-    pub fn take_queued(
-        &mut self,
-        thread_id: &ThreadId,
-        id: u64,
-        cx: &mut Context<Self>,
-    ) -> Option<Queued> {
-        let index = self.queued_index(thread_id, id)?;
-        let message = self.queued.get_mut(thread_id)?.remove(index);
-        self.queue_changed(thread_id, cx);
-        message
-    }
-
-    /// Send the next queued message once the thread is idle.
-    fn flush_queue(&mut self, id: &ThreadId, thread: &Entity<ThreadState>, cx: &mut Context<Self>) {
-        let idle = thread.read(cx).model.as_ref().is_some_and(|m| {
-            m.running_turn().is_none() && m.thread.status != loft_protocol::ThreadStatus::Running
-        });
-        if !idle || self.flushing.contains(id) {
-            return;
-        }
-        let Some(next) = self.queued.get_mut(id).and_then(|q| q.pop_front()) else {
-            return;
-        };
-        let Some(client) = self.client.clone() else {
-            self.queued.entry(id.clone()).or_default().push_front(next);
-            return;
-        };
-        self.flushing.insert(id.clone());
-        let thread_id = id.clone();
-        let attachments = next.images.iter().map(|i| i.to_attachment()).collect();
-        let fut = client.request(Request::SendMessage {
-            thread_id: id.clone(),
-            text: next.text.clone(),
-            attachments,
-        });
-        let id = id.clone();
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = fut.await;
-            let _ = this.update(cx, |store, cx| {
-                store.flushing.remove(&id);
-                if let Err(err) = result {
-                    // Still first in line: it goes when the agent is free.
-                    store.queued.entry(id.clone()).or_default().push_front(next);
-                    if err.code != loft_protocol::ErrorCode::Conflict {
-                        store.fail(err.message, cx);
-                    }
-                }
-                store.queue_changed(&id, cx);
-            });
-        })
-        .detach();
-        self.queue_changed(&thread_id, cx);
+    /// For a thread its agent's usage limit stopped: carry on by itself
+    /// when the limit resets, or don't.
+    pub fn resume_at_reset(&mut self, thread_id: ThreadId, on: bool, cx: &mut Context<Self>) {
+        self.request(Request::ResumeAtReset { thread_id, on }, cx, |_, _, _| {});
     }
 
     /// Say something in a thread as the user, from outside the composer
@@ -2040,7 +1941,7 @@ impl AppStore {
                 .is_some_and(|m| m.running_turn().is_some())
         });
         if running {
-            self.enqueue(thread_id, Queued::new(text, Vec::new()), cx);
+            self.enqueue(thread_id, Outgoing::new(text, Vec::new()), cx);
         } else {
             self.send_message(thread_id, text, Vec::new(), cx);
         }
@@ -2254,8 +2155,11 @@ pub enum Row {
     TurnFooter {
         turn_ix: usize,
     },
+    /// The agent's usage limit stopped the thread: when it resets, and
+    /// whether the thread carries on then.
+    Limit,
     /// A message of yours waiting for the turn to end (its id in the
-    /// store's queue): the last rows, in the order they'll go.
+    /// thread's queue): the last rows, in the order they'll go.
     Queued(u64),
 }
 
@@ -2289,9 +2193,6 @@ pub struct ThreadState {
     /// Threads this one's agent started that are still running: their
     /// cards stay in view even under a folded "Worked for …".
     live_spawned: std::collections::HashSet<ThreadId>,
-    /// Your messages waiting for the turn to end, in order (ids in the
-    /// store's queue): they close the timeline.
-    queued: Vec<u64>,
     /// Where your messages' rows were drawn this frame (row → bounds), and
     /// which of them were in view at the last paint (the turn map's lit
     /// ticks).
@@ -2324,28 +2225,9 @@ impl ThreadState {
             cards: Vec::new(),
             reveal: None,
             live_spawned: Default::default(),
-            queued: Vec::new(),
             drawn_messages: Default::default(),
             visible_messages: Default::default(),
         }
-    }
-
-    /// The messages waiting in line for this thread (from the store). A
-    /// new one is brought into view.
-    pub fn set_queued(&mut self, queued: Vec<u64>, cx: &mut Context<Self>) {
-        if queued == self.queued {
-            return;
-        }
-        let grew = queued.len() > self.queued.len();
-        self.queued = queued;
-        if self.model.is_none() {
-            return;
-        }
-        self.sync_rows(None, cx);
-        if grew {
-            self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
-        }
-        cx.notify();
     }
 
     /// Which of the threads this one started are running (from the store).
@@ -2433,6 +2315,7 @@ impl ThreadState {
             | Row::Waiting
             | Row::TurnFooter { .. }
             | Row::Card(_)
+            | Row::Limit
             | Row::Queued(_) => false,
         })
     }
@@ -2562,7 +2445,10 @@ impl ThreadState {
                 .unwrap_or(rows.len());
             rows.insert(at, Row::Card(ix));
         }
-        rows.extend(self.queued.iter().map(|id| Row::Queued(*id)));
+        if model.thread.limit.is_some() && model.running_turn().is_none() {
+            rows.push(Row::Limit);
+        }
+        rows.extend(model.queue.iter().map(|m| Row::Queued(m.id)));
         std::mem::replace(&mut self.rows, rows)
     }
 
@@ -2830,9 +2716,12 @@ impl ThreadState {
         let Some(model) = self.model.as_mut() else {
             return;
         };
+        let queued = model.queue.len();
         if !model.apply_event(env) {
             return;
         }
+        // A message joined the queue: bring it into view.
+        let joined = model.queue.len() > queued;
         let changed = match &env.event {
             Event::ItemUpserted { item } => {
                 self.last_activity = Some(web_time::Instant::now());
@@ -2846,6 +2735,9 @@ impl ThreadState {
             _ => None,
         };
         self.sync_rows(changed.as_ref(), cx);
+        if joined {
+            self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
+        }
         // A turn's changes came in: its card appears under it.
         if let Event::TurnUpdated { turn } = &env.event {
             self.remeasure_turn_footer(&turn.id, cx);

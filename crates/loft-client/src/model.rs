@@ -101,6 +101,9 @@ pub struct ThreadModel {
     /// Ordered by `ordinal`.
     pub items: Vec<Item>,
     pub requests: Vec<RuntimeRequest>,
+    /// Messages waiting for the running turn to complete, in order (the
+    /// daemon holds and sends them).
+    pub queue: Vec<loft_protocol::QueuedMessage>,
 }
 
 impl ThreadModel {
@@ -112,6 +115,7 @@ impl ThreadModel {
                 turns,
                 mut items,
                 requests,
+                queue,
             } => {
                 items.sort_by_key(|i| i.ordinal);
                 Some(Self {
@@ -120,6 +124,7 @@ impl ThreadModel {
                     turns,
                     items,
                     requests,
+                    queue,
                 })
             }
             _ => None,
@@ -150,6 +155,12 @@ impl ThreadModel {
                     Some(r) => *r = request.clone(),
                     None => self.requests.push(request.clone()),
                 }
+            }
+            Event::QueueUpdated { thread_id, queue } => {
+                if thread_id != &self.thread.id {
+                    return false;
+                }
+                self.queue = queue.clone();
             }
             Event::ProjectAdded { .. }
             | Event::ProjectUpdated { .. }
@@ -251,7 +262,9 @@ mod tests {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            limit: None,
             automation_id: None,
+            pull_request: None,
         };
         let item = Item {
             id: ItemId::new(),
@@ -271,6 +284,7 @@ mod tests {
             turns: vec![],
             items: vec![item],
             requests: vec![],
+            queue: vec![],
         })
         .unwrap();
         (m, id)

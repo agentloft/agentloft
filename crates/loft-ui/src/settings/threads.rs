@@ -1,7 +1,9 @@
 //! Settings ▸ Threads: how a new thread gets its title (`[titles]`). After
 //! the first message an agent writes a short one; until then, or with this
 //! off, the message's first line is the title. And when archived threads
-//! are deleted for good (`[threads] delete_archived_after_days`).
+//! are deleted for good (`[threads] delete_archived_after_days`), and
+//! whether threads a usage limit stopped carry on at its reset
+//! (`[threads] resume_at_reset`).
 
 use super::{Field, SettingsView, agents::AGENTS, row, text_input, web::heading};
 use crate::theme::Palette;
@@ -113,6 +115,30 @@ impl SettingsView {
                     p,
                 ));
         }
+        page = page
+            .child(heading(
+                "Usage limits",
+                "A thread whose agent runs out of its plan's usage stops and says when the limit resets.",
+                p,
+            ))
+            .child(row(
+                "Carry on when the limit resets",
+                "Limited threads go on by themselves a minute after the reset, then send what was queued. Off: each thread offers it on its own.",
+                Switch::new("threads-resume-at-reset")
+                    .cursor_pointer()
+                    .checked(self.config.threads.resume_at_reset)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                        // Off is the default.
+                        let value = if *on {
+                            SettingValue::Bool(true)
+                        } else {
+                            SettingValue::Unset
+                        };
+                        this.write(&["threads", "resume_at_reset"], value, true, cx);
+                    }))
+                    .into_any_element(),
+                p,
+            ));
         page = page.child(heading(
             "Archive",
             "Archived threads leave the sidebar and wait under Archived, where you can bring them back.",

@@ -52,6 +52,10 @@ actions!(
     ]
 );
 
+// The composer's recall, thread context and quoting (`workspace/compose.rs`).
+mod compose;
+pub use compose::QuoteSelection;
+
 const CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 272.;
 const HEADER_HEIGHT: f32 = 52.;
@@ -162,6 +166,8 @@ pub struct WorkspaceView {
     /// The open `/` or `@` completion popover.
     completion: Option<crate::completion::Completion>,
     completion_seq: u64,
+    /// Sent prompts being recalled with ↑ (`workspace/compose.rs`).
+    composing: compose::Composing,
     /// Open the folder browser on the next render (asked for without a
     /// window at hand).
     pending_add_project: bool,
@@ -197,6 +203,8 @@ pub struct WorkspaceView {
     dock_slide: Slide,
     /// The dock's height as last laid out (it slides, and reopens, at it).
     dock_height: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The thread's project actions in the header (`actions.rs`).
+    pub(crate) actions_bar: crate::actions::ActionsBar,
     /// Where the details button is (its card opens under it).
     details_anchor: std::rc::Rc<std::cell::Cell<Option<gpui_kit::Bounds<gpui_kit::Pixels>>>>,
     sidebar_slide: Slide,
@@ -253,6 +261,9 @@ impl WorkspaceView {
                 crate::panel::PanelEvent::DocNote(thread_id, path, note) => {
                     this.add_doc_note(thread_id, path, note, cx)
                 }
+                crate::panel::PanelEvent::AddToMessage(thread_id, text) => {
+                    this.add_terminal_selection(thread_id, text, window, cx)
+                }
                 crate::panel::PanelEvent::Maximized(_) => cx.notify(),
                 crate::panel::PanelEvent::ShowPanel => {
                     this.panel_open = true;
@@ -294,8 +305,12 @@ impl WorkspaceView {
             }),
             // Follow the system light/dark switch when theme = "system".
             cx.observe_window_appearance(window, |_, _, cx| theme::apply(cx)),
-            // Switching native tabs: refresh the tab strip.
-            cx.observe_window_activation(window, |_, _, cx| cx.notify()),
+            // Switching native tabs: refresh the tab strip. Back from
+            // another app: the project's actions may have been edited.
+            cx.observe_window_activation(window, |this, _, cx| {
+                this.actions_bar.stale();
+                cx.notify()
+            }),
         ];
         Self {
             plan_limits: cx.new(|_| crate::plan_limits::PlanLimits::new(store.clone())),
@@ -323,6 +338,7 @@ impl WorkspaceView {
             search_seq: 0,
             completion: None,
             completion_seq: 0,
+            composing: Default::default(),
             pending_add_project: false,
             browser_preview: false,
             browser_preview_at: None,
@@ -341,6 +357,7 @@ impl WorkspaceView {
             dock_open: false,
             dock_slide: Slide::default(),
             dock_height: std::rc::Rc::new(std::cell::Cell::new(DOCK_HEIGHT)),
+            actions_bar: Default::default(),
             details_anchor: Default::default(),
             details_open: false,
             peek: None,
@@ -387,7 +404,12 @@ impl WorkspaceView {
         }
     }
 
-    fn on_store_event(&mut self, event: &StoreEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_store_event(
+        &mut self,
+        event: &StoreEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             StoreEvent::OpenFile {
                 thread_id,
@@ -468,6 +490,7 @@ impl WorkspaceView {
             StoreEvent::EditQueued { thread_id, id } => {
                 self.edit_queued(thread_id, *id, window, cx);
             }
+            StoreEvent::Unsent { thread_id } => self.take_unsent(thread_id, window, cx),
             StoreEvent::ConfirmArchive { thread_id, reason } => {
                 confirm_archive(
                     thread_id.clone(),
@@ -499,6 +522,18 @@ impl WorkspaceView {
         };
         self.panel_open = true;
         match dev.split_once(':') {
+            // `all:<hook>++<hook>`: several hooks, in order.
+            Some(("all", hooks)) => {
+                for hook in hooks.split("++") {
+                    self.apply_dev_tab(hook, thread, window, cx);
+                }
+            }
+            // `do:<step> <step> …`: keys, typing and the pointer, in order
+            // (`dev_script` in workspace/compose.rs lists the steps).
+            Some(("do", script)) => {
+                self.panel_open = false;
+                self.dev_script(script, thread, window, cx);
+            }
             Some(("type", text)) => {
                 let composer = self.composer_for(thread, window, cx);
                 let text = text.to_owned();
@@ -1029,7 +1064,7 @@ impl WorkspaceView {
             Some(("queue", text)) => {
                 self.panel_open = false;
                 for part in text.split('|') {
-                    let queued = crate::store::Queued::new(part.to_owned(), Vec::new());
+                    let queued = crate::store::Outgoing::new(part.to_owned(), Vec::new());
                     let id = thread_id.clone();
                     self.store.update(cx, |s, cx| s.enqueue(id, queued, cx));
                 }
@@ -1118,6 +1153,27 @@ impl WorkspaceView {
                             this.submit(&tid, &composer, window, cx, false);
                         });
                     }
+                })
+                .detach();
+            }
+            // Run one of the project's actions, by name.
+            Some(("action", name)) => {
+                self.panel_open = false;
+                self.run_action(thread_id.clone(), name.to_owned(), window, cx);
+            }
+            // The palette with a query typed, a moment after launch (once
+            // what it lists for the thread, like its project's actions, is
+            // in).
+            Some(("palette", query)) => {
+                self.panel_open = false;
+                let query = query.to_owned();
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1500))
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        crate::palette::open_with(cx.entity(), &this.store, &query, window, cx)
+                    });
                 })
                 .detach();
             }
@@ -1858,7 +1914,11 @@ impl WorkspaceView {
                         this.submit(&thread_id, state, window, cx, false);
                     }
                     InputEvent::Change => {
-                        this.refresh_completion(&thread_id, state, cx);
+                        // (A prompt recalled with ↑ is not being typed:
+                        // nothing to complete, and ↑↓ stay recall's.)
+                        if !this.shows_recalled(&thread_id, state, cx) {
+                            this.refresh_completion(&thread_id, state, cx);
+                        }
                         this.queue_draft_save(&thread_id, state, cx);
                         // The sidebar lists a new thread once something is
                         // typed for it (and stops when that is deleted).
@@ -2072,12 +2132,12 @@ impl WorkspaceView {
             images.iter().map(|a| a.to_attachment()).collect();
         let id = thread_id.clone();
         if self.is_running(thread_id, cx) {
-            let message = crate::store::Queued::new(text, images);
+            let message = crate::store::Outgoing::new(text, images);
             self.store.update(cx, |store, cx| {
                 if steer {
-                    store.steer(id, message, None, cx);
+                    store.steer(id, message, cx);
                 } else {
-                    // Sent automatically when the current turn ends.
+                    // The daemon sends it when the current turn completes.
                     store.enqueue(id, message, cx);
                 }
             });
@@ -2265,12 +2325,67 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(q) = self
-            .store
-            .update(cx, |s, cx| s.take_queued(thread_id, id, cx))
-        else {
+        let Some(q) = self.store.read(cx).queued(thread_id, id, cx) else {
             return;
         };
+        self.store.update(cx, |s, cx| s.dequeue(thread_id, id, cx));
+        // Threads it carried as context come back as chips.
+        let (text, threads) = crate::thread_ref::split(&q.text);
+        self.back_to_composer(thread_id, &text, window, cx);
+        if !threads.is_empty() {
+            let waiting = self.pasted.entry(thread_id.clone()).or_default();
+            for thread in threads {
+                let line = thread.to_text();
+                if !waiting.contains(&line) {
+                    waiting.push(line);
+                }
+            }
+        }
+        // Its images are the daemon's by now: read them back.
+        let Some(client) = self.store.read(cx).client() else {
+            return;
+        };
+        let thread_id = thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            let mut images = Vec::new();
+            for a in q.attachments {
+                let mut data = Vec::new();
+                loop {
+                    let part = client
+                        .request(loft_protocol::Request::ReadPath {
+                            path: a.path.clone(),
+                            thread_id: None,
+                            offset: data.len() as u64,
+                        })
+                        .await;
+                    let Ok(loft_protocol::Response::File { file }) = part else {
+                        data.clear();
+                        break;
+                    };
+                    data.extend_from_slice(&file.bytes.0);
+                    if !file.truncated || file.bytes.0.is_empty() {
+                        break;
+                    }
+                }
+                images.extend(crate::attachments::PendingImage::stored(
+                    a.name,
+                    std::path::Path::new(&a.path),
+                    data,
+                ));
+            }
+            let _ = this.update(cx, |this, cx| this.add_images(&thread_id, images, cx));
+        })
+        .detach();
+    }
+
+    /// Put `text` in a thread's composer, ahead of what is typed there.
+    fn back_to_composer(
+        &mut self,
+        thread_id: &ThreadId,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(thread) = self.store.read(cx).threads.get(thread_id).cloned() else {
             return;
         };
@@ -2278,16 +2393,27 @@ impl WorkspaceView {
         composer.update(cx, |c, cx| {
             let current = c.value().to_string();
             let text = if current.trim().is_empty() {
-                q.text.clone()
+                text.to_owned()
             } else {
-                format!("{}\n\n{}", q.text, current.trim_end())
+                format!("{}\n\n{}", text, current.trim_end())
             };
             let end = text.len();
             c.set_value(text, window, cx);
             c.set_selected_range(end..end, cx);
             c.focus(window, cx);
         });
-        self.add_images(thread_id, q.images, cx);
+    }
+
+    /// Messages the daemon didn't take go back where they were typed.
+    fn take_unsent(&mut self, thread_id: &ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        let unsent = self
+            .store
+            .update(cx, |s, _| s.unsent.remove(thread_id))
+            .unwrap_or_default();
+        for message in unsent {
+            self.back_to_composer(thread_id, &message.text, window, cx);
+            self.add_images(thread_id, message.images, cx);
+        }
     }
 
     /// Chips for large pastes waiting in the composer.
@@ -2300,6 +2426,11 @@ impl WorkspaceView {
         let pasted = self.pasted.get(thread_id).filter(|v| !v.is_empty())?;
         let mut row = h_flex().gap_2().flex_wrap().px_3().pt_2();
         for (ix, text) in pasted.iter().enumerate() {
+            // Another thread, added as context: its own chip.
+            if let Some(thread) = crate::thread_ref::parse(text) {
+                row = row.child(self.thread_chip(thread_id, ix, &thread, p, cx));
+                continue;
+            }
             let lines = text.lines().count();
             let preview: String = text
                 .lines()
@@ -2588,6 +2719,7 @@ impl WorkspaceView {
                     selected: previous.min(items.len() - 1),
                     items,
                     info,
+                    threads: Vec::new(),
                     scroll,
                 });
                 cx.notify();
@@ -2597,6 +2729,8 @@ impl WorkspaceView {
                     return;
                 };
                 let seq = self.completion_seq;
+                // Other threads by title, listed after the files.
+                let threads = self.matching_threads(thread_id, &query, cx);
                 let body = loft_protocol::Request::FindFiles {
                     root: loft_protocol::FsRoot::Thread(thread_id.clone()),
                     query,
@@ -2614,15 +2748,20 @@ impl WorkspaceView {
                             Ok(loft_protocol::Response::Paths { paths }) => paths,
                             _ => Vec::new(),
                         };
-                        this.completion = (!items.is_empty()).then(|| Completion {
+                        let rows = items.len() + threads.len();
+                        this.completion = (rows > 0).then(|| Completion {
                             thread_id,
                             kind,
                             token,
-                            selected: previous.min(items.len().saturating_sub(1)),
+                            selected: previous.min(rows.saturating_sub(1)),
                             items,
                             info: Vec::new(),
+                            threads,
                             scroll,
                         });
+                        if let Some(completion) = &this.completion {
+                            completion.scroll_to_selected();
+                        }
                         cx.notify();
                     });
                 })
@@ -2643,6 +2782,18 @@ impl WorkspaceView {
         };
         if let Some(ix) = ix {
             c.selected = ix;
+        }
+        // A thread: what was typed for it goes, and it waits as a chip.
+        if let Some(thread) = c.picked_thread().cloned() {
+            if let Some(composer) = self.composers.get(&c.thread_id).cloned() {
+                composer.update(cx, |state, cx| {
+                    state.set_selected_range(c.token.clone(), cx);
+                    state.replace("", window, cx);
+                    state.focus(window, cx);
+                });
+            }
+            self.add_thread_ref(&c.thread_id, thread, cx);
+            return;
         }
         let (Some(text), Some(composer)) =
             (c.insertion(), self.composers.get(&c.thread_id).cloned())
@@ -3987,6 +4138,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_thread = title.is_some();
+        let actions = title
+            .as_ref()
+            .and_then(|(_, thread)| self.actions_control(thread, p, cx));
         h_flex()
             .id("titlebar")
             .on_click(titlebar_double_click)
@@ -4028,6 +4182,10 @@ impl WorkspaceView {
                     )),
                     ThreadWorkspace::Local => None,
                 };
+                let pr_badge = thread
+                    .pull_request
+                    .as_ref()
+                    .map(|pr| crate::pull_request::badge(pr, p));
                 d.child(
                     h_flex()
                         .flex_1()
@@ -4065,7 +4223,9 @@ impl WorkspaceView {
                         .child(chip),
                 )
                 .children(branch_chip)
+                .children(pr_badge)
             })
+            .children(actions)
             .when(has_thread, |d| {
                 let anchor = self.details_anchor.clone();
                 let measure = anchor.clone();
@@ -4583,6 +4743,8 @@ impl WorkspaceView {
                     )
                     .flex_1(),
                 )
+                // Right click: Copy, and Quote, for what is selected.
+                .context_menu(compose::timeline_menu(cx.entity().downgrade()))
                 .into_any_element()
         };
 
@@ -4734,24 +4896,42 @@ impl WorkspaceView {
                                     .shadow_lg()
                                     // While completions show, ↑/↓/⏎/⇥/esc drive them
                                     // instead of the textarea.
-                                    .capture_action(cx.listener(
-                                        |this, _: &gpui_kit::component::input::MoveUp, _, cx| {
-                                            if let Some(c) = &mut this.completion {
-                                                c.move_by(-1);
-                                                cx.stop_propagation();
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
-                                    .capture_action(cx.listener(
-                                        |this, _: &gpui_kit::component::input::MoveDown, _, cx| {
-                                            if let Some(c) = &mut this.completion {
-                                                c.move_by(1);
-                                                cx.stop_propagation();
-                                                cx.notify();
-                                            }
-                                        },
-                                    ))
+                                    // With nothing typed (or a recalled prompt
+                                    // as it came), they recall sent prompts.
+                                    .capture_action({
+                                        let id = thread_id.clone();
+                                        cx.listener(
+                                            move |this,
+                                                  _: &gpui_kit::component::input::MoveUp,
+                                                  window,
+                                                  cx| {
+                                                if let Some(c) = &mut this.completion {
+                                                    c.move_by(-1);
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                } else if this.recall_step(&id, true, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        )
+                                    })
+                                    .capture_action({
+                                        let id = thread_id.clone();
+                                        cx.listener(
+                                            move |this,
+                                                  _: &gpui_kit::component::input::MoveDown,
+                                                  window,
+                                                  cx| {
+                                                if let Some(c) = &mut this.completion {
+                                                    c.move_by(1);
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                } else if this.recall_step(&id, false, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        )
+                                    })
                                     .capture_action(cx.listener(
                                         |this,
                                          _: &gpui_kit::component::input::Enter,
@@ -4828,6 +5008,9 @@ impl WorkspaceView {
                                             },
                                         )
                                     })
+                                    // A thread dragged here is context for
+                                    // the message (over the pane's drop zones).
+                                    .children(self.composer_drop_target(&thread_id, p, cx))
                                     .children(strip)
                                     .children(self.note_chips(&thread_id, p, cx))
                                     .children(self.paste_chips(&thread_id, p, cx))
@@ -5785,6 +5968,11 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 crate::palette::open(cx.entity(), &this.store, window, cx)
             }))
+            .on_action(
+                cx.listener(|this, _: &QuoteSelection, window, cx| {
+                    this.quote_selection(window, cx)
+                }),
+            )
             .on_action(cx.listener(|_, _: &NewWindow, _, cx| {
                 crate::windows::open(None, crate::windows::Placement::Window, cx);
             }))

@@ -28,4 +28,6 @@ mod links;
 mod theme;
 mod view;
 
-pub use view::{Copy, KEY_CONTEXT, Paste, SelectAll, TerminalEvent, TerminalView, init};
+pub use view::{
+    AddSelectionToMessage, Copy, KEY_CONTEXT, Paste, SelectAll, TerminalEvent, TerminalView, init,
+};

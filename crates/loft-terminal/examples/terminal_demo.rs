@@ -136,6 +136,7 @@ impl Demo {
                     window.set_window_title(title);
                 }
                 TerminalEvent::OpenUrl(url) => println!("OPEN {url}"),
+                TerminalEvent::AddToMessage(text) => println!("ADD {text}"),
                 TerminalEvent::Bell => {}
             },
         );

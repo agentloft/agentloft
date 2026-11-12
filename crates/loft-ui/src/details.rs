@@ -74,6 +74,16 @@ fn started_threads(store: &AppStore, thread_id: &ThreadId) -> Vec<loft_protocol:
     all
 }
 
+/// The thread's pull request, as Agentloft last heard about it.
+fn pull_request(store: &AppStore, thread_id: &ThreadId) -> Option<loft_protocol::PullRequest> {
+    let thread = store
+        .workspace
+        .threads
+        .iter()
+        .find(|t| t.id == *thread_id)?;
+    thread.pull_request.clone()
+}
+
 /// Where a card is shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Place {
@@ -267,9 +277,15 @@ pub fn open(
     let agents = subagents(store.read(cx), &thread_id, cx).len() as f32;
     let threads = started_threads(store.read(cx), &thread_id).len() as f32;
     let parent = if info.parent.is_some() { 1. } else { 0. };
+    // Its pull request has a row (two lines) when it has one.
+    let pr = if pull_request(store.read(cx), &thread_id).is_some() {
+        TALL_ROW
+    } else {
+        0.
+    };
     // What the thread is (a line under it when lists follow), then the lists.
     let sections = agents.min(1.) + threads.min(1.);
-    let top = TALL_ROW + (3. + parent) * ROW + (1. + parent + sections.min(1.)) * DIVIDER;
+    let top = TALL_ROW + pr + (3. + parent) * ROW + (1. + parent + sections.min(1.)) * DIVIDER;
     let lists = (agents + threads) * ROW + sections * SECTION + (sections - 1.).max(0.) * DIVIDER;
     let height = PAD * 2. + top + lists.min(LISTS_MAX) + 4.;
     let win = window.bounds();
@@ -337,6 +353,9 @@ pub struct DetailsCard {
     /// Where the editor ⌄ is (its menu opens under it).
     editor_anchor: std::rc::Rc<Cell<Option<Bounds<Pixels>>>>,
     copied: bool,
+    /// Whether the card has (room for) the pull request's row: one found
+    /// while it floats in a window of its own makes that window taller.
+    pr_row: bool,
 }
 
 impl DetailsCard {
@@ -422,6 +441,13 @@ impl DetailsCard {
             .threads
             .get(&thread_id)
             .and_then(|t| t.read(cx).model.as_ref()?.last_turn().map(|t| t.id.clone()));
+        // The user is looking: have Agentloft ask GitHub how the pull
+        // request stands now, or whether the branch has one by now.
+        let pr_row = pull_request(store.read(cx), &thread_id).is_some();
+        if pr_row || matches!(info.workspace, ThreadWorkspace::Worktree { .. }) {
+            let id = thread_id.clone();
+            store.update(cx, |store, cx| store.refresh_pull_request(id, cx));
+        }
         let mut this = Self {
             store,
             workspace,
@@ -438,6 +464,7 @@ impl DetailsCard {
             editors: installed_editors(),
             editor_anchor: Default::default(),
             copied: false,
+            pr_row,
         };
         this.count_changes(cx);
         this
@@ -754,6 +781,108 @@ impl Render for DetailsCard {
                     }
                 })),
         );
+
+        // Its pull request: what it is and how its checks stand. Opens in
+        // the browser.
+        let pr = pull_request(self.store.read(cx), &self.thread_id);
+        if place == Place::Window && pr.is_some() != self.pr_row {
+            // Found (or gone) while the card is open: its window follows.
+            self.pr_row = pr.is_some();
+            let grow = if self.pr_row { TALL_ROW } else { -TALL_ROW };
+            let now = window.bounds().size;
+            window.resize(size(now.width, now.height + px(grow)));
+        }
+        if let Some(pr) = pr {
+            use crate::pull_request as show;
+            let tone = show::color(show::tone(&pr), &p);
+            let url = pr.url.clone();
+            // Under the title, while it is open: "3 passing, 1 failing, 2
+            // running", each count in its own colour, then the review (the
+            // part that gives way when the line is full). Nothing to say:
+            // the title has the row.
+            let counts: Vec<_> = [
+                (pr.checks.passing, "passing", p.success),
+                (pr.checks.failing, "failing", p.danger),
+                (pr.checks.pending, "running", p.warning),
+            ]
+            .into_iter()
+            .filter(|(n, ..)| *n > 0 && pr.is_open())
+            .collect();
+            let review = pr.review.filter(|_| pr.is_open());
+            let status = (!counts.is_empty() || review.is_some()).then(|| {
+                let mut line = h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(p.faint_foreground);
+                let last = counts.len().saturating_sub(1);
+                for (ix, (n, what, color)) in counts.iter().enumerate() {
+                    line = line.child(
+                        h_flex()
+                            .flex_none()
+                            .child(div().text_color(*color).child(format!("{n} {what}")))
+                            .when(ix < last, |d| d.child(",")),
+                    );
+                }
+                if let Some(review) = review {
+                    line = line
+                        .when(!counts.is_empty(), |d| d.child("·"))
+                        .child(div().min_w_0().truncate().child(show::review_label(review)));
+                }
+                line
+            });
+            // All of it in words, for when the row cuts a long line short.
+            let about = format!("#{} {} · {}", pr.number, pr.title, show::describe(&pr));
+            top = top.child(
+                row("details-pull-request", &p)
+                    .h(px(TALL_ROW))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.selected))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(about.clone()).build(window, cx)
+                    })
+                    .child(
+                        Icon::new(show::icon(&pr))
+                            .small()
+                            .text_color(tone)
+                            .into_any_element(),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(p.muted_foreground)
+                                            .child(format!("#{}", pr.number)),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w_0().truncate().child(pr.title.clone()),
+                                    )
+                                    // Open, Draft, Merged or Closed.
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_xs()
+                                            .text_color(p.faint_foreground)
+                                            .child(show::state_label(pr.state)),
+                                    ),
+                            )
+                            .children(status),
+                    )
+                    .on_click(move |_, window, cx| {
+                        cx.open_url(&url);
+                        Self::dismiss(place, window, cx);
+                    }),
+            );
+        }
 
         // Changes not on the remote yet.
         let changes = match self.changes {

@@ -235,6 +235,9 @@ pub struct ThreadsConfig {
     pub compact_when_idle: bool,
     pub compact_idle_minutes: u32,
     pub compact_min_tokens: u64,
+    /// A thread its agent's usage limit stopped carries on by itself when
+    /// the limit resets (each thread can also be told to, one at a time).
+    pub resume_at_reset: bool,
 }
 
 impl Default for ThreadsConfig {
@@ -244,6 +247,7 @@ impl Default for ThreadsConfig {
             compact_when_idle: true,
             compact_idle_minutes: 60,
             compact_min_tokens: 100_000,
+            resume_at_reset: false,
         }
     }
 }
@@ -688,6 +692,28 @@ impl Config {
 #[serde(default)]
 pub struct ProjectConfig {
     pub worktree: ProjectWorktreeConfig,
+    /// Commands the project runs often (`[[actions]]`), in the order
+    /// written: buttons on a thread and command-palette entries.
+    pub actions: Vec<ProjectAction>,
+}
+
+/// One `[[actions]]` entry: a command run in a terminal tab in the
+/// thread's folder. An entry without a name or a command is left out
+/// ([`ProjectConfig::parse`]) rather than spoiling the rest of the file.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectAction {
+    /// What the button and the terminal tab say ("Dev"). Actions are told
+    /// apart by it.
+    pub name: String,
+    /// Typed into the login shell (`npm run dev`).
+    pub command: String,
+    /// A Lucide icon name (`play`, `flask-conical`); the UI picks one
+    /// when it is missing or not one it has.
+    pub icon: Option<String>,
+    /// Shown in the browser panel once the command has started
+    /// (`http://localhost:3000`).
+    pub preview_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -716,12 +742,38 @@ impl ProjectConfig {
     pub fn load(root: &Path) -> Self {
         let file = root.join(".agentloft").join("config.toml");
         match std::fs::read_to_string(&file) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
+            Ok(text) => Self::parse(&text).unwrap_or_else(|err| {
                 tracing::warn!(file = %file.display(), %err, "invalid project config");
                 Self::default()
             }),
             Err(_) => Self::default(),
         }
+    }
+
+    /// The config a file's text holds, its actions tidied: names, commands
+    /// and optional values trimmed, entries without a name or a command
+    /// dropped, and of two with the same name (whatever the case) the
+    /// first kept.
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let mut cfg: Self = toml::from_str(text)?;
+        let mut seen = std::collections::HashSet::new();
+        let filled = |v: Option<String>| v.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        cfg.actions = cfg
+            .actions
+            .into_iter()
+            .filter_map(|a| {
+                let (name, command) = (a.name.trim(), a.command.trim());
+                let keep =
+                    !name.is_empty() && !command.is_empty() && seen.insert(name.to_lowercase());
+                keep.then(|| ProjectAction {
+                    name: name.to_owned(),
+                    command: command.to_owned(),
+                    icon: filled(a.icon),
+                    preview_url: filled(a.preview_url),
+                })
+            })
+            .collect();
+        Ok(cfg)
     }
 }
 
@@ -1162,6 +1214,105 @@ mod tests {
         let c = ProjectConfig::load(dir.path());
         assert_eq!(c.worktree.setup.as_deref(), Some("npm ci"));
         assert_eq!(c.worktree.copy.len(), 2);
+        assert!(c.actions.is_empty());
+    }
+
+    #[test]
+    fn project_actions_are_read_in_order() {
+        let c = ProjectConfig::parse(
+            r#"
+[worktree]
+setup = "npm ci"
+
+[[actions]]
+name = "Dev"
+command = "npm run dev"
+icon = "play"
+preview_url = "http://localhost:3000"
+
+[[actions]]
+name = "Test"
+command = "npm test"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.worktree.setup.as_deref(), Some("npm ci"));
+        assert_eq!(
+            c.actions,
+            vec![
+                ProjectAction {
+                    name: "Dev".into(),
+                    command: "npm run dev".into(),
+                    icon: Some("play".into()),
+                    preview_url: Some("http://localhost:3000".into()),
+                },
+                ProjectAction {
+                    name: "Test".into(),
+                    command: "npm test".into(),
+                    icon: None,
+                    preview_url: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn project_actions_are_tidied() {
+        let c = ProjectConfig::parse(
+            r#"
+[[actions]]
+name = "  Dev "
+command = " npm run dev\n"
+icon = " "
+preview_url = ""
+
+[[actions]]
+name = "dev"
+command = "a second one by the same name"
+
+[[actions]]
+name = ""
+command = "nameless"
+
+[[actions]]
+name = "Empty"
+command = "   "
+
+[[actions]]
+name = "No command"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.actions,
+            vec![ProjectAction {
+                name: "Dev".into(),
+                command: "npm run dev".into(),
+                icon: None,
+                preview_url: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn project_actions_come_from_the_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentloft")).unwrap();
+        let file = dir.path().join(".agentloft/config.toml");
+        // An incomplete action costs only itself: the setup script stays.
+        std::fs::write(
+            &file,
+            "[worktree]\nsetup = \"npm ci\"\n\n[[actions]]\nname = \"Dev\"\n\n\
+             [[actions]]\nname = \"Lint\"\ncommand = \"npm run lint\"\n",
+        )
+        .unwrap();
+        let c = ProjectConfig::load(dir.path());
+        assert_eq!(c.worktree.setup.as_deref(), Some("npm ci"));
+        assert_eq!(c.actions.len(), 1);
+        assert_eq!(c.actions[0].name, "Lint");
+        // A file that doesn't parse: the defaults.
+        std::fs::write(&file, "[[actions]]\nname = 3\n").unwrap();
+        assert_eq!(ProjectConfig::load(dir.path()), ProjectConfig::default());
     }
 
     #[cfg(unix)]

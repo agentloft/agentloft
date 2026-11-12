@@ -51,6 +51,9 @@ pub struct Daemon {
     prices_task: tokio::task::JoinHandle<()>,
     /// Starts automations' runs when they are due.
     automations_task: tokio::task::JoinHandle<()>,
+    limits_task: tokio::task::JoinHandle<()>,
+    /// Keeps threads' open pull requests (state, checks, review) current.
+    pull_requests_task: tokio::task::JoinHandle<()>,
     _lock: File,
 }
 
@@ -119,6 +122,8 @@ impl Daemon {
         let cleanup_task = core.spawn_archive_cleanup();
         let prices_task = prices::spawn(core.clone(), paths.clone());
         let automations_task = core.spawn_automations();
+        let limits_task = core.spawn_limit_resumes();
+        let pull_requests_task = core.spawn_pull_requests();
         Ok(Self {
             core,
             web,
@@ -128,6 +133,8 @@ impl Daemon {
             cleanup_task,
             prices_task,
             automations_task,
+            limits_task,
+            pull_requests_task,
             _lock: lock,
         })
     }
@@ -143,6 +150,8 @@ impl Daemon {
         self.cleanup_task.abort();
         self.prices_task.abort();
         self.automations_task.abort();
+        self.limits_task.abort();
+        self.pull_requests_task.abort();
         let _ = self.web_task.await;
         self.core.shutdown().await;
         let _ = self.task.await;

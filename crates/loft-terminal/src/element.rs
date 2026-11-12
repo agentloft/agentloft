@@ -266,8 +266,15 @@ fn register_input(
         let hitbox = hitbox.clone();
         move |event: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                view.update(cx, |view, cx| view.mouse_down(event, window, cx));
-                cx.stop_propagation();
+                let keeps = view.update(cx, |view, cx| {
+                    view.mouse_down(event, window, cx);
+                    view.keeps_press(event)
+                });
+                // (A right click the program has no use for opens the
+                // view's context menu.)
+                if keeps {
+                    cx.stop_propagation();
+                }
             }
         }
     });

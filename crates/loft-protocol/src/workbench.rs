@@ -115,6 +115,36 @@ pub struct TerminalInfo {
     pub exited: Option<i32>,
 }
 
+/// A command a project runs often (`[[actions]]` in its
+/// `.agentloft/config.toml`): a button on its threads and a palette entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectAction {
+    /// What it is called ("Dev"); a project's actions are told apart by it.
+    pub name: String,
+    /// Typed into a shell in the thread's folder.
+    pub command: String,
+    /// A Lucide icon name, if the project chose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// A page to show in the browser panel once the command has started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+}
+
+/// The reattach key (`Request::TerminalOpen`) of the terminal a thread
+/// runs the action called `name` in: one per action, so running it again
+/// finds the shell it has. `thread_key` is the thread's own terminal key.
+pub fn action_terminal_key(thread_key: &str, name: &str) -> String {
+    format!("{thread_key}{ACTION_KEY_MARK}{name}")
+}
+
+/// The action's name, if `key` is one of [`action_terminal_key`]'s.
+pub fn action_of_terminal_key(key: &str) -> Option<&str> {
+    key.split_once(ACTION_KEY_MARK).map(|(_, name)| name)
+}
+
+const ACTION_KEY_MARK: &str = "#run:";
+
 /// How much of a thread `ReadThread` returns.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +188,53 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DiffScope::Turn(TurnId("t1".into()))).unwrap(),
             r#"{"kind":"turn","turn":"t1"}"#
+        );
+    }
+
+    #[test]
+    fn an_actions_terminal_key_carries_its_name() {
+        let key = action_terminal_key("thread:abc", "Dev server");
+        // Under the thread's own key, so it is listed, and closed, with it.
+        assert!(key.starts_with("thread:abc#"));
+        assert_eq!(action_of_terminal_key(&key), Some("Dev server"));
+        assert_eq!(action_of_terminal_key("thread:abc"), None);
+        assert_eq!(action_of_terminal_key("thread:abc#2"), None);
+    }
+
+    #[test]
+    fn a_terminal_is_opened_with_or_without_a_command() {
+        use crate::Request;
+        // As clients before `command` wrote it.
+        let old = r#"{"op":"terminal_open","root":{"kind":"thread","id":"t"},"cols":80,"rows":24}"#;
+        let Request::TerminalOpen { command, key, .. } = serde_json::from_str(old).unwrap() else {
+            panic!()
+        };
+        assert_eq!((command, key), (None, None));
+        let with = Request::TerminalOpen {
+            root: FsRoot::Thread(ThreadId("t".into())),
+            cols: 80,
+            rows: 24,
+            key: Some(action_terminal_key("thread:t", "Dev")),
+            command: Some("npm run dev".into()),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""command":"npm run dev""#), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), with);
+    }
+
+    #[test]
+    fn an_action_leaves_out_what_it_has_not() {
+        let action = ProjectAction {
+            name: "Test".into(),
+            command: "npm test".into(),
+            icon: None,
+            preview_url: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, r#"{"name":"Test","command":"npm test"}"#);
+        assert_eq!(
+            serde_json::from_str::<ProjectAction>(&json).unwrap(),
+            action
         );
     }
 }

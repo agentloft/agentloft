@@ -1,6 +1,7 @@
 //! Composer completions: `/` at the start lists the agent's slash commands,
-//! `@` anywhere fuzzy-finds files in the thread's workspace. ↑/↓ move,
-//! Enter or Tab insert, Esc dismisses.
+//! `@` anywhere fuzzy-finds files in the thread's workspace and, after
+//! them, other threads by title (picked, one becomes a chip: see
+//! `thread_ref`). ↑/↓ move, Enter or Tab insert, Esc dismisses.
 
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
@@ -29,6 +30,9 @@ pub struct Completion {
     pub items: Vec<String>,
     /// For slash commands: what each item does (same order as `items`).
     pub info: Vec<SlashCommandInfo>,
+    /// For `@`: other threads whose title matches, listed after `items`
+    /// (`selected` runs on through them).
+    pub threads: Vec<crate::thread_ref::Found>,
     pub selected: usize,
     /// The list scrolls; the chosen row is kept in view.
     pub scroll: gpui_kit::ScrollHandle,
@@ -51,12 +55,30 @@ impl Completion {
         })
     }
 
+    /// The thread chosen, when the chosen row is one.
+    pub fn picked_thread(&self) -> Option<&crate::thread_ref::ThreadRef> {
+        let ix = self.selected.checked_sub(self.items.len())?;
+        self.threads.get(ix).map(|found| &found.thread)
+    }
+
+    /// How many rows can be chosen.
+    pub fn rows(&self) -> usize {
+        self.items.len() + self.threads.len()
+    }
+
     pub fn move_by(&mut self, delta: isize) {
-        let n = self.items.len() as isize;
+        let n = self.rows() as isize;
         if n > 0 {
             self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
-            self.scroll.scroll_to_item(self.selected);
+            self.scroll_to_selected();
         }
+    }
+
+    /// Keep the chosen row in view (the threads' heading is one of the
+    /// list's children too).
+    pub fn scroll_to_selected(&self) {
+        let heading = usize::from(self.selected >= self.items.len() && !self.threads.is_empty());
+        self.scroll.scroll_to_item(self.selected + heading);
     }
 }
 
@@ -193,6 +215,58 @@ pub fn popover(
                 .on_click(move |_, window, cx| on_pick(ix, window, cx)),
         );
     }
+    if !c.threads.is_empty() {
+        list = list.child(
+            div()
+                .px_2()
+                .pt(px(6.))
+                .pb(px(2.))
+                .text_xs()
+                .text_color(p.faint_foreground)
+                .child("Threads"),
+        );
+    }
+    for (ix, found) in c.threads.iter().enumerate() {
+        let ix = c.items.len() + ix;
+        let active = ix == c.selected;
+        let on_pick = on_pick.clone();
+        list = list.child(
+            h_flex()
+                .id(SharedString::from(format!("completion-{ix}")))
+                .gap_2()
+                .items_center()
+                .px_2()
+                .py(px(5.))
+                .rounded(px(7.))
+                .text_sm()
+                .cursor_pointer()
+                .when(active, |d| d.bg(p.selected))
+                .when(!active, |d| d.hover(|d| d.bg(p.hover)))
+                .child(
+                    Icon::new(IconName::MessageSquare)
+                        .xsmall()
+                        .text_color(p.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex_shrink(1.)
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .child(found.thread.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(40.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(p.faint_foreground)
+                        .child(found.project.clone()),
+                )
+                .on_click(move |_, window, cx| on_pick(ix, window, cx)),
+        );
+    }
     v_flex()
         .mx_2()
         .rounded(px(12.))
@@ -215,6 +289,9 @@ pub fn popover(
                         c.items.len(),
                         if c.items.len() == 1 { "" } else { "s" }
                     ),
+                    Kind::File if c.picked_thread().is_some() => {
+                        "↑↓ to choose · ⏎ or ⇥ to add the thread as context · esc to dismiss".into()
+                    }
                     Kind::File => "↑↓ to choose · ⏎ or ⇥ to insert · esc to dismiss".into(),
                 }),
         )
@@ -236,6 +313,35 @@ mod tests {
             trigger("日本 @x", "日本 @x".len()).map(|t| t.2),
             Some("x".into())
         );
+    }
+
+    #[test]
+    fn threads_are_chosen_after_the_files() {
+        use crate::thread_ref::{Found, ThreadRef};
+        let thread = ThreadRef::new(ThreadId("t-1".into()), "Fix login");
+        let mut c = Completion {
+            thread_id: ThreadId("here".into()),
+            kind: Kind::File,
+            token: 0..4,
+            items: vec!["src/login.rs".into()],
+            info: Vec::new(),
+            threads: vec![Found {
+                thread: thread.clone(),
+                project: "Shop".into(),
+            }],
+            selected: 0,
+            scroll: Default::default(),
+        };
+        assert_eq!(c.rows(), 2);
+        assert_eq!(c.insertion().as_deref(), Some("@src/login.rs "));
+        assert_eq!(c.picked_thread(), None);
+        // ↓ goes on from the last file to the first thread: a chip, not text.
+        c.move_by(1);
+        assert_eq!(c.picked_thread(), Some(&thread));
+        assert_eq!(c.insertion(), None);
+        // And round to the files again.
+        c.move_by(1);
+        assert_eq!(c.selected, 0);
     }
 
     #[test]

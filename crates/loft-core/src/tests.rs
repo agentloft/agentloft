@@ -862,7 +862,9 @@ async fn pull_request_pushes_branch_and_calls_gh() {
         &repo,
         &["remote", "add", "origin", remote.to_str().unwrap()],
     );
-    // A stand-in `gh` that records its arguments and the PR body.
+    // A stand-in `gh` that records its arguments and the PR body. Only
+    // `pr create`: the thread's pull request is also asked about with
+    // `pr view` (crate::pull_requests), here answered with "none".
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let gh = bin.join("gh");
@@ -870,7 +872,7 @@ async fn pull_request_pushes_branch_and_calls_gh() {
     std::fs::write(
         &gh,
         format!(
-            "#!/bin/sh\necho \"$@\" > '{log}'\ncat >> '{log}'\necho https://github.com/acme/repo/pull/7\n",
+            "#!/bin/sh\n[ \"$2\" = create ] || {{ echo 'no pull requests found' >&2; exit 1; }}\necho \"$@\" > '{log}'\ncat >> '{log}'\necho https://github.com/acme/repo/pull/7\n",
             log = log.display()
         ),
     )
@@ -2128,4 +2130,365 @@ async fn automations_start_threads_on_schedule() {
         .await
         .unwrap();
     assert!(f.core.with_store(|s| s.automations()).unwrap().is_empty());
+}
+
+fn queue_of(core: &Core, id: &ThreadId) -> Vec<loft_protocol::QueuedMessage> {
+    match core.snapshot(&Topic::Thread(id.clone())).unwrap() {
+        Snapshot::Thread { queue, .. } => queue,
+        _ => panic!(),
+    }
+}
+
+fn user_messages(core: &Core, id: &ThreadId) -> Vec<String> {
+    let (_, _, items, _) = thread_snapshot(core, id);
+    items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::UserMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn enqueue(core: &Arc<Core>, id: &ThreadId, text: &str) {
+    core.handle(Request::Enqueue {
+        thread_id: id.clone(),
+        text: text.into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn queued_messages_go_one_per_completed_turn_in_their_order() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    // Nothing running and nothing ahead: it is simply sent.
+    enqueue(&f.core, &thread.id, "slow one two three four five six").await;
+    assert!(queue_of(&f.core, &thread.id).is_empty());
+    enqueue(&f.core, &thread.id, "second").await;
+    enqueue(&f.core, &thread.id, "third").await;
+    enqueue(&f.core, &thread.id, "dropped").await;
+    let queue = queue_of(&f.core, &thread.id);
+    let texts: Vec<&str> = queue.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, ["second", "third", "dropped"]);
+    // Reordered and taken out by id.
+    f.core
+        .handle(Request::MoveQueued {
+            thread_id: thread.id.clone(),
+            id: queue[1].id,
+            to: queue[0].id,
+        })
+        .await
+        .unwrap();
+    f.core
+        .handle(Request::Dequeue {
+            thread_id: thread.id.clone(),
+            id: queue[2].id,
+        })
+        .await
+        .unwrap();
+    let texts: Vec<String> = queue_of(&f.core, &thread.id)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(texts, ["third", "second"]);
+
+    wait_for(&f.core, &thread.id, |_, turns| {
+        turns.len() == 3 && turns[2].status.is_terminal()
+    })
+    .await;
+    assert_eq!(
+        user_messages(&f.core, &thread.id),
+        ["slow one two three four five six", "third", "second"]
+    );
+    assert!(queue_of(&f.core, &thread.id).is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_turn_holds_the_queue_and_a_restart_keeps_it() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "slow and then fail".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    enqueue(&f.core, &thread.id, "after that one").await;
+    enqueue(&f.core, &thread.id, "and then this").await;
+    wait_for(&f.core, &thread.id, turn_done).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (_, turns, _, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(turns.len(), 1, "nothing was sent after a failed turn");
+    assert_eq!(turns[0].status, TurnStatus::Failed);
+    assert_eq!(queue_of(&f.core, &thread.id).len(), 2);
+
+    // The daemon restarts: the queue is still there, and still waits.
+    let core2 = Core::new(
+        Store::open(&f.db).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    core2.recover().unwrap();
+    let queue = queue_of(&core2, &thread.id);
+    assert_eq!(queue.len(), 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(thread_snapshot(&core2, &thread.id).1.len(), 1);
+
+    // Sent by hand, the first starts a turn, and the rest follow it.
+    core2
+        .handle(Request::SendQueued {
+            thread_id: thread.id.clone(),
+            id: queue[0].id,
+        })
+        .await
+        .unwrap();
+    wait_for(&core2, &thread.id, |_, turns| {
+        turns.len() == 3 && turns[2].status.is_terminal()
+    })
+    .await;
+    assert_eq!(
+        user_messages(&core2, &thread.id),
+        ["slow and then fail", "after that one", "and then this"]
+    );
+    assert!(queue_of(&core2, &thread.id).is_empty());
+}
+
+#[tokio::test]
+async fn a_queued_message_can_go_into_the_running_turn() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    enqueue(&f.core, &thread.id, "slow one two three four five six").await;
+    enqueue(&f.core, &thread.id, "now, please").await;
+    enqueue(&f.core, &thread.id, "later").await;
+    let queue = queue_of(&f.core, &thread.id);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    f.core
+        .handle(Request::SendQueued {
+            thread_id: thread.id.clone(),
+            id: queue[0].id,
+        })
+        .await
+        .unwrap();
+    let left: Vec<String> = queue_of(&f.core, &thread.id)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(left, ["later"]);
+    // Gone by now: asking again says so.
+    let err = f
+        .core
+        .handle(Request::SendQueued {
+            thread_id: thread.id.clone(),
+            id: queue[0].id,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    wait_for(&f.core, &thread.id, |_, turns| {
+        turns.len() == 2 && turns[1].status.is_terminal()
+    })
+    .await;
+    // The steered one joined the first turn; the other got its own.
+    let (_, turns, items, _) = thread_snapshot(&f.core, &thread.id);
+    let turn_of = |text: &str| {
+        items
+            .iter()
+            .find(|i| matches!(&i.body, ItemBody::UserMessage { text: t, .. } if t == text))
+            .and_then(|i| i.turn_id.clone())
+    };
+    assert_eq!(turn_of("now, please"), Some(turns[0].id.clone()));
+    assert_eq!(turn_of("later"), Some(turns[1].id.clone()));
+}
+
+#[tokio::test]
+async fn a_limit_stop_shows_on_the_thread_and_carries_on_at_the_reset() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let resume = |on: bool| {
+        f.core.handle(Request::ResumeAtReset {
+            thread_id: thread.id.clone(),
+            on,
+        })
+    };
+    // Not stopped by a limit: nothing to carry on from.
+    assert_eq!(resume(true).await.unwrap_err().code, ErrorCode::Conflict);
+
+    let before = now_ms();
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "do the work limit:3600".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    enqueue(&f.core, &thread.id, "then this").await;
+    wait_for(&f.core, &thread.id, turn_done).await;
+    let (now, turns, _, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(turns[0].status, TurnStatus::Failed);
+    let limit = now.limit.expect("the thread says a limit stopped it");
+    let resets = limit.resets_at_ms.unwrap();
+    assert!((before + 3_600_000..=now_ms() + 3_600_000).contains(&resets));
+    assert!(!limit.resume, "off unless asked for");
+
+    // Before the reset nothing happens; after it (and a margin) it goes on.
+    resume(true).await.unwrap();
+    assert!(thread_snapshot(&f.core, &thread.id).0.limit.unwrap().resume);
+    assert_eq!(f.core.resume_due(resets - 1), Some(resets + 60_000));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(thread_snapshot(&f.core, &thread.id).1.len(), 1);
+    assert_eq!(f.core.resume_due(resets + 60_000), None);
+    // The turn that carries on, then what was queued behind the stop.
+    wait_for(&f.core, &thread.id, |_, turns| {
+        turns.len() == 3 && turns[2].status.is_terminal()
+    })
+    .await;
+    let (now, turns, _, _) = thread_snapshot(&f.core, &thread.id);
+    assert_eq!(turns[1].status, TurnStatus::Completed);
+    assert_eq!(now.limit, None);
+    assert_eq!(
+        user_messages(&f.core, &thread.id),
+        [
+            "do the work limit:3600",
+            "Continue where you left off.",
+            "then this"
+        ]
+    );
+
+    // A limit that doesn't say when it resets can't be waited for.
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "limit again".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    wait_for(&f.core, &thread.id, |_, turns| {
+        turns.len() == 4 && turns[3].status.is_terminal()
+    })
+    .await;
+    let limit = thread_snapshot(&f.core, &thread.id).0.limit.unwrap();
+    assert_eq!(limit.resets_at_ms, None);
+    assert_eq!(resume(true).await.unwrap_err().code, ErrorCode::Conflict);
+    // The user's next message clears it.
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "fine now".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(thread_snapshot(&f.core, &thread.id).0.limit, None);
+}
+
+#[tokio::test]
+async fn limited_threads_carry_on_by_themselves_when_set_to_and_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite");
+    let mut config = loft_config::Config::default();
+    config.threads.resume_at_reset = true;
+    let opts = || CoreOptions {
+        flush_interval: Duration::from_millis(20),
+        config: config.clone(),
+        ..Default::default()
+    };
+    let core = Core::new(
+        Store::open(&db).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        opts(),
+    );
+    let thread = new_thread(&core, dir.path()).await;
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "limit:3600".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+    let limit = thread_snapshot(&core, &thread.id).0.limit.unwrap();
+    assert!(limit.resume, "the setting arms it");
+    let resets = limit.resets_at_ms.unwrap();
+
+    // A daemon started after the reset passed acts on it.
+    let core2 = Core::new(
+        Store::open(&db).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        opts(),
+    );
+    core2.recover().unwrap();
+    let task = core2.spawn_limit_resumes();
+    assert_eq!(core2.resume_due(resets + 60_000), None);
+    wait_for(&core2, &thread.id, |_, turns| {
+        turns.len() == 2 && turns[1].status.is_terminal()
+    })
+    .await;
+    task.abort();
+    assert_eq!(thread_snapshot(&core2, &thread.id).0.limit, None);
+}
+
+#[tokio::test]
+async fn stopping_a_thread_stops_the_threads_it_spawned() {
+    let f = fixture();
+    let parent = new_thread(&f.core, f._dir.path()).await;
+    let spawn = |top_level: bool| {
+        let (core, from) = (f.core.clone(), parent.id.clone());
+        async move {
+            let Response::Thread { thread } = core
+                .handle(Request::SpawnThread {
+                    from,
+                    prompt: "slow a b c".into(),
+                    title: None,
+                    harness: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    worktree: false,
+                    top_level,
+                    project: None,
+                    chat: false,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            thread
+        }
+    };
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: parent.id.clone(),
+            text: "slow one two three four five six".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    let child = spawn(false).await;
+    let own = spawn(true).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    f.core
+        .handle(Request::Interrupt {
+            thread_id: parent.id.clone(),
+        })
+        .await
+        .unwrap();
+    for id in [&parent.id, &child.id, &own.id] {
+        wait_for(&f.core, id, turn_done).await;
+    }
+    let status = |id: &ThreadId| thread_snapshot(&f.core, id).1[0].status;
+    assert_eq!(status(&parent.id), TurnStatus::Interrupted);
+    assert_eq!(status(&child.id), TurnStatus::Interrupted);
+    // Started as a thread of its own: it isn't the parent's to stop.
+    assert_eq!(status(&own.id), TurnStatus::Completed);
 }

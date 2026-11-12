@@ -11,6 +11,7 @@
 //! only when the player has a new frame, and a paused player is let go of
 //! after a while (its last frame stays as the picture).
 
+#[cfg(target_os = "macos")]
 use crate::press::ClaimsPress as _;
 use gpui_kit::{AnyElement, App, SharedString, Window};
 use std::path::{Path, PathBuf};

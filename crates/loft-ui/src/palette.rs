@@ -2,6 +2,7 @@
 //! action — app-wide or on the current thread — with its shortcut shown.
 
 use crate::panel::Tab;
+use crate::workspace::QuoteSelection;
 use crate::workspace::{
     AddProject, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings, ShowBrowser,
     ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTerminal, ToggleTheme,
@@ -56,8 +57,25 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let groups = Rc::new(build(store, cx));
+    open_with(view, store, "", window, cx)
+}
+
+/// [`open`], with `query` already typed.
+pub fn open_with(
+    view: Entity<WorkspaceView>,
+    store: &Entity<crate::store::AppStore>,
+    query: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // What is selected in the conversation now (opening the palette moves
+    // the focus): it can be quoted from here.
+    let selected = gpui_kit::base::TextSelection::selected_text(window, cx);
+    let groups = Rc::new(build(store, selected.trim(), cx));
     let state = cx.new(|cx| CommandState::new(window, cx));
+    if !query.is_empty() {
+        state.update(cx, |s, cx| s.set_query(query, window, cx));
+    }
     let found = cx.new(|_| Found::default());
     let focus = state.clone();
     let store = store.clone();
@@ -373,7 +391,11 @@ fn message_row(hit: &loft_protocol::SearchHit, title: &str, cx: &App) -> gpui_ki
         .into_any_element()
 }
 
-fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Vec<Entry>>)> {
+fn build(
+    store: &Entity<crate::store::AppStore>,
+    selected_text: &str,
+    cx: &App,
+) -> Vec<(String, Rc<Vec<Entry>>)> {
     let store_entity = store.clone();
     let store = store.read(cx);
     let selected = store
@@ -425,6 +447,16 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
             ThreadStatus::Running | ThreadStatus::WaitingApproval
         );
         let mut items = Vec::new();
+        // Only while something is selected in the conversation.
+        if !selected_text.is_empty() {
+            let text = selected_text.to_owned();
+            items.push(entry(
+                "Quote selection in message",
+                IconName::TextQuote,
+                Some(Box::new(QuoteSelection)),
+                move |v, window, cx| v.quote_text(&text, window, cx),
+            ));
+        }
         if running {
             items.push(entry(
                 "Stop turn",
@@ -432,6 +464,20 @@ fn build(store: &Entity<crate::store::AppStore>, cx: &App) -> Vec<(String, Rc<Ve
                 Some(Box::new(Interrupt)),
                 |v, _, cx| v.interrupt(cx),
             ));
+        }
+        // The project's actions (`.agentloft/config.toml`).
+        for action in store.project_actions(&t.project_id).iter() {
+            let (id, name) = (t.id.clone(), action.name.clone());
+            let mut e = entry(
+                format!("Run: {}", action.name),
+                action.icon,
+                None,
+                move |v, window, cx| v.run_action(id.clone(), name.clone(), window, cx),
+            );
+            e.item = e
+                .item
+                .keywords(["action".to_owned(), action.command.clone()]);
+            items.push(e);
         }
         for (h, name) in store.available_harnesses() {
             let id = t.id.clone();

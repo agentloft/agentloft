@@ -18,12 +18,16 @@ A native desktop app for running coding agents side by side: **Claude Code**, **
 - Pick the model and permission mode per thread, from what each agent actually offers.
 - Attach images by paste, drag-and-drop or the paperclip.
 - Complete `/` slash commands and `@` file mentions as you type.
-- Queue messages while a turn runs.
+- ↑ in an empty composer brings back prompts you sent. `@` also finds other threads, and a thread dragged from the sidebar onto the composer does the same: it rides along as a chip the agent can read with `read_thread`.
+- Quote a selection from the conversation (⌘', right-click, or ⌘K), or add a terminal selection as a code block (right-click ▸ Add Selection to Message, or ⌘' in the terminal).
+- Queue messages while a turn runs: the daemon holds them and sends each as the turn before it completes, with the app open or not.
 
 **Workspaces you can trust.**
 - **Worktrees:** a thread can work in its own git worktree on an `agentloft/<slug>` branch. Your project's `.agentloft/config.toml` can name a setup script and untracked files to copy in.
+- **Project actions:** name the commands a project runs often in its `.agentloft/config.toml` (`[[actions]]` with `name`, `command`, optional `icon` and `preview_url`). They show as a button on the thread and as "Run: …" in ⌘K. Each runs in its own terminal tab in the thread's folder, and its preview URL opens in the browser panel.
 - **Checkpoints:** every turn is checkpointed into hidden refs. You get per-turn and per-thread diffs, and *Undo changes* on any turn.
 - **Merge-back:** squash-merge into your branch, with a conflict pre-check, or open a GitHub PR through `gh`.
+- **Pull requests:** a worktree thread shows its pull request and checks (needs the GitHub CLI, signed in). Agentloft finds the PR whether it or the agent opened it, and keeps its state, checks and review current.
 
 **Forks to any agent.**
 - Fork a thread to the same agent with full context (a native fork).
@@ -43,6 +47,8 @@ A native desktop app for running coding agents side by side: **Claude Code**, **
 
 **Built for long-running agents.**
 - **Agents keep running:** a small daemon (`agentloftd`) owns agents, terminals and git, so agents keep working when you close or update the app. After an update, a new daemon takes over once agents go idle.
+- **Usage limits:** a thread that runs out of its plan's usage says when the limit resets, and can carry on by itself then (per thread, or always: Settings ▸ Threads). What was queued behind it follows.
+- **Stop means stop:** stopping a thread also stops the threads its agent started.
 - **Windows:** several windows and native tab groups, not tied to projects, restored on relaunch.
 - **Navigation:** a command palette (⌘K).
 - **Attention:** a Dock badge and bounce when an agent needs you, and unread dots in the sidebar.

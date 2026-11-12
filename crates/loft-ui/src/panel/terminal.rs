@@ -25,12 +25,22 @@ pub struct TerminalPane {
     size: (u16, u16),
     exited: Option<i32>,
     title: Option<String>,
+    /// The project action this shell runs (its key says): the tab's name.
+    action: Option<String>,
+    /// A command to type into the shell the next time one is opened.
+    run: Option<String>,
     error: Option<String>,
     /// Last shown without the right to a terminal (a browser session with
     /// terminals off); opens its shell once that changes.
     blocked: bool,
     _subs: Vec<Subscription>,
 }
+
+/// The terminal's selection, asked to go into the thread's message
+/// ("Add Selection to Message").
+pub struct AddToMessage(pub String);
+
+impl gpui_kit::EventEmitter<AddToMessage> for TerminalPane {}
 
 impl TerminalPane {
     pub fn new(
@@ -42,9 +52,12 @@ impl TerminalPane {
     ) -> Self {
         let view = cx.new(|cx| TerminalView::new(window, cx));
         let sub = cx.subscribe(&view, |this, _, event, cx| this.on_view_event(event, cx));
+        let action = loft_protocol::action_of_terminal_key(&key).map(str::to_owned);
         Self {
             store,
             root,
+            action,
+            run: None,
             key,
             view,
             id: None,
@@ -97,6 +110,8 @@ impl TerminalPane {
                 cx.notify();
             }
             TerminalEvent::Bell => {}
+            // For the composer of the thread this shell belongs to.
+            TerminalEvent::AddToMessage(text) => cx.emit(AddToMessage(text.clone())),
             TerminalEvent::OpenUrl(url) => {
                 // Local dev servers open next to the chat; the rest in the
                 // default browser.
@@ -145,33 +160,37 @@ impl TerminalPane {
             cols,
             rows,
             key: Some(self.key.clone()),
+            command: self.run.take(),
         };
         request_in(&self.store, body, cx, |this, result, cx| {
             this.opening = false;
             match result {
-                Ok(Response::Terminal { terminal }) => {
-                    this.id = Some(terminal.id.clone());
-                    this.exited = None;
-                    // The grid may have changed while the open was in flight.
-                    let (cols, rows) = this.size;
-                    if cols > 0 && (cols, rows) != (terminal.cols, terminal.rows) {
-                        let resize = Request::TerminalResize {
-                            id: terminal.id.clone(),
-                            cols,
-                            rows,
-                        };
-                        this.send(resize, cx);
-                    }
-                    let weak = cx.entity().downgrade();
-                    this.store
-                        .update(cx, |s, cx| s.subscribe_terminal(terminal.id, weak, cx));
-                }
+                Ok(Response::Terminal { terminal }) => this.attach(terminal, cx),
                 Ok(other) => this.error = Some(format!("unexpected response: {other:?}")),
                 Err(err) => this.error = Some(err.message),
             }
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// The daemon's shell for this pane: follow it.
+    fn attach(&mut self, terminal: loft_protocol::TerminalInfo, cx: &mut Context<Self>) {
+        self.id = Some(terminal.id.clone());
+        self.exited = None;
+        // The grid may have changed while the open was in flight.
+        let (cols, rows) = self.size;
+        if cols > 0 && (cols, rows) != (terminal.cols, terminal.rows) {
+            let resize = Request::TerminalResize {
+                id: terminal.id.clone(),
+                cols,
+                rows,
+            };
+            self.send(resize, cx);
+        }
+        let weak = cx.entity().downgrade();
+        self.store
+            .update(cx, |s, cx| s.subscribe_terminal(terminal.id, weak, cx));
     }
 
     pub fn restart(&mut self, cx: &mut Context<Self>) {
@@ -197,11 +216,49 @@ impl TerminalPane {
         }
     }
 
-    /// Tab label: the program's title, else the shell's name.
+    /// Tab label: the action it runs, else the program's title, else the
+    /// shell's name.
     pub fn label(&self) -> String {
-        match &self.title {
-            Some(t) if !t.is_empty() => t.clone(),
+        match (&self.action, &self.title) {
+            (Some(action), _) => action.clone(),
+            (None, Some(t)) if !t.is_empty() => t.clone(),
             _ => "Shell".into(),
+        }
+    }
+
+    /// Run `command` here, typed as the user would: in the shell about to
+    /// open, in a new one if the last has exited, and in a live one only
+    /// if what it ran before has ended (the daemon can tell).
+    pub fn run(&mut self, command: String, cx: &mut Context<Self>) {
+        if self.exited.is_some() {
+            self.run = Some(command);
+            self.restart(cx);
+        } else if self.id.is_some() {
+            // The same key: the daemon answers with the shell it has (no
+            // size given, so that is left alone).
+            let body = Request::TerminalOpen {
+                root: self.root.clone(),
+                cols: 0,
+                rows: 0,
+                key: Some(self.key.clone()),
+                command: Some(command),
+            };
+            request_in(&self.store, body, cx, |this, result, cx| {
+                // The shell had just ended, so this is a new one.
+                if let Ok(Response::Terminal { terminal }) = result
+                    && this.id.as_ref().is_some_and(|id| *id != terminal.id)
+                {
+                    if let Some(old) = this.id.take() {
+                        this.store.update(cx, |s, _| s.forget_terminal(&old));
+                    }
+                    this.view.update(cx, |v, cx| v.reset(cx));
+                    this.attach(terminal, cx);
+                    cx.notify();
+                }
+            });
+        } else if !self.opening {
+            // Opens once the view knows its size.
+            self.run = Some(command);
         }
     }
 

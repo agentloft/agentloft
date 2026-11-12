@@ -488,7 +488,7 @@ Layout uses gpui-kit `Resizable` and `Dock`. The right dock can be split. The bo
 | Command card | Custom | Command line, cwd, exit code, duration, streaming output (ANSI → styled runs, capped and expandable). |
 | File-change card | gpui-kit **`Diff`** (unified/split, word-level, virtualized) | Inline per item. A "view in dock" action opens the full diff. |
 | Approval card | Custom + `Button` group | Options come from `RequestOpened.options`. Keyboard: `y` once, `a` always, `n` deny, `esc` deny+stop. A count also appears in the sidebar's needs-attention badge. |
-| Composer | gpui-kit **`Input` (multi-line) / `Editor`** with IME, undo, paste hooks | Slash-command popover, `@file` fuzzy mentions, image paste/drop. Messages queue while a turn runs, with "steer now" for harnesses that support it. Per-thread draft persisted. |
+| Composer | gpui-kit **`Input` (multi-line) / `Editor`** with IME, undo, paste hooks | Slash-command popover, `@file` fuzzy mentions, image paste/drop. Messages queue while a turn runs, with "steer now" for harnesses that support it; the daemon holds the queue and sends it (TRACKING ▸ Long-running threads). Per-thread draft persisted. |
 | Diff dock | gpui-kit `Diff` | Turn diff, cumulative diff, and comparison against any checkpoint. File list. Revert actions. |
 | Terminal | Custom GPUI element on libghostty-vt (`loft-terminal`, [ADR-0007](adr/0007-terminal-architecture.md)) | Tabs per thread; ⌘-click URLs. |
 | Command palette | gpui-kit `Command` | All GPUI actions. |
@@ -619,7 +619,7 @@ command = "opencode"
 args = ["acp"]
 ```
 
-Per-project config lives in an optional `<repo>/.agentloft/config.toml`. It holds the worktree setup script, files to copy into new worktrees (`.env*`), and default harness and model. The keymap is `~/.agentloft/keymap.toml`.
+Per-project config lives in an optional `<repo>/.agentloft/config.toml`. It holds the worktree setup script, files to copy into new worktrees (`.env*`), the project's actions (`[[actions]]`: commands run from a button on the thread), and default harness and model. The keymap is `~/.agentloft/keymap.toml`.
 
 ---
 

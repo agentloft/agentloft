@@ -6,7 +6,9 @@ mod automations;
 mod clients;
 mod forks;
 mod handoff;
+mod limits;
 mod pages;
+mod pull_requests;
 mod remote;
 mod settings;
 mod terminals;
@@ -143,6 +145,8 @@ pub struct Core {
     clients: ClientRegistry,
     /// Serializes worktree creation (two first messages racing).
     worktree_lock: tokio::sync::Mutex<()>,
+    /// Which threads' pull requests are followed, and when each is due.
+    pull_requests: pull_requests::PullRequests,
     /// Live config (starts as `opts.config`; replaced on reload).
     config: std::sync::RwLock<loft_config::Config>,
     /// `ListModels` answers per harness (probing Codex starts its CLI).
@@ -163,6 +167,12 @@ pub struct Core {
     price_catalog: std::sync::RwLock<Option<Arc<loft_config::pricing::Catalog>>>,
     /// Wakes the automation scheduler when an automation changes.
     automation_wake: Arc<tokio::sync::Notify>,
+    /// Threads to carry on when their usage limit resets, and when that is
+    /// (`limits.rs`).
+    limit_resumes: Mutex<HashMap<ThreadId, i64>>,
+    limit_wake: Arc<tokio::sync::Notify>,
+    /// The id the next queued message gets.
+    queued_ids: std::sync::atomic::AtomicU64,
     opts: CoreOptions,
 }
 
@@ -189,6 +199,7 @@ impl Core {
             pages: pages::Pages::default(),
             clients: ClientRegistry::default(),
             worktree_lock: tokio::sync::Mutex::new(()),
+            pull_requests: Default::default(),
             config: std::sync::RwLock::new(opts.config.clone()),
             models: Mutex::new(HashMap::new()),
             commands: Mutex::new(HashMap::new()),
@@ -198,6 +209,10 @@ impl Core {
             config_rev: tokio::sync::watch::channel(0).0,
             price_catalog: std::sync::RwLock::new(None),
             automation_wake: Arc::new(tokio::sync::Notify::new()),
+            limit_resumes: Mutex::new(HashMap::new()),
+            limit_wake: Arc::new(tokio::sync::Notify::new()),
+            // From the clock, so ids from before a restart aren't given again.
+            queued_ids: std::sync::atomic::AtomicU64::new(now_ms().max(0) as u64),
             opts,
         })
     }
@@ -500,6 +515,12 @@ impl Core {
         &self.opts
     }
 
+    /// An id for a message joining a thread's queue.
+    pub(crate) fn next_queued_id(&self) -> u64 {
+        self.queued_ids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn harness(&self, id: &HarnessId) -> Option<Arc<dyn Harness>> {
         self.harnesses.get(id.as_str()).cloned()
     }
@@ -585,6 +606,7 @@ impl Core {
                     None => None,
                     Some(thread) => Some(Snapshot::Thread {
                         seq,
+                        queue: s.queue(id)?,
                         turns: s.turns(id)?,
                         items: s.items(id)?,
                         requests: s.requests(id)?,
@@ -967,10 +989,40 @@ impl Core {
                 })
                 .await
             }
-            Request::Interrupt { thread_id } => {
-                self.thread_call(&thread_id, |reply| ThreadCmd::Interrupt { reply })
+            Request::Enqueue {
+                thread_id,
+                text,
+                attachments,
+            } => {
+                if text.trim().is_empty() && attachments.is_empty() {
+                    return Err(ErrorBody::new(ErrorCode::BadRequest, "empty message"));
+                }
+                let attachments = self.store_attachments(&thread_id, attachments).await?;
+                self.ensure_workspace(&thread_id, &text).await?;
+                self.thread_call(&thread_id, |reply| ThreadCmd::Enqueue {
+                    text,
+                    attachments,
+                    reply,
+                })
+                .await
+            }
+            Request::Dequeue { thread_id, id } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::Dequeue { id, reply })
                     .await
             }
+            Request::MoveQueued { thread_id, id, to } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::MoveQueued { id, to, reply })
+                    .await
+            }
+            Request::SendQueued { thread_id, id } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::SendQueued { id, reply })
+                    .await
+            }
+            Request::ResumeAtReset { thread_id, on } => {
+                self.thread_call(&thread_id, |reply| ThreadCmd::ResumeAtReset { on, reply })
+                    .await
+            }
+            Request::Interrupt { thread_id } => self.interrupt(&thread_id).await,
             Request::AgentInfo { thread_id, kind } => {
                 self.thread_call(&thread_id, |reply| ThreadCmd::AgentInfo { kind, reply })
                     .await
@@ -1026,6 +1078,14 @@ impl Core {
                     .map_err(internal)??;
                 Ok(Response::File { file })
             }
+            Request::ProjectActions { project_id } => {
+                let core = self.clone();
+                let actions =
+                    tokio::task::spawn_blocking(move || core.project_actions(&project_id))
+                        .await
+                        .map_err(internal)??;
+                Ok(Response::Actions { actions })
+            }
             Request::ReadPath {
                 path,
                 thread_id,
@@ -1066,17 +1126,29 @@ impl Core {
                 cols,
                 rows,
                 key,
+                command,
             } => {
+                let command = command.filter(|c| !c.trim().is_empty());
                 if let Some(terminal) = key
                     .as_deref()
                     .and_then(|k| self.terminals.reattach(k, cols, rows))
                 {
+                    // Its shell is live: the command goes in only if what
+                    // it ran before has ended.
+                    if let Some(command) = &command {
+                        self.terminals.run_if_idle(&terminal.id, command);
+                    }
                     return Ok(Response::Terminal { terminal });
                 }
                 let dir = self.root_dir(&root)?;
-                let terminal =
-                    self.terminals
-                        .open(&dir, cols, rows, key, &self.opts.env, self.bus.clone())?;
+                let terminal = self.terminals.open(
+                    &dir,
+                    (cols, rows),
+                    key,
+                    command,
+                    &self.opts.env,
+                    self.bus.clone(),
+                )?;
                 Ok(Response::Terminal { terminal })
             }
             Request::TerminalInput { id, data } => {
@@ -1242,6 +1314,9 @@ impl Core {
                 })
             }
             Request::CreatePullRequest { thread_id } => self.create_pull_request(&thread_id).await,
+            Request::RefreshPullRequest { thread_id } => {
+                self.refresh_pull_request(&thread_id).await
+            }
             Request::RevertTurn { thread_id, turn_id } => {
                 self.revert_turn(&thread_id, &turn_id).await
             }
@@ -1581,12 +1656,48 @@ impl Core {
             started_at_ms: None,
             draft: None,
             waiting_on: Vec::new(),
+            limit: None,
             automation_id: None,
+            pull_request: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
         }])?;
         Ok(Response::Thread { thread })
+    }
+
+    /// Stop a thread's running turn, and the turns of the threads its agent
+    /// started (and theirs): stopping an orchestrator stops its workers.
+    /// Not the ones it started as threads of their own (`detached`).
+    pub(crate) async fn interrupt(self: &Arc<Self>, thread_id: &ThreadId) -> CoreResult<Response> {
+        let own = self
+            .thread_call(thread_id, |reply| ThreadCmd::Interrupt { reply })
+            .await;
+        let threads = self.with_store(|s| s.threads())?;
+        let mut stopped = false;
+        let mut parents = vec![thread_id.clone()];
+        while let Some(parent) = parents.pop() {
+            for child in threads.iter().filter(|t| {
+                t.parent.as_ref().is_some_and(|p| {
+                    p.thread_id == parent
+                        && p.kind == loft_protocol::ForkKind::Spawned
+                        && !p.detached
+                })
+            }) {
+                parents.push(child.id.clone());
+                if matches!(
+                    child.status,
+                    ThreadStatus::Running | ThreadStatus::WaitingApproval
+                ) {
+                    stopped |= self
+                        .thread_call(&child.id, |reply| ThreadCmd::Interrupt { reply })
+                        .await
+                        .is_ok();
+                }
+            }
+        }
+        // Nothing of its own to stop, but something it started was.
+        if stopped { Ok(Response::Ok) } else { own }
     }
 
     async fn thread_call(

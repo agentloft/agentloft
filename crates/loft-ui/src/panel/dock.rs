@@ -103,6 +103,60 @@ impl WorkbenchPanel {
         }
     }
 
+    /// Run a project action in `thread_id`: in the shell it has (wherever
+    /// that is: it is brought to the front, and the command typed again
+    /// only if it has ended), else in a new docked shell named after it.
+    pub fn run_action(
+        &mut self,
+        thread_id: &ThreadId,
+        name: &str,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let base = format!("thread:{}", thread_id.as_str());
+        let key = loft_protocol::action_terminal_key(&base, name);
+        let Some(panel) = self.ensure_id(thread_id, window, cx) else {
+            return;
+        };
+        let in_tabs = panel
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Open::Terminal { key: k, .. } if *k == key));
+        let in_dock = panel.dock.iter().position(|(k, _)| *k == key);
+        let pane = match (in_tabs, in_dock) {
+            (Some(ix), _) => {
+                let Open::Terminal { pane, .. } = &panel.tabs[ix] else {
+                    return;
+                };
+                let pane = pane.clone();
+                self.activate(thread_id, ix, window, cx);
+                cx.emit(PanelEvent::ShowPanel);
+                pane
+            }
+            (None, Some(ix)) => {
+                let pane = panel.dock[ix].1.clone();
+                self.activate_docked(thread_id, ix, window, cx);
+                cx.emit(PanelEvent::ShowDock);
+                pane
+            }
+            (None, None) => {
+                // Its key carries the action's name: the tab's title, and
+                // how the shell is found again (also after a restart).
+                let pane = self.make_terminal(thread_id, key.clone(), window, cx);
+                if let Some(panel) = self.threads.get_mut(thread_id) {
+                    panel.dock.push((key, pane.clone()));
+                    panel.dock_active = panel.dock.len() - 1;
+                }
+                focus_terminal(&pane, window, cx);
+                cx.emit(PanelEvent::ShowDock);
+                pane
+            }
+        };
+        pane.update(cx, |pane, cx| pane.run(command, cx));
+        cx.notify();
+    }
+
     /// Send a docked shell to the side panel, as its showing tab.
     fn move_to_panel(
         &mut self,

@@ -155,9 +155,16 @@ pub struct Thread {
     /// is): with no turn running, the thread is waiting on these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on: Vec<String>,
+    /// The last turn was stopped by the agent's usage limit. Gone when the
+    /// next turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitStop>,
     /// Started by this automation (one of its runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_id: Option<AutomationId>,
+    /// The pull request for its branch, as GitHub last described it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequest>,
 }
 
 impl Thread {
@@ -206,7 +213,9 @@ impl Thread {
             started_at_ms,
             draft,
             waiting_on,
+            limit,
             automation_id,
+            pull_request,
         } = self;
         Thread {
             id: id.clone(),
@@ -228,9 +237,157 @@ impl Thread {
             started_at_ms: *started_at_ms,
             draft: draft.clone(),
             waiting_on: waiting_on.clone(),
+            limit: *limit,
             automation_id: automation_id.clone(),
+            pull_request: pull_request.clone(),
         }
     }
+}
+
+/// A thread's pull request (kept small: a thread is logged whole on every
+/// change).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub state: PullRequestState,
+    /// How its checks stand (all zero: none reported).
+    #[serde(default, skip_serializing_if = "PullRequestChecks::is_empty")]
+    pub checks: PullRequestChecks,
+    /// What reviewers decided, when the repository asks for reviews or
+    /// someone has reviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewDecision>,
+    /// When GitHub last said something new about it. A look that finds it
+    /// unchanged is not recorded.
+    #[serde(default)]
+    pub refreshed_at_ms: i64,
+}
+
+impl PullRequest {
+    /// Still open (a draft is): its checks and reviews can change.
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, PullRequestState::Open | PullRequestState::Draft)
+    }
+
+    /// The same pull request in the same state, whenever each was fetched.
+    pub fn same_as(&self, other: &PullRequest) -> bool {
+        // Every field by name: a new one must be compared (or left out) here.
+        let PullRequest {
+            number,
+            url,
+            title,
+            state,
+            checks,
+            review,
+            refreshed_at_ms: _,
+        } = self;
+        *number == other.number
+            && *url == other.url
+            && *title == other.title
+            && *state == other.state
+            && *checks == other.checks
+            && *review == other.review
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+/// A pull request's checks, counted by how each stands. Skipped checks are
+/// left out.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestChecks {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub passing: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failing: u32,
+    /// Queued or running.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl PullRequestChecks {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// All of them in one word: failing if any failed, else running if any
+    /// is still going, else passing. `None`: there are no checks.
+    pub fn rollup(&self) -> Option<ChecksState> {
+        if self.failing > 0 {
+            Some(ChecksState::Failing)
+        } else if self.pending > 0 {
+            Some(ChecksState::Pending)
+        } else if self.passing > 0 {
+            Some(ChecksState::Passing)
+        } else {
+            None
+        }
+    }
+
+    /// "3 passing, 1 failing, 2 running" (`None`: there are no checks).
+    pub fn summary(&self) -> Option<String> {
+        let parts: Vec<String> = [
+            (self.passing, "passing"),
+            (self.failing, "failing"),
+            (self.pending, "running"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksState {
+    Passing,
+    Failing,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
+/// A turn the agent's usage limit stopped (`Thread::limit`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LimitStop {
+    /// When the limit resets, if the agent said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
+    /// Carry on by itself when it resets (`Request::ResumeAtReset`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
+}
+
+/// A message waiting in a thread's queue: sent, in order, as each turn
+/// completes. The daemon holds it, so it outlives the window that typed it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedMessage {
+    /// Stays the same while others are sent or moved around it.
+    pub id: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
+    pub queued_at_ms: i64,
 }
 
 /// Where a fork came from (ADR-0011).

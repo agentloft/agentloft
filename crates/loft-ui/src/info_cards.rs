@@ -29,7 +29,7 @@ pub(crate) fn tokens(n: f64) -> String {
 }
 
 /// "Sat 6:00 AM" (within the week), else "Nov 21, 6:00 AM".
-fn local_time(at: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn local_time(at: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::Local;
     let local = at.with_timezone(&Local);
     let days = (local - Local::now()).num_days();

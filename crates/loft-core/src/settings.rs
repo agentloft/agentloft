@@ -171,6 +171,11 @@ const KEYS: &[Key] = &[
         about: "Compact when idle only when the context holds at least this many tokens (default 100000)",
     },
     Key {
+        key: "threads.resume_at_reset",
+        kind: Kind::Bool,
+        about: "A thread stopped by its agent's usage limit carries on by itself when the limit resets (default off; each thread can be told to on its own)",
+    },
+    Key {
         key: "usage.price_catalog",
         kind: Kind::Text,
         about: "Where model prices for cost estimates come from each day (models.dev's format); empty = only the built-in prices and [pricing]",

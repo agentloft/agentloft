@@ -8,11 +8,23 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// Scrollback kept per terminal for replay (8 MiB).
 const RING_CAP: usize = 8 * 1024 * 1024;
+
+/// A new shell is ready for a typed command once it has printed something
+/// (its prompt) and then nothing for this long…
+const PROMPT_QUIET: Duration = Duration::from_millis(200);
+/// …or after this long whatever it printed: a shell reads what was typed
+/// ahead once it gets there.
+const PROMPT_WAIT: Duration = Duration::from_secs(5);
+/// A shell that was just typed a command takes a moment to put it in the
+/// foreground; until then it still looks idle, and isn't.
+const STARTING: Duration = Duration::from_millis(600);
 
 struct Ring {
     data: VecDeque<u8>,
@@ -26,6 +38,45 @@ struct Term {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     ring: Mutex<Ring>,
+    /// The shell's process id: it is in the foreground while it waits at
+    /// its prompt.
+    shell_pid: Option<u32>,
+    /// A command is waiting for the new shell's prompt to be typed.
+    typing: AtomicBool,
+    /// When a command was last typed for the user.
+    typed_at: Mutex<Option<Instant>>,
+}
+
+impl Term {
+    /// Whether the shell is waiting at its prompt: no command of its own
+    /// is in the terminal's foreground. `false` where that can't be told.
+    fn idle(&self) -> bool {
+        if self.typing.load(Ordering::SeqCst)
+            || lock(&self.info).exited.is_some()
+            || lock(&self.typed_at).is_some_and(|at| at.elapsed() < STARTING)
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let foreground = lock(&self.master).process_group_leader();
+            foreground.is_some() && foreground == self.shell_pid.map(|pid| pid as _)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Type `command` and Enter, as the user would.
+    fn type_line(&self, command: &str) {
+        *lock(&self.typed_at) = Some(Instant::now());
+        let mut w = lock(&self.writer);
+        let _ = w
+            .write_all(command.trim().as_bytes())
+            .and_then(|_| w.write_all(b"\r"))
+            .and_then(|_| w.flush());
+    }
 }
 
 #[derive(Default)]
@@ -47,9 +98,9 @@ impl Terminals {
     pub fn open(
         &self,
         cwd: &Path,
-        cols: u16,
-        rows: u16,
+        (cols, rows): (u16, u16),
         key: Option<String>,
+        command: Option<String>,
         env: &HashMap<String, String>,
         bus: broadcast::Sender<BusMsg>,
     ) -> Result<TerminalInfo, ErrorBody> {
@@ -112,6 +163,9 @@ impl Terminals {
                 data: VecDeque::new(),
                 end: 0,
             }),
+            shell_pid: child.process_id(),
+            typing: AtomicBool::new(command.is_some()),
+            typed_at: Mutex::new(None),
         });
         lock(&self.map).insert(id.clone(), term.clone());
         // A terminal previously under this key has exited: drop it.
@@ -123,6 +177,7 @@ impl Terminals {
         }
 
         // Reader thread: PTY → ring buffer → bus.
+        let typist = command.map(|command| (term.clone(), command));
         std::thread::Builder::new()
             .name(format!("pty-{}", &id.as_str()[..8]))
             .spawn(move || {
@@ -132,7 +187,31 @@ impl Terminals {
                 let _ = bus.send(BusMsg::TerminalExited { id, code });
             })
             .map_err(|e| err(format!("spawn reader: {e}")))?;
+        if let Some((term, command)) = typist {
+            let typed = std::thread::Builder::new()
+                .name("pty-command".into())
+                .spawn({
+                    let term = term.clone();
+                    move || type_at_prompt(&term, &command)
+                });
+            if typed.is_err() {
+                term.typing.store(false, Ordering::SeqCst);
+            }
+        }
         Ok(info)
+    }
+
+    /// Type `command` into a live terminal if its shell is waiting at the
+    /// prompt (nothing of its own running); says whether it did.
+    pub fn run_if_idle(&self, id: &TerminalId, command: &str) -> bool {
+        let Ok(term) = self.get(id) else {
+            return false;
+        };
+        let idle = term.idle();
+        if idle {
+            term.type_line(command);
+        }
+        idle
     }
 
     /// The live terminal opened under `key`, resized to the caller's grid.
@@ -254,6 +333,30 @@ impl Terminals {
             let _ = lock(&term.killer).kill();
         }
     }
+}
+
+/// Type `command` into a new shell once its prompt is up. Typed any
+/// sooner the shell would still run it, but the line would show twice:
+/// echoed by the terminal as it arrives, then drawn again by the shell's
+/// own line editor.
+fn type_at_prompt(term: &Term, command: &str) {
+    let started = Instant::now();
+    let (mut seen, mut changed) = (0, started);
+    loop {
+        std::thread::sleep(Duration::from_millis(25));
+        if lock(&term.info).exited.is_some() {
+            break;
+        }
+        let end = lock(&term.ring).end;
+        if end != seen {
+            (seen, changed) = (end, Instant::now());
+        }
+        if (seen > 0 && changed.elapsed() >= PROMPT_QUIET) || started.elapsed() >= PROMPT_WAIT {
+            term.type_line(command);
+            break;
+        }
+    }
+    term.typing.store(false, Ordering::SeqCst);
 }
 
 fn pump(

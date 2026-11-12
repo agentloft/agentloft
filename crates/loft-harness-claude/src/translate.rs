@@ -76,6 +76,11 @@ pub struct Translator {
     /// Tasks started and not yet finished: task id → what it is.
     open_tasks: std::collections::BTreeMap<String, String>,
     interrupt_requested: bool,
+    /// Plan limits Claude said are used up (`rate_limit_event`), by which
+    /// limit, with when each resets (ms) if it said.
+    limits_hit: HashMap<String, Option<i64>>,
+    /// An answer in this turn was refused for a rate limit.
+    refused_for_limit: bool,
     turn_active: bool,
     next_request: u64,
     /// Messages sent and not yet echoed back (`--replay-user-messages`),
@@ -447,8 +452,61 @@ impl Translator {
             Some("control_request") => self.on_control_request(v),
             Some("control_response") => self.on_control_response(v),
             Some("result") => self.on_result(v),
+            Some("rate_limit_event") => {
+                self.on_rate_limit(v.get("rate_limit_info").unwrap_or(&Value::Null));
+                vec![]
+            }
             _ => vec![],
         }
+    }
+
+    /// Claude's word on a plan limit: used up (`rejected`, and no extra
+    /// usage to fall back on), or fine again.
+    fn on_rate_limit(&mut self, info: &Value) {
+        let flag = |key: &str| info.get(key).and_then(Value::as_bool) == Some(true);
+        let extra = matches!(
+            str_at(info, "overageStatus"),
+            Some("allowed" | "allowed_warning")
+        ) || flag("isUsingOverage")
+            || flag("overageInUse");
+        let which = str_at(info, "rateLimitType")
+            .unwrap_or("unknown")
+            .to_owned();
+        match str_at(info, "status") {
+            Some("rejected") if !extra => {
+                // Seconds since the epoch.
+                let resets = info
+                    .get("resetsAt")
+                    .and_then(Value::as_i64)
+                    .filter(|s| *s > 0)
+                    .map(|s| s.saturating_mul(1000));
+                self.limits_hit.insert(which, resets);
+            }
+            Some(_) => {
+                self.limits_hit.remove(&which);
+            }
+            None => {}
+        }
+    }
+
+    /// The limit that ended a failed turn, if one did: every limit that is
+    /// used up has to reset before the turn can go on, so the latest reset
+    /// counts (unknown if any of them is).
+    fn limit_hit(&mut self, now_ms: i64) -> Option<loft_harness::LimitHit> {
+        // One that has reset since was never taken back: forget it.
+        self.limits_hit
+            .retain(|_, resets| resets.is_none_or(|at| at > now_ms));
+        let refused = std::mem::take(&mut self.refused_for_limit);
+        if self.limits_hit.is_empty() {
+            return refused.then(loft_harness::LimitHit::default);
+        }
+        let resets_at_ms = self
+            .limits_hit
+            .values()
+            .copied()
+            .collect::<Option<Vec<i64>>>()
+            .and_then(|all| all.into_iter().max());
+        Some(loft_harness::LimitHit { resets_at_ms })
     }
 
     fn on_system(&mut self, v: &Value) -> Vec<Out> {
@@ -759,6 +817,15 @@ impl Translator {
         let parent = str_at(v, "parent_tool_use_id").map(str::to_owned);
         let streamed = self.streamed_messages.contains(&msg_id);
         let mut out = Vec::new();
+        if parent.is_none() {
+            self.refused_for_limit = str_at(v, "error") == Some("rate_limit");
+            if self.refused_for_limit {
+                // What that refusal said about the limit, when it did.
+                if let Some(info) = v.pointer("/api_error_params/rate_limit_info") {
+                    self.on_rate_limit(info);
+                }
+            }
+        }
         // The latest main-thread message marks where a fork can resume.
         if parent.is_none()
             && let Some(uuid) = str_at(v, "uuid")
@@ -1236,6 +1303,12 @@ impl Translator {
         }
         self.turn_active = false;
         self.interrupt_requested = false;
+        let limit = self.limit_hit(now_ms());
+        if status == TurnStatus::Failed
+            && let Some(limit) = limit
+        {
+            out.push(Out::Event(HarnessEvent::LimitReached(limit)));
+        }
         out.push(Out::Event(HarnessEvent::TurnCompleted {
             status,
             usage,
@@ -1243,6 +1316,13 @@ impl Translator {
         }));
         out
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Claude's tool for asking the user multiple-choice questions.
@@ -1484,6 +1564,106 @@ mod tests {
             out.extend(t.on_line(line));
         }
         (t, out)
+    }
+
+    /// A turn's worth of lines: what came out, as events.
+    fn turn(t: &mut Translator, lines: &[Value]) -> Vec<HarnessEvent> {
+        let mut out = t.start_turn("prompt");
+        for line in lines {
+            out.extend(t.on_line(&line.to_string()));
+        }
+        out.into_iter()
+            .filter_map(|o| match o {
+                Out::Event(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn limit_of(events: &[HarnessEvent]) -> Option<loft_harness::LimitHit> {
+        events.iter().find_map(|e| match e {
+            HarnessEvent::LimitReached(hit) => Some(*hit),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_turn_the_plan_limit_ends_says_so_and_when_it_resets() {
+        let later = now_ms() / 1000 + 3600;
+        let refused = json!({"type": "result", "subtype": "success", "is_error": true,
+            "result": "You've hit your limit · resets 3pm"});
+        let rejected = |which: &str, resets: i64| {
+            json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "rateLimitType": which, "resetsAt": resets,
+                "isUsingOverage": false}})
+        };
+        let mut t = Translator::new();
+        let events = turn(
+            &mut t,
+            &[
+                rejected("five_hour", later),
+                rejected("seven_day", later + 7200),
+                refused.clone(),
+            ],
+        );
+        // Both have to reset: the later one counts.
+        assert_eq!(
+            limit_of(&events).unwrap().resets_at_ms,
+            Some((later + 7200) * 1000)
+        );
+        let last = events.len() - 1;
+        assert!(matches!(events[last - 1], HarnessEvent::LimitReached(_)));
+        assert!(matches!(
+            &events[last],
+            HarnessEvent::TurnCompleted { status: TurnStatus::Failed, error: Some(e), .. }
+                if e.contains("hit your limit")
+        ));
+
+        // Fine again: a turn that fails after that failed for something else.
+        let fine = |which: &str| {
+            json!({"type": "rate_limit_event",
+                "rate_limit_info": {"status": "allowed", "rateLimitType": which}})
+        };
+        let other = json!({"type": "result", "subtype": "error_during_execution",
+            "is_error": true, "result": "boom"});
+        let events = turn(
+            &mut t,
+            &[fine("five_hour"), fine("seven_day"), other.clone()],
+        );
+        assert_eq!(limit_of(&events), None);
+
+        // Extra usage covers it: not a stop.
+        let covered = json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "rateLimitType": "five_hour", "resetsAt": later,
+            "overageStatus": "allowed"}});
+        assert_eq!(limit_of(&turn(&mut t, &[covered, other.clone()])), None);
+
+        // A limit that reset since, never taken back, isn't one any more.
+        let mut t = Translator::new();
+        let events = turn(&mut t, &[rejected("five_hour", later - 7200), other]);
+        assert_eq!(limit_of(&events), None);
+
+        // A refused answer with nothing said about when: a limit, reset unknown.
+        let answer = json!({"type": "assistant", "error": "rate_limit",
+            "message": {"id": "m1", "content": []}});
+        let events = turn(&mut t, &[answer, refused.clone()]);
+        assert_eq!(limit_of(&events).unwrap().resets_at_ms, None);
+        // The refusal's own record of the limit is read too.
+        let answer = json!({"type": "assistant", "error": "rate_limit",
+            "api_error_params": {"rate_limit_info": {
+                "status": "rejected", "rateLimitType": "five_hour", "resetsAt": later}},
+            "message": {"id": "m2", "content": []}});
+        let events = turn(&mut t, &[answer, refused]);
+        assert_eq!(limit_of(&events).unwrap().resets_at_ms, Some(later * 1000));
+
+        // A turn that completes says nothing, whatever was said before it.
+        let mut t = Translator::new();
+        let done =
+            json!({"type": "result", "subtype": "success", "is_error": false, "result": "ok"});
+        assert_eq!(
+            limit_of(&turn(&mut t, &[rejected("five_hour", later), done])),
+            None
+        );
     }
 
     fn events(out: &[Out]) -> Vec<&HarnessEvent> {

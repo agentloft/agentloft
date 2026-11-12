@@ -217,6 +217,11 @@ impl Core {
             | Request::CreateThread { .. }
             | Request::SendMessage { .. }
             | Request::Steer { .. }
+            | Request::Enqueue { .. }
+            | Request::Dequeue { .. }
+            | Request::MoveQueued { .. }
+            | Request::SendQueued { .. }
+            | Request::ResumeAtReset { .. }
             | Request::Interrupt { .. }
             | Request::AgentInfo { .. }
             | Request::StopSubagent { .. }
@@ -235,6 +240,7 @@ impl Core {
             | Request::SetDraft { .. }
             | Request::UnarchiveThread { .. }
             | Request::CreatePullRequest { .. }
+            | Request::RefreshPullRequest { .. }
             | Request::ArchiveThread { .. }
             | Request::DeleteThread { .. }
             | Request::SearchThreads { .. }
@@ -263,6 +269,9 @@ impl Core {
             | Request::PutUiState { .. }
             | Request::DeleteTheme { .. }
             | Request::ProjectIcon { .. }
+            // What a project's config names; running one opens a terminal,
+            // which is asked for below.
+            | Request::ProjectActions { .. }
             // Settings: read (secrets hidden) and the harmless keys.
             | Request::GetSettings
             | Request::SaveTheme { .. }
@@ -890,6 +899,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_projects_actions_are_read_from_its_config_each_time() {
+        async fn of(f: &Fixture, id: &ProjectId) -> CoreResult<Vec<loft_protocol::ProjectAction>> {
+            let req = Request::ProjectActions {
+                project_id: id.clone(),
+            };
+            match remote(f, req).await? {
+                Response::Actions { actions } => Ok(actions),
+                other => panic!("{other:?}"),
+            }
+        }
+        let (f, _) = fixture().await;
+        // No config file: no actions.
+        assert!(of(&f, &f.project_id).await.unwrap().is_empty());
+        let file = f.project.join(".agentloft/config.toml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            "[[actions]]\nname = \"Dev\"\ncommand = \"npm run dev\"\nicon = \"play\"\n\
+             preview_url = \"http://localhost:3000\"\n\n\
+             [[actions]]\nname = \"Test\"\ncommand = \"npm test\"\n",
+        )
+        .unwrap();
+        let found = of(&f, &f.project_id).await.unwrap();
+        assert_eq!(
+            found,
+            vec![
+                loft_protocol::ProjectAction {
+                    name: "Dev".into(),
+                    command: "npm run dev".into(),
+                    icon: Some("play".into()),
+                    preview_url: Some("http://localhost:3000".into()),
+                },
+                loft_protocol::ProjectAction {
+                    name: "Test".into(),
+                    command: "npm test".into(),
+                    icon: None,
+                    preview_url: None,
+                },
+            ]
+        );
+        // The file changed: so does the answer.
+        std::fs::write(
+            &file,
+            "[[actions]]\nname = \"Lint\"\ncommand = \"npm run lint\"\n",
+        )
+        .unwrap();
+        let found = of(&f, &f.project_id).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Lint");
+        // One that doesn't parse: none, not an error.
+        std::fs::write(&file, "[[actions]\n").unwrap();
+        assert!(of(&f, &f.project_id).await.unwrap().is_empty());
+        let unknown = of(&f, &ProjectId::new()).await.unwrap_err();
+        assert_eq!(unknown.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
     async fn terminals_shutdown_and_management_are_refused() {
         let (f, thread) = fixture().await;
         let open = || Request::TerminalOpen {
@@ -897,6 +963,7 @@ mod tests {
             cols: 80,
             rows: 24,
             key: None,
+            command: Some("id".into()),
         };
         assert!(is_forbidden(&remote(&f, open()).await));
         let id = loft_protocol::TerminalId::new();

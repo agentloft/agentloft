@@ -76,6 +76,7 @@ gpui_kit::assets::icon_assets!(
         MousePointerClick,
         MessageSquare,
         MessageSquareDashed,
+        TextQuote,
         Palette,
         FolderGit2,
         Link,
@@ -129,6 +130,17 @@ gpui_kit::assets::icon_assets!(
         SquareCheck,
         Volume2,
         VolumeX,
+        // Project actions (`actions.rs`): the icons guessed for them, and
+        // a few more a project may name.
+        FlaskConical,
+        Hammer,
+        Rocket,
+        Package,
+        Database,
+        Server,
+        Terminal,
+        Wrench,
+        Zap,
     ]
 );
 
