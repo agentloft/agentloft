@@ -1083,18 +1083,44 @@ impl WorkspaceView {
                     .update(cx, |p, cx| p.open_file(&thread_id, path, window, cx));
             }
             Some(("docnote", spec)) => {
-                // `path|x,y;x,y|note[|send]`: open a document, turn notes on,
-                // click each point (window coordinates) and leave the note
-                // there; with `send`, send the message after.
+                // `path|x,y;x1,y1,x2,y2;x,y!|note[|send]`: open a document,
+                // turn notes on, click each point or drag from one to the
+                // other (window coordinates) and leave the note there (after
+                // a `!` the note box is left open instead); with `send`, send
+                // the message after.
                 let mut parts = spec.split('|');
                 let path = parts.next().unwrap_or_default().to_owned();
-                let points: Vec<(f32, f32)> = parts
+                // Where the pointer goes down, where it comes up, and whether
+                // the note box is then left open.
+                struct Step {
+                    from: (f32, f32),
+                    to: (f32, f32),
+                    open: bool,
+                }
+                let points: Vec<Step> = parts
                     .next()
                     .unwrap_or_default()
                     .split(';')
                     .filter_map(|p| {
-                        let (x, y) = p.split_once(',')?;
-                        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                        let (p, open) = match p.trim().strip_suffix('!') {
+                            Some(p) => (p, true),
+                            None => (p.trim(), false),
+                        };
+                        let n: Vec<f32> =
+                            p.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                        match n.as_slice() {
+                            [x, y] => Some(Step {
+                                from: (*x, *y),
+                                to: (*x, *y),
+                                open,
+                            }),
+                            [x1, y1, x2, y2] => Some(Step {
+                                from: (*x1, *y1),
+                                to: (*x2, *y2),
+                                open,
+                            }),
+                            _ => None,
+                        }
                     })
                     .collect();
                 let note = parts.next().unwrap_or("A note").to_owned();
@@ -1117,27 +1143,40 @@ impl WorkspaceView {
                         }
                     });
                     pause(600).await;
-                    for (x, y) in points {
+                    for Step { from, to, open } in points {
                         use gpui_kit::{
-                            Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
+                            Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+                            PlatformInput,
                         };
-                        let position = gpui_kit::point(px(x), px(y));
+                        let at = |(x, y): (f32, f32)| gpui_kit::point(px(x), px(y));
                         let (button, modifiers) = (MouseButton::Left, Modifiers::default());
-                        let steps = [
-                            PlatformInput::MouseDown(MouseDownEvent {
-                                button,
-                                position,
-                                modifiers,
-                                click_count: 1,
-                                first_mouse: false,
-                            }),
-                            PlatformInput::MouseUp(MouseUpEvent {
-                                button,
-                                position,
-                                modifiers,
-                                click_count: 1,
-                            }),
-                        ];
+                        let mut steps = vec![PlatformInput::MouseDown(MouseDownEvent {
+                            button,
+                            position: at(from),
+                            modifiers,
+                            click_count: 1,
+                            first_mouse: false,
+                        })];
+                        if from != to {
+                            // A drag passes through the points between.
+                            for i in 1..=8 {
+                                let t = i as f32 / 8.;
+                                steps.push(PlatformInput::MouseMove(MouseMoveEvent {
+                                    position: at((
+                                        from.0 + (to.0 - from.0) * t,
+                                        from.1 + (to.1 - from.1) * t,
+                                    )),
+                                    pressed_button: Some(button),
+                                    modifiers,
+                                }));
+                            }
+                        }
+                        steps.push(PlatformInput::MouseUp(MouseUpEvent {
+                            button,
+                            position: at(to),
+                            modifiers,
+                            click_count: 1,
+                        }));
                         for step in steps {
                             let _ = cx.update(|window, cx| {
                                 window.dispatch_event(step, cx);
@@ -1145,6 +1184,9 @@ impl WorkspaceView {
                             pause(60).await;
                         }
                         pause(300).await;
+                        if open {
+                            continue;
+                        }
                         let _ = this.update_in(cx, |this, window, cx| {
                             if let Some(doc) = doc(this, cx) {
                                 doc.update(cx, |d, cx| d.finish_note(&note, window, cx));

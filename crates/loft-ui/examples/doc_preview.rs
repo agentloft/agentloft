@@ -4,14 +4,16 @@
 //! ```sh
 //! cargo run -p loft-ui --example doc_preview -- deck.pptx [--width 900] [--height 700]
 //!     [--scroll 1200] [--annotate] [--click 300,240]… [--drag 100,200,400,200]…
-//!     [--note "Make this blue"] [--find "text"] [--shot out.jpg]
+//!     [--note "Make this blue"] [--hover 300,240] [--find "text"] [--shot out.jpg]
 //! ```
 //!
 //! * `--scroll` starts that many pixels down the document.
 //! * `--annotate` turns note-taking on once the document is read.
 //! * `--click x,y` clicks at window coordinates and `--drag x1,y1,x2,y2`
-//!   drags from one point to another (to select text), in the order given;
-//!   each is followed by `--note`, if there is one, as the note's text.
+//!   drags from one point to another (over an area, or to select text), in
+//!   the order given; each is followed by `--note`, if there is one, as the
+//!   note's text. Without `--note` the note box stays open.
+//! * `--hover x,y` then moves the pointer there with no button held.
 //! * `--find` looks for text (in a PDF), as its find bar does.
 //! * `--shot` saves the window as drawn (a JPEG) and quits. It needs no
 //!   screen-recording permission, but the example must be built with
@@ -50,6 +52,7 @@ struct Script {
     /// Where the pointer goes down and where it comes up (the same for a click).
     clicks: Vec<((f32, f32), (f32, f32))>,
     note: Option<String>,
+    hover: Option<(f32, f32)>,
     find: Option<String>,
     shot: Option<String>,
 }
@@ -94,6 +97,12 @@ fn main() {
                 }
             }
             "--note" => script.note = args.next(),
+            "--hover" => {
+                let at = args.next().unwrap_or_default();
+                script.hover = at
+                    .split_once(',')
+                    .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)));
+            }
             "--find" => script.find = args.next(),
             "--shot" => script.shot = args.next(),
             _ => path = Some(arg),
@@ -104,7 +113,7 @@ fn main() {
     let bytes = std::fs::read(&path).expect("cannot read the file");
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(loft_ui::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
@@ -210,6 +219,17 @@ fn run(script: Script, preview: Entity<DocPreview>, window: &mut Window, cx: &mu
                 });
                 pause(250).await;
             }
+        }
+        if let Some((x, y)) = script.hover {
+            let _ = cx.update(|window, cx| {
+                let moved = PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(x), px(y)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                });
+                window.dispatch_event(moved, cx);
+            });
+            pause(250).await;
         }
         if let Some(query) = &script.find {
             let _ = cx.update(|window, cx| {

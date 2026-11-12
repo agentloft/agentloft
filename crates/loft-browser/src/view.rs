@@ -1206,7 +1206,7 @@ impl Render for BrowserView {
                 Button::new("loft-browser-annotate")
                     .cursor_pointer()
                     .small()
-                    .icon(IconName::MessageSquarePlus)
+                    .icon(crate::ANNOTATE_ICON)
                     .when(self.annotating, |b| b.primary())
                     .when(!self.annotating, |b| b.ghost())
                     .tooltip(if self.annotating {
@@ -1296,7 +1296,7 @@ impl Render for BrowserView {
                 .bg(primary.opacity(0.12))
                 .text_xs()
                 .child(
-                    Icon::new(IconName::MousePointerClick)
+                    Icon::new(crate::ANNOTATE_ICON)
                         .xsmall()
                         .text_color(primary),
                 )

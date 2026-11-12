@@ -3,25 +3,28 @@
 //! slides themselves (drawn by [`super::slides`]) with speaker notes, PDFs as
 //! their pages.
 //!
-//! Notes: with annotating on, a click on a shape, a cell or a spot on a page
-//! (in a Word document, a selection) asks for a note about it. The note gets
-//! a numbered pin here and is handed on as a [`DocEvent`] for the composer,
-//! which sends it to the agent with the next message.
+//! Notes, as in the browser panel: with annotating on, what is under the
+//! pointer lights up; a click on it (a shape, a cell, a line or a spot on a
+//! page) or a drag over an area (in a Word document, a selection) opens a
+//! note box next to it. The note gets a numbered pin here and is handed on
+//! as a [`DocEvent`] for the composer, which sends it to the agent with the
+//! next message.
 
-use crate::panel::slides::{self, Marks, PIN, Spot};
+use crate::panel::slides::{self, Marks, PIN, Pointer, Spot};
 use crate::spinner::Spinner;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, Bounds, ClickEvent, Context, CursorStyle, ElementId, Entity,
+    App, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, ElementId, Entity,
     EventEmitter, FontWeight, Image, ImageFormat, ImageSource, InteractiveElement as _,
-    IntoElement, ListHorizontalSizingBehavior, MouseButton, ParentElement as _, Pixels, Render,
-    RenderImage, ScrollHandle, SharedString, SharedUri, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, img,
-    prelude::FluentBuilder as _, px, relative, uniform_list,
+    IntoElement, KeyDownEvent, ListHorizontalSizingBehavior, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollHandle,
+    SharedString, SharedUri, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, canvas, div, img, point,
+    prelude::FluentBuilder as _, px, relative, size, uniform_list,
 };
 use loft_docs::pdf::PdfDoc;
 use loft_docs::{Cell, Document, EmbeddedImage, Sheet};
@@ -52,6 +55,16 @@ pub enum Place {
     Shape { slide: usize, shape: usize },
     /// A point on a slide, as fractions of its width and height.
     Slide { slide: usize, x: f32, y: f32 },
+    /// An area of a slide, as fractions of its width and height, and the
+    /// shapes in it.
+    SlideArea {
+        slide: usize,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        shapes: Vec<usize>,
+    },
     /// A cell: the sheet's position among the visible ones, row and column
     /// from 0.
     Cell {
@@ -59,10 +72,28 @@ pub enum Place {
         row: usize,
         col: usize,
     },
+    /// A block of cells, from `row`, `col` to `to_row`, `to_col`, both
+    /// counted in.
+    Cells {
+        sheet: usize,
+        row: usize,
+        col: usize,
+        to_row: usize,
+        to_col: usize,
+    },
     /// A passage of a Word document; the note's `what` quotes it.
     Text,
     /// A point on a PDF page (from 0), as fractions of its width and height.
     Page { page: usize, x: f32, y: f32 },
+    /// An area of a PDF page (a line of its text, or one dragged out), as
+    /// fractions of its width and height.
+    PageArea {
+        page: usize,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
 }
 
 /// A note left on a place in a document.
@@ -116,6 +147,8 @@ struct SlideView {
     notes: Option<String>,
     scene: Option<Arc<loft_docs::scene::Scene>>,
     md: Option<Entity<TextViewState>>,
+    /// Where the slide is on screen, once drawn with notes on.
+    bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// One PDF page: its picture once drawn, and where it is on screen.
@@ -206,14 +239,58 @@ fn occurrences(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+/// What a note is about.
+struct About {
+    place: Place,
+    /// For its chip in the composer: "Slide 3", "B4", "Page 2".
+    chip: String,
+    /// The line over the note box: "picture · Logo", "Area · 3 shapes".
+    label: String,
+    /// As part of a sentence, for the agent.
+    what: String,
+}
+
 /// A note being written.
 struct Draft {
-    place: Place,
-    chip: String,
-    what: String,
-    input: Entity<InputState>,
+    about: About,
+    /// What the note box sits next to, in the window.
+    anchor: Bounds<Pixels>,
+    input: Entity<TextareaState>,
     _sub: Subscription,
 }
+
+/// Something of a document the pointer picks things on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Surface {
+    /// A slide, by its position in the deck (from 0).
+    Slide(usize),
+    /// A PDF page (from 0).
+    Page(usize),
+}
+
+/// The button is down on a slide or a page: a click, or a drag over an area.
+struct Drag {
+    on: Surface,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    /// It has gone far enough to be a drag.
+    moved: bool,
+}
+
+/// The button is down on a sheet: the cells from `from` to `to` (row and
+/// column) are being picked.
+struct CellDrag {
+    sheet: usize,
+    from: (usize, usize),
+    to: (usize, usize),
+}
+
+/// How far the pointer goes with the button down before it is a drag.
+const DRAG_FROM: f32 = 6.;
+/// How wide the note box is, and how much room it wants under what it is
+/// about before it goes above instead.
+const NOTE_WIDTH: f32 = 290.;
+const NOTE_ROOM: f32 = 168.;
 
 pub struct DocPreview {
     state: State,
@@ -225,6 +302,15 @@ pub struct DocPreview {
     notes: Vec<DocNote>,
     next_n: u32,
     draft: Option<Draft>,
+    /// The shape or the line of text under the pointer.
+    hover: Option<(Surface, usize)>,
+    drag: Option<Drag>,
+    cell_drag: Option<CellDrag>,
+    /// Where the document's view is in the window.
+    view_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// Where the top left of a sheet's first row is in the window, scrolled
+    /// as it is.
+    grid_origin: Rc<std::cell::Cell<Option<Point<Pixels>>>>,
     /// Counts looks at PDF pages, to tell the ones not seen for longest.
     looks: u64,
     find: Option<Find>,
@@ -275,6 +361,11 @@ impl DocPreview {
             notes: Vec::new(),
             next_n: 1,
             draft: None,
+            hover: None,
+            drag: None,
+            cell_drag: None,
+            view_bounds: Rc::default(),
+            grid_origin: Rc::default(),
             looks: 0,
             find: None,
         }
@@ -298,6 +389,9 @@ impl DocPreview {
         self.annotating = on && self.can_annotate();
         if !self.annotating {
             self.draft = None;
+            self.hover = None;
+            self.drag = None;
+            self.cell_drag = None;
         }
         cx.notify();
     }
@@ -323,10 +417,28 @@ impl DocPreview {
         };
         let mut by_page: Vec<(usize, Vec<loft_docs::pdf::Pin>)> = Vec::new();
         for note in &self.notes {
-            let Place::Page { page, x, y } = note.place else {
-                continue;
+            let (page, pin) = match note.place {
+                Place::Page { page, x, y } => (
+                    page,
+                    loft_docs::pdf::Pin {
+                        x,
+                        y,
+                        n: note.n,
+                        area: None,
+                    },
+                ),
+                // The pin goes on the area's top right corner, as here.
+                Place::PageArea { page, x, y, w, h } => (
+                    page,
+                    loft_docs::pdf::Pin {
+                        x: x + w,
+                        y,
+                        n: note.n,
+                        area: Some([x, y, w, h]),
+                    },
+                ),
+                _ => continue,
             };
-            let pin = loft_docs::pdf::Pin { x, y, n: note.n };
             match by_page.iter_mut().find(|(p, _)| *p == page) {
                 Some((_, pins)) => pins.push(pin),
                 None => by_page.push((page, vec![pin])),
@@ -350,29 +462,33 @@ impl DocPreview {
         }))
     }
 
-    /// Opens the note field for `place`.
+    /// Opens the note box for `about`, next to `anchor` (in the window).
     fn begin_note(
         &mut self,
-        place: Place,
-        chip: String,
-        what: String,
+        about: About,
+        anchor: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.annotating {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Note for the agent…"));
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 8)
+                .submit_on_enter(true)
+                .placeholder("What should change here?")
+        });
         let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
                 this.commit_note(cx);
             }
         });
         input.update(cx, |i, cx| i.focus(window, cx));
+        self.hover = None;
         self.draft = Some(Draft {
-            place,
-            chip,
-            what,
+            about,
+            anchor,
             input,
             _sub: sub,
         });
@@ -389,27 +505,490 @@ impl DocPreview {
         self.commit_note(cx);
     }
 
-    /// The note being written is done: pin it and hand it on.
+    /// The note being written is done: pin it and hand it on. With nothing
+    /// written, there is no note.
     fn commit_note(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.draft.take() else {
             return;
         };
+        cx.notify();
         let text = draft.input.read(cx).value().trim().to_owned();
         if text.is_empty() {
-            self.draft = Some(draft);
             return;
         }
         let note = DocNote {
             n: self.next_n,
-            place: draft.place,
-            chip: draft.chip,
-            what: draft.what,
+            place: draft.about.place,
+            chip: draft.about.chip,
+            what: draft.about.what,
             note: text,
         };
         self.next_n += 1;
         self.notes.push(note.clone());
         cx.emit(DocEvent::Note(note));
+    }
+
+    /// Where a slide or a page was painted last.
+    fn surface(&self, on: Surface) -> Option<Bounds<Pixels>> {
+        match (&self.state, on) {
+            (State::Slides { slides, .. }, Surface::Slide(ix)) => slides.get(ix)?.bounds.get(),
+            (State::Pdf { pages, .. }, Surface::Page(ix)) => pages.get(ix)?.bounds.get(),
+            _ => None,
+        }
+    }
+
+    /// The boxes, in the window, of what can be picked on a slide (its
+    /// shapes) or a page (the lines of its text), in the order they are
+    /// drawn.
+    fn things(&self, on: Surface) -> Vec<Bounds<Pixels>> {
+        let Some(bounds) = self.surface(on) else {
+            return Vec::new();
+        };
+        let wide = f32::from(bounds.size.width);
+        let boxed = |x: f32, y: f32, w: f32, h: f32| Bounds {
+            origin: point(bounds.origin.x + px(x), bounds.origin.y + px(y)),
+            size: size(px(w), px(h)),
+        };
+        match (&self.state, on) {
+            (State::Slides { slides, size, .. }, Surface::Slide(ix)) => {
+                let scale = wide / size.0.max(1.);
+                slides
+                    .get(ix)
+                    .and_then(|s| s.scene.as_ref())
+                    .map(|scene| {
+                        scene
+                            .shapes
+                            .iter()
+                            .map(|shape| {
+                                let (x, y, w, h) = slides::hit_box(shape, scale);
+                                boxed(x, y, w, h)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            (State::Pdf { doc, pages }, Surface::Page(ix)) => {
+                let (Some(&(page_w, _)), Some(text)) = (
+                    doc.pages.get(ix),
+                    pages.get(ix).and_then(|slot| slot.text.as_ref()),
+                ) else {
+                    return Vec::new();
+                };
+                let scale = wide / page_w.max(1.);
+                text.spans
+                    .iter()
+                    .map(|s| boxed(s.x * scale, s.y * scale, s.w * scale, s.h * scale))
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The pointer did something on a slide or a page while notes can be
+    /// left.
+    fn pointer(&mut self, on: Surface, pointer: Pointer, cx: &mut Context<Self>) {
+        if !self.annotating {
+            return;
+        }
+        match pointer {
+            Pointer::Down(at) => {
+                // The press is for a note, not for selecting text.
+                gpui_kit::component::GlobalState::suppress_text_selection(cx);
+                self.draft = None;
+                self.hover = None;
+                self.drag = Some(Drag {
+                    on,
+                    from: at,
+                    to: at,
+                    moved: false,
+                });
+                cx.notify();
+            }
+            Pointer::Over(at) => {
+                // What a note is being written about stays the one lit.
+                if self.draft.is_some() || self.drag.is_some() {
+                    return;
+                }
+                // The one on top is the one drawn last.
+                let hover = self
+                    .things(on)
+                    .iter()
+                    .rposition(|b| b.contains(&at))
+                    .map(|ix| (on, ix));
+                if hover != self.hover {
+                    self.hover = hover;
+                    cx.notify();
+                }
+            }
+            Pointer::Out => {
+                if self.hover.take_if(|(over, _)| *over == on).is_some() {
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// The pointer moved with the button down.
+    fn drag_to(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        // On a sheet, the cells picked run to the one nearest the pointer,
+        // wherever it has gone.
+        if let (Some(drag), State::Sheets { sheets, .. }, Some(origin)) =
+            (&mut self.cell_drag, &self.state, self.grid_origin.get())
+            && let Some(sheet) = sheets.get(drag.sheet)
+        {
+            let rows = sheet.rows.len();
+            let cols = sheet.rows.first().map_or(0, Vec::len);
+            let nearest = |from: f32, each: f32, count: usize| {
+                ((from / each).floor().max(0.) as usize).min(count.saturating_sub(1))
+            };
+            let to = (
+                nearest(f32::from(at.y - origin.y), ROW_HEIGHT, rows),
+                nearest(f32::from(at.x - origin.x) - GUTTER, COL_WIDTH, cols),
+            );
+            if drag.to != to {
+                drag.to = to;
+                cx.notify();
+            }
+            return;
+        }
+        let Some(drag) = &mut self.drag else { return };
+        if !drag.moved {
+            let (dx, dy) = (f32::from(at.x - drag.from.x), f32::from(at.y - drag.from.y));
+            if dx.hypot(dy) < DRAG_FROM {
+                return;
+            }
+            drag.moved = true;
+        }
+        drag.to = at;
         cx.notify();
+    }
+
+    /// The button came up: what was clicked, or the area dragged over, gets
+    /// its note box.
+    fn release(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cells) = self.cell_drag.take() {
+            cx.notify();
+            self.note_cells(cells, at, window, cx);
+            return;
+        }
+        let Some(drag) = self.drag.take() else { return };
+        cx.notify();
+        let Some(bounds) = self.surface(drag.on) else {
+            return;
+        };
+        let things = self.things(drag.on);
+        if !drag.moved {
+            let hit = things.iter().rposition(|b| b.contains(&drag.from));
+            let [x, y, ..] = fractions(bounds, drag.from, drag.from);
+            let (about, anchor) = match hit {
+                Some(ix) => (self.about_thing(drag.on, ix), things[ix]),
+                // A point's pin stands on it, to its right.
+                None => (
+                    self.about_point(drag.on, x, y),
+                    Bounds {
+                        origin: point(drag.from.x, drag.from.y - px(PIN)),
+                        size: size(px(PIN), px(PIN)),
+                    },
+                ),
+            };
+            if let Some(about) = about {
+                self.begin_note(about, anchor, window, cx);
+            }
+            return;
+        }
+        let area = fractions(bounds, drag.from, drag.to);
+        let dragged = Bounds::from_corners(
+            point(drag.from.x.min(drag.to.x), drag.from.y.min(drag.to.y)),
+            point(drag.from.x.max(drag.to.x), drag.from.y.max(drag.to.y)),
+        )
+        .intersect(&bounds);
+        // A drag that left the slide or the page at once covers nothing.
+        if dragged.size.width < px(3.) || dragged.size.height < px(3.) {
+            return;
+        }
+        // What is mostly in the area is what the note is about: the drag
+        // need not cover a thing exactly.
+        let inside: Vec<usize> = things
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                let whole = f32::from(b.size.width) * f32::from(b.size.height);
+                let part = b.intersect(&dragged);
+                let part = f32::from(part.size.width).max(0.) * f32::from(part.size.height).max(0.);
+                whole > 0. && part / whole >= 0.6
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        if let Some(about) = self.about_area(drag.on, area, inside, dragged) {
+            self.begin_note(about, dragged, window, cx);
+        }
+    }
+
+    /// What a note on thing `ix` of a slide or a page (a shape, a line of
+    /// text) is about.
+    fn about_thing(&self, on: Surface, ix: usize) -> Option<About> {
+        match (&self.state, on) {
+            (State::Slides { slides, .. }, Surface::Slide(at)) => {
+                let slide = slides.get(at)?;
+                let shape = slide.scene.as_ref()?.shapes.get(ix)?;
+                let n = slide.index;
+                let text = shape.plain_text();
+                Some(About {
+                    place: Place::Shape {
+                        slide: n,
+                        shape: ix,
+                    },
+                    chip: format!("Slide {n}"),
+                    label: if text.is_empty() {
+                        shape_tag(shape)
+                    } else {
+                        format!("{} · {}", shape_kind(shape), clip(&text, 80))
+                    },
+                    what: format!("slide {n}, {}", shape_words(shape)),
+                })
+            }
+            (State::Pdf { doc, pages }, Surface::Page(page)) => {
+                let span = pages.get(page)?.text.as_ref()?.spans.get(ix)?;
+                let &(pw, ph) = doc.pages.get(page)?;
+                let n = page + 1;
+                Some(About {
+                    place: Place::PageArea {
+                        page,
+                        x: span.x / pw,
+                        y: span.y / ph,
+                        w: span.w / pw,
+                        h: span.h / ph,
+                    },
+                    chip: format!("Page {n}"),
+                    label: format!("text · {}", clip(&span.text, 80)),
+                    what: format!("page {n}, the text “{}”", clip(&span.text, 300)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// What a note on a point of a slide or a page is about.
+    fn about_point(&self, on: Surface, x: f32, y: f32) -> Option<About> {
+        let at = point_in_words(x, y);
+        match (&self.state, on) {
+            (State::Slides { slides, .. }, Surface::Slide(ix)) => {
+                let n = slides.get(ix)?.index;
+                Some(About {
+                    place: Place::Slide { slide: n, x, y },
+                    chip: format!("Slide {n}"),
+                    label: format!("Slide {n} · {at}"),
+                    what: format!("slide {n}, {at}"),
+                })
+            }
+            (State::Pdf { .. }, Surface::Page(page)) => {
+                let n = page + 1;
+                Some(About {
+                    place: Place::Page { page, x, y },
+                    chip: format!("Page {n}"),
+                    label: format!("Page {n} · {at}"),
+                    what: format!("page {n}, {at}"),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// What a note on an area of a slide or a page is about: `area` as
+    /// fractions (left, top, width, height), `inside` the things in it.
+    fn about_area(
+        &self,
+        on: Surface,
+        [x, y, w, h]: [f32; 4],
+        inside: Vec<usize>,
+        dragged: Bounds<Pixels>,
+    ) -> Option<About> {
+        let across = area_in_words(x, y, w, h);
+        let sized = format!(
+            "Area · {} × {}",
+            f32::from(dragged.size.width).round(),
+            f32::from(dragged.size.height).round()
+        );
+        match (&self.state, on) {
+            (State::Slides { slides, .. }, Surface::Slide(ix)) => {
+                let slide = slides.get(ix)?;
+                let n = slide.index;
+                // At most this many are named.
+                let shapes: Vec<usize> = inside.into_iter().take(8).collect();
+                let named: Vec<String> = shapes
+                    .iter()
+                    .filter_map(|&ix| slide.scene.as_ref()?.shapes.get(ix))
+                    .map(shape_words)
+                    .collect();
+                let mut what = format!("slide {n}, the area {across}");
+                if !named.is_empty() {
+                    what.push_str(&format!(", with {}", named.join("; ")));
+                }
+                Some(About {
+                    label: match shapes.len() {
+                        0 => sized,
+                        1 => "Area · 1 shape".to_owned(),
+                        n => format!("Area · {n} shapes"),
+                    },
+                    place: Place::SlideArea {
+                        slide: n,
+                        x,
+                        y,
+                        w,
+                        h,
+                        shapes,
+                    },
+                    chip: format!("Slide {n}"),
+                    what,
+                })
+            }
+            (State::Pdf { pages, .. }, Surface::Page(page)) => {
+                let n = page + 1;
+                let said: Vec<&str> = pages
+                    .get(page)
+                    .and_then(|slot| slot.text.as_ref())
+                    .map(|text| {
+                        inside
+                            .iter()
+                            .filter_map(|&ix| text.spans.get(ix))
+                            .map(|span| span.text.trim())
+                            .filter(|said| !said.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut what = format!("page {n}, the area {across}");
+                if !said.is_empty() {
+                    what.push_str(&format!(", with the text “{}”", clip(&said.join(" "), 300)));
+                }
+                Some(About {
+                    place: Place::PageArea { page, x, y, w, h },
+                    chip: format!("Page {n}"),
+                    label: match said.len() {
+                        0 => sized,
+                        1 => "Area · 1 line".to_owned(),
+                        n => format!("Area · {n} lines"),
+                    },
+                    what,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The button went down on a cell (row and column).
+    fn cell_press(&mut self, sheet: usize, cell: (usize, usize), cx: &mut Context<Self>) {
+        if !self.annotating {
+            return;
+        }
+        gpui_kit::component::GlobalState::suppress_text_selection(cx);
+        self.draft = None;
+        self.cell_drag = Some(CellDrag {
+            sheet,
+            from: cell,
+            to: cell,
+        });
+        cx.notify();
+    }
+
+    /// The cells picked get their note box; the button came up at `at`.
+    fn note_cells(
+        &mut self,
+        picked: CellDrag,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let State::Sheets { sheets, .. } = &self.state else {
+            return;
+        };
+        let Some(sheet) = sheets.get(picked.sheet) else {
+            return;
+        };
+        let (row, to_row) = (
+            picked.from.0.min(picked.to.0),
+            picked.from.0.max(picked.to.0),
+        );
+        let (col, to_col) = (
+            picked.from.1.min(picked.to.1),
+            picked.from.1.max(picked.to.1),
+        );
+        let value = |r: usize, c: usize| {
+            sheet
+                .rows
+                .get(r)
+                .and_then(|cells| cells.get(c))
+                .map(cell_text)
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+        };
+        let name = &sheet.name;
+        let first = format!("{}{}", column_name(col), row + 1);
+        let about = if (row, col) == (to_row, to_col) {
+            let said = value(row, col);
+            About {
+                place: Place::Cell {
+                    sheet: picked.sheet,
+                    row,
+                    col,
+                },
+                label: match &said {
+                    Some(said) => format!("{first} · {}", clip(said, 80)),
+                    None => format!("{first} · empty"),
+                },
+                what: match &said {
+                    Some(said) => {
+                        format!("cell {first} on sheet “{name}” (“{}”)", clip(said, 80))
+                    }
+                    None => format!("cell {first} on sheet “{name}” (empty)"),
+                },
+                chip: first,
+            }
+        } else {
+            let range = format!("{first}:{}{}", column_name(to_col), to_row + 1);
+            let count = (to_row - row + 1) * (to_col - col + 1);
+            // The first few cells that say something, to tell the block by.
+            let said: Vec<String> = (row..=to_row)
+                .flat_map(|r| (col..=to_col).map(move |c| (r, c)))
+                .filter_map(|(r, c)| value(r, c))
+                .take(6)
+                .map(|said| format!("“{}”", clip(&said, 40)))
+                .collect();
+            let mut what = format!("cells {range} on sheet “{name}”");
+            if said.is_empty() {
+                what.push_str(" (empty)");
+            } else {
+                what.push_str(&format!(" (starting {})", said.join(", ")));
+            }
+            About {
+                place: Place::Cells {
+                    sheet: picked.sheet,
+                    row,
+                    col,
+                    to_row,
+                    to_col,
+                },
+                label: format!("{range} · {count} cells"),
+                what,
+                chip: range,
+            }
+        };
+        let anchor = match self.grid_origin.get() {
+            Some(origin) => Bounds {
+                origin: point(
+                    origin.x + px(GUTTER + col as f32 * COL_WIDTH),
+                    origin.y + px(row as f32 * ROW_HEIGHT),
+                ),
+                size: size(
+                    px((to_col - col + 1) as f32 * COL_WIDTH),
+                    px((to_row - row + 1) as f32 * ROW_HEIGHT),
+                ),
+            },
+            None => Bounds {
+                origin: at,
+                size: size(px(0.), px(0.)),
+            },
+        };
+        self.begin_note(about, anchor, window, cx);
     }
 
     /// Whether the document can be searched (a PDF can).
@@ -795,6 +1374,7 @@ impl DocPreview {
                             notes: s.notes.filter(|n| !n.trim().is_empty()),
                             scene: s.scene.map(Arc::new),
                             md,
+                            bounds: Rc::default(),
                         }
                     })
                     .collect();
@@ -811,174 +1391,107 @@ impl DocPreview {
         }
     }
 
-    /// Pins, the cell a note is being written on and what a click does, for
-    /// row `row` of sheet `sheet`; `None` when the row has none of them.
+    /// Pins, the cells picked or noted and what the pointer does, for row
+    /// `row` of sheet `sheet`; `None` when the row has none of them.
     fn row_marks(
         &self,
         sheet: usize,
         row: usize,
-        sheet_name: &str,
-        cells: &[String],
         view: &WeakEntity<Self>,
         p: &Palette,
     ) -> Option<RowMarks> {
-        let here = |place: &Place| match place {
-            Place::Cell {
-                sheet: s,
-                row: r,
-                col,
-            } if *s == sheet && *r == row => Some(*col),
-            _ => None,
+        // The columns of a place's cells in this row, and whether the row is
+        // its first.
+        let here = |place: &Place| {
+            let (rows, cols) = match *place {
+                Place::Cell {
+                    sheet: s,
+                    row: r,
+                    col,
+                } if s == sheet => ((r, r), (col, col)),
+                Place::Cells {
+                    sheet: s,
+                    row: r,
+                    col,
+                    to_row,
+                    to_col,
+                } if s == sheet => ((r, to_row), (col, to_col)),
+                _ => return None,
+            };
+            (rows.0..=rows.1)
+                .contains(&row)
+                .then_some((cols, rows.0 == row))
         };
-        let pins: Vec<(usize, u32)> = self
+        let noted: Vec<((usize, usize), bool, u32)> = self
             .notes
             .iter()
-            .filter_map(|n| Some((here(&n.place)?, n.n)))
+            .filter_map(|n| here(&n.place).map(|(cols, first)| (cols, first, n.n)))
             .collect();
-        let active = self.draft.as_ref().and_then(|d| here(&d.place));
-        if !self.annotating && pins.is_empty() {
+        let active = match &self.cell_drag {
+            Some(drag) if drag.sheet == sheet => {
+                let rows = drag.from.0.min(drag.to.0)..=drag.from.0.max(drag.to.0);
+                rows.contains(&row)
+                    .then_some((drag.from.1.min(drag.to.1), drag.from.1.max(drag.to.1)))
+            }
+            Some(_) => None,
+            None => self
+                .draft
+                .as_ref()
+                .and_then(|d| here(&d.about.place))
+                .map(|(cols, _)| cols),
+        };
+        if !self.annotating && noted.is_empty() {
             return None;
         }
-        let pick = self.annotating.then(|| {
+        let on = self.annotating.then(|| {
             let view = view.clone();
-            let sheet_name = sheet_name.to_owned();
-            let cells = cells.to_vec();
-            Rc::new(move |col: usize, window: &mut Window, cx: &mut App| {
-                let at = format!("{}{}", column_name(col), row + 1);
-                let mut what = format!("cell {at} on sheet “{sheet_name}”");
-                match cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty()) {
-                    Some(value) => what.push_str(&format!(" (“{}”)", clip(value, 80))),
-                    None => what.push_str(" (empty)"),
-                }
-                let place = Place::Cell { sheet, row, col };
-                let _ = view.update(cx, |this, cx| this.begin_note(place, at, what, window, cx));
-            }) as PickCell
+            Rc::new(move |col: usize, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.cell_press(sheet, (row, col), cx));
+            }) as OnCell
         });
         Some(RowMarks {
             row,
-            pins,
+            // The pin is on the last cell of a block's first row.
+            pins: noted
+                .iter()
+                .filter(|(_, first, _)| *first)
+                .map(|((_, to), _, n)| (*to, *n))
+                .collect(),
+            noted: noted.iter().map(|(cols, ..)| *cols).collect(),
             active,
-            pick,
+            on,
+            origin: self.grid_origin.clone(),
             accent: p.accent,
             on_accent: p.accent_foreground,
         })
     }
 
-    /// What a click on a slide is a note about.
-    fn slide_place(slide: &SlideView, spot: Spot) -> (Place, String, String) {
-        use loft_docs::scene::ShapeKind;
-        let n = slide.index;
-        let chip = format!("Slide {n}");
-        match spot {
-            Spot::Shape(ix) => {
-                let shape = slide.scene.as_ref().and_then(|s| s.shapes.get(ix));
-                let mut what = format!("slide {n}");
-                if let Some(shape) = shape {
-                    let kind = match &shape.kind {
-                        ShapeKind::Picture(_) => "picture".to_owned(),
-                        ShapeKind::Table(_) => "table".to_owned(),
-                        ShapeKind::Drawing(d) => d.what.clone(),
-                        ShapeKind::Unsupported(what) => what.to_lowercase(),
-                        ShapeKind::Shape => "shape".to_owned(),
-                    };
-                    what.push_str(&format!(", the {kind}"));
-                    if !shape.name.trim().is_empty() {
-                        what.push_str(&format!(" “{}”", shape.name.trim()));
-                    }
-                    let text = shape.plain_text();
-                    if !text.is_empty() {
-                        what.push_str(&format!(" (“{}”)", clip(&text, 80)));
-                    } else if let Some(alt) = &shape.description {
-                        what.push_str(&format!(" (described as “{}”)", clip(alt, 80)));
-                    }
-                }
-                (
-                    Place::Shape {
-                        slide: n,
-                        shape: ix,
-                    },
-                    chip,
-                    what,
-                )
-            }
-            Spot::At(x, y) => (
-                Place::Slide { slide: n, x, y },
-                chip,
-                format!("slide {n}, {}", point_in_words(x, y)),
-            ),
-        }
-    }
-
-    /// The bar under the document while notes are being left: the note field,
-    /// or what to click.
+    /// The bar over the document while notes are being left: what to do, and
+    /// the way out.
     fn note_bar(&self, p: &Palette, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         if !self.annotating {
             return None;
         }
-        let bar = h_flex()
-            .flex_none()
-            .w_full()
-            .min_h(px(40.))
-            .px_3()
-            .py_1p5()
-            .gap_2()
-            .items_center()
-            .border_t_1()
-            .border_color(p.border)
-            .bg(p.accent.opacity(0.06))
-            .text_xs();
-        let button = |id: &'static str, label: &'static str, strong: bool| {
-            div()
-                .id(id)
-                .flex_none()
-                .px_2()
-                .py(px(3.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(strong, |d| {
-                    d.bg(p.accent)
-                        .text_color(p.accent_foreground)
-                        .font_weight(FontWeight::MEDIUM)
-                        .hover(|d| d.opacity(0.9))
-                })
-                .when(!strong, |d| {
-                    d.text_color(p.muted_foreground)
-                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                })
-                .child(label)
+        let how = match &self.state {
+            State::Slides { .. } => "Click a shape or drag over an area to leave a note.",
+            State::Sheets { .. } => "Click a cell or drag over several to leave a note.",
+            State::Word { .. } => "Select some text to leave a note on it.",
+            _ => "Click a line or a spot, or drag over an area, to leave a note.",
         };
-        let bar = match &self.draft {
-            Some(draft) => bar
-                .child(slides::pin(Some(self.next_n), p.accent, p.accent_foreground))
+        Some(
+            h_flex()
+                .flex_none()
+                .w_full()
+                .px_3()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(p.border)
+                .bg(p.accent.opacity(0.12))
+                .text_xs()
                 .child(
-                    div()
-                        .flex_none()
-                        .max_w(px(160.))
-                        .truncate()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(draft.chip.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Input::new(&draft.input).appearance(false).small()),
-                )
-                .child(
-                    button("note-add", "Add note", true)
-                        .on_click(cx.listener(|this, _, _, cx| this.commit_note(cx))),
-                )
-                .child(
-                    button("note-cancel", "Cancel", false).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.draft = None;
-                            cx.notify();
-                        },
-                    )),
-                ),
-            None => bar
-                .child(
-                    Icon::new(IconName::MessageSquarePlus)
+                    Icon::new(loft_browser::ANNOTATE_ICON)
                         .xsmall()
                         .text_color(p.accent),
                 )
@@ -986,23 +1499,117 @@ impl DocPreview {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .text_color(p.muted_foreground)
-                        .child(match &self.state {
-                            State::Slides { .. } => {
-                                "Click a shape, or anywhere on a slide, to leave a note for the agent"
-                            }
-                            State::Sheets { .. } => "Click a cell to leave a note for the agent",
-                            State::Word { .. } => "Select some text to leave a note on it",
-                            _ => "Click a spot on a page to leave a note for the agent",
-                        }),
+                        .child(format!("{how} Notes wait in the composer until you send.")),
                 )
                 .child(
-                    button("note-done", "Done", false)
+                    div()
+                        .id("note-done")
+                        .flex_none()
+                        .px_2()
+                        .py(px(3.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_color(p.muted_foreground)
+                        .hover(|d| d.bg(p.hover).text_color(p.foreground))
+                        .child("Done")
                         .on_click(cx.listener(|this, _, _, cx| this.set_annotating(false, cx))),
-                ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The box a note is written in, next to what it is about: under it
+    /// where there is room, else over it.
+    fn note_box(&self, p: &Palette, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let draft = self.draft.as_ref()?;
+        let view = self.view_bounds.get()?;
+        let (wide, tall) = (f32::from(view.size.width), f32::from(view.size.height));
+        let about = draft.anchor;
+        let left = f32::from(about.left() - view.left());
+        let top = f32::from(about.top() - view.top());
+        let bottom = f32::from(about.bottom() - view.top());
+        let x = left.clamp(8., (wide - NOTE_WIDTH - 8.).max(8.));
+        let card = div()
+            .id("doc-note")
+            .absolute()
+            .left(px(x))
+            .w(px(NOTE_WIDTH.min((wide - 16.).max(120.))));
+        let card = if bottom + NOTE_ROOM < tall {
+            card.top(px(bottom.max(0.) + 8.))
+        } else if top - NOTE_ROOM > 0. {
+            card.bottom(px(tall - top + 8.))
+        } else {
+            card.top(px(8.))
         };
-        Some(bar.into_any_element())
+        Some(
+            card
+                // What is under the box gets no pointer: a click in it is
+                // not a click on the document.
+                .occlude()
+                .p(px(10.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(p.border)
+                .bg(p.elevated)
+                .shadow_lg()
+                .text_size(px(13.))
+                // (The field would otherwise keep the key to itself.)
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.draft = None;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .mx(px(2.))
+                        .mb(px(6.))
+                        .truncate()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.accent)
+                        .child(draft.about.label.clone()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(p.border)
+                        .bg(p.background)
+                        .child(Textarea::new(&draft.input).appearance(false).small()),
+                )
+                .child(
+                    h_flex()
+                        .mt(px(8.))
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(p.faint_foreground)
+                                .child("⏎ add · esc cancel"),
+                        )
+                        .child(
+                            div()
+                                .id("note-add")
+                                .flex_none()
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .bg(p.accent)
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(p.accent_foreground)
+                                .hover(|d| d.opacity(0.9))
+                                .child("Add note")
+                                .on_click(cx.listener(|this, _, _, cx| this.commit_note(cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_sheets(&self, p: &Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -1098,14 +1705,12 @@ impl DocPreview {
                                     };
                                     let active = *active;
                                     let view = cx.entity().downgrade();
-                                    let name = sheet.name.clone();
                                     range
                                         .filter_map(|r| sheet.rows.get(r).map(|row| (r, row)))
                                         .map(|(r, row)| {
                                             let cells: Vec<String> =
                                                 row.iter().map(cell_text).collect();
-                                            let marks =
-                                                this.row_marks(active, r, &name, &cells, &view, &p);
+                                            let marks = this.row_marks(active, r, &view, &p);
                                             grid_row(Some(r + 1), cells, &p, false, marks)
                                         })
                                         .collect::<Vec<_>>()
@@ -1177,18 +1782,22 @@ fn cell_text(c: &Cell) -> String {
     }
 }
 
-/// What a click on a cell does while notes can be left: called with the
+/// What a press on a cell does while notes can be left: called with the
 /// cell's column.
-type PickCell = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+type OnCell = Rc<dyn Fn(usize, &mut App)>;
 
 /// Notes on one row of a sheet.
 struct RowMarks {
     row: usize,
     /// Column and pin number.
     pins: Vec<(usize, u32)>,
-    /// The column of the cell a note is being written on.
-    active: Option<usize>,
-    pick: Option<PickCell>,
+    /// The columns, first and last, of the noted blocks that cross the row.
+    noted: Vec<(usize, usize)>,
+    /// The columns of the cells being picked, or written about.
+    active: Option<(usize, usize)>,
+    on: Option<OnCell>,
+    /// Told where the grid is: see `DocPreview::grid_origin`.
+    origin: Rc<std::cell::Cell<Option<Point<Pixels>>>>,
     accent: gpui_kit::Hsla,
     on_accent: gpui_kit::Hsla,
 }
@@ -1222,6 +1831,23 @@ fn grid_row(
                 .text_color(p.faint_foreground)
                 .child(number.map(|n| n.to_string()).unwrap_or_default()),
         );
+    // While notes can be left, the row tells where the grid is, for placing
+    // the note box next to the cells picked.
+    if let Some(marks) = marks.as_ref().filter(|m| m.on.is_some()) {
+        let (origin, above) = (marks.origin.clone(), marks.row as f32 * ROW_HEIGHT);
+        row = row.relative().child(
+            canvas(
+                move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                    origin.set(Some(point(bounds.origin.x, bounds.origin.y - px(above))));
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_0(),
+        );
+    }
     for (col, text) in cells.into_iter().enumerate() {
         let numeric = !header && text.parse::<f64>().is_ok();
         let cell = div()
@@ -1243,11 +1869,15 @@ fn grid_row(
             continue;
         };
         let accent = marks.accent;
+        let within = |(from, to): &(usize, usize)| (*from..=*to).contains(&col);
         let pin = marks.pins.iter().find(|(c, _)| *c == col).map(|(_, n)| *n);
         let cell = cell
             .relative()
-            .when(marks.active == Some(col), |d| {
-                d.bg(accent.opacity(0.14)).border_1().border_color(accent)
+            .when(marks.noted.iter().any(within), |d| {
+                d.bg(accent.opacity(0.08))
+            })
+            .when(marks.active.as_ref().is_some_and(within), |d| {
+                d.bg(accent.opacity(0.18))
             })
             // On the side the cell's own text is not: numbers sit right.
             .when_some(pin, |d, n| {
@@ -1260,22 +1890,85 @@ fn grid_row(
                     pin.right(px(3.))
                 })
             });
-        row = match &marks.pick {
-            Some(pick) => {
-                let pick = pick.clone();
+        row = match &marks.on {
+            Some(on) => {
+                let on = on.clone();
                 // Rows share a parent: the id has to tell their cells apart.
                 let id = ElementId::NamedInteger("cell".into(), (marks.row * 256 + col) as u64);
                 row.child(
                     cell.id(id)
                         .cursor(CursorStyle::Crosshair)
-                        .hover(|d| d.bg(accent.opacity(0.1)))
-                        .on_click(move |_, window, cx| pick(col, window, cx)),
+                        .hover(|d| d.bg(accent.opacity(0.12)))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| on(col, cx)),
                 )
             }
             None => row.child(cell),
         };
     }
     row.into_any_element()
+}
+
+/// What kind of thing a shape is, in a word or two.
+fn shape_kind(shape: &loft_docs::scene::Shape) -> String {
+    use loft_docs::scene::ShapeKind;
+    match &shape.kind {
+        ShapeKind::Picture(_) => "picture".to_owned(),
+        ShapeKind::Table(_) => "table".to_owned(),
+        ShapeKind::Drawing(d) => d.what.clone(),
+        ShapeKind::Unsupported(what) => what.to_lowercase(),
+        ShapeKind::Shape => "shape".to_owned(),
+    }
+}
+
+/// A shape's label while the pointer is on it: its kind and its name.
+fn shape_tag(shape: &loft_docs::scene::Shape) -> String {
+    let (kind, name) = (shape_kind(shape), shape.name.trim());
+    if name.is_empty() {
+        kind
+    } else {
+        format!("{kind} · {}", clip(name, 40))
+    }
+}
+
+/// A shape as part of a sentence: "the picture “Logo” (“…”)".
+fn shape_words(shape: &loft_docs::scene::Shape) -> String {
+    let mut what = format!("the {}", shape_kind(shape));
+    if !shape.name.trim().is_empty() {
+        what.push_str(&format!(" “{}”", shape.name.trim()));
+    }
+    let text = shape.plain_text();
+    if !text.is_empty() {
+        what.push_str(&format!(" (“{}”)", clip(&text, 80)));
+    } else if let Some(alt) = &shape.description {
+        what.push_str(&format!(" (described as “{}”)", clip(alt, 80)));
+    }
+    what
+}
+
+/// The rectangle between two places in the window, cut to `within`, as
+/// fractions of it: left, top, width, height.
+fn fractions(within: Bounds<Pixels>, a: Point<Pixels>, b: Point<Pixels>) -> [f32; 4] {
+    let (w, h) = (
+        f32::from(within.size.width).max(1.),
+        f32::from(within.size.height).max(1.),
+    );
+    let fx = |x: Pixels| (f32::from(x - within.origin.x) / w).clamp(0., 1.);
+    let fy = |y: Pixels| (f32::from(y - within.origin.y) / h).clamp(0., 1.);
+    let (x0, x1) = (fx(a.x.min(b.x)), fx(a.x.max(b.x)));
+    let (y0, y1) = (fy(a.y.min(b.y)), fy(a.y.max(b.y)));
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// An area given as fractions, the way one would say it.
+fn area_in_words(x: f32, y: f32, w: f32, h: f32) -> String {
+    let pc = |f: f32| (f * 100.).round() as i32;
+    format!(
+        "from {}% across and {}% down to {}% across and {}% down",
+        pc(x),
+        pc(y),
+        pc(x + w),
+        pc(y + h)
+    )
 }
 
 /// `text` cut to `max` characters, with an ellipsis when something was cut.
@@ -1335,14 +2028,24 @@ impl Render for DocPreview {
                 .when(annotating, |d| {
                     d.on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
                             let quote = gpui_kit::base::TextSelection::selected_text(window, cx);
                             let quote = quote.trim();
                             if quote.is_empty() {
                                 return;
                             }
-                            let what = format!("the text “{}”", clip(quote, 300));
-                            this.begin_note(Place::Text, clip(quote, 24), what, window, cx);
+                            let about = About {
+                                place: Place::Text,
+                                chip: clip(quote, 24),
+                                label: format!("text · {}", clip(quote, 80)),
+                                what: format!("the text “{}”", clip(quote, 300)),
+                            };
+                            // Under the line the selection ended on.
+                            let anchor = Bounds {
+                                origin: point(event.position.x, event.position.y - px(10.)),
+                                size: size(px(0.), px(22.)),
+                            };
+                            this.begin_note(about, anchor, window, cx);
                         }),
                     )
                 })
@@ -1376,6 +2079,9 @@ impl Render for DocPreview {
                     let spot = |place: &Place| match *place {
                         Place::Shape { slide, shape } if slide == n => Some(Spot::Shape(shape)),
                         Place::Slide { slide, x, y } if slide == n => Some(Spot::At(x, y)),
+                        Place::SlideArea {
+                            slide, x, y, w, h, ..
+                        } if slide == n => Some(Spot::Area { x, y, w, h }),
                         _ => None,
                     };
                     let pins: Vec<(u32, Spot)> = self
@@ -1383,26 +2089,40 @@ impl Render for DocPreview {
                         .iter()
                         .filter_map(|note| Some((note.n, spot(&note.place)?)))
                         .collect();
+                    let on = Surface::Slide(ix);
+                    let about = self.draft.as_ref().map(|d| &d.about.place);
                     let marks = (annotating || !pins.is_empty()).then(|| Marks {
                         accent: p.accent,
                         on_accent: p.accent_foreground,
                         pins,
-                        active: self.draft.as_ref().and_then(|d| spot(&d.place)),
-                        pick: annotating.then(|| {
+                        active: about.and_then(spot),
+                        picked: match about {
+                            Some(Place::SlideArea { slide, shapes, .. }) if *slide == n => {
+                                shapes.clone()
+                            }
+                            _ => Vec::new(),
+                        },
+                        hover: self
+                            .hover
+                            .filter(|(over, _)| *over == on)
+                            .and_then(|(_, shape)| {
+                                let shape = slide.scene.as_ref()?.shapes.get(shape)?;
+                                Some((self.hover?.1, shape_tag(shape).into()))
+                            }),
+                        marquee: self
+                            .drag
+                            .as_ref()
+                            .filter(|drag| drag.on == on && drag.moved)
+                            .and_then(|drag| {
+                                Some(fractions(slide.bounds.get()?, drag.from, drag.to))
+                            }),
+                        on: annotating.then(|| {
                             let view = view.clone();
-                            Rc::new(move |spot: Spot, window: &mut Window, cx: &mut App| {
-                                let _ = view.update(cx, |this, cx| {
-                                    let State::Slides { slides, .. } = &this.state else {
-                                        return;
-                                    };
-                                    let Some(slide) = slides.get(ix) else {
-                                        return;
-                                    };
-                                    let (place, chip, what) = Self::slide_place(slide, spot);
-                                    this.begin_note(place, chip, what, window, cx);
-                                });
-                            }) as slides::Pick
+                            Rc::new(move |pointer: Pointer, _: &mut Window, cx: &mut App| {
+                                let _ = view.update(cx, |this, cx| this.pointer(on, pointer, cx));
+                            }) as slides::OnPointer
                         }),
+                        bounds: slide.bounds.clone(),
                     });
                     let card = match (&slide.scene, &slide.md) {
                         // A slide is a rectangle: no rounded corners to cut into it.
@@ -1503,17 +2223,20 @@ impl Render for DocPreview {
                     .top_0()
                     .left_0()
                     .size_full();
+                    let on = Surface::Page(ix);
+                    // A place on this page: its point, or its area.
                     let here = |place: &Place| match *place {
-                        Place::Page { page, x, y } if page == ix => Some((x, y)),
+                        Place::Page { page, x, y } if page == ix => Some((x, y, None)),
+                        Place::PageArea { page, x, y, w, h } if page == ix => {
+                            Some((x, y, Some((w, h))))
+                        }
                         _ => None,
                     };
-                    let at = |(x, y): (f32, f32), n: Option<u32>| {
-                        slides::pin(n, p.accent, p.accent_foreground)
-                            .absolute()
-                            .left(relative(x))
+                    let boxed = |d: gpui_kit::Div, [x, y, w, h]: [f32; 4]| {
+                        d.left(relative(x))
                             .top(relative(y))
-                            .ml(px(-PIN / 2.))
-                            .mt(px(-PIN / 2.))
+                            .w(relative(w))
+                            .h(relative(h))
                     };
                     let mut page = div()
                         .id(("pdf-page", ix))
@@ -1528,13 +2251,78 @@ impl Render for DocPreview {
                             d.child(img(image.clone()).absolute().top_0().left_0().size_full())
                         })
                         .child(sensor);
+                    // What a note is about, outlined, with its pin on the top
+                    // right corner; a point has only the pin, its tip on it.
                     for note in &self.notes {
-                        if let Some(spot) = here(&note.place) {
-                            page = page.child(at(spot, Some(note.n)));
+                        let pin = slides::pin(Some(note.n), p.accent, p.accent_foreground);
+                        match here(&note.place) {
+                            Some((x, y, Some((w, h)))) => {
+                                page = page
+                                    .child(boxed(slides::mark(p.accent), [x, y, w, h]))
+                                    .child(
+                                        pin.absolute()
+                                            .left(relative(x + w))
+                                            .top(relative(y))
+                                            .ml(px(-PIN / 2.))
+                                            .mt(px(-PIN / 2.)),
+                                    );
+                            }
+                            Some((x, y, None)) => {
+                                page = page.child(
+                                    pin.absolute()
+                                        .left(relative(x))
+                                        .top(relative(y))
+                                        .mt(px(-PIN)),
+                                );
+                            }
+                            None => {}
                         }
                     }
-                    if let Some(spot) = self.draft.as_ref().and_then(|d| here(&d.place)) {
-                        page = page.child(at(spot, None));
+                    match self.draft.as_ref().and_then(|d| here(&d.about.place)) {
+                        Some((x, y, Some((w, h)))) => {
+                            page = page.child(boxed(slides::marquee(p.accent), [x, y, w, h]));
+                        }
+                        Some((x, y, None)) => {
+                            page = page.child(
+                                slides::pin(None, p.accent, p.accent_foreground)
+                                    .absolute()
+                                    .left(relative(x))
+                                    .top(relative(y))
+                                    .ml(px(-PIN / 2.))
+                                    .mt(px(-PIN / 2.)),
+                            );
+                        }
+                        None => {}
+                    }
+                    // The line of text under the pointer, lit and labelled.
+                    if let Some((_, line)) = self.hover.filter(|(over, _)| *over == on)
+                        && let Some(span) = slot.text.as_ref().and_then(|t| t.spans.get(line))
+                    {
+                        let (x, y) = (span.x / pw, span.y / ph);
+                        page = page
+                            .child(boxed(
+                                div()
+                                    .absolute()
+                                    .rounded(px(4.))
+                                    .border_2()
+                                    .border_color(p.accent)
+                                    .bg(p.accent.opacity(0.12)),
+                                [x, y, span.w / pw, span.h / ph],
+                            ))
+                            .child(
+                                slides::tag("text".into(), p.accent, p.accent_foreground)
+                                    .left(relative(x))
+                                    .top(relative(y))
+                                    .mt(px(-slides::TAG)),
+                            );
+                    }
+                    if let Some(drag) = self.drag.as_ref().filter(|d| d.on == on && d.moved)
+                        && let Some(bounds) = slot.bounds.get()
+                    {
+                        page = page.child(boxed(
+                            slides::marquee(p.accent),
+                            fractions(bounds, drag.from, drag.to),
+                        ));
                     }
                     // Over the picture: the page's words, unseen, where they
                     // are drawn, so they can be selected, copied and found;
@@ -1628,29 +2416,28 @@ impl Render for DocPreview {
                         }
                     }
                     if annotating {
-                        let bounds_cell = slot.bounds.clone();
-                        page = page.cursor(CursorStyle::Crosshair).on_click(cx.listener(
-                            move |this, event: &ClickEvent, window, cx| {
-                                let Some(bounds) = bounds_cell.get() else {
-                                    return;
-                                };
-                                let pos = event.position();
-                                let (w, h) = (
-                                    f32::from(bounds.size.width).max(1.),
-                                    f32::from(bounds.size.height).max(1.),
-                                );
-                                let x = (f32::from(pos.x - bounds.origin.x) / w).clamp(0., 1.);
-                                let y = (f32::from(pos.y - bounds.origin.y) / h).clamp(0., 1.);
-                                let n = ix + 1;
-                                this.begin_note(
-                                    Place::Page { page: ix, x, y },
-                                    format!("Page {n}"),
-                                    format!("page {n}, {}", point_in_words(x, y)),
-                                    window,
-                                    cx,
-                                );
-                            },
-                        ));
+                        let pointer = |view: &WeakEntity<Self>| {
+                            let view = view.clone();
+                            move |pointer: Pointer, cx: &mut App| {
+                                let _ = view.update(cx, |this, cx| this.pointer(on, pointer, cx));
+                            }
+                        };
+                        let (down, over, out) = (pointer(&view), pointer(&view), pointer(&view));
+                        page = page
+                            .cursor(CursorStyle::Crosshair)
+                            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                                down(Pointer::Down(event.position), cx)
+                            })
+                            .on_mouse_move(move |event, _, cx| {
+                                if event.pressed_button.is_none() {
+                                    over(Pointer::Over(event.position), cx)
+                                }
+                            })
+                            .on_hover(move |hovered, _, cx| {
+                                if !*hovered {
+                                    out(Pointer::Out, cx)
+                                }
+                            });
                     }
                     list = list.child(
                         v_flex()
@@ -1681,17 +2468,53 @@ impl Render for DocPreview {
                     .into_any_element()
             }
         };
+        // Tells where the view is, for placing the note box; and, while
+        // notes can be left, follows a drag wherever the pointer goes and
+        // sees the button come up.
+        let sensor = canvas(
+            {
+                let seen = self.view_bounds.clone();
+                move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| seen.set(Some(bounds))
+            },
+            {
+                let view = view.clone();
+                move |_, _, window: &mut Window, _: &mut App| {
+                    if !annotating {
+                        return;
+                    }
+                    let moved = view.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture
+                            && event.pressed_button == Some(MouseButton::Left)
+                        {
+                            let _ = moved.update(cx, |this, cx| this.drag_to(event.position, cx));
+                        }
+                    });
+                    let released = view.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                            let _ = released
+                                .update(cx, |this, cx| this.release(event.position, window, cx));
+                        }
+                    });
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
         v_flex()
             .size_full()
             .children(self.find_bar(&p, cx))
+            .children(self.note_bar(&p, cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .child(div().absolute().inset_0().child(body)),
+                    .child(sensor)
+                    .child(div().absolute().inset_0().child(body))
+                    .children(self.note_box(&p, cx)),
             )
-            .children(self.note_bar(&p, cx))
     }
 }
 
@@ -1728,6 +2551,25 @@ mod tests {
         for r in occurrences(odd, "istanbul") {
             assert_eq!(&odd[r], "istanbul");
         }
+    }
+
+    #[test]
+    fn a_drag_is_an_area_of_what_it_is_on() {
+        use super::{area_in_words, fractions};
+        use gpui_kit::{Bounds, point, px, size};
+        let slide = Bounds {
+            origin: point(px(100.), px(50.)),
+            size: size(px(400.), px(200.)),
+        };
+        // Whichever way it was dragged, and cut to the slide.
+        let area = fractions(slide, point(px(300.), px(150.)), point(px(200.), px(100.)));
+        assert_eq!(area, [0.25, 0.25, 0.25, 0.25]);
+        let off = fractions(slide, point(px(0.), px(0.)), point(px(900.), px(150.)));
+        assert_eq!(off, [0., 0., 1., 0.5]);
+        assert_eq!(
+            area_in_words(0.25, 0.25, 0.25, 0.25),
+            "from 25% across and 25% down to 50% across and 50% down"
+        );
     }
 
     #[test]

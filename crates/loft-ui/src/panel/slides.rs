@@ -5,7 +5,6 @@
 //! point) turns them into pixels, so a slide looks the same at any width. A
 //! slide that is scrolled out of view builds nothing.
 
-use crate::press::ClaimsPress as _;
 use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_kit::{
     AnyElement, App, Bounds, BoxShadow, CursorStyle, Div, Element, ElementId, Font, FontStyle,
@@ -275,28 +274,49 @@ fn hsla(c: Color) -> Hsla {
     .into()
 }
 
-/// A place on a slide: one of its shapes (by position in the scene), or a
-/// point given as fractions of the slide's width and height.
+/// A place on a slide: one of its shapes (by position in the scene), a point
+/// or an area, given as fractions of the slide's width and height.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Spot {
     Shape(usize),
     At(f32, f32),
+    Area { x: f32, y: f32, w: f32, h: f32 },
 }
 
-/// What is drawn over a slide for notes: numbered pins, the place a note is
-/// being written about, and, while notes can be left, what a click does.
+/// What the pointer does on something notes can be left on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Pointer {
+    /// The button went down here (a place in the window).
+    Down(Point<Pixels>),
+    /// It moved to here with no button held.
+    Over(Point<Pixels>),
+    /// It left.
+    Out,
+}
+
+/// Told what the pointer does while notes can be left.
+pub type OnPointer = Rc<dyn Fn(Pointer, &mut Window, &mut App)>;
+
+/// What is drawn over a slide for notes: numbered pins with what they are
+/// about outlined, the place a note is being written about, the shape under
+/// the pointer and an area being dragged out.
 #[derive(Clone)]
 pub struct Marks {
     pub accent: Hsla,
     pub on_accent: Hsla,
     pub pins: Vec<(u32, Spot)>,
     pub active: Option<Spot>,
-    /// Called with the shape clicked, or the point when none was.
-    pub pick: Option<Pick>,
+    /// The shapes in the area a note is being written about.
+    pub picked: Vec<usize>,
+    /// The shape under the pointer and what to call it.
+    pub hover: Option<(usize, SharedString)>,
+    /// An area being dragged out, as fractions: left, top, width, height.
+    pub marquee: Option<[f32; 4]>,
+    /// While notes can be left: told what the pointer does on the slide.
+    pub on: Option<OnPointer>,
+    /// Where the slide was painted last, for whoever handles the pointer.
+    pub bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
-
-/// What a click on a slide does while notes can be left.
-pub type Pick = Rc<dyn Fn(Spot, &mut Window, &mut App)>;
 
 /// The slide, as wide as its parent and as tall as its proportions make it.
 ///
@@ -315,6 +335,9 @@ pub fn slide(
                 return None;
             }
             let scale = f32::from(bounds.size.width) / sw;
+            if let Some(marks) = &marks {
+                marks.bounds.set(Some(bounds));
+            }
             let fonts = Fonts {
                 text: window.text_system().clone(),
                 default: window.text_style().font_family.clone(),
@@ -324,7 +347,7 @@ pub fn slide(
             };
             let mut root = draw(&scene, (sw, sh), scale, &images, &fonts);
             if let Some(marks) = &marks {
-                root = root.child(marks_el(&scene, (sw, sh), scale, bounds.origin, marks));
+                root = root.child(marks_el(&scene, (sw, sh), scale, marks));
             }
             // Under an id of the slide's own: the ids inside (pieces of
             // text, shapes to click) repeat from slide to slide.
@@ -391,7 +414,7 @@ fn draw(scene: &Scene, (sw, sh): (f32, f32), scale: f32, images: &Images, fonts:
 
 /// A shape's box in pixels, grown to something a pointer can hit when it is a
 /// line or a sliver.
-fn hit_box(shape: &Shape, scale: f32) -> (f32, f32, f32, f32) {
+pub(crate) fn hit_box(shape: &Shape, scale: f32) -> (f32, f32, f32, f32) {
     const MIN: f32 = 10.;
     let (mut x, mut y) = (shape.x * scale, shape.y * scale);
     let (mut w, mut h) = (shape.w * scale, shape.h * scale);
@@ -406,14 +429,9 @@ fn hit_box(shape: &Shape, scale: f32) -> (f32, f32, f32, f32) {
     (x, y, w, h)
 }
 
-/// The layer over a slide's shapes that takes clicks for notes and shows pins.
-fn marks_el(
-    scene: &Scene,
-    (sw, sh): (f32, f32),
-    scale: f32,
-    origin: Point<Pixels>,
-    marks: &Marks,
-) -> AnyElement {
+/// The layer over a slide's shapes that takes the pointer for notes and shows
+/// them.
+fn marks_el(scene: &Scene, (sw, sh): (f32, f32), scale: f32, marks: &Marks) -> AnyElement {
     let (w, h) = (sw * scale, sh * scale);
     let accent = marks.accent;
     let mut layer = div()
@@ -423,85 +441,109 @@ fn marks_el(
         .left_0()
         .w(px(w))
         .h(px(h));
-    if let Some(pick) = &marks.pick {
-        let on_slide = pick.clone();
+    if let Some(on) = &marks.on {
+        let (down, over, out) = (on.clone(), on.clone(), on.clone());
         layer = layer
             .cursor(CursorStyle::Crosshair)
-            .on_click(move |event, window, cx| {
-                let at = event.position();
-                let fx = (f32::from(at.x - origin.x) / w).clamp(0., 1.);
-                let fy = (f32::from(at.y - origin.y) / h).clamp(0., 1.);
-                on_slide(Spot::At(fx, fy), window, cx);
+            .on_mouse_down(gpui_kit::MouseButton::Left, move |event, window, cx| {
+                down(Pointer::Down(event.position), window, cx)
+            })
+            .on_mouse_move(move |event, window, cx| {
+                if event.pressed_button.is_none() {
+                    over(Pointer::Over(event.position), window, cx)
+                }
+            })
+            .on_hover(move |hovered, window, cx| {
+                if !*hovered {
+                    out(Pointer::Out, window, cx)
+                }
             });
-        for (ix, shape) in scene.shapes.iter().enumerate() {
-            let (x, y, bw, bh) = hit_box(shape, scale);
-            let on_shape = pick.clone();
+    }
+    let boxed = |ix: usize| scene.shapes.get(ix).map(|s| hit_box(s, scale));
+    let area = |x: f32, y: f32, aw: f32, ah: f32| (x * w, y * h, aw * w, ah * h);
+    // What a note is about, outlined, with its pin on the top right corner;
+    // a point has only the pin, its tip on the point.
+    for (n, spot) in &marks.pins {
+        let rect = match *spot {
+            Spot::Shape(ix) => boxed(ix),
+            Spot::Area { x, y, w: aw, h: ah } => Some(area(x, y, aw, ah)),
+            Spot::At(fx, fy) => {
+                let at = (fx * w + PIN / 2., fy * h - PIN / 2.);
+                layer = layer.child(pin_el(Some(*n), at, (w, h), marks));
+                None
+            }
+        };
+        if let Some((x, y, bw, bh)) = rect {
+            layer = layer
+                .child(mark(accent).left(px(x)).top(px(y)).w(px(bw)).h(px(bh)))
+                .child(pin_el(Some(*n), (x + bw, y), (w, h), marks));
+        }
+    }
+    for &ix in &marks.picked {
+        if let Some((x, y, bw, bh)) = boxed(ix) {
             layer = layer.child(
                 div()
-                    .id(("shape", ix))
                     .absolute()
                     .left(px(x))
                     .top(px(y))
                     .w(px(bw))
                     .h(px(bh))
-                    // Only the shape on top lights up, not the ones under it;
-                    // the wheel still scrolls the deck.
-                    .block_mouse_except_scroll()
-                    .cursor(CursorStyle::Crosshair)
-                    .hover(|d| d.border_2().border_color(accent).bg(accent.opacity(0.1)))
-                    .claims_press()
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        on_shape(Spot::Shape(ix), window, cx);
-                    }),
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(accent.opacity(0.67))
+                    .bg(accent.opacity(0.06)),
             );
         }
     }
-    // Where a spot's pin goes, in pixels: just outside a shape's top left
-    // corner, so it does not sit on the first letters; or on the point.
-    let place = |spot: Spot| -> Option<(f32, f32)> {
-        match spot {
-            Spot::Shape(ix) => scene.shapes.get(ix).map(|s| {
-                let (x, y, _, _) = hit_box(s, scale);
-                (x - PIN * 0.3, y - PIN * 0.3)
-            }),
-            Spot::At(fx, fy) => Some((fx * w, fy * h)),
-        }
+    let lit = |x: f32, y: f32, bw: f32, bh: f32| {
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(bw))
+            .h(px(bh))
+            .rounded(px(4.))
+            .border_2()
+            .border_color(accent)
+            .bg(accent.opacity(0.12))
     };
-    if let Some(Spot::Shape(ix)) = marks.active
-        && let Some(shape) = scene.shapes.get(ix)
+    match marks.active {
+        Some(Spot::Shape(ix)) => {
+            if let Some((x, y, bw, bh)) = boxed(ix) {
+                layer = layer.child(lit(x, y, bw, bh));
+            }
+        }
+        Some(Spot::Area { x, y, w: aw, h: ah }) => {
+            let (x, y, bw, bh) = area(x, y, aw, ah);
+            layer = layer.child(marquee(accent).left(px(x)).top(px(y)).w(px(bw)).h(px(bh)));
+        }
+        Some(Spot::At(fx, fy)) => {
+            layer = layer.child(pin_el(None, (fx * w, fy * h), (w, h), marks));
+        }
+        None => {}
+    }
+    if let Some((ix, name)) = &marks.hover
+        && let Some((x, y, bw, bh)) = boxed(*ix)
     {
-        let (x, y, bw, bh) = hit_box(shape, scale);
-        layer = layer.child(
-            div()
-                .absolute()
-                .left(px(x))
-                .top(px(y))
-                .w(px(bw))
-                .h(px(bh))
-                .border_2()
-                .border_color(accent)
-                .bg(accent.opacity(0.12)),
+        layer = layer.child(lit(x, y, bw, bh)).child(
+            tag(name.clone(), accent, marks.on_accent)
+                .left(px(x.clamp(0., (w - 40.).max(0.))))
+                .top(px((y - TAG).max(0.))),
         );
     }
-    if let Some(Spot::At(..)) = marks.active
-        && let Some((x, y)) = marks.active.and_then(place)
-    {
-        layer = layer.child(pin_el(None, (x, y), (w, h), marks));
-    }
-    for (n, spot) in &marks.pins {
-        if let Some(at) = place(*spot) {
-            layer = layer.child(pin_el(Some(*n), at, (w, h), marks));
-        }
+    if let Some([x, y, aw, ah]) = marks.marquee {
+        let (x, y, bw, bh) = area(x, y, aw, ah);
+        layer = layer.child(marquee(accent).left(px(x)).top(px(y)).w(px(bw)).h(px(bh)));
     }
     layer.into_any_element()
 }
 
 /// The size of a pin, in pixels.
 pub const PIN: f32 = 20.;
+/// How tall the label over what the pointer is on is.
+pub const TAG: f32 = 20.;
 
-/// A numbered pin centred on `at`, kept inside a `within`-sized area; without
-/// a number, the dot that shows where a note being written will go.
+/// A pin centred on `at`, kept inside a `within`-sized area.
 fn pin_el(n: Option<u32>, at: (f32, f32), within: (f32, f32), marks: &Marks) -> Div {
     let x = (at.0 - PIN / 2.).clamp(0., (within.0 - PIN).max(0.));
     let y = (at.1 - PIN / 2.).clamp(0., (within.1 - PIN).max(0.));
@@ -511,14 +553,17 @@ fn pin_el(n: Option<u32>, at: (f32, f32), within: (f32, f32), marks: &Marks) -> 
         .top(px(y))
 }
 
-/// A pin's disc, for any document: the caller places it.
+/// A pin, for any document: the caller places it. With a number, the drop
+/// that marks a note (its tip at the bottom left); without, the dot that
+/// shows where a note being written will go.
 pub fn pin(n: Option<u32>, accent: Hsla, on_accent: Hsla) -> Div {
     div()
         .flex_none()
         .size(px(PIN))
         .rounded(px(PIN / 2.))
+        .when(n.is_some(), |d| d.rounded_bl(px(2.)))
         .bg(accent)
-        .border_2()
+        .border_1()
         .border_color(on_accent)
         .shadow_md()
         .flex()
@@ -529,6 +574,39 @@ pub fn pin(n: Option<u32>, accent: Hsla, on_accent: Hsla) -> Div {
         .font_weight(FontWeight::BOLD)
         .text_color(on_accent)
         .when_some(n, |d, n| d.child(n.to_string()))
+}
+
+/// The dashed outline around what a note is about: the caller places it.
+pub fn mark(accent: Hsla) -> Div {
+    div()
+        .absolute()
+        .rounded(px(5.))
+        .border_1()
+        .border_dashed()
+        .border_color(accent)
+}
+
+/// The area being dragged out: the caller places it.
+pub fn marquee(accent: Hsla) -> Div {
+    mark(accent).rounded(px(6.)).bg(accent.opacity(0.08))
+}
+
+/// The label over what the pointer is on: the caller places it.
+pub fn tag(name: SharedString, accent: Hsla, on_accent: Hsla) -> Div {
+    div()
+        .absolute()
+        .h(px(TAG - 2.))
+        .px(px(6.))
+        .rounded(px(4.))
+        .bg(accent)
+        .flex()
+        .items_center()
+        .whitespace_nowrap()
+        .text_size(px(11.))
+        .line_height(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(on_accent)
+        .child(name)
 }
 
 /// A gradient through more than two colours, over a `w` × `h` box: the

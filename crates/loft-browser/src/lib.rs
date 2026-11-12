@@ -71,6 +71,11 @@ mod snapshot;
 mod surface;
 mod view;
 
+/// The icon for leaving notes on things for the agent, here and wherever
+/// else the app offers it (documents in the viewer).
+pub const ANNOTATE_ICON: gpui_kit::assets::IconName =
+    gpui_kit::assets::IconName::SquareDashedMousePointer;
+
 pub use address::{DEFAULT_SEARCH_TEMPLATE, normalize_address, search_url};
 pub use command::{BrowserCommand, BrowserError, EVAL_TIMEOUT, NAVIGATION_TIMEOUT, SCRIPT_TIMEOUT};
 pub use host::{Corners, HostEvent, HostPicture, HostSurface, ViewHost, without_band};

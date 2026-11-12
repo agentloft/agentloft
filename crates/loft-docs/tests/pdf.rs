@@ -101,14 +101,32 @@ fn a_page_picture_carries_its_pins() {
         x: 0.5,
         y: 0.5,
         n: 12,
+        area: None,
     }];
     let png = doc.render_marked_png(0, 600, &pins).expect("a picture");
     assert!(png.starts_with(b"\x89PNG"));
     let plain = doc.render_marked_png(0, 600, &[]).expect("a picture");
     assert_ne!(png, plain, "the pin is drawn");
     // A pin off the page's edge is clipped, not a panic.
-    let edge = [loft_docs::pdf::Pin { x: 1., y: 0., n: 3 }];
+    let edge = [loft_docs::pdf::Pin {
+        x: 1.,
+        y: 0.,
+        n: 3,
+        area: None,
+    }];
     assert!(doc.render_marked_png(0, 600, &edge).is_ok());
+    // An area is outlined as well; one that runs off the page is clipped.
+    let area = [loft_docs::pdf::Pin {
+        area: Some([0.2, 0.2, 0.3, 0.4]),
+        ..pins[0]
+    }];
+    let outlined = doc.render_marked_png(0, 600, &area).expect("a picture");
+    assert_ne!(outlined, png, "the area is outlined");
+    let off = [loft_docs::pdf::Pin {
+        area: Some([0.8, -0.5, 0.9, 2.]),
+        ..pins[0]
+    }];
+    assert!(doc.render_marked_png(0, 600, &off).is_ok());
 }
 
 #[test]

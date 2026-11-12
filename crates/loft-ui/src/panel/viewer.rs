@@ -665,11 +665,11 @@ impl Render for FileViewer {
                     d.child(
                         header_icon(
                             "annotate",
-                            IconName::MessageSquarePlus,
+                            loft_browser::ANNOTATE_ICON,
                             if on {
                                 "Stop annotating"
                             } else {
-                                "Annotate: leave notes on this document for the agent"
+                                "Annotate: click something or drag over an area to leave notes for the agent"
                             },
                             &p,
                         )

@@ -73,7 +73,7 @@ gpui_kit::assets::icon_assets!(
         House,
         Loader,
         Minus,
-        MousePointerClick,
+        SquareDashedMousePointer,
         MessageSquare,
         MessageSquareDashed,
         TextQuote,

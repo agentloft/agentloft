@@ -306,6 +306,9 @@ pub struct Pin {
     pub x: f32,
     pub y: f32,
     pub n: u32,
+    /// The area the mark is about, outlined: left, top, width and height as
+    /// fractions of the page's. The mark itself still goes at `x`, `y`.
+    pub area: Option<[f32; 4]>,
 }
 
 impl PdfDoc {
@@ -455,6 +458,14 @@ impl PdfDoc {
         let radius = (pw as f32 / 60.).clamp(9., 22.);
         let buf = pixmap.data_as_u8_slice_mut();
         for pin in pins {
+            if let Some([x, y, w, h]) = pin.area {
+                let (x0, y0) = (x.clamp(0., 1.) * pw as f32, y.clamp(0., 1.) * ph as f32);
+                let x1 = (x + w).clamp(0., 1.) * pw as f32;
+                let y1 = (y + h).clamp(0., 1.) * ph as f32;
+                draw_outline(buf, (pw, ph), (x0, y0, x1, y1), (radius * 0.22).max(2.));
+            }
+        }
+        for pin in pins {
             let cx = pin.x.clamp(0., 1.) * pw as f32;
             let cy = pin.y.clamp(0., 1.) * ph as f32;
             draw_pin(buf, (pw, ph), (cx, cy), radius, pin.n);
@@ -479,6 +490,32 @@ const DIGITS: [[u8; 5]; 10] = [
     [0b111, 0b101, 0b111, 0b101, 0b111],
     [0b111, 0b101, 0b111, 0b001, 0b111],
 ];
+
+/// A rectangle's outline `thick` pixels wide in the pin's colour, onto opaque
+/// RGBA.
+fn draw_outline(
+    buf: &mut [u8],
+    (w, h): (usize, usize),
+    (x0, y0, x1, y1): (f32, f32, f32, f32),
+    thick: f32,
+) {
+    let t = thick.round().max(1.) as i64;
+    let (x0, y0) = (x0.round() as i64, y0.round() as i64);
+    let (x1, y1) = (x1.round() as i64, y1.round() as i64);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let on_edge = x < x0 + t || x > x1 - t || y < y0 + t || y > y1 - t;
+            if !on_edge || x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                continue;
+            }
+            let i = (y as usize * w + x as usize) * 4;
+            if let Some(px) = buf.get_mut(i..i + 4) {
+                px[..3].copy_from_slice(&PIN);
+                px[3] = 255;
+            }
+        }
+    }
+}
 
 /// A filled disc with a white rim and the number in white, onto opaque RGBA.
 fn draw_pin(buf: &mut [u8], (w, h): (usize, usize), (cx, cy): (f32, f32), r: f32, n: u32) {
