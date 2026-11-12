@@ -3,6 +3,7 @@
 //! so one moves between the dock and the side panel without restarting.
 
 use super::{Open, PanelEvent, WorkbenchPanel, focus_terminal, terminal_title};
+use crate::press::ClaimsPress as _;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
@@ -214,6 +215,7 @@ impl WorkbenchPanel {
                             })
                             .hover(|d| d.bg(p.border))
                             .child(Icon::new(IconName::X).xsmall())
+                            .claims_press()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close_docked(&cid, ix, cx);

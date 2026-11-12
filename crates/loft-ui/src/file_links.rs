@@ -3,6 +3,7 @@
 //! this machine becomes one (`open /some/file` stays code), so there is
 //! nothing to guess from how the text looks.
 
+use crate::press::ClaimsPress as _;
 use crate::theme::Palette;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::text::{
@@ -161,6 +162,10 @@ impl MarkdownPlugin for FileLinks {
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                 })
+                // The press is the link's, not the start of a text selection
+                // in the message around it (which would otherwise keep
+                // following the pointer after the click opened the file).
+                .claims_press()
                 .on_click(move |_, window, cx| {
                     let store = crate::windows::store_of(window, cx);
                     match (store, &thread) {

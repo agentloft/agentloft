@@ -11,6 +11,7 @@
 //! only when the player has a new frame, and a paused player is let go of
 //! after a while (its last frame stays as the picture).
 
+use crate::press::ClaimsPress as _;
 use gpui_kit::{AnyElement, App, SharedString, Window};
 use std::path::{Path, PathBuf};
 
@@ -694,6 +695,7 @@ mod imp {
                 // A press here is the button's, not the start of a selection
                 // in the text around the video.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .claims_press()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     on_click(this, cx);

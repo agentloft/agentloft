@@ -2,6 +2,7 @@
 //! no project (a chat), a pinned or any other project — or add a project
 //! (new, local folder, git URL, GitHub) and start there.
 
+use crate::press::ClaimsPress as _;
 use crate::theme::Palette;
 use crate::workspace::WorkspaceView;
 use gpui_kit::assets::IconName;
@@ -582,6 +583,7 @@ fn render_row(row: &Row, toggle_pin: PinFn, cx: &App) -> AnyElement {
                     .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation()
                     })
+                    .claims_press()
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         toggle_pin(id.clone(), window, cx);

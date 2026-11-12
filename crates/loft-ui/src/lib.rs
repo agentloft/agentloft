@@ -27,6 +27,7 @@ mod new_in;
 mod palette;
 pub mod panel;
 mod plan_limits;
+mod press;
 mod project_icon;
 pub mod settings;
 mod shell_highlight;

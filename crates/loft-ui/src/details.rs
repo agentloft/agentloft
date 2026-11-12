@@ -6,6 +6,7 @@
 //! only (a browser tab).
 
 use crate::panel::Tab;
+use crate::press::ClaimsPress as _;
 use crate::store::AppStore;
 use crate::theme::Palette;
 use crate::workspace::WorkspaceView;
@@ -657,6 +658,7 @@ impl Render for DetailsCard {
                                         .text_color(p.muted_foreground)
                                         .hover(|d| d.bg(p.border).text_color(p.foreground))
                                         .child(Icon::new(IconName::ChevronDown).xsmall())
+                                        .claims_press()
                                         .on_click(move |_, window, cx| {
                                             cx.stop_propagation();
                                             let Some(at) = anchor.get() else {
@@ -913,6 +915,7 @@ impl Render for DetailsCard {
                                         )
                                         .build(window, cx)
                                     })
+                                    .claims_press()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         let (t, i) = (this.thread_id.clone(), stop_id.clone());

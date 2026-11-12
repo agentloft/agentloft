@@ -12,6 +12,7 @@ pub mod slides;
 pub mod terminal;
 pub mod viewer;
 
+use crate::press::ClaimsPress as _;
 use crate::spinner::Spinner;
 use crate::store::{AppStore, ThreadState};
 use crate::theme::Palette;
@@ -1115,6 +1116,7 @@ impl Render for WorkbenchPanel {
                                     })
                                     .build(window, cx)
                                 })
+                                .claims_press()
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     view.update(cx, |b, cx| b.set_muted(!muted, cx));
@@ -1133,6 +1135,7 @@ impl Render for WorkbenchPanel {
                             })
                             .hover(|d| d.bg(p.border))
                             .child(Icon::new(IconName::X).xsmall())
+                            .claims_press()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close(&cid, ix, cx);

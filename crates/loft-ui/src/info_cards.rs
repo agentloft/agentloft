@@ -2,6 +2,7 @@
 //! Claude (`get_context_usage`, `get_usage`), `/status` from Codex
 //! (account, limits, usage history and the thread's tokens).
 
+use crate::press::ClaimsPress as _;
 use crate::spinner::Spinner;
 use crate::store::{AppStore, CardState, InfoCard, ThreadState};
 use crate::theme::Palette;
@@ -1363,6 +1364,7 @@ pub(crate) fn render(
                                     p,
                                 )
                                 .when(copied, |d| d.text_color(p.success))
+                                .claims_press()
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
@@ -1379,6 +1381,7 @@ pub(crate) fn render(
                                 "Refresh",
                                 p,
                             )
+                            .claims_press()
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
                                 let client = store_reload.read(cx).client();
@@ -1387,6 +1390,7 @@ pub(crate) fn render(
                         )
                         .child(
                             icon_button(format!("card-close-{ix}"), IconName::X, "Dismiss", p)
+                                .claims_press()
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     t_close.update(cx, |t, cx| t.remove_card(ix, cx));

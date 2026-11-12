@@ -3,6 +3,7 @@
 //! controls (accent, contrast, sizes, fonts).
 
 use super::{ACCENTS, Field, SettingsView, row, segmented, text_input};
+use crate::press::ClaimsPress as _;
 use crate::spinner::Spinner;
 use crate::theme::{self, Palette};
 use crate::themes::{self, Swatch, Theme, ThemeFile};
@@ -716,6 +717,7 @@ impl SettingsView {
                     .gap_0p5()
                     .child(
                         icon_action(&format!("edit-{id}"), IconName::SquarePen, "Edit", p)
+                            .claims_press()
                             .on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _, window, cx| {
@@ -727,6 +729,7 @@ impl SettingsView {
                     )
                     .child(
                         icon_action(&format!("delete-{id}"), IconName::Trash, "Delete", p)
+                            .claims_press()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.delete_theme(&id, cx);
@@ -740,6 +743,7 @@ impl SettingsView {
                     "Make a copy to edit",
                     p,
                 )
+                .claims_press()
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.fork_theme(&theme, window, cx);

@@ -3,6 +3,7 @@
 //! the agent receives them natively (Claude image blocks, Codex
 //! `localImage`).
 
+use crate::press::ClaimsPress as _;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex};
@@ -161,6 +162,7 @@ pub fn strip(
                         .text_color(gpui_kit::white())
                         .cursor_pointer()
                         .child(Icon::new(IconName::X).xsmall())
+                        .claims_press()
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             on_remove(ix, window, cx)

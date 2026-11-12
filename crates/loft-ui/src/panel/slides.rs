@@ -5,6 +5,7 @@
 //! point) turns them into pixels, so a slide looks the same at any width. A
 //! slide that is scrolled out of view builds nothing.
 
+use crate::press::ClaimsPress as _;
 use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_kit::{
     AnyElement, App, Bounds, BoxShadow, CursorStyle, Div, Element, ElementId, Font, FontStyle,
@@ -448,6 +449,7 @@ fn marks_el(
                     .block_mouse_except_scroll()
                     .cursor(CursorStyle::Crosshair)
                     .hover(|d| d.border_2().border_color(accent).bg(accent.opacity(0.1)))
+                    .claims_press()
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         on_shape(Spot::Shape(ix), window, cx);

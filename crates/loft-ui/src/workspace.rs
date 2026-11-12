@@ -4,6 +4,7 @@
 
 use crate::items::render_row;
 use crate::panel::{Tab, WorkbenchPanel};
+use crate::press::ClaimsPress as _;
 use crate::spinner::Spinner;
 use crate::store::{AppStore, ConnState, StoreEvent, ThreadState};
 use crate::theme::{self, Palette, relative_time};
@@ -595,7 +596,8 @@ impl WorkspaceView {
             }
             Some(("click", spec)) => {
                 self.panel_open = false;
-                // Several, one after another: `x,y,after_ms;x,y,after_ms`.
+                // Several, one after another: `x,y,after_ms;x,y,after_ms`; a step
+                // `move x,y,after_ms` only moves the pointer.
                 for click in spec.split(';') {
                     dev_click(click.to_owned(), window, cx);
                 }
@@ -1434,12 +1436,14 @@ impl WorkspaceView {
                     note.note.clone(),
                     describe_note(note),
                 )
-                .child(remove(format!("note-remove-{ix}")).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.remove_note(&tid, ix, cx);
-                    },
-                ))),
+                .child(
+                    remove(format!("note-remove-{ix}"))
+                        .claims_press()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remove_note(&tid, ix, cx);
+                        })),
+                ),
             );
         }
         for (ix, (path, note)) in doc_notes.iter().enumerate() {
@@ -1453,12 +1457,14 @@ impl WorkspaceView {
                     note.note.clone(),
                     format!("{file}: {}", note.what),
                 )
-                .child(remove(format!("doc-note-remove-{ix}")).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.remove_doc_note(&tid, ix, cx);
-                    }),
-                )),
+                .child(
+                    remove(format!("doc-note-remove-{ix}"))
+                        .claims_press()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remove_doc_note(&tid, ix, cx);
+                        })),
+                ),
             );
         }
         Some(row.into_any_element())
@@ -2308,6 +2314,7 @@ impl WorkspaceView {
                                 .text_color(p.muted_foreground)
                                 .hover(|d| d.bg(p.selected).text_color(p.foreground))
                                 .child(Icon::new(IconName::X).xsmall())
+                                .claims_press()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     if let Some(list) = this.pasted.get_mut(&tid)
@@ -2903,6 +2910,7 @@ impl WorkspaceView {
                     })
                     .hover(|d| d.bg(p.hover).text_color(p.foreground))
                     .child(Icon::new(IconName::X).xsmall())
+                    .claims_press()
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         let id = id.clone();
@@ -3274,7 +3282,8 @@ impl WorkspaceView {
     }
 
     /// A run of sidebar rows. With `older` (the group's key), threads idle
-    /// for over 12 hours fold under an "Older" row at the end.
+    /// for over 12 hours fold under an "Older" row, returned apart so the
+    /// caller can place it (the flat list keeps it at the bottom).
     fn render_rows(
         &mut self,
         rows: Vec<Nested<'_>>,
@@ -3283,7 +3292,7 @@ impl WorkspaceView {
         drawn: &mut Vec<ThreadId>,
         p: &Palette,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::Div {
+    ) -> (gpui_kit::Div, Option<gpui_kit::Div>) {
         let (recent, old) = match &older {
             Some(_) => split_older(rows, &self.store.read(cx).unread, now_ms()),
             None => (rows, Vec::new()),
@@ -3293,7 +3302,7 @@ impl WorkspaceView {
             list = list.child(self.sidebar_row(row, subtitle, drawn, p, cx));
         }
         let Some(key) = older.filter(|_| !old.is_empty()) else {
-            return list;
+            return (list, None);
         };
         let open = self.show_older.contains(&key);
         let count = old.iter().filter(|r| r.depth == 0).count();
@@ -3301,7 +3310,7 @@ impl WorkspaceView {
             "older-{}",
             key.as_ref().map_or("threads", |k| k.as_str())
         ));
-        list = list.child(
+        let mut folded = v_flex().gap_px().child(
             h_flex()
                 .id(toggle_id)
                 .gap_1p5()
@@ -3334,10 +3343,10 @@ impl WorkspaceView {
         );
         if open {
             for row in &old {
-                list = list.child(self.sidebar_row(row, subtitle, drawn, p, cx));
+                folded = folded.child(self.sidebar_row(row, subtitle, drawn, p, cx));
             }
         }
-        list
+        (list, Some(folded))
     }
 
     /// One thread's sidebar row.
@@ -3415,6 +3424,9 @@ impl WorkspaceView {
             .retain(|id| all_threads.iter().any(|t| &t.id == id));
         let mut drawn: Vec<ThreadId> = Vec::new();
         let mut list = v_flex().gap_4().px_2().pb_4();
+        // Kept at the foot of the list, however short it is: the flat
+        // list's "Older" row and the archived threads.
+        let mut foot = v_flex().gap_px().px_2().pb_2();
         // Chats (threads without a project) come first.
         let chats: Vec<ProjectId> = {
             let store = self.store.read(cx);
@@ -3486,7 +3498,7 @@ impl WorkspaceView {
             .collect();
         if !pinned.is_empty() {
             let rows = nest_forks(pinned, &folded_threads);
-            let rows = self.render_rows(rows, None, &subtitle, &mut drawn, p, cx);
+            let (rows, _) = self.render_rows(rows, None, &subtitle, &mut drawn, p, cx);
             list = list.child(
                 v_flex()
                     .gap_1()
@@ -3526,14 +3538,16 @@ impl WorkspaceView {
                 })
                 .collect();
             let rows = nest_forks(threads, &folded_threads);
-            list = list.child(self.render_rows(
+            let (rows, older) = self.render_rows(
                 rows,
                 query.is_empty().then_some(None),
                 &subtitle,
                 &mut drawn,
                 p,
                 cx,
-            ));
+            );
+            list = list.child(rows);
+            foot = foot.children(older);
         }
 
         for project in projects.iter().filter(|_| !flat) {
@@ -3570,7 +3584,7 @@ impl WorkspaceView {
             );
             let mut rows = v_flex().gap_px();
             if !folded {
-                rows = self.render_rows(
+                let (recent, older) = self.render_rows(
                     nest_forks(threads, &folded_threads),
                     query.is_empty().then(|| Some(project.id.clone())),
                     &|_| None,
@@ -3578,6 +3592,7 @@ impl WorkspaceView {
                     p,
                     cx,
                 );
+                rows = recent.children(older);
             }
             list = list.child(v_flex().gap_1().child(header).child(rows));
         }
@@ -3600,17 +3615,19 @@ impl WorkspaceView {
         if !archived.is_empty() {
             let open = self.show_archived;
             let mut section = v_flex().gap_px().child(
+                // Styled like the "Older" row above it.
                 h_flex()
                     .id("archived-toggle")
-                    .gap_2()
+                    .gap_1p5()
                     .items_center()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(6.))
+                    .pl(px(12.))
+                    .pr_2()
+                    .py(px(5.))
+                    .rounded(px(7.))
                     .cursor_pointer()
                     .text_xs()
-                    .text_color(p.muted_foreground)
-                    .hover(|d| d.bg(p.hover))
+                    .text_color(p.faint_foreground)
+                    .hover(|d| d.bg(p.hover).text_color(p.muted_foreground))
                     .child(Icon::new(IconName::Archive).xsmall())
                     .child(format!("Archived ({})", archived.len()))
                     .child(div().flex_1())
@@ -3657,7 +3674,7 @@ impl WorkspaceView {
                     );
                 }
             }
-            list = list.child(section);
+            foot = foot.child(section);
         }
 
         let (dot, status): (_, SharedString) = match &conn {
@@ -3780,12 +3797,15 @@ impl WorkspaceView {
                     ),
             )
             .child(
-                div()
+                v_flex()
                     .id("sidebar-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(list),
+                    .child(list.flex_shrink_0())
+                    // Pushes the foot down when the list is short.
+                    .child(div().flex_1())
+                    .child(foot.flex_shrink_0()),
             )
             .child(
                 h_flex()
@@ -6390,6 +6410,7 @@ fn project_header(
         .child(
             div()
                 .id(SharedString::from(format!("new-wrap-{}", project.id)))
+                .claims_press()
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(icon_button(
                     format!("new-{}", project.id),
@@ -6618,6 +6639,7 @@ fn thread_row(
                 })
                 .xsmall(),
             )
+            .claims_press()
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 let id = id.clone();
@@ -6691,6 +6713,7 @@ fn thread_row(
                 }))
                 // Clicks in the field stay in the field; a click anywhere
                 // else saves.
+                .claims_press()
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish_rename(true, cx)))
                 .h(px(22.))
@@ -6777,6 +6800,7 @@ fn thread_row(
                         .flex()
                         .items_center()
                         .gap(px(2.))
+                        .claims_press()
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child({
                             use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -6787,6 +6811,7 @@ fn thread_row(
                                 .ghost()
                                 .xsmall()
                                 .tooltip("Archive")
+                                .claims_press()
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     let id = id.clone();
@@ -8142,6 +8167,8 @@ fn context_ring(fraction: f32, color: gpui_kit::Hsla, track: gpui_kit::Hsla) -> 
 /// window's own event handling: opens popovers and menus for a screenshot.
 fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>) {
     let n: Vec<f32> = spec
+        .trim_start()
+        .trim_start_matches("move")
         .split(',')
         .filter_map(|v| v.trim().parse().ok())
         .collect();
@@ -8151,6 +8178,8 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
     // `x,y,after_ms,x2,y2`: a drag, pressed at the first place and let go
     // at the second.
     let released = gpui_kit::point(px(at(3, at(0, 10.))), px(at(4, at(1, 10.))));
+    // `move x,y,after_ms`: the pointer only passes over, no button held.
+    let only_moves = spec.trim_start().starts_with("move");
     cx.spawn_in(window, async move |_, cx| {
         use gpui_kit::{
             Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
@@ -8193,6 +8222,7 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
         .enumerate()
         // (The move with the button down is a drag's only.)
         .filter_map(|(ix, step)| (ix != 2 || released != position).then_some(step))
+        .take(if only_moves { 1 } else { 4 })
         {
             let _ = cx.update(|window, cx| {
                 // This window is already in hand; another one is asked for.
