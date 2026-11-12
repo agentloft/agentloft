@@ -993,7 +993,11 @@ impl Render for DetailsCard {
             .font_weight(FontWeight::NORMAL);
         match place {
             // No taller than its column either.
-            Place::Docked => card.w_full().min_h_0().into_any_element(),
+            // It floats over the conversation's margin when there is one
+            // conversation: what is under it gets no pointer, or the
+            // conversation, which takes the wheel before anything over it,
+            // scrolls instead of the card's lists.
+            Place::Docked => card.w_full().min_h_0().occlude().into_any_element(),
             Place::Window => div()
                 .size_full()
                 .track_focus(&self.focus)

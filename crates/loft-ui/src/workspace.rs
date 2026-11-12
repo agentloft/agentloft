@@ -627,6 +627,46 @@ impl WorkspaceView {
                 })
                 .detach();
             }
+            Some(("wheel", spec)) => {
+                // `x,y,dy[,after_ms]`: one wheel turn of `dy` pixels at
+                // window coordinates, as a trackpad sends it, with the
+                // details card open (its lists scroll).
+                self.panel_open = false;
+                self.details_open = true;
+                let n: Vec<f32> = spec
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+                let position = gpui_kit::point(px(at(0, 10.)), px(at(1, 10.)));
+                let dy = at(2, -60.);
+                let after = std::time::Duration::from_millis(at(3, 2500.) as u64);
+                cx.spawn_in(window, async move |_, cx| {
+                    cx.background_executor().timer(after).await;
+                    let _ = cx.update(|window, cx| {
+                        window.dispatch_event(
+                            gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                                position,
+                                pressed_button: None,
+                                modifiers: gpui_kit::Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                                position,
+                                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                                    px(0.),
+                                    px(dy),
+                                )),
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
             Some(("viewkeys", spec)) => {
                 // `x,y,after_ms`: click a field of the thread's view, type
                 // "abc", press Cmd+A, type "z" (so the field holds "z" if
