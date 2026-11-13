@@ -261,15 +261,46 @@ impl Render for ChangesView {
         } else if let Some(note) = note {
             centered(&p, IconName::GitCompare, note, false)
         } else if let Some(diff) = &self.diff {
-            div()
+            let omitted = self
+                .result
+                .as_ref()
+                .map(|r| r.omitted.as_slice())
+                .unwrap_or_default();
+            v_flex()
                 .flex_1()
                 .min_h_0()
-                .child(Diff::new(diff).size_full())
+                .when(!omitted.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .px_3()
+                            .py_1p5()
+                            .text_xs()
+                            .text_color(p.muted_foreground)
+                            .border_b_1()
+                            .border_color(p.border)
+                            .child(too_large_note(omitted)),
+                    )
+                })
+                .child(div().flex_1().min_h_0().child(Diff::new(diff).size_full()))
                 .into_any_element()
         } else {
             div().flex_1().into_any_element()
         };
         v_flex().size_full().child(header).child(body)
+    }
+}
+
+/// Which files' changes aren't shown, and why.
+fn too_large_note(omitted: &[String]) -> String {
+    let name = |path: &String| path.rsplit('/').next().unwrap_or(path).to_owned();
+    match omitted {
+        [one] => format!("{} is too large to show here.", name(one)),
+        [first, rest @ ..] => format!(
+            "{} and {} more are too large to show here.",
+            name(first),
+            rest.len()
+        ),
+        [] => String::new(),
     }
 }
 
@@ -285,4 +316,53 @@ fn centered(p: &Palette, icon: IconName, text: String, error: bool) -> gpui_kit:
         .child(Icon::new(icon).large())
         .child(text)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file whose changes were left out keeps only its header: the diff
+    /// still parses, with it listed as an empty file among the others.
+    #[test]
+    fn a_header_only_file_parses_among_the_others() {
+        let patch = concat!(
+            "diff --git a/a.txt b/a.txt\n",
+            "index 5626abf..f719efd 100644\n",
+            "--- a/a.txt\n",
+            "+++ b/a.txt\n",
+            "@@ -1,2 +1,2 @@\n",
+            " one\n",
+            "-two\n",
+            "+TWO\n",
+            "diff --git a/big page.htm b/big page.htm\n",
+            "new file mode 100644\n",
+            "index 0000000..1b2c3d4\n",
+            "diff --git a/z.txt b/z.txt\n",
+            "new file mode 100644\n",
+            "index 0000000..8e8c1a1\n",
+            "--- /dev/null\n",
+            "+++ b/z.txt\n",
+            "@@ -0,0 +1 @@\n",
+            "+last\n",
+        );
+        let files = DiffFile::parse(patch).expect("parses");
+        let paths: Vec<&str> = files.iter().map(|f| f.path().as_ref()).collect();
+        assert_eq!(paths, ["a.txt", "big page.htm", "z.txt"]);
+        assert_eq!(files[0].additions(), 1);
+        assert_eq!(files[1].additions(), 0);
+        assert_eq!(files[2].additions(), 1);
+    }
+
+    #[test]
+    fn the_note_names_what_is_left_out() {
+        assert_eq!(
+            too_large_note(&["assets/sec/s1.htm".into()]),
+            "s1.htm is too large to show here."
+        );
+        assert_eq!(
+            too_large_note(&["a/x.so".into(), "b.rlib".into(), "c".into()]),
+            "x.so and 2 more are too large to show here."
+        );
+    }
 }

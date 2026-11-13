@@ -491,6 +491,73 @@ pub fn origin_base(dir: &Path) -> Option<(String, String)> {
     Some((base, upstream))
 }
 
+/// Most of one file's changes a patch carries (1 MiB): a generated page, a
+/// data dump or a vendored build past it is listed, not shown.
+const MAX_FILE_PATCH: usize = 1024 * 1024;
+/// Most patch text in one diff (8 MiB).
+const MAX_PATCH: usize = 8 * 1024 * 1024;
+
+/// `patch` without the changes of files too large to show (over 1 MiB, or
+/// past 8 MiB in all), and those files' paths. Their headers stay, so they
+/// are still listed (as an empty file's addition is).
+pub fn bound_patch(patch: String) -> (String, Vec<String>) {
+    if patch.len() <= MAX_PATCH
+        && !file_patches(&patch)
+            .iter()
+            .any(|f| f.len() > MAX_FILE_PATCH)
+    {
+        return (patch, Vec::new());
+    }
+    let mut out = String::with_capacity(MAX_PATCH.min(patch.len()));
+    let mut omitted = Vec::new();
+    for file in file_patches(&patch) {
+        if file.len() <= MAX_FILE_PATCH && out.len() + file.len() <= MAX_PATCH {
+            out.push_str(file);
+            continue;
+        }
+        let mut path = None;
+        for line in file.split_inclusive('\n') {
+            let bare = line.trim_end_matches(['\n', '\r']);
+            // Where the changes start: the `---`/`+++` pair, a hunk, or a
+            // binary marker.
+            if bare.starts_with("--- ")
+                || bare.starts_with("@@")
+                || bare.starts_with("Binary files ")
+                || bare == "GIT binary patch"
+            {
+                break;
+            }
+            if path.is_none()
+                && let Some(rest) = bare.strip_prefix("diff --git ")
+            {
+                path = rest.rsplit_once(" b/").map(|(_, b)| b.to_owned());
+            }
+            out.push_str(line);
+        }
+        omitted.push(path.unwrap_or_else(|| "(a file)".to_owned()));
+    }
+    (out, omitted)
+}
+
+/// The per-file sections of a patch (`diff --git …` to the next one).
+fn file_patches(patch: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = patch
+        .match_indices("diff --git ")
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || patch.as_bytes()[i - 1] == b'\n')
+        .collect();
+    if starts.first() != Some(&0) {
+        starts.insert(0, 0);
+    }
+    let ends = starts.iter().skip(1).copied().chain([patch.len()]);
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&start, end)| &patch[start..end])
+        .filter(|section| !section.is_empty())
+        .collect()
+}
+
 fn parse_numstat(text: &str) -> Vec<FileStat> {
     text.lines()
         .filter_map(|line| {
@@ -544,6 +611,32 @@ mod tests {
         ]))
         .unwrap();
         dir
+    }
+
+    #[test]
+    fn a_file_too_large_to_show_is_listed_not_sent() {
+        let dir = repo();
+        let d = dir.path();
+        std::fs::write(d.join("a.txt"), "one\nTWO\n").unwrap();
+        // A generated page: 2 MiB of text, untracked.
+        let line = "<p>".to_owned() + &"x".repeat(1020) + "</p>\n";
+        std::fs::write(d.join("big page.htm"), line.repeat(2048)).unwrap();
+        std::fs::write(d.join("z.txt"), "last\n").unwrap();
+        let whole = diff_working_tree(d).unwrap();
+        assert!(whole.patch.len() > 2 * 1024 * 1024);
+
+        let (patch, omitted) = bound_patch(whole.patch.clone());
+        assert_eq!(omitted, ["big page.htm"]);
+        assert!(patch.len() < 4096, "{} bytes left", patch.len());
+        // The others are whole; the big one keeps its header only.
+        assert!(patch.contains("+TWO\n") && patch.contains("+last\n"));
+        assert!(patch.contains("diff --git a/big page.htm b/big page.htm\nnew file mode"));
+        assert!(!patch.contains("<p>") && !patch.contains("+++ b/big page.htm"));
+
+        // Nothing to cut: the patch comes back as it was.
+        std::fs::remove_file(d.join("big page.htm")).unwrap();
+        let small = diff_working_tree(d).unwrap().patch;
+        assert_eq!(bound_patch(small.clone()), (small, vec![]));
     }
 
     #[test]

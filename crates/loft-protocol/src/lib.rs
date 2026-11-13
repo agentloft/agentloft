@@ -26,8 +26,13 @@ pub(crate) fn is_zero(n: &u64) -> bool {
 /// Bumped on any incompatible wire change. The daemon accepts `N` and `N-1`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Maximum frame size accepted on the socket (16 MiB).
-pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+/// Largest message either side sends or accepts (256 MiB). A long thread's
+/// snapshot alone runs to tens of megabytes; nothing should come near this.
+pub const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
+
+/// Largest message the daemon accepts from a web session (16 MiB): requests
+/// are small, and the browser is on the network.
+pub const MAX_REMOTE_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Client → daemon

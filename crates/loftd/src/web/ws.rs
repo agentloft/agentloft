@@ -17,7 +17,7 @@ use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use loft_core::RemotePolicy;
-use loft_protocol::{MAX_FRAME_LEN, ServerMsg};
+use loft_protocol::{MAX_REMOTE_FRAME_LEN, ServerMsg};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
@@ -84,8 +84,10 @@ pub(crate) fn upgrade(mut request: Request<Incoming>, ctx: &Ctx, host: &str) -> 
         match on_upgrade.await {
             Ok(upgraded) => {
                 let mut config = WebSocketConfig::default();
-                config.max_message_size = Some(MAX_FRAME_LEN);
-                config.max_frame_size = Some(MAX_FRAME_LEN);
+                // What the browser may send; what it is sent is bounded by
+                // `conn::encode`.
+                config.max_message_size = Some(MAX_REMOTE_FRAME_LEN);
+                config.max_frame_size = Some(MAX_REMOTE_FRAME_LEN);
                 let socket = WebSocketStream::from_raw_socket(
                     TokioIo::new(upgraded),
                     Role::Server,
@@ -187,11 +189,14 @@ where
                         tracing::warn!(session = %authed.id, "web access: browser too slow; dropping");
                         break Some(close(1013, "too slow"));
                     }
-                    let Ok(json) = serde_json::to_string(&message) else { continue };
-                    if json.len() > MAX_FRAME_LEN {
-                        tracing::warn!(len = json.len(), "web access: message over the frame limit");
-                        break Some(close(1009, "message too big"));
-                    }
+                    let json = match conn::encode(&message) {
+                        conn::Encoded::Ready(json) => json,
+                        conn::Encoded::Skip => continue,
+                        // The browser would miss it without knowing: start
+                        // over (it reconnects and takes fresh snapshots).
+                        conn::Encoded::TooBig => break Some(close(1009, "message too big")),
+                    };
+                    let Ok(json) = String::from_utf8(json) else { continue };
                     match tokio::time::timeout(WRITE_TIMEOUT, sink.send(Message::text(json))).await {
                         Ok(Ok(())) => {}
                         _ => break None,

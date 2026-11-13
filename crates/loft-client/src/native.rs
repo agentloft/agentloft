@@ -8,13 +8,14 @@ use futures::stream::SplitSink;
 use futures::{SinkExt as _, StreamExt as _};
 use loft_config::Paths;
 use loft_protocol::{
-    ClientKind, ClientMsg, Hello, MAX_FRAME_LEN, PROTOCOL_VERSION, Request, ServerMsg,
+    ClientKind, ClientMsg, ErrorBody, ErrorCode, Hello, MAX_FRAME_LEN, PROTOCOL_VERSION, Request,
+    ServerMsg,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 impl Client {
@@ -60,23 +61,61 @@ impl Client {
             None => bail!("daemon closed the connection during handshake"),
         };
 
+        let pending: Pending = Arc::default();
         let (tx, mut out_rx) = mpsc::unbounded_channel::<ClientMsg>();
+        // Dropped when the writer stops (it failed, or every handle to the
+        // connection is gone): the reader then ends the connection too.
+        let (writing, mut writer_done) = oneshot::channel::<()>();
+        let writer_pending = pending.clone();
         tokio::spawn(async move {
+            let _writing = writing;
             while let Some(msg) = out_rx.recv().await {
                 let Ok(bytes) = serde_json::to_vec(&msg) else {
                     continue;
                 };
-                if sink.send(Bytes::from(bytes)).await.is_err() {
-                    break;
+                if bytes.len() > MAX_FRAME_LEN {
+                    // Too large to send: that request fails, nothing else.
+                    tracing::warn!(len = bytes.len(), "a request is too large to send");
+                    if let ClientMsg::Request { id, .. } = msg {
+                        crate::fail(
+                            &writer_pending,
+                            id,
+                            ErrorBody::new(
+                                ErrorCode::BadRequest,
+                                format!(
+                                    "This is too large to send ({} MB).",
+                                    bytes.len().div_ceil(1024 * 1024)
+                                ),
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                if let Err(err) = sink.send(Bytes::from(bytes)).await {
+                    tracing::warn!(%err, "couldn't write to agentloftd; reconnecting");
+                    return;
                 }
             }
         });
 
-        let pending: Pending = Arc::default();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let reader_pending = pending.clone();
         tokio::spawn(async move {
-            while let Some(Ok(frame)) = source.next().await {
+            loop {
+                let frame = tokio::select! {
+                    frame = source.next() => frame,
+                    // Requests no longer go out: a connection that only
+                    // listens would look fine while nothing worked.
+                    _ = &mut writer_done => break,
+                };
+                let frame = match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(err)) => {
+                        tracing::warn!(%err, "couldn't read from agentloftd; reconnecting");
+                        break;
+                    }
+                    None => break,
+                };
                 match serde_json::from_slice::<ServerMsg>(&frame) {
                     Ok(msg) => {
                         if !dispatch(msg, &reader_pending, &events_tx) {

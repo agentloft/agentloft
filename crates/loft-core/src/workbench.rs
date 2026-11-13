@@ -276,6 +276,7 @@ impl Core {
             files: vec![],
             note: Some(note.to_owned()),
             base: None,
+            omitted: Vec::new(),
         };
         let repo = {
             let dir = dir.clone();
@@ -354,12 +355,19 @@ impl Core {
             turn.changes = Some(files.clone());
             let _ = self.commit(vec![loft_protocol::Event::TurnUpdated { turn }]);
         }
+        // A file of megabytes (a generated page, a vendored build) is listed,
+        // not sent: the whole patch is one message.
+        let patch = diff.patch;
+        let (patch, omitted) = tokio::task::spawn_blocking(move || loft_git::bound_patch(patch))
+            .await
+            .map_err(internal)?;
         Ok(DiffResult {
             scope,
             note: files.is_empty().then(|| "No changes.".to_owned()),
-            patch: diff.patch,
+            patch,
             files,
             base,
+            omitted,
         })
     }
 

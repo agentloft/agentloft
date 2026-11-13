@@ -150,6 +150,18 @@ pub(crate) fn dispatch(
     events.send(event).is_ok()
 }
 
+/// Answer request `id` with `err` without the daemon (it never went out).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn fail(pending: &Pending, id: u64, err: ErrorBody) {
+    let waiter = pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+    if let Some(waiter) = waiter {
+        let _ = waiter.send(Err(err));
+    }
+}
+
 /// The connection is gone: fail what was waiting and say so.
 pub(crate) fn disconnect(pending: &Pending, events: &mpsc::UnboundedSender<ClientEvent>) {
     for (_, waiter) in pending.lock().unwrap_or_else(|e| e.into_inner()).drain() {

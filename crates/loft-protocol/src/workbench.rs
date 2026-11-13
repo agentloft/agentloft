@@ -92,6 +92,10 @@ pub struct DiffResult {
     /// What it was compared with, when that is a branch (`origin/main`).
     #[serde(default)]
     pub base: Option<String>,
+    /// Files whose changes are too large to show: `patch` has their
+    /// headers only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

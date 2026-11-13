@@ -73,18 +73,95 @@ pub(crate) fn peer_allowed(stream: &UnixStream, paths: &Paths) -> bool {
     }
 }
 
+/// A message for a client, as it goes on the wire.
+pub(crate) enum Encoded {
+    Ready(Vec<u8>),
+    /// It doesn't serialize (a bug, logged): there is nothing to send.
+    Skip,
+    /// Too large to send, and not an answer that could say so instead. The
+    /// connection has to end: the client would carry on without it, never
+    /// knowing (a thread that stops updating, answers that never come).
+    TooBig,
+}
+
+/// Serialize `msg` for a client. An answer too large to send becomes an
+/// error answer, so the request that asked for it fails and nothing else.
+pub(crate) fn encode(msg: &ServerMsg) -> Encoded {
+    encode_within(msg, MAX_FRAME_LEN)
+}
+
+fn encode_within(msg: &ServerMsg, limit: usize) -> Encoded {
+    let bytes = match serde_json::to_vec(msg) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::error!(%err, kind = msg_kind(msg), "a message for a client doesn't serialize");
+            return Encoded::Skip;
+        }
+    };
+    if bytes.len() <= limit {
+        return Encoded::Ready(bytes);
+    }
+    let len = bytes.len();
+    match msg {
+        ServerMsg::Response { id, .. } => {
+            tracing::error!(len, "an answer is too large to send; it fails instead");
+            let failed = ServerMsg::Response {
+                id: *id,
+                result: Err(ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "The answer is too large to send ({} MB).",
+                        len.div_ceil(1024 * 1024)
+                    ),
+                )),
+            };
+            serde_json::to_vec(&failed).map_or(Encoded::Skip, Encoded::Ready)
+        }
+        other => {
+            tracing::error!(
+                len,
+                kind = msg_kind(other),
+                "a message is too large to send; closing the connection"
+            );
+            Encoded::TooBig
+        }
+    }
+}
+
+/// What kind of message this is, for logs.
+fn msg_kind(msg: &ServerMsg) -> &'static str {
+    match msg {
+        ServerMsg::Welcome(_) => "welcome",
+        ServerMsg::Response { .. } => "response",
+        ServerMsg::Snapshot { .. } => "snapshot",
+        ServerMsg::Event { .. } => "event",
+        ServerMsg::Delta { .. } => "delta",
+        ServerMsg::TerminalOutput { .. } => "terminal_output",
+        ServerMsg::TerminalExited { .. } => "terminal_exited",
+        ServerMsg::PageFrame { .. } => "page_frame",
+        ServerMsg::PageState { .. } => "page_state",
+        ServerMsg::PageClosed { .. } => "page_closed",
+        ServerMsg::PageAction { .. } => "page_action",
+        ServerMsg::ClientCall { .. } => "client_call",
+        ServerMsg::Fatal(_) => "fatal",
+    }
+}
+
 /// Serve a local client on the Unix socket.
 pub(crate) async fn serve_unix(stream: UnixStream, hub: Hub) {
     let (mut sink, source): (SplitSink<_, Bytes>, _) = Framed::new(stream, codec()).split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            let Ok(bytes) = serde_json::to_vec(&msg) else {
-                continue;
+            let bytes = match encode(&msg) {
+                Encoded::Ready(bytes) => bytes,
+                Encoded::Skip => continue,
+                Encoded::TooBig => return,
             };
-            if sink.send(Bytes::from(bytes)).await.is_err() {
-                break;
+            if let Err(err) = sink.send(Bytes::from(bytes)).await {
+                tracing::warn!(%err, "couldn't write to a client; closing its connection");
+                return;
             }
         }
     });
@@ -92,8 +169,16 @@ pub(crate) async fn serve_unix(stream: UnixStream, hub: Hub) {
     let frames = source
         .take_while(|frame| futures::future::ready(frame.is_ok()))
         .filter_map(|frame| futures::future::ready(frame.ok().map(|f| f.freeze())));
-    run(frames, out_tx, hub, Peer::Local).await;
-    let _ = writer.await;
+    tokio::select! {
+        () = run(frames, out_tx, hub, Peer::Local) => {
+            let _ = (&mut writer).await;
+        }
+        // Nothing more reaches the client: end the connection rather than
+        // keep it half alive (requests heard, never answered). Dropping the
+        // handler drops its subscriptions and the socket, and the client
+        // reconnects and catches up from fresh snapshots.
+        _ = &mut writer => {}
+    }
     tracing::debug!("client disconnected");
 }
 
@@ -692,5 +777,60 @@ fn matches_topic(topic: &Topic, event: &loft_protocol::Event) -> bool {
         Topic::Workspace => event.is_workspace_event(),
         Topic::Thread(id) => event.thread_id() == Some(id),
         Topic::Terminal(_) | Topic::Page(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loft_protocol::{Delta, DeltaChannel, ItemId, ThreadId};
+
+    fn decoded(encoded: Encoded) -> ServerMsg {
+        match encoded {
+            Encoded::Ready(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            Encoded::Skip => panic!("skipped"),
+            Encoded::TooBig => panic!("too big"),
+        }
+    }
+
+    /// An answer too large to send fails that request, and the connection
+    /// carries on; anything else too large ends the connection, so the
+    /// client reconnects instead of silently missing it.
+    #[test]
+    fn a_message_too_large_fails_its_request_or_ends_the_connection() {
+        let big = "x".repeat(4096);
+        let answer = ServerMsg::Response {
+            id: 7,
+            result: Ok(Response::Text { text: big.clone() }),
+        };
+        match decoded(encode_within(&answer, 1024)) {
+            ServerMsg::Response {
+                id: 7,
+                result: Err(err),
+            } => {
+                assert!(err.message.contains("too large"), "{}", err.message);
+            }
+            other => panic!("expected an error answer, got {other:?}"),
+        }
+        // Within the limit it goes as it is.
+        assert!(matches!(
+            decoded(encode_within(&answer, 1 << 20)),
+            ServerMsg::Response {
+                id: 7,
+                result: Ok(_)
+            }
+        ));
+
+        let delta = ServerMsg::Delta {
+            sub_id: 1,
+            delta: Delta {
+                thread_id: ThreadId::new(),
+                item_id: ItemId::new(),
+                channel: DeltaChannel::Text,
+                offset: 0,
+                text: big,
+            },
+        };
+        assert!(matches!(encode_within(&delta, 1024), Encoded::TooBig));
     }
 }
