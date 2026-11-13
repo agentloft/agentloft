@@ -1,6 +1,6 @@
 //! Workbench wire types: file system, diffs, terminals and client calls.
 
-use crate::ids::{ProjectId, TerminalId, ThreadId, TurnId};
+use crate::ids::{ItemId, ProjectId, TerminalId, ThreadId, TurnId};
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -63,6 +63,17 @@ pub struct FileContent {
     #[serde(default, skip_serializing_if = "crate::is_zero")]
     pub offset: u64,
     pub bytes: Bytes,
+}
+
+/// Which more of a thread to send (`Request::ThreadItems`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ItemsPage {
+    /// Everything one subagent did: the steps of the call `of`.
+    Steps { of: ItemId },
+    /// The turns before the item at `ordinal` (whole turns, a page's worth),
+    /// as a snapshot carries them.
+    Before { ordinal: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

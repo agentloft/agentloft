@@ -398,8 +398,9 @@ impl WorkspaceView {
     /// window's own event handling, with the composer focused first.
     /// A step is `wait=<ms>`, `click=x,y`, `rclick=x,y`, `move=x,y`,
     /// `drag=x,y,x2,y2` (or its parts `press=x,y`, `hold=x,y`, `release=x,y`),
-    /// all in window points, `'text` (typed a character at a time) or a
-    /// keystroke (`up`, `enter`, `cmd-k`).
+    /// `scroll=x,y,dy` (a wheel scroll at x,y; `dy` > 0 goes up), all in
+    /// window points, `'text` (typed a character at a time) or a keystroke
+    /// (`up`, `enter`, `cmd-k`).
     pub(super) fn dev_script(
         &mut self,
         script: &str,
@@ -457,6 +458,17 @@ impl WorkspaceView {
                         continue;
                     }
                     "move" => vec![moved(at(0), None)],
+                    "scroll" => vec![
+                        moved(at(0), None),
+                        PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                            position: at(0),
+                            delta: gpui_kit::ScrollDelta::Pixels(point(
+                                px(0.),
+                                px(n.get(2).copied().unwrap_or(0.)),
+                            )),
+                            ..Default::default()
+                        }),
+                    ],
                     // A drag in parts, to look at it half way.
                     "press" => vec![moved(at(0), None), down(at(0), left)],
                     "hold" => vec![moved(at(0), Some(left))],

@@ -73,6 +73,10 @@ impl Render for AgentView {
         let Some(thread) = self.store.read(cx).threads.get(&self.thread_id).cloned() else {
             return div().into_any_element();
         };
+        // The thread came with only this agent's latest steps: the rest
+        // (once; again after a reconnect).
+        let item_id = self.item_id.clone();
+        thread.update(cx, |t, cx| t.load_steps(&item_id, cx));
         // Pull out what we need, then build the report markdown if it changed.
         let (agent, report_text) = {
             let state = thread.read(cx);

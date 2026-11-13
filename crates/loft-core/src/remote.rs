@@ -265,6 +265,7 @@ impl Core {
             | Request::ReadFile { .. }
             | Request::FindFiles { .. }
             | Request::GetDiff { .. }
+            | Request::ThreadItems { .. }
             // Confined in `handle_remote`.
             | Request::ReadPath { .. }
             // The settings files (secrets hidden in `handle_remote`), shared

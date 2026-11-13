@@ -2282,10 +2282,29 @@ pub struct ThreadState {
     /// Turns whose "changed files" card is open (they start folded).
     pub open_diffs: HashSet<loft_protocol::TurnId>,
     store: WeakEntity<AppStore>,
+    /// Earlier turns have been asked for and haven't come yet.
+    loading_older: bool,
+    /// Subagents whose whole run has been asked for (since the snapshot).
+    steps_asked: HashSet<ItemId>,
 }
+
+/// How close to the top of a thread's loaded turns the reader gets before
+/// the turns before them are asked for, in rows.
+const OLDER_WITHIN_ROWS: usize = 8;
 
 impl ThreadState {
     fn new(id: ThreadId, store: WeakEntity<AppStore>, cx: &mut Context<Self>) -> Self {
+        let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+        // Near the top of what is here: the turns before come in.
+        cx.observe(&scroller, |this: &mut Self, scroller, cx| {
+            if this.has_older()
+                && !this.loading_older
+                && scroller.read(cx).logical_scroll_top().item_ix < OLDER_WITHIN_ROWS
+            {
+                this.load_older(cx);
+            }
+        })
+        .detach();
         Self {
             id,
             asked_changes: HashSet::new(),
@@ -2293,7 +2312,7 @@ impl ThreadState {
             store,
             model: None,
             rows: Vec::new(),
-            scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            scroller,
             markdown: HashMap::new(),
             views: HashMap::new(),
             expanded: HashMap::new(),
@@ -2304,7 +2323,159 @@ impl ThreadState {
             live_spawned: Default::default(),
             drawn_messages: Default::default(),
             visible_messages: Default::default(),
+            loading_older: false,
+            steps_asked: HashSet::new(),
         }
+    }
+
+    /// Whether earlier turns are still to come (a long thread comes in
+    /// part, its last turns first).
+    pub fn has_older(&self) -> bool {
+        self.model.as_ref().is_some_and(|m| m.older)
+    }
+
+    /// Ask for the turns before those here (once at a time).
+    pub fn load_older(&mut self, cx: &mut Context<Self>) {
+        let Some(ordinal) = self
+            .model
+            .as_ref()
+            .filter(|m| m.older)
+            .and_then(|m| m.first_ordinal())
+        else {
+            return;
+        };
+        if std::mem::replace(&mut self.loading_older, true) {
+            return;
+        }
+        let body = Request::ThreadItems {
+            thread_id: self.id.clone(),
+            page: loft_protocol::ItemsPage::Before { ordinal },
+        };
+        self.fetch(body, cx, |this, result, cx| {
+            this.loading_older = false;
+            match result {
+                Ok(Response::Items { items, older }) => this.take_older(items, older, cx),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(err = %err.message, "earlier turns"),
+            }
+        });
+    }
+
+    /// Ask for everything subagent `of` did (its row only has its latest
+    /// steps), once.
+    pub fn load_steps(&mut self, of: &ItemId, cx: &mut Context<Self>) {
+        if self.model.is_none() || !self.steps_asked.insert(of.clone()) {
+            return;
+        }
+        let body = Request::ThreadItems {
+            thread_id: self.id.clone(),
+            page: loft_protocol::ItemsPage::Steps { of: of.clone() },
+        };
+        let of = of.clone();
+        self.fetch(body, cx, move |this, result, cx| match result {
+            Ok(Response::Items { items, .. }) => this.take_steps(items, cx),
+            Ok(_) => {}
+            Err(err) => {
+                // Asked again the next time its tab is drawn.
+                this.steps_asked.remove(&of);
+                tracing::warn!(err = %err.message, "a subagent's steps");
+            }
+        });
+    }
+
+    /// Send `body` once the update this runs in is over (it may be the
+    /// store's own, which can't be read until then).
+    fn fetch(
+        &mut self,
+        body: Request,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Result<Response, ErrorBody>, &mut Context<Self>) + 'static,
+    ) {
+        let (this, store) = (cx.entity().downgrade(), self.store.clone());
+        cx.defer(move |cx| {
+            let Some(store) = store.upgrade() else {
+                return;
+            };
+            let _ = this.update(cx, |_, cx| request_in(&store, body, cx, then));
+        });
+    }
+
+    /// Earlier turns came: they go in above, where the reader is stays put.
+    fn take_older(&mut self, items: Vec<loft_protocol::Item>, older: bool, cx: &mut Context<Self>) {
+        if self.model.is_none() {
+            return;
+        }
+        self.merge_keeping_cards(items.clone());
+        if let Some(model) = self.model.as_mut() {
+            model.older = older;
+        }
+        for item in &items {
+            self.sync_markdown(&item.id, &item.body, cx);
+            self.sync_view(item, cx);
+        }
+        self.drawn_messages.borrow_mut().clear();
+        self.visible_messages.borrow_mut().clear();
+        let before = self.rows.len();
+        self.rebuild_rows();
+        let added = self.rows.len().saturating_sub(before);
+        tracing::debug!(
+            items = items.len(),
+            rows = added,
+            older,
+            "earlier turns came"
+        );
+        self.scroller.update(cx, |s, cx| {
+            s.prepend(added, cx);
+        });
+        // A message asked to be shown may be in what came.
+        if let Some(id) = self.reveal.take() {
+            match self.row_of_item(&id) {
+                Some(row) => self.scroller.update(cx, |s, cx| {
+                    s.scroll_to_item(row, cx);
+                }),
+                None => {
+                    self.reveal = Some(id);
+                    self.load_older(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Merge fetched items in. Reports sit before a given item (by index),
+    /// so they are pinned to that item's place again after.
+    fn merge_keeping_cards(&mut self, items: Vec<loft_protocol::Item>) {
+        let Some(model) = self.model.as_mut() else {
+            return;
+        };
+        let pins: Vec<Option<u64>> = self
+            .cards
+            .iter()
+            .map(|card| model.items.get(card.after).map(|i| i.ordinal))
+            .collect();
+        model.merge(items);
+        for (card, pin) in self.cards.iter_mut().zip(pins) {
+            card.after = match pin {
+                Some(ordinal) => model.items.partition_point(|i| i.ordinal < ordinal),
+                None => model.items.len(),
+            };
+        }
+    }
+
+    /// A subagent's whole run came (for its tab).
+    fn take_steps(&mut self, items: Vec<loft_protocol::Item>, cx: &mut Context<Self>) {
+        if self.model.is_none() {
+            return;
+        }
+        self.merge_keeping_cards(items.clone());
+        for item in &items {
+            self.sync_markdown(&item.id, &item.body, cx);
+            self.sync_view(item, cx);
+        }
+        tracing::debug!(items = items.len(), "a subagent's steps came");
+        // Steps aren't timeline rows; their indexes moved, though.
+        self.sync_rows(None, cx);
+        cx.notify();
     }
 
     /// Which of the threads this one started are running (from the store).
@@ -2350,6 +2521,11 @@ impl ThreadState {
                 s.scroll_to_item(row, cx);
             }),
             None if self.model.is_none() => self.reveal = Some(id),
+            // In an earlier turn not here yet: bring turns in until it is.
+            None if self.has_older() => {
+                self.reveal = Some(id);
+                self.load_older(cx);
+            }
             None => {}
         }
     }
@@ -2775,6 +2951,9 @@ impl ThreadState {
             return;
         };
         self.markdown.clear();
+        // What was fetched besides went with the old model.
+        self.steps_asked.clear();
+        self.loading_older = false;
         // Views keep their state across a reconnect: only those whose item
         // is gone are dropped.
         self.views
@@ -2788,7 +2967,13 @@ impl ThreadState {
         self.ensure_ticker(cx);
         self.fetch_turn_diffs(cx);
         let count = self.rows.len();
-        let reveal = self.reveal.take().and_then(|id| self.row_of_item(&id));
+        let wanted = self.reveal.take();
+        let reveal = wanted.as_ref().and_then(|id| self.row_of_item(id));
+        if let Some(id) = wanted.filter(|_| reveal.is_none() && self.has_older()) {
+            // In an earlier turn: bring turns in until it is here.
+            self.reveal = Some(id);
+            self.load_older(cx);
+        }
         self.scroller.update(cx, |s, cx| {
             s.reset(count, cx);
             match reveal {

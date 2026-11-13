@@ -104,6 +104,8 @@ pub struct ThreadModel {
     /// Messages waiting for the running turn to complete, in order (the
     /// daemon holds and sends them).
     pub queue: Vec<loft_protocol::QueuedMessage>,
+    /// Earlier turns are still at the daemon (a long thread comes in part).
+    pub older: bool,
 }
 
 impl ThreadModel {
@@ -116,6 +118,7 @@ impl ThreadModel {
                 mut items,
                 requests,
                 queue,
+                older,
             } => {
                 items.sort_by_key(|i| i.ordinal);
                 Some(Self {
@@ -125,6 +128,7 @@ impl ThreadModel {
                     items,
                     requests,
                     queue,
+                    older,
                 })
             }
             _ => None,
@@ -211,6 +215,47 @@ impl ThreadModel {
         }
     }
 
+    /// Take in items fetched apart from the snapshot (earlier turns, a
+    /// subagent's steps). One already here stays as it is if it is as new:
+    /// events may have updated it since the fetch was asked for. Returns
+    /// how many came in ahead of the first item already here.
+    pub fn merge(&mut self, items: Vec<Item>) -> usize {
+        let first = self.items.first().map(|i| i.ordinal);
+        let mut ahead = 0;
+        let mut index: std::collections::HashMap<loft_protocol::ItemId, usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ix, i)| (i.id.clone(), ix))
+            .collect();
+        for item in items {
+            match index.get(&item.id) {
+                Some(&ix) => {
+                    if self.items[ix].updated_at_ms < item.updated_at_ms {
+                        self.items[ix] = item;
+                    }
+                }
+                None => {
+                    if first.is_none_or(|first| item.ordinal < first) {
+                        ahead += 1;
+                    }
+                    index.insert(item.id.clone(), self.items.len());
+                    self.items.push(item);
+                }
+            }
+        }
+        self.items.sort_by_key(|i| i.ordinal);
+        ahead
+    }
+
+    /// Where the earliest turn here starts: the page before it comes next.
+    pub fn first_ordinal(&self) -> Option<u64> {
+        self.items
+            .iter()
+            .find(|i| i.parent_id.is_none())
+            .map(|i| i.ordinal)
+    }
+
     pub fn running_turn(&self) -> Option<&Turn> {
         self.turns
             .iter()
@@ -287,9 +332,33 @@ mod tests {
             items: vec![item],
             requests: vec![],
             queue: vec![],
+            older: false,
         })
         .unwrap();
         (m, id)
+    }
+
+    /// Earlier turns come in ahead of what is here; an item an event has
+    /// updated since stays as the event left it.
+    #[test]
+    fn fetched_items_merge_in_order_without_undoing_events() {
+        let (mut m, id) = model_with_item("now");
+        m.items[0].ordinal = 10;
+        m.items[0].updated_at_ms = 50;
+        let mut earlier = m.items[0].clone();
+        earlier.id = ItemId::new();
+        earlier.ordinal = 3;
+        let mut stale = m.items[0].clone();
+        stale.body = ItemBody::AssistantMessage {
+            text: "stale".into(),
+        };
+        stale.updated_at_ms = 40;
+        assert_eq!(m.merge(vec![earlier.clone(), stale]), 1);
+        assert_eq!(m.items.len(), 2);
+        assert_eq!(m.items[0].id, earlier.id);
+        assert_eq!(m.items[1].id, id);
+        assert!(matches!(&m.items[1].body, ItemBody::AssistantMessage { text } if text == "now"));
+        assert_eq!(m.first_ordinal(), Some(3));
     }
 
     fn delta(m: &ThreadModel, id: &ItemId, offset: usize, text: &str) -> Delta {

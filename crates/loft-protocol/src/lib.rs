@@ -23,6 +23,11 @@ pub(crate) fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// For `skip_serializing_if`: `false` is left off the wire.
+pub(crate) fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Bumped on any incompatible wire change. The daemon accepts `N` and `N-1`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -439,6 +444,11 @@ pub enum Request {
         thread_id: ThreadId,
         scope: DiffScope,
     },
+    /// More of a thread than its snapshot carries (`Snapshot::Thread::older`).
+    ThreadItems {
+        thread_id: ThreadId,
+        page: ItemsPage,
+    },
     /// Open a shell. With `key`, a live terminal opened earlier with the same
     /// key is returned (resized, unless `cols`/`rows` are 0) instead, so a UI
     /// restart reattaches. `command` is typed into the shell as its user
@@ -844,6 +854,13 @@ pub enum Response {
     Diff {
         diff: DiffResult,
     },
+    /// A page of a thread's items, oldest first. `older`: there are earlier
+    /// turns still (for `ItemsPage::Before`).
+    Items {
+        items: Vec<Item>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        older: bool,
+    },
     Terminal {
         terminal: TerminalInfo,
     },
@@ -960,6 +977,12 @@ pub enum Snapshot {
         /// Messages waiting for the running turn to end, in order.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         queue: Vec<QueuedMessage>,
+        /// A long thread comes in part: `items` holds its last turns, and of
+        /// each subagent only its latest steps. Earlier turns and a
+        /// subagent's whole run come with `Request::ThreadItems`. `true` when
+        /// earlier turns were left out.
+        #[serde(default, skip_serializing_if = "is_false")]
+        older: bool,
     },
     Terminal {
         seq: u64,

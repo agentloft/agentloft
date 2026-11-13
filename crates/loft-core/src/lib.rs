@@ -7,6 +7,7 @@ mod cleanup;
 mod clients;
 mod forks;
 mod handoff;
+mod item_pages;
 mod limits;
 mod pages;
 mod pull_requests;
@@ -588,6 +589,30 @@ impl Core {
 
     // -- queries ------------------------------------------------------------
 
+    /// More of a thread than its snapshot carried, as live as the snapshot.
+    fn thread_items(
+        &self,
+        thread_id: &ThreadId,
+        page: loft_protocol::ItemsPage,
+    ) -> CoreResult<Response> {
+        let all = self.with_store(|s| {
+            s.thread(thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
+            s.items(thread_id)
+        })?;
+        let (mut items, older) = match page {
+            loft_protocol::ItemsPage::Steps { of } => (item_pages::steps(all, &of), false),
+            loft_protocol::ItemsPage::Before { ordinal } => item_pages::page(all, Some(ordinal)),
+        };
+        let live = self.live();
+        for item in items.iter_mut() {
+            if let Some(l) = live.get(&item.id) {
+                *item = l.clone();
+            }
+        }
+        Ok(Response::Items { items, older })
+    }
+
     pub fn snapshot(&self, topic: &Topic) -> CoreResult<Snapshot> {
         if let Topic::Terminal(id) = topic {
             let (terminal, replay, end) = self.terminals.snapshot(id)?;
@@ -614,14 +639,18 @@ impl Core {
                 Topic::Terminal(_) | Topic::Page(_) => None,
                 Topic::Thread(id) => match s.thread(id)? {
                     None => None,
-                    Some(thread) => Some(Snapshot::Thread {
-                        seq,
-                        queue: s.queue(id)?,
-                        turns: s.turns(id)?,
-                        items: s.items(id)?,
-                        requests: s.requests(id)?,
-                        thread,
-                    }),
+                    Some(thread) => {
+                        let (items, older) = item_pages::page(s.items(id)?, None);
+                        Some(Snapshot::Thread {
+                            seq,
+                            queue: s.queue(id)?,
+                            turns: s.turns(id)?,
+                            items,
+                            requests: s.requests(id)?,
+                            thread,
+                            older,
+                        })
+                    }
                 },
             })
         })?;
@@ -1131,6 +1160,7 @@ impl Core {
             Request::GetDiff { thread_id, scope } => Ok(Response::Diff {
                 diff: self.diff(&thread_id, scope).await?,
             }),
+            Request::ThreadItems { thread_id, page } => self.thread_items(&thread_id, page),
             Request::TerminalOpen {
                 root,
                 cols,
