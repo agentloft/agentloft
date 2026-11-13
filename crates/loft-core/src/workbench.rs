@@ -551,6 +551,9 @@ impl Core {
             }
             let at = clock(item.started_at_ms.unwrap_or(item.updated_at_ms));
             match &item.body {
+                ItemBody::ContextSummary { text } => {
+                    out.push_str(&format!("## Inherited context · {at}\n{text}\n\n"))
+                }
                 ItemBody::UserMessage { text, .. } => {
                     out.push_str(&format!("## User · {at}\n{text}\n\n"))
                 }

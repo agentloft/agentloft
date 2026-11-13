@@ -306,8 +306,8 @@ pub enum Request {
         message: Option<String>,
     },
     /// Fork a thread (ADR-0011). The same harness forks natively; another
-    /// harness gets a handoff digest back as a `draft` first message for the
-    /// user to review. The fork gets its own worktree from the parent's
+    /// harness gets a handoff digest saved as inherited context.
+    /// The fork gets its own worktree from the parent's
     /// current state unless `share_workspace` (or not a git repo).
     ForkThread {
         thread_id: ThreadId,
@@ -908,10 +908,11 @@ pub enum Response {
         #[serde(default)]
         files: Option<Box<UiFiles>>,
     },
-    /// A new fork, plus the handoff digest to offer as its first message.
+    /// A new fork with its inherited context already saved.
     Forked {
         thread: Thread,
-        #[serde(default)]
+        /// Legacy composer prefill; new forks leave this empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         draft: Option<String>,
     },
     Automation {

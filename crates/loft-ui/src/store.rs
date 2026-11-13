@@ -174,6 +174,8 @@ pub enum StoreEvent {
     /// Show (`Some`) or take down (`None`) the "working on it" toast of a
     /// slow action, so its result doesn't sit beside a stale progress note.
     Progress { message: Option<String> },
+    /// A newly opened thread is ready for the user's next message.
+    FocusComposer { thread_id: ThreadId },
     /// Archiving needs confirmation (e.g. the worktree is dirty).
     ConfirmArchive { thread_id: ThreadId, reason: String },
     /// Put queued message `id` back in the composer to edit it.
@@ -264,8 +266,8 @@ pub struct AppStore {
     /// Messages the daemon didn't take (it couldn't be reached, say), for
     /// the composer to take back so nothing typed is lost.
     pub unsent: HashMap<ThreadId, Vec<Outgoing>>,
-    /// Text to prefill a thread's composer with (a fork's handoff digest).
-    pub drafts: HashMap<ThreadId, String>,
+    /// A fork is being prepared (worktree and inherited context).
+    forking: bool,
     /// Threads that finished a turn while not selected (sidebar dot).
     pub unread: std::collections::HashSet<ThreadId>,
     /// Model pickers' options per harness (`ListModels`).
@@ -336,7 +338,7 @@ impl AppStore {
             automations_open: false,
             actions: Default::default(),
             unsent: HashMap::new(),
-            drafts: HashMap::new(),
+            forking: false,
             unread: Default::default(),
             models: HashMap::new(),
             harness_status: HashMap::new(),
@@ -1704,8 +1706,7 @@ impl AppStore {
         });
     }
 
-    /// Fork into `harness` (ADR-0011) and open the fork; a cross-provider
-    /// fork's handoff digest lands in its composer for review.
+    /// Fork into `harness` (ADR-0011) and open it with context already saved.
     /// `at_turn` forks from the end of that turn instead of the latest.
     pub fn fork_thread(
         &mut self,
@@ -1714,21 +1715,32 @@ impl AppStore {
         at_turn: Option<loft_protocol::TurnId>,
         cx: &mut Context<Self>,
     ) {
+        if self.forking {
+            return;
+        }
+        self.forking = true;
+        cx.emit(StoreEvent::Progress {
+            message: Some("Creating fork…".into()),
+        });
         let body = Request::ForkThread {
             thread_id,
             harness: Some(harness),
             share_workspace: false,
             at_turn,
         };
-        self.request_result(body, cx, |store, result, cx| match result {
-            Ok(Response::Forked { thread, draft }) => {
-                if let Some(draft) = draft {
-                    store.drafts.insert(thread.id.clone(), draft);
+        self.request_result(body, cx, |store, result, cx| {
+            store.forking = false;
+            cx.emit(StoreEvent::Progress { message: None });
+            match result {
+                Ok(Response::Forked { thread, .. }) => {
+                    store.select_thread(thread.id.clone(), cx);
+                    cx.emit(StoreEvent::FocusComposer {
+                        thread_id: thread.id,
+                    });
                 }
-                store.select_thread(thread.id, cx);
+                Ok(_) => {}
+                Err(err) => store.notify_result(Err(err), cx),
             }
-            Ok(_) => {}
-            Err(err) => store.notify_result(Err(err), cx),
         });
     }
 
@@ -1839,7 +1851,6 @@ impl AppStore {
         self.on_archived(thread_id, cx);
         self.threads.remove(thread_id);
         self.unread.remove(thread_id);
-        self.drafts.remove(thread_id);
         self.unsent.remove(thread_id);
         let subs: Vec<u64> = self
             .subs

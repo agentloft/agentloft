@@ -1,5 +1,5 @@
 //! Forks (ADR-0011): same harness → the provider's native fork; another
-//! harness → a deterministic handoff digest offered as the first message.
+//! harness → a deterministic handoff digest saved as inherited context.
 //! By default the fork gets its own worktree from the parent's current
 //! state, so conversation and code start from the same point.
 
@@ -7,8 +7,8 @@ use crate::worktrees::{blocking, slug_or};
 use crate::{Core, CoreResult, handoff};
 use loft_git::worktree as wt;
 use loft_protocol::{
-    DiffScope, ErrorBody, ErrorCode, Event, ForkKind, HarnessId, Response, Thread, ThreadId,
-    ThreadParent, ThreadStatus, ThreadWorkspace,
+    DiffScope, ErrorBody, ErrorCode, Event, ForkKind, HarnessId, Item, ItemBody, ItemId,
+    ItemStatus, Response, Thread, ThreadId, ThreadParent, ThreadStatus, ThreadWorkspace,
 };
 use loft_store::now_ms;
 use std::path::{Path, PathBuf};
@@ -282,7 +282,7 @@ impl Core {
             && parent.native_session_id.is_some()
             && h.capabilities().native_fork
             && at.as_ref().is_none_or(|t| t.native_turn.is_some());
-        let draft = if native || items.is_empty() {
+        let context = if native || items.is_empty() {
             None
         } else {
             let files = match &at {
@@ -368,7 +368,7 @@ impl Core {
             } else {
                 Vec::new()
             },
-            started_at_ms: None,
+            started_at_ms: Some(now),
             draft: None,
             waiting_on: Vec::new(),
             limit: None,
@@ -377,10 +377,29 @@ impl Core {
             landed: false,
             suggestion: None,
         };
-        self.commit(vec![Event::ThreadCreated {
+        let mut events = vec![Event::ThreadCreated {
             thread: thread.clone(),
-        }])?;
-        Ok(Response::Forked { thread, draft })
+        }];
+        if let Some(text) = context {
+            events.push(Event::ItemUpserted {
+                item: Item {
+                    id: ItemId::new(),
+                    thread_id: thread.id.clone(),
+                    turn_id: None,
+                    ordinal: 0,
+                    status: ItemStatus::Completed,
+                    body: ItemBody::ContextSummary { text },
+                    updated_at_ms: now,
+                    parent_id: None,
+                    started_at_ms: None,
+                },
+            });
+        }
+        self.commit(events)?;
+        Ok(Response::Forked {
+            thread,
+            draft: None,
+        })
     }
 
     /// A new worktree from a checkpoint of the parent's current state (or

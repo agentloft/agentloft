@@ -32,6 +32,7 @@ Run the full suite once, in the background if your tool allows it, saving the ou
 
 ## Gotchas
 
+- Handoff forks save an `ItemBody::ContextSummary` in the child's timeline, not a composer draft. The core includes it with the first ordinary message (retrying after failure), so it must survive restarts and stay separate from user-entered text.
 - Every daemon answer, event and snapshot is one message (`MAX_FRAME_LEN`). Anything that grows with the user's data (diffs, file reads, tool output) needs a bound where it is made. An answer that is still too big fails its request (`conn::encode`); anything else too big ends the connection and the client reconnects. Before that, a 14 MB untracked page in a working-tree diff silently killed the window's connection: requests still ran in the daemon, nothing came back, and "Connected" stayed on.
 - To see what the user's daemon answers, send read-only requests (`get_diff`, a thread subscription) over its socket (frames as in "Seeding"); never ones that change their data. An answer that never comes, on a connection still open, is the dead-connection symptom.
 - New Lucide icons go in `AppIcons` in `crates/loft-ui/src/assets.rs`; an unlisted icon renders as a blank box.

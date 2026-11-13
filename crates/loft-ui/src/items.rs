@@ -565,6 +565,47 @@ pub(crate) fn render_item(
         return crate::view::render(state, item, p);
     }
     match &item.body {
+        ItemBody::ContextSummary { text } => {
+            let open = state.is_expanded(&item.id, false);
+            let key = item.id.clone();
+            let thread = thread.clone();
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("context-{}", item.id)))
+                        .gap_1p5()
+                        .items_center()
+                        .text_sm()
+                        .text_color(p.muted_foreground)
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(p.foreground))
+                        .child(Icon::new(IconName::GitFork).small())
+                        .child("Context loaded from the original thread")
+                        .child(chevron(open))
+                        .on_click(move |_, _, cx| {
+                            thread.update(cx, |t, cx| t.toggle(key.clone(), false, cx));
+                        }),
+                )
+                .when(open, |d| {
+                    d.child(
+                        div()
+                            .pl_3()
+                            .border_l_1()
+                            .border_color(p.border)
+                            .text_sm()
+                            .text_color(p.muted_foreground)
+                            .child(
+                                TextView::markdown(
+                                    SharedString::from(format!("context-md-{}", item.id)),
+                                    text.clone(),
+                                )
+                                .selectable(true),
+                            ),
+                    )
+                })
+                .into_any_element()
+        }
         ItemBody::UserMessage { text, attachments } => {
             use gpui_kit::StyledImage as _;
             use gpui_kit::component::menu::ContextMenuExt as _;

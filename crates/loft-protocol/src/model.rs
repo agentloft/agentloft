@@ -670,6 +670,11 @@ pub enum ItemStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ItemBody {
+    /// Inherited fork context, saved before the first turn and included
+    /// with the user's first message to the agent.
+    ContextSummary {
+        text: String,
+    },
     UserMessage {
         text: String,
         /// Images sent with the message.

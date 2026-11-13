@@ -477,6 +477,17 @@ impl WorkspaceView {
                     );
                 }
             }
+            StoreEvent::FocusComposer { thread_id } => {
+                let thread = self
+                    .store
+                    .read(cx)
+                    .selected_thread()
+                    .filter(|t| &t.read(cx).id == thread_id);
+                if let Some(thread) = thread {
+                    let composer = self.composer_for(&thread, window, cx);
+                    composer.update(cx, |c, cx| c.focus(window, cx));
+                }
+            }
             StoreEvent::Browse { url } => {
                 self.panel_open = true;
                 self.panel
@@ -1983,13 +1994,6 @@ impl WorkspaceView {
                 },
             );
         self._subs.push(sub);
-        // A fork's handoff digest, for the user to review and send.
-        if let Some(draft) = self.store.update(cx, |s, _| s.drafts.remove(&id)) {
-            composer.update(cx, |c, cx| {
-                c.set_value(draft, window, cx);
-                c.focus(window, cx);
-            });
-        }
         self.composer_placeholder.insert(id.clone(), placeholder);
         self.composers.insert(id, composer.clone());
         composer
@@ -4750,7 +4754,7 @@ impl WorkspaceView {
                             harness_name(&model.thread.harness)
                         ),
                         loft_protocol::ForkKind::Handoff => {
-                            "It starts from a handoff summary. Review it below, then send.".into()
+                            "Context loaded. Send your next message to continue.".into()
                         }
                         loft_protocol::ForkKind::Spawned => {
                             "Started by that thread's agent.".into()

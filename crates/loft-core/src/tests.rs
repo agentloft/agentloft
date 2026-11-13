@@ -1027,7 +1027,7 @@ async fn automatic_cleanup_never_deletes_a_remote_branch() {
 }
 
 #[tokio::test]
-async fn fork_gets_own_worktree_and_handoff_draft() {
+async fn fork_gets_own_worktree_and_saved_context() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -1078,9 +1078,23 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
         loft_protocol::ForkKind::Handoff,
         "fake has no native fork"
     );
-    let draft = draft.expect("handoff draft");
-    assert!(draft.contains("- Make the greeting friendlier"), "{draft}");
-    assert!(draft.contains(&format!("thread `{}`", parent.id)));
+    assert!(draft.is_none(), "the composer is for the next message");
+    assert!(thread.draft.is_none());
+    assert!(
+        thread.is_started(),
+        "forks stay in the sidebar after restarting"
+    );
+    let (_, turns, items, _) = thread_snapshot(&core, &thread.id);
+    assert!(turns.is_empty(), "forking doesn't start agent work");
+    let [context] = items.as_slice() else {
+        panic!("{items:?}")
+    };
+    let ItemBody::ContextSummary { text } = &context.body else {
+        panic!("{context:?}")
+    };
+    assert!(context.turn_id.is_none());
+    assert!(text.contains("- Make the greeting friendlier"), "{text}");
+    assert!(text.contains(&format!("thread `{}`", parent.id)));
     let ThreadWorkspace::Worktree { path, branch, base } = &thread.workspace else {
         panic!("{:?}", thread.workspace)
     };
@@ -1109,6 +1123,74 @@ async fn fork_gets_own_worktree_and_handoff_draft() {
         panic!()
     };
     assert_eq!(shared.cwd, parent.cwd);
+
+    // Context belongs to the fork itself and survives closing the app
+    // before sending anything. The harness gets it with the next message;
+    // the transcript records only what the user actually typed.
+    let child_id = thread.id.clone();
+    core.shutdown().await;
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            ..Default::default()
+        },
+    );
+    core.handle(Request::SendMessage {
+        thread_id: child_id.clone(),
+        text: "fail this attempt".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &child_id, turn_done).await;
+    assert_eq!(
+        thread_snapshot(&core, &child_id).1[0].status,
+        TurnStatus::Failed
+    );
+    for (n, message) in ["Add a farewell too", "Use a warmer tone"]
+        .iter()
+        .enumerate()
+    {
+        core.handle(Request::SendMessage {
+            thread_id: child_id.clone(),
+            text: (*message).into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+        wait_for(&core, &child_id, |_, turns| {
+            turns.len() == n + 2 && turns[n + 1].status.is_terminal()
+        })
+        .await;
+        let (_, turns, items, _) = thread_snapshot(&core, &child_id);
+        assert_eq!(turns[n + 1].status, TurnStatus::Completed);
+        assert!(items.iter().any(|i| matches!(&i.body,
+            ItemBody::UserMessage { text, .. } if text == message)));
+        let reply = items
+            .iter()
+            .rev()
+            .find_map(|i| match &i.body {
+                ItemBody::AssistantMessage { text } => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        if n == 0 {
+            assert!(reply.contains("Make the greeting friendlier"), "{reply}");
+            assert!(
+                reply.contains("## Next message\nAdd a farewell too"),
+                "{reply}"
+            );
+        } else {
+            assert_eq!(
+                reply,
+                &format!("echo: {message}"),
+                "context is included once"
+            );
+        }
+    }
 }
 
 #[tokio::test]

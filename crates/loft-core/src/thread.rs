@@ -158,8 +158,13 @@ pub(crate) type ThreadHandle = mpsc::UnboundedSender<ThreadCmd>;
 pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let queue = core.with_store(|s| s.queue(&thread.id)).unwrap_or_default();
+    let handoff_pending = thread
+        .parent
+        .as_ref()
+        .is_some_and(|p| p.kind == ForkKind::Handoff);
     let actor = ThreadActor {
         queue,
+        handoff_pending,
         limit_hit: None,
         resumed: false,
         send_next: false,
@@ -185,6 +190,8 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
 }
 
 struct ThreadActor {
+    /// Stop looking up inherited context once the provider has it.
+    handoff_pending: bool,
     /// Messages waiting for the running turn to complete, in order
     /// (mirrored in the store on every change).
     queue: Vec<QueuedMessage>,
@@ -1041,9 +1048,46 @@ impl ThreadActor {
         attachments: Vec<AttachmentRef>,
         note: Option<String>,
     ) {
+        // The summary belongs to the fork, not its composer. Read the
+        // saved item here so it survives a restart before the first send.
+        // Keep including it after a failed first turn; once a turn has
+        // completed the provider's session carries the context forward.
+        let context = if self.handoff_pending && !text.starts_with('/') {
+            self.core.with_store(|s| {
+                let turns = s.turns(&self.thread.id)?;
+                let items = s.items(&self.thread.id)?;
+                let delivered = items.iter().any(|i| {
+                    matches!(&i.body, ItemBody::UserMessage { text, .. } if !text.starts_with('/'))
+                        && turns.iter().any(|t| {
+                            i.turn_id.as_ref() == Some(&t.id) && t.status == TurnStatus::Completed
+                        })
+                });
+                Ok((!delivered)
+                    .then(|| {
+                        items.into_iter().find_map(|i| match i.body {
+                            ItemBody::ContextSummary { text } => Some(text),
+                            _ => None,
+                        })
+                    })
+                    .flatten())
+            })
+        } else {
+            Ok(None)
+        };
+        if !text.starts_with('/') && matches!(&context, Ok(None)) {
+            self.handoff_pending = false;
+        }
         let text = match note {
             Some(note) => format!("{note}\n\n{text}"),
             None => text,
+        };
+        let text = match context {
+            Ok(Some(context)) => format!("{context}\n\n## Next message\n{text}"),
+            Ok(None) => text,
+            Err(err) => {
+                let _ = self.finish_turn(TurnStatus::Failed, None, Some(err.message));
+                return;
+            }
         };
         let images = attachments
             .into_iter()

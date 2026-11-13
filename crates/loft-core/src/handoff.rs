@@ -1,7 +1,7 @@
 //! Deterministic handoff digest (ADR-0011): what a fork into another
 //! provider starts from. Built only from the parent's event log and diff,
-//! so it's instant, free and reproducible. The user reviews and edits it as
-//! the fork's first message.
+//! so it's instant, free and reproducible. Saved in the fork's timeline
+//! and sent to the agent alongside the user's next message.
 
 use loft_protocol::{DiffFileStat, Item, ItemBody, Thread};
 
@@ -33,6 +33,15 @@ pub(crate) fn digest(
         "I'm continuing a task that another agent ({harness_name}) worked on in the thread \"{}\". Here's where it stands.\n",
         parent.title
     );
+
+    if let Some(text) = items.iter().find_map(|i| match &i.body {
+        ItemBody::ContextSummary { text } => Some(text),
+        _ => None,
+    }) {
+        out.push_str("\n## Inherited context\n");
+        out.push_str(&clip(text, 3_000));
+        out.push('\n');
+    }
 
     if !requests.is_empty() {
         out.push_str("\n## What was asked\n");
@@ -79,7 +88,7 @@ pub(crate) fn digest(
 
     let mut out = clip(&out, BUDGET);
     out.push_str(&format!(
-        "\nThe full history is in Agentloft thread `{}`. Use the agentloft MCP tools (`read_thread`, `get_thread_diff`) if you need more detail.\n\nNext: ",
+        "\nThe full history is in Agentloft thread `{}`. Use the agentloft MCP tools (`read_thread`, `get_thread_diff`) if you need more detail.\n\nThis is background context. Follow the user's next message below.\n",
         parent.id
     ));
     out
@@ -242,6 +251,6 @@ mod tests {
         assert!(a.contains("## Where it ended\nAdded greet() to main.py."));
         assert!(a.contains("- main.py (+3 −1)"));
         assert!(a.contains("- [ ] Add tests") && !a.contains("Write greet"));
-        assert!(a.contains("thread `T1`") && a.ends_with("Next: "));
+        assert!(a.contains("thread `T1`") && a.contains("This is background context."));
     }
 }

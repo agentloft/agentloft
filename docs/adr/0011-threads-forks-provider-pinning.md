@@ -31,7 +31,10 @@ Native fork support:
   - the cumulative diff summary;
   - open TODOs and plan items.
 - It is trimmed to a token budget.
-- The user can review and edit it before sending.
+- The digest is saved as inherited context in the fork's timeline, under
+  an expandable row. The composer stays empty for the user's next message.
+- The core includes it with the first message to the new agent. Forking
+  alone does not ask the agent to do more work.
 - The digest is **deterministic** (decided): instant, free and reproducible.
 - It ends with the parent's thread id. The new agent can read the parent's full history on demand through the Agentloft MCP server ([ADR-0013](0013-agentloft-mcp-cross-thread-context.md)). This replaces "ask the source agent to summarise".
 
@@ -41,6 +44,7 @@ Native fork support:
 
 **UI**
 - Forks nest under their parent in the sidebar. A fork marker item appears in both timelines.
+- Creating a fork shows progress while its worktree is prepared.
 
 ## Consequences
 **Benefits**
