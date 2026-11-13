@@ -152,6 +152,12 @@ pub enum HarnessEvent {
         native_id: String,
         result: ToolResult,
     },
+    /// An item that had ended is in progress again: a background subagent
+    /// that was stopped, or had finished, and was sent another message.
+    /// It ends again with an `ItemCompleted`.
+    ItemReopened {
+        native_id: String,
+    },
     ItemCompleted {
         native_id: String,
         /// Replace the body entirely (e.g. final full text). `None` keeps the

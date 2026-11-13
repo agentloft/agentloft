@@ -1465,6 +1465,28 @@ impl ThreadActor {
                 self.core.live().insert(item_id, item.clone());
                 self.core.commit(vec![Event::ItemUpserted { item }])?;
             }
+            HarnessEvent::ItemReopened { native_id } => {
+                let Some(item_id) = self
+                    .items
+                    .get(&native_id)
+                    .or_else(|| self.subagents.get(&native_id))
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                let item = match self.core.live().get(&item_id).cloned() {
+                    Some(item) => Some(item),
+                    None => self.load_item(&item_id)?,
+                };
+                let Some(mut item) = item else {
+                    return Ok(());
+                };
+                item.status = ItemStatus::InProgress;
+                item.updated_at_ms = now_ms();
+                self.items.insert(native_id, item_id.clone());
+                self.core.live().insert(item_id, item.clone());
+                self.core.commit(vec![Event::ItemUpserted { item }])?;
+            }
             HarnessEvent::ItemCompleted {
                 native_id,
                 body,

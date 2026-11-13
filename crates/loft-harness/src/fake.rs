@@ -14,6 +14,9 @@
 //! - contains `bgagents`: starts three subagents in the background first.
 //!   They work on after the turn, a step at a time with a pause between
 //!   steps (short ones with `quick` in the text), then finish;
+//! - contains `bgresume`: the first subagent `bgagents` started in the
+//!   session's first turn is sent a message: it works again, takes a step
+//!   and finishes;
 //! - contains `fail`: completes the turn as failed;
 //! - contains `limit`: fails the turn the way a used-up plan does.
 //!   `limit:<seconds>` says the limit resets that many seconds from now
@@ -215,6 +218,35 @@ async fn run_turn(
     text: &str,
 ) -> bool {
     ends.emit(HarnessEvent::TurnStarted);
+
+    if text.contains("bgresume") {
+        let agent = "agent-1-0".to_owned();
+        let step = format!("{agent}-resumed");
+        ends.emit(HarnessEvent::ItemReopened {
+            native_id: agent.clone(),
+        });
+        ends.emit(HarnessEvent::ItemStarted {
+            parent: Some(agent.clone()),
+            native_id: step.clone(),
+            body: ItemBody::AssistantMessage {
+                text: String::new(),
+            },
+        });
+        ends.emit(HarnessEvent::ItemCompleted {
+            native_id: step,
+            body: Some(ItemBody::AssistantMessage {
+                text: "Again: nothing to report.".into(),
+            }),
+            tool_result: None,
+            status: ItemStatus::Completed,
+        });
+        ends.emit(HarnessEvent::ItemCompleted {
+            native_id: agent,
+            body: None,
+            tool_result: None,
+            status: ItemStatus::Completed,
+        });
+    }
 
     if text.contains("bgagents") {
         background.0.push(start_background_agents(

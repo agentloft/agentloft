@@ -2237,6 +2237,55 @@ async fn a_background_subagent_is_open_until_it_finishes() {
     assert_eq!(ended.len(), 3);
 }
 
+/// A subagent that finished (or was stopped) and is sent a message works
+/// again: its item, from an earlier turn, is in progress until it ends anew.
+#[tokio::test]
+async fn a_subagent_sent_a_message_after_it_ended_works_again() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let send = |text: &str| {
+        f.core.handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: text.into(),
+            attachments: vec![],
+        })
+    };
+    send("bgagents quick").await.unwrap();
+    wait_for(&f.core, &thread.id, |t, turns| {
+        t.waiting_on.is_empty() && turns.len() == 1 && turn_done(t, turns)
+    })
+    .await;
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    let first = items
+        .iter()
+        .find(
+            |i| matches!(&i.body, ItemBody::ToolCall { title, .. } if title == "Audit the daemon"),
+        )
+        .cloned()
+        .unwrap();
+    assert_eq!(first.status, ItemStatus::Completed);
+
+    let mut bus = f.core.subscribe();
+    send("bgresume").await.unwrap();
+    wait_for(&f.core, &thread.id, |t, turns| {
+        turns.len() == 2 && turn_done(t, turns)
+    })
+    .await;
+    let mut seen = Vec::new();
+    while let Ok(msg) = bus.try_recv() {
+        if let BusMsg::Event(env) = msg
+            && let Event::ItemUpserted { item } = &env.event
+            && item.id == first.id
+        {
+            seen.push(item.status);
+        }
+    }
+    assert_eq!(seen, [ItemStatus::InProgress, ItemStatus::Completed]);
+    let (_, _, items, _) = thread_snapshot(&f.core, &thread.id);
+    assert!(items.iter().any(|i| i.parent_id.as_ref() == Some(&first.id)
+        && matches!(&i.body, ItemBody::AssistantMessage { text } if text.starts_with("Again"))));
+}
+
 /// A session that goes away takes its background subagents with it.
 #[tokio::test]
 async fn a_background_subagent_ends_with_its_session() {

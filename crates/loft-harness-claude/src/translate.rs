@@ -73,6 +73,11 @@ pub struct Translator {
     queries: HashSet<String>,
     /// Agent tool call id → the task id Claude runs it as (to stop it).
     tasks: HashMap<String, String>,
+    /// Subagent task id → the Agent tool call that launched it, for the
+    /// whole session. A subagent sent a message after it was stopped or
+    /// finished starts again under the same task id, but Claude names the
+    /// `SendMessage` call as its tool call; its item is the Agent call's.
+    agent_tasks: HashMap<String, String>,
     /// Tasks started and not yet finished: task id → what it is.
     open_tasks: std::collections::BTreeMap<String, String>,
     interrupt_requested: bool,
@@ -526,25 +531,45 @@ impl Translator {
                     .unwrap_or_default(),
             })],
             Some("task_started") => {
+                let mut out = Vec::new();
                 if let (Some(task), Some(tool)) = (str_at(v, "task_id"), str_at(v, "tool_use_id")) {
-                    self.tasks.insert(tool.to_owned(), task.to_owned());
+                    if self.agents.contains(tool) {
+                        self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+                    }
+                    match self.agent_tasks.get(task).cloned() {
+                        // A subagent resumed by a message: its own item
+                        // is in progress again, until its task ends anew.
+                        Some(agent) if agent != tool => {
+                            if self.agents.insert(agent.clone()) {
+                                out.push(Out::Event(HarnessEvent::ItemReopened {
+                                    native_id: agent.clone(),
+                                }));
+                            }
+                            self.tasks.retain(|_, t| t != task);
+                            self.tasks.insert(agent, task.to_owned());
+                        }
+                        _ => {
+                            self.tasks.insert(tool.to_owned(), task.to_owned());
+                        }
+                    }
                 }
                 // A command a subagent runs and waits for is one of its
                 // steps, not background work of its own.
                 let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
                 let step = flag("owned_by_subagent") && !flag("is_backgrounded");
                 match str_at(v, "task_id") {
-                    Some(_) if step => vec![],
+                    Some(_) if step => {}
                     Some(task) => {
                         let what = str_at(v, "description")
                             .or_else(|| str_at(v, "subagent_type"))
                             .unwrap_or("a background task")
                             .to_owned();
                         self.open_tasks.insert(task.to_owned(), what);
-                        self.background_tasks()
+                        out.extend(self.background_tasks());
                     }
-                    None => vec![],
+                    None => {}
                 }
+                out
             }
             // A task finished (or stopped, or failed).
             Some("task_notification") => match str_at(v, "task_id") {
@@ -2234,6 +2259,62 @@ mod tests {
         );
         // And nothing is left to stop.
         assert!(t.stop_subagent("tu_a").is_empty());
+    }
+
+    #[test]
+    fn a_stopped_subagent_sent_a_message_is_working_again() {
+        // Recorded: an Agent call in the background, stopped (`TaskStop`),
+        // then sent a message (`SendMessage`). Claude starts the same task
+        // again but names the SendMessage call as its tool call, and ends
+        // it under that one too.
+        let (mut t, out) = replay(include_str!("../fixtures/2.1.323-resumed-subagent.jsonl"));
+        let agent = "toolu_01GcyprnU6c1w3Ssaqozwyu7";
+        let mut status = None;
+        let mut sequence = Vec::new();
+        for e in events(&out) {
+            match e {
+                HarnessEvent::ItemCompleted {
+                    native_id,
+                    status: s,
+                    ..
+                } if native_id == agent => {
+                    status = Some(*s);
+                    sequence.push(format!("{s:?}"));
+                }
+                HarnessEvent::ItemReopened { native_id } if native_id == agent => {
+                    status = None;
+                    sequence.push("reopened".into());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(sequence, ["Declined", "reopened", "Completed"]);
+        assert_eq!(status, Some(ItemStatus::Completed));
+        assert!(t.stop_subagent(agent).is_empty(), "nothing left to stop");
+    }
+
+    #[test]
+    fn a_resumed_subagent_can_be_stopped_from_its_item() {
+        let mut t = Translator::new();
+        t.start_turn("x");
+        t.on_line(r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"dig","prompt":"dig","run_in_background":true}}]}}"#);
+        t.on_line(r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu_a","description":"dig","is_backgrounded":true,"task_type":"local_agent"}"#);
+        t.on_line(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_a","content":"Async agent launched successfully."}]}}"#);
+        t.on_line(r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"tu_a","status":"completed"}"#);
+        // Sent a message after it finished: it works again.
+        t.on_line(r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"tu_send","name":"SendMessage","input":{"to":"t1","message":"more"}}]}}"#);
+        let out = t.on_line(r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"tu_send","description":"dig","is_backgrounded":true,"task_type":"local_agent"}"#);
+        assert!(
+            events(&out).iter().any(
+                |e| matches!(e, HarnessEvent::ItemReopened { native_id } if native_id == "tu_a")
+            )
+        );
+        let stop = t.stop_subagent("tu_a");
+        let [Out::Send(stop)] = stop.as_slice() else {
+            panic!("its item stops it");
+        };
+        assert_eq!(stop["request"]["task_id"], "t1");
+        assert!(t.stop_subagent("tu_send").is_empty());
     }
 
     #[test]
