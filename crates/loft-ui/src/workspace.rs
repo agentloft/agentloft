@@ -138,7 +138,9 @@ pub struct WorkspaceView {
     /// Notes left on documents open in a thread's panel, not sent yet: the
     /// file (as its tab has it) and the note.
     doc_notes: HashMap<ThreadId, Vec<(String, crate::panel::docs::DocNote)>>,
-    composer_harness: HashMap<ThreadId, HarnessId>,
+    /// What each composer shows while empty: the agent's suggested next
+    /// message, or the agent's invitation.
+    composer_placeholder: HashMap<ThreadId, String>,
     observed: HashMap<ThreadId, Subscription>,
     search: Entity<InputState>,
     query: String,
@@ -322,7 +324,7 @@ impl WorkspaceView {
             pasted: HashMap::new(),
             page_notes: HashMap::new(),
             doc_notes: HashMap::new(),
-            composer_harness: HashMap::new(),
+            composer_placeholder: HashMap::new(),
             observed: HashMap::new(),
             search,
             query: String::new(),
@@ -1925,34 +1927,28 @@ impl WorkspaceView {
             let sub = cx.observe(thread, |_, _, cx| cx.notify());
             self.observed.insert(id.clone(), sub);
         }
-        let harness_now = thread
+        let placeholder_now = thread
             .read(cx)
             .model
             .as_ref()
-            .map(|m| m.thread.harness.clone());
+            .map(|m| composer_placeholder(&m.thread));
         if let Some(c) = self.composers.get(&id).cloned() {
-            // Keep the placeholder in sync after a harness switch.
-            if let Some(h) = harness_now
-                && self.composer_harness.get(&id) != Some(&h)
+            // Keep the placeholder in sync: a suggestion came or went, or
+            // the agent changed.
+            if let Some(text) = placeholder_now
+                && self.composer_placeholder.get(&id) != Some(&text)
             {
-                c.update(cx, |c, cx| {
-                    c.set_placeholder(placeholder_for(&h), window, cx)
-                });
-                self.composer_harness.insert(id.clone(), h);
+                c.update(cx, |c, cx| c.set_placeholder(text.clone(), window, cx));
+                self.composer_placeholder.insert(id.clone(), text);
             }
             return c;
         }
-        let thread_harness = thread
-            .read(cx)
-            .model
-            .as_ref()
-            .map(|m| m.thread.harness.clone())
-            .unwrap_or_else(HarnessId::claude);
+        let placeholder = placeholder_now.unwrap_or_else(|| placeholder_for(&HarnessId::claude()));
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 12)
                 .submit_on_enter(true)
-                .placeholder(placeholder_for(&thread_harness))
+                .placeholder(placeholder.clone())
         });
         let thread_id = id.clone();
         let sub =
@@ -1994,7 +1990,7 @@ impl WorkspaceView {
                 c.focus(window, cx);
             });
         }
-        self.composer_harness.insert(id.clone(), thread_harness);
+        self.composer_placeholder.insert(id.clone(), placeholder);
         self.composers.insert(id, composer.clone());
         composer
     }
@@ -4530,6 +4526,9 @@ impl WorkspaceView {
         let thread_id = model.thread.id.clone();
         let running = model.running_turn().is_some();
         let stop_hint = crate::keymap::hint("stop", cx);
+        // The empty composer shows the agent's suggested next message.
+        let offers_suggestion =
+            !running && suggestion(&model.thread).is_some() && composer.read(cx).value().is_empty();
         // Open approvals whose card isn't on screen (a background subagent's
         // step, or a step inside folded work) are pinned above the composer.
         let shown_items: std::collections::HashSet<usize> = state
@@ -5003,17 +5002,22 @@ impl WorkspaceView {
                                             }
                                         },
                                     ))
-                                    .capture_action(cx.listener(
-                                        |this,
-                                         _: &gpui_kit::component::input::IndentInline,
-                                         window,
-                                         cx| {
-                                            if this.completion.is_some() {
-                                                cx.stop_propagation();
-                                                this.accept_completion(None, window, cx);
-                                            }
-                                        },
-                                    ))
+                                    .capture_action({
+                                        let id = thread_id.clone();
+                                        cx.listener(
+                                            move |this,
+                                                  _: &gpui_kit::component::input::IndentInline,
+                                                  window,
+                                                  cx| {
+                                                if this.completion.is_some() {
+                                                    cx.stop_propagation();
+                                                    this.accept_completion(None, window, cx);
+                                                } else if this.take_suggestion(&id, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        )
+                                    })
                                     .capture_action(cx.listener(
                                         |this, _: &gpui_kit::component::input::Escape, _, cx| {
                                             if this.completion.take().is_some() {
@@ -5139,6 +5143,17 @@ impl WorkspaceView {
                                                     .flex_none()
                                                     .gap_2()
                                                     .items_center()
+                                                    .when(offers_suggestion, |d| {
+                                                        d.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(p.faint_foreground)
+                                                                .child(format!(
+                                                                    "{} to accept",
+                                                                    crate::keymap::display("tab")
+                                                                )),
+                                                        )
+                                                    })
                                                     .when(running && !stop_hint.is_empty(), |d| {
                                                         d.child(
                                                             div()
@@ -7251,6 +7266,23 @@ pub fn harness_name(h: &HarnessId) -> &'static str {
         HarnessId::FAKE => "Echo",
         _ => "Agent",
     }
+}
+
+/// The agent's suggested next message while the thread is idle (Tab takes
+/// it), else the invitation to ask the agent something.
+fn composer_placeholder(thread: &loft_protocol::Thread) -> String {
+    match suggestion(thread) {
+        Some(text) => text.to_owned(),
+        None => placeholder_for(&thread.harness),
+    }
+}
+
+/// The suggested next message, while it can be taken (nothing running).
+fn suggestion(thread: &loft_protocol::Thread) -> Option<&str> {
+    thread
+        .suggestion
+        .as_deref()
+        .filter(|_| thread.status == loft_protocol::ThreadStatus::Idle)
 }
 
 fn placeholder_for(h: &HarnessId) -> String {

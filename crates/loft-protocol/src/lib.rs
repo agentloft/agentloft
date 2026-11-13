@@ -1141,6 +1141,7 @@ mod tests {
             "slash_commands": ["help", "compact"],
             "command_info": [{"name": "help", "description": "What you can do"}],
             "started_at_ms": 6, "draft": "half a thought", "waiting_on": ["a dev server"],
+            "suggestion": "run the tests",
         });
         let thread: Thread = serde_json::from_value(json).unwrap();
         assert!(!thread.command_info.is_empty() && !thread.slash_commands.is_empty());
@@ -1162,6 +1163,7 @@ mod tests {
             "started_at_ms",
             "draft",
             "waiting_on",
+            "suggestion",
         ] {
             assert!(!as_json[field].is_null(), "{field}");
         }

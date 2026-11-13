@@ -196,6 +196,11 @@ const KEYS: &[Key] = &[
         about: "A thread stopped by its agent's usage limit carries on by itself when the limit resets (default off; each thread can be told to on its own)",
     },
     Key {
+        key: "threads.suggest_next",
+        kind: Kind::Bool,
+        about: "After each turn, offer the agent's guess at your next message in the empty composer (Tab takes it); the agent is asked once per turn, Claude on Haiku (default on)",
+    },
+    Key {
         key: "usage.price_catalog",
         kind: Kind::Text,
         about: "Where model prices for cost estimates come from each day (models.dev's format); empty = only the built-in prices and [pricing]",

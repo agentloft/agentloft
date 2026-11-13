@@ -3,7 +3,8 @@
 //! off, the message's first line is the title. And when archived threads
 //! are deleted for good (`[threads] delete_archived_after_days`), and
 //! whether threads a usage limit stopped carry on at its reset
-//! (`[threads] resume_at_reset`).
+//! (`[threads] resume_at_reset`). And whether the empty composer offers
+//! the agent's guess at the next message (`[threads] suggest_next`).
 
 use super::{Field, SettingsView, agents::AGENTS, row, text_input, web::heading};
 use crate::theme::Palette;
@@ -116,6 +117,29 @@ impl SettingsView {
                 ));
         }
         page = page
+            .child(heading(
+                "Next message",
+                "After each turn, the empty composer shows what you will likely send next. Tab puts it in, to send or edit.",
+                p,
+            ))
+            .child(row(
+                "Suggest the next message",
+                "The thread's agent is asked once after each turn, a small request: Claude on Haiku, others on the thread's model.",
+                Switch::new("threads-suggest-next")
+                    .cursor_pointer()
+                    .checked(self.config.threads.suggest_next)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                        // On is the default.
+                        let value = if *on {
+                            SettingValue::Unset
+                        } else {
+                            SettingValue::Bool(false)
+                        };
+                        this.write(&["threads", "suggest_next"], value, true, cx);
+                    }))
+                    .into_any_element(),
+                p,
+            ))
             .child(heading(
                 "Usage limits",
                 "A thread whose agent runs out of its plan's usage stops and says when the limit resets.",

@@ -101,6 +101,41 @@ impl WorkspaceView {
         }
     }
 
+    // -- the agent's suggested next message ---------------------------------
+
+    /// ⇥ in an empty composer: the agent's suggested next message goes in,
+    /// to send as it is or edit. `false`: there is none to take, and the
+    /// key is the composer's.
+    pub(super) fn take_suggestion(
+        &mut self,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(composer) = self.composers.get(thread_id).cloned() else {
+            return false;
+        };
+        if !composer.read(cx).focus_handle(cx).is_focused(window)
+            || !composer.read(cx).value().is_empty()
+        {
+            return false;
+        }
+        let text = self
+            .store
+            .read(cx)
+            .threads
+            .get(thread_id)
+            .and_then(|t| t.read(cx).model.as_ref())
+            .and_then(|m| super::suggestion(&m.thread))
+            .map(str::to_owned);
+        let Some(text) = text else {
+            return false;
+        };
+        // An edit like any other: it can be undone, and the draft follows.
+        composer.update(cx, |c, cx| c.replace(text, window, cx));
+        true
+    }
+
     /// The threads sent along with the prompt now recalled (`text`) wait
     /// as chips again, in place of those the prompt recalled before
     /// brought. Chips the user added, or kept by editing, are theirs.

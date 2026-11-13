@@ -753,6 +753,7 @@ mod tests {
             automation_id: None,
             pull_request: None,
             landed: false,
+            suggestion: None,
         }
     }
 

@@ -170,6 +170,10 @@ pub struct Thread {
     /// the worktree can be cleaned up without losing anything.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub landed: bool,
+    /// The agent's guess at the user's next message, offered in the empty
+    /// composer. Gone when the next turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
 }
 
 impl Thread {
@@ -222,6 +226,7 @@ impl Thread {
             automation_id,
             pull_request,
             landed,
+            suggestion,
         } = self;
         Thread {
             id: id.clone(),
@@ -247,6 +252,7 @@ impl Thread {
             automation_id: automation_id.clone(),
             pull_request: pull_request.clone(),
             landed: *landed,
+            suggestion: suggestion.clone(),
         }
     }
 }

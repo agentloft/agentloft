@@ -266,6 +266,7 @@ mod tests {
             automation_id: None,
             pull_request: None,
             landed: false,
+            suggestion: None,
         };
         let item = Item {
             id: ItemId::new(),

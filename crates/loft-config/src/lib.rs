@@ -238,6 +238,10 @@ pub struct ThreadsConfig {
     /// A thread its agent's usage limit stopped carries on by itself when
     /// the limit resets (each thread can also be told to, one at a time).
     pub resume_at_reset: bool,
+    /// After each turn, offer the agent's guess at the next message in the
+    /// empty composer (Tab takes it). The agent is asked once, the way
+    /// thread titles are written.
+    pub suggest_next: bool,
 }
 
 impl Default for ThreadsConfig {
@@ -248,6 +252,7 @@ impl Default for ThreadsConfig {
             compact_idle_minutes: 60,
             compact_min_tokens: 100_000,
             resume_at_reset: false,
+            suggest_next: true,
         }
     }
 }

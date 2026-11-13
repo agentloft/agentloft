@@ -102,6 +102,12 @@ pub(crate) enum ThreadCmd {
         draft: Option<String>,
         reply: Reply,
     },
+    /// Internal: an agent's guess at the next message after turn
+    /// `turn_id` (`crate::suggestions`). Dropped if another turn started.
+    Suggested {
+        turn_id: TurnId,
+        text: String,
+    },
     /// Internal: an agent named the thread. Applied only while the title
     /// is still `placeholder` (a rename in between wins).
     GeneratedTitle {
@@ -157,6 +163,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
         limit_hit: None,
         resumed: false,
         send_next: false,
+        suggest_after: None,
         self_tx: tx.downgrade(),
         pending_start: None,
         after_compact: None,
@@ -187,6 +194,9 @@ struct ThreadActor {
     resumed: bool,
     /// A turn completed with messages queued: send the first.
     send_next: bool,
+    /// The turn an agent was asked to suggest a next message after; any
+    /// newer turn makes the answer moot.
+    suggest_after: Option<TurnId>,
     self_tx: mpsc::WeakUnboundedSender<ThreadCmd>,
     /// Prompt waiting for the "before" checkpoint before it is sent.
     pending_start: Option<(String, Vec<AttachmentRef>)>,
@@ -334,6 +344,11 @@ impl ThreadActor {
                     thread: self.thread.clone(),
                 });
                 let _ = reply.send(res);
+            }
+            ThreadCmd::Suggested { turn_id, text } => {
+                if self.suggest_after.as_ref() == Some(&turn_id) {
+                    self.offer_suggestion(text);
+                }
             }
             ThreadCmd::GeneratedTitle { placeholder, title } => {
                 if self.thread.title == placeholder && title != placeholder {
@@ -720,6 +735,8 @@ impl ThreadActor {
         if self.thread.limit.take().is_some() {
             self.core.limit_changed(&self.thread.id, None);
         }
+        self.thread.suggestion = None;
+        self.suggest_after = None;
         let mut events = vec![
             Event::TurnStarted { turn: turn.clone() },
             Event::ItemUpserted { item: user_item },
@@ -1570,6 +1587,7 @@ impl ThreadActor {
                 error,
             } => self.finish_turn(status, usage, error)?,
             HarnessEvent::LimitReached(hit) => self.limit_hit = Some(hit),
+            HarnessEvent::PromptSuggestion(text) => self.offer_suggestion(text),
             HarnessEvent::Notice { level, text } => {
                 let item = self.new_item(
                     self.turn_id(),
@@ -1776,13 +1794,98 @@ impl ThreadActor {
         self.core.commit(events)?;
         crate::pull_requests::turn_ended(&self.core, &self.thread);
         crate::cleanup::turn_ended(&self.core, &self.thread);
+        let finished_id = finished.as_ref().map(|t| t.id.clone());
         if let Some(turn) = finished.filter(|t| t.checkpoint_before.is_some()) {
             self.capture_checkpoint(&turn, false);
         }
         // The run loop sends it, after a session restart that was waiting
         // for the thread to be idle.
         self.send_next = status == TurnStatus::Completed && !self.queue.is_empty();
+        if status == TurnStatus::Completed
+            && self.queue.is_empty()
+            && let Some(turn_id) = finished_id
+        {
+            self.ask_for_suggestion(turn_id);
+        }
         Ok(())
+    }
+
+    /// Offer `text` as the next message, if nothing has been sent since,
+    /// suggestions are wanted and none is offered yet (the first one stays:
+    /// text shouldn't change under the user's eyes).
+    fn offer_suggestion(&mut self, text: String) {
+        let text = text.trim();
+        if text.is_empty()
+            || self.turn.is_some()
+            || self.pending_start.is_some()
+            || !self.queue.is_empty()
+            || !self.core.config().threads.suggest_next
+            || self.thread.suggestion.is_some()
+        {
+            return;
+        }
+        self.thread.suggestion = Some(text.to_owned());
+        // Not activity: keep `updated_at_ms` (sidebar order).
+        if let Err(err) = self.core.commit(vec![Event::ThreadUpdated {
+            thread: self.thread.clone(),
+        }]) {
+            tracing::warn!(?err, "save suggestion");
+        }
+    }
+
+    /// Ask the thread's agent once, in the background, for the user's
+    /// likely next message after `turn_id` (the way titles are written).
+    fn ask_for_suggestion(&mut self, turn_id: TurnId) {
+        if !self.core.config().threads.suggest_next
+            || !crate::suggestions::can_ask(&self.thread.harness)
+        {
+            return;
+        }
+        let exchange = self.core.with_store(|s| {
+            let thread = &self.thread.id;
+            let reply = s.find_item_newest_first(thread, |i| match i.body {
+                ItemBody::AssistantMessage { text }
+                    if i.parent_id.is_none() && i.turn_id.as_ref() == Some(&turn_id) =>
+                {
+                    (!text.trim().is_empty()).then_some(text)
+                }
+                _ => None,
+            })?;
+            let prompt = s.find_item_newest_first(thread, |i| match i.body {
+                ItemBody::UserMessage { text, .. } if i.turn_id.as_ref() == Some(&turn_id) => {
+                    Some(text)
+                }
+                _ => None,
+            })?;
+            Ok((prompt, reply))
+        });
+        let Ok((prompt, Some(reply))) = exchange else {
+            tracing::debug!(thread = %self.thread.id, "no reply to suggest a next message after");
+            return;
+        };
+        let prompt = crate::suggestions::prompt(prompt.as_deref().unwrap_or(""), &reply);
+        self.suggest_after = Some(turn_id.clone());
+        let (core, thread_id) = (self.core.clone(), self.thread.id.clone());
+        let harness = self.thread.harness.clone();
+        let model = crate::suggestions::model(&harness, self.thread.model.as_deref());
+        tokio::spawn(async move {
+            let text = match core.ask_once(prompt, harness.clone(), model).await {
+                Ok(Response::Text { text }) => {
+                    tracing::debug!(%thread_id, answer = %text, "suggestion asked");
+                    crate::suggestions::clean(&text)
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(harness = %harness.as_str(), err = %err.message, "suggestion failed");
+                    None
+                }
+            };
+            if let Some(text) = text
+                && let Ok(handle) = core.thread_handle(&thread_id)
+            {
+                let _ = handle.send(ThreadCmd::Suggested { turn_id, text });
+            }
+        });
     }
 
     // -- helpers ------------------------------------------------------------

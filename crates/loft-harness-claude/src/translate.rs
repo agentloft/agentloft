@@ -461,6 +461,14 @@ impl Translator {
                 self.on_rate_limit(v.get("rate_limit_info").unwrap_or(&Value::Null));
                 vec![]
             }
+            // `--prompt-suggestions` (not passed by us; it can be added in
+            // `[harness.claude] extra_args`): after a turn's result.
+            Some("prompt_suggestion") => match str_at(v, "suggestion").map(str::trim) {
+                Some(text) if !text.is_empty() => {
+                    vec![Out::Event(HarnessEvent::PromptSuggestion(text.to_owned()))]
+                }
+                _ => vec![],
+            },
             _ => vec![],
         }
     }
@@ -1771,6 +1779,26 @@ mod tests {
             seen = so_far.len();
         }
         assert_eq!(*last, (&whole, false), "and once more, whole");
+    }
+
+    #[test]
+    fn a_suggestion_follows_the_turn() {
+        // Recorded with `--prompt-suggestions`: the guess comes after the
+        // result, once the turn is over.
+        let (t, out) = replay(include_str!("../fixtures/2.1.322-prompt-suggestion.jsonl"));
+        let evs = events(&out);
+        let done = evs
+            .iter()
+            .position(|e| matches!(e, HarnessEvent::TurnCompleted { .. }))
+            .expect("the turn completes");
+        assert!(matches!(
+            &evs[done + 1..],
+            [HarnessEvent::PromptSuggestion(s)] if s == "run it to check that both functions work"
+        ));
+        assert!(!t.turn_active());
+        let mut t = Translator::new();
+        let blank = json!({"type": "prompt_suggestion", "suggestion": "  "});
+        assert!(t.on_line(&blank.to_string()).is_empty());
     }
 
     #[test]

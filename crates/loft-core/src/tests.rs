@@ -2851,3 +2851,52 @@ async fn stopping_a_thread_stops_the_threads_it_spawned() {
     // Started as a thread of its own: it isn't the parent's to stop.
     assert_eq!(status(&own.id), TurnStatus::Completed);
 }
+
+#[tokio::test]
+async fn a_suggested_next_message_lasts_until_the_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(config.clone()),
+            flush_interval: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, dir.path()).await;
+    let send = |text: &str| Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: text.into(),
+        attachments: vec![],
+    };
+    core.handle(send("add a flag suggest:run the tests"))
+        .await
+        .unwrap();
+    wait_for(&core, &thread.id, |t, _| {
+        t.suggestion.as_deref() == Some("run the tests")
+    })
+    .await;
+    let (t, ..) = thread_snapshot(&core, &thread.id);
+    assert_eq!(t.status, ThreadStatus::Idle);
+
+    // Sending anything (the suggestion or not) takes it away.
+    core.handle(send("something else")).await.unwrap();
+    wait_for(&core, &thread.id, |_, turns| turns.len() == 2).await;
+    let (t, ..) = thread_snapshot(&core, &thread.id);
+    assert_eq!(t.suggestion, None);
+    wait_for(&core, &thread.id, turn_done).await;
+
+    // Turned off: none is offered.
+    std::fs::write(&config, "[threads]\nsuggest_next = false\n").unwrap();
+    core.handle(Request::ReloadConfig).await.unwrap();
+    core.handle(send("again suggest:commit it")).await.unwrap();
+    wait_for(&core, &thread.id, |_, turns| {
+        turns.len() == 3 && turns[2].status.is_terminal()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (t, ..) = thread_snapshot(&core, &thread.id);
+    assert_eq!(t.suggestion, None);
+}

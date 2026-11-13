@@ -17,6 +17,8 @@
 //! - contains `bgresume`: the first subagent `bgagents` started in the
 //!   session's first turn is sent a message: it works again, takes a step
 //!   and finishes;
+//! - contains `suggest:<text>`: after the turn, suggests `<text>` (to the end
+//!   of the line) as the user's next message, the way Claude does;
 //! - contains `fail`: completes the turn as failed;
 //! - contains `limit`: fails the turn the way a used-up plan does.
 //!   `limit:<seconds>` says the limit resets that many seconds from now
@@ -570,6 +572,12 @@ async fn run_turn(
             None => "fake failure".into(),
         }),
     });
+    if let Some(rest) = script.split("suggest:").nth(1) {
+        let text = rest.lines().next().unwrap_or_default().trim();
+        if !text.is_empty() {
+            ends.emit(HarnessEvent::PromptSuggestion(text.to_owned()));
+        }
+    }
     true
 }
 

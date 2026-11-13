@@ -216,6 +216,7 @@ impl Core {
             automation_id: None,
             pull_request: None,
             landed: false,
+            suggestion: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
@@ -374,6 +375,7 @@ impl Core {
             automation_id: None,
             pull_request: None,
             landed: false,
+            suggestion: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),

@@ -12,6 +12,7 @@ mod pages;
 mod pull_requests;
 mod remote;
 mod settings;
+mod suggestions;
 mod terminals;
 mod thread;
 mod titles;
@@ -1677,6 +1678,7 @@ impl Core {
             automation_id: None,
             pull_request: None,
             landed: false,
+            suggestion: None,
         };
         self.commit(vec![Event::ThreadCreated {
             thread: thread.clone(),
@@ -1841,6 +1843,9 @@ impl Core {
                 HarnessId::CODEX => {
                     cmd.args(["exec", "--skip-git-repo-check", "--ephemeral"])
                         .args(["-s", "read-only", "-c", "model_reasoning_effort=low"])
+                        // No tools wanted: leave out what would load them
+                        // (and the user's hooks, which would run for it).
+                        .args(CODEX_ASK_OFF.iter().flat_map(|key| ["-c", key]))
                         .arg("-o")
                         .arg(&answer_file);
                     if let Some(m) = &model {
@@ -1893,6 +1898,18 @@ impl Core {
         Ok(Response::Text { text })
     }
 }
+
+/// `codex exec -c` overrides for a one-off answer: hooks, plugins, apps,
+/// memories, subagents and web search off (checked against Codex 0.167;
+/// unknown keys only draw a warning).
+const CODEX_ASK_OFF: &[&str] = &[
+    "features.hooks=false",
+    "features.plugins=false",
+    "features.apps=false",
+    "features.memories=false",
+    "features.multi_agent=false",
+    "web_search=\"disabled\"",
+];
 
 /// Drop terminal colour codes from CLI output.
 fn strip_ansi(text: &str) -> String {

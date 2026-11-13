@@ -196,6 +196,11 @@ pub enum HarnessEvent {
         level: NoticeLevel,
         text: String,
     },
+    /// The agent's own guess at the user's next message, after a turn
+    /// ended (Claude's `prompt_suggestion`, when `--prompt-suggestions` is
+    /// among its extra arguments). The core asks for one anyway; the first
+    /// to come is offered.
+    PromptSuggestion(String),
     /// The session's process went away. No more events follow.
     Exited {
         code: Option<i32>,
