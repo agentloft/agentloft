@@ -2431,6 +2431,7 @@ impl ThreadState {
         if let Some(id) = self.reveal.take() {
             match self.row_of_item(&id) {
                 Some(row) => self.scroller.update(cx, |s, cx| {
+                    tracing::debug!(row, "showing the message asked for");
                     s.scroll_to_item(row, cx);
                 }),
                 None => {

@@ -576,7 +576,15 @@ fn prompts(thread: &ThreadState) -> Vec<String> {
 /// one of its own), oldest first.
 fn said(thread: &ThreadState) -> impl DoubleEndedIterator<Item = &str> {
     let items = thread.model.as_ref().map_or(&[][..], |m| &m.items[..]);
-    items.iter().filter_map(|item| match &item.body {
+    // A long thread's earlier turns aren't here: their outline has what
+    // was said in them.
+    let earlier = thread
+        .model
+        .as_ref()
+        .into_iter()
+        .flat_map(|m| m.not_loaded())
+        .map(|o| &o.message);
+    earlier.chain(items).filter_map(|item| match &item.body {
         loft_protocol::ItemBody::UserMessage { text, .. } if item.parent_id.is_none() => {
             Some(text.as_str())
         }

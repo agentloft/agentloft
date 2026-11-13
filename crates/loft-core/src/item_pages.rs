@@ -3,23 +3,40 @@
 //! A thread with subagents at work for hours holds thousands of steps, most
 //! of them in no turn's timeline (their own tab shows them).
 
-use loft_protocol::{Item, ItemBody, ItemId};
+use loft_protocol::{Item, ItemBody, ItemId, TurnOutline};
 use std::collections::HashMap;
 
 /// A thread with no more items than this goes whole.
 const WHOLE_UP_TO: usize = 1500;
 /// Top-level items in a page: whole turns, newest first, until this many.
 const PAGE_ITEMS: usize = 300;
+/// How much of a left-out turn's reply its outline carries, in characters.
+const OUTLINE_REPLY: usize = 600;
+
+/// A part of a thread for a client.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Page {
+    pub items: Vec<Item>,
+    /// Earlier turns are left.
+    pub older: bool,
+    /// For a thread's first page: the earlier turns, as an outline.
+    pub outline: Vec<TurnOutline>,
+}
 
 /// What a client gets of `items` (in timeline order): the top-level items
 /// of whole turns before `before` (an ordinal; the newest when `None`), a
 /// page's worth, and of each subagent among them its latest steps (what
 /// its row shows: its current step, its last words, when it last moved).
-/// Also whether earlier turns are left.
-pub(crate) fn page(items: Vec<Item>, before: Option<u64>) -> (Vec<Item>, bool) {
+/// Also whether earlier turns are left, and (for the first page) their
+/// outline.
+pub(crate) fn page(items: Vec<Item>, before: Option<u64>) -> Page {
     if before.is_none() && items.len() <= WHOLE_UP_TO {
-        return (items, false);
+        return Page {
+            items,
+            ..Page::default()
+        };
     }
+    let first_page = before.is_none();
     let before = before.unwrap_or(u64::MAX);
     let top: Vec<&Item> = items
         .iter()
@@ -34,9 +51,14 @@ pub(crate) fn page(items: Vec<Item>, before: Option<u64>) -> (Vec<Item>, bool) {
         }
     }
     let Some(first) = top.get(start).map(|i| i.ordinal) else {
-        return (Vec::new(), false);
+        return Page::default();
     };
     let older = start > 0;
+    let outline = if first_page {
+        outline(&top[..start])
+    } else {
+        Vec::new()
+    };
     let shown: HashMap<&ItemId, ()> = top[start..].iter().map(|i| (&i.id, ())).collect();
 
     // Per subagent shown: its latest tool call, last message and the step
@@ -63,12 +85,39 @@ pub(crate) fn page(items: Vec<Item>, before: Option<u64>) -> (Vec<Item>, bool) {
     for ix in tails.values().flatten().flatten() {
         keep[*ix] = true;
     }
-    let page = items
+    let items = items
         .into_iter()
         .zip(keep)
         .filter_map(|(item, keep)| keep.then_some(item))
         .collect();
-    (page, older)
+    Page {
+        items,
+        older,
+        outline,
+    }
+}
+
+/// Each message the user sent among `top` (top-level items, in order) and
+/// the start of the agent's last reply in its turn.
+fn outline(top: &[&Item]) -> Vec<TurnOutline> {
+    let mut replies: HashMap<_, &str> = HashMap::new();
+    for item in top {
+        if let ItemBody::AssistantMessage { text } = &item.body {
+            replies.insert(&item.turn_id, text.as_str());
+        }
+    }
+    top.iter()
+        .filter(|i| matches!(i.body, ItemBody::UserMessage { .. }))
+        .map(|message| TurnOutline {
+            message: (*message).clone(),
+            reply: message
+                .turn_id
+                .as_ref()
+                .and_then(|_| replies.get(&message.turn_id))
+                .map(|r| r.chars().take(OUTLINE_REPLY).collect())
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// One subagent's whole run: the steps of the call `of`.
@@ -145,8 +194,14 @@ mod tests {
         items.push(item(next(), None, Some(&agent_id), tool("last step")));
         let all = items.clone();
 
-        let (first, older) = page(items, None);
+        let Page {
+            items: first,
+            older,
+            outline,
+        } = page(items, None);
         assert!(older);
+        // The earlier 34 turns, as an outline: no messages in this one.
+        assert!(outline.is_empty());
         let top: Vec<&Item> = first.iter().filter(|i| i.parent_id.is_none()).collect();
         // Whole turns: 300 reached on the 6th turn from the end (with the
         // subagent call, the last turn has 51).
@@ -167,7 +222,12 @@ mod tests {
         let mut before = top[0].ordinal;
         let mut pages = 0;
         loop {
-            let (page_items, older) = page(all.clone(), Some(before));
+            let Page {
+                items: page_items,
+                older,
+                outline,
+            } = page(all.clone(), Some(before));
+            assert!(outline.is_empty(), "only the first page has one");
             assert!(
                 page_items
                     .iter()
@@ -190,13 +250,60 @@ mod tests {
         steps(all.to_vec(), of).len()
     }
 
+    /// The turns left out of the first page come as an outline: each
+    /// message and the start of its turn's last reply.
+    #[test]
+    fn earlier_turns_come_as_an_outline() {
+        let mut items = Vec::new();
+        let mut ordinal = 0;
+        let turns: Vec<TurnId> = (0..12).map(|_| TurnId::new()).collect();
+        for (n, turn) in turns.iter().enumerate() {
+            ordinal += 1;
+            let ask = ItemBody::UserMessage {
+                text: format!("ask {n}"),
+                attachments: vec![],
+            };
+            items.push(item(ordinal, Some(turn), None, ask));
+            for k in 0..150 {
+                ordinal += 1;
+                let body = if k == 149 {
+                    said(&format!("answer {n} {}", "x".repeat(1000)))
+                } else {
+                    tool("step")
+                };
+                items.push(item(ordinal, Some(turn), None, body));
+            }
+        }
+        let page = page(items, None);
+        assert!(page.older);
+        // Two turns fill a page (302 items); the ten before are outlined.
+        assert_eq!(page.outline.len(), 10);
+        let asks: Vec<String> = page
+            .outline
+            .iter()
+            .map(|o| match &o.message.body {
+                ItemBody::UserMessage { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(asks.first().map(String::as_str), Some("ask 0"));
+        assert_eq!(asks.last().map(String::as_str), Some("ask 9"));
+        assert!(page.outline[0].reply.starts_with("answer 0 xxx"));
+        assert_eq!(page.outline[0].reply.chars().count(), OUTLINE_REPLY);
+    }
+
     #[test]
     fn a_short_thread_goes_whole() {
         let turn = TurnId::new();
         let agent = item(1, Some(&turn), None, tool("agent"));
         let step = item(2, None, Some(&agent.id), tool("step"));
         let items = vec![agent, step];
-        let (got, older) = page(items.clone(), None);
-        assert_eq!((got, older), (items, false));
+        assert_eq!(
+            page(items.clone(), None),
+            Page {
+                items,
+                ..Page::default()
+            }
+        );
     }
 }

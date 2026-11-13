@@ -106,6 +106,9 @@ pub struct ThreadModel {
     pub queue: Vec<loft_protocol::QueuedMessage>,
     /// Earlier turns are still at the daemon (a long thread comes in part).
     pub older: bool,
+    /// The turns before those the snapshot carried: each one's message and
+    /// the start of its reply. See [`Self::not_loaded`].
+    pub outline: Vec<loft_protocol::TurnOutline>,
 }
 
 impl ThreadModel {
@@ -119,6 +122,7 @@ impl ThreadModel {
                 requests,
                 queue,
                 older,
+                outline,
             } => {
                 items.sort_by_key(|i| i.ordinal);
                 Some(Self {
@@ -129,6 +133,7 @@ impl ThreadModel {
                     requests,
                     queue,
                     older,
+                    outline,
                 })
             }
             _ => None,
@@ -248,6 +253,14 @@ impl ThreadModel {
         ahead
     }
 
+    /// The outlined turns whose items aren't here yet, oldest first.
+    pub fn not_loaded(&self) -> impl DoubleEndedIterator<Item = &loft_protocol::TurnOutline> {
+        let first = self.first_ordinal();
+        self.outline
+            .iter()
+            .filter(move |o| first.is_none_or(|first| o.message.ordinal < first))
+    }
+
     /// Where the earliest turn here starts: the page before it comes next.
     pub fn first_ordinal(&self) -> Option<u64> {
         self.items
@@ -333,6 +346,7 @@ mod tests {
             requests: vec![],
             queue: vec![],
             older: false,
+            outline: vec![],
         })
         .unwrap();
         (m, id)

@@ -2206,20 +2206,40 @@ impl WorkspaceView {
         let model = state.model.as_ref()?;
         let tid = state.id.clone();
         let items = &model.items;
-        // A tick per message you sent: its row, and its item.
-        let marks: Vec<(usize, usize)> = state
-            .rows
+        // A tick per message you sent: first those of the turns not here yet
+        // (a long thread's outline), then each one's row and item.
+        let first = model.first_ordinal();
+        let mut marks: Vec<TurnMark> = model
+            .outline
             .iter()
             .enumerate()
-            .filter_map(|(row_ix, row)| match row {
-                crate::store::Row::Item(i)
-                    if matches!(items[*i].body, loft_protocol::ItemBody::UserMessage { .. }) =>
-                {
-                    Some((row_ix, *i))
-                }
-                _ => None,
+            .filter(|(_, o)| first.is_none_or(|first| o.message.ordinal < first))
+            .map(|(outline, o)| TurnMark::Earlier {
+                outline,
+                id: o.message.id.clone(),
             })
             .collect();
+        let earlier = marks.len();
+        marks.extend(
+            state
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row_ix, row)| match row {
+                    crate::store::Row::Item(i)
+                        if matches!(
+                            items[*i].body,
+                            loft_protocol::ItemBody::UserMessage { .. }
+                        ) =>
+                    {
+                        Some(TurnMark::Row {
+                            row: row_ix,
+                            item: *i,
+                        })
+                    }
+                    _ => None,
+                }),
+        );
         if marks.len() < 2 {
             return None;
         }
@@ -2242,12 +2262,17 @@ impl WorkspaceView {
         let visible = state.visible_messages.borrow().clone();
         let lit: Vec<usize> = if visible.is_empty() {
             let top = state.scroller.read(cx).logical_scroll_top().item_ix;
-            vec![marks.iter().rposition(|(row, ..)| *row <= top).unwrap_or(0)]
+            vec![
+                marks
+                    .iter()
+                    .rposition(|m| matches!(m, TurnMark::Row { row, .. } if *row <= top))
+                    .unwrap_or(earlier),
+            ]
         } else {
             marks
                 .iter()
                 .enumerate()
-                .filter(|(_, (row, ..))| visible.contains(row))
+                .filter(|(_, m)| matches!(m, TurnMark::Row { row, .. } if visible.contains(row)))
                 .map(|(ix, _)| ix)
                 .collect()
         };
@@ -2267,8 +2292,17 @@ impl WorkspaceView {
             .peek
             .as_ref()
             .filter(|(thread, _)| *thread == tid)
-            .and_then(|(_, ix)| Some((*ix, turn_peek(items, marks.get(*ix)?.1))));
-        for (ix, (row, _)) in marks.into_iter().enumerate() {
+            .and_then(|(_, ix)| {
+                let peek = match marks.get(*ix)? {
+                    TurnMark::Row { item, .. } => turn_peek(items, *item),
+                    TurnMark::Earlier { outline, .. } => {
+                        let o = model.outline.get(*outline)?;
+                        peek_text(&o.message, Some(o.reply.as_str()).filter(|r| !r.is_empty()))
+                    }
+                };
+                Some((*ix, peek))
+            });
+        for (ix, mark) in marks.into_iter().enumerate() {
             let peek = peeked.as_ref().filter(|(peeked, _)| *peeked == ix);
             let hovered = peek.is_some();
             let is_current = lit.contains(&ix);
@@ -2344,10 +2378,20 @@ impl WorkspaceView {
                             cx.notify();
                         }
                     }))
-                    .on_click(move |_, _, cx| {
-                        scroller.update(cx, |s, cx| {
-                            s.scroll_to_item(row, cx);
-                        });
+                    .on_click({
+                        let thread = thread.clone();
+                        move |_, _, cx| match &mark {
+                            TurnMark::Row { row, .. } => {
+                                scroller.update(cx, |s, cx| {
+                                    s.scroll_to_item(*row, cx);
+                                });
+                            }
+                            // Not here yet: the turns come in until it is,
+                            // and it is shown.
+                            TurnMark::Earlier { id, .. } => {
+                                thread.update(cx, |t, cx| t.reveal(id.clone(), cx));
+                            }
+                        }
                     }),
             );
         }
@@ -8420,8 +8464,32 @@ fn context_color(fraction: Option<f32>, p: &Palette) -> gpui_kit::Hsla {
 /// "230K", "1.2M".
 /// What a turn-map tick's card says: the first line of the message at
 /// `message`, and the start of its turn's reply as plain text.
+/// A tick beside the timeline: a message you sent.
+enum TurnMark {
+    /// In a turn not loaded yet: its place in the thread's outline.
+    Earlier {
+        outline: usize,
+        id: loft_protocol::ItemId,
+    },
+    /// Here: its row, and its item.
+    Row { row: usize, item: usize },
+}
+
 fn turn_peek(items: &[loft_protocol::Item], message: usize) -> (String, String) {
     let item = &items[message];
+    let reply = items
+        .iter()
+        .rev()
+        .filter(|it| it.parent_id.is_none() && it.turn_id == item.turn_id)
+        .find_map(|it| match &it.body {
+            loft_protocol::ItemBody::AssistantMessage { text } => Some(text.as_str()),
+            _ => None,
+        });
+    peek_text(item, reply)
+}
+
+/// A turn's card: `message` (the user's) and `reply`, the agent's last.
+fn peek_text(item: &loft_protocol::Item, reply: Option<&str>) -> (String, String) {
     let loft_protocol::ItemBody::UserMessage { text, attachments } = &item.body else {
         return Default::default();
     };
@@ -8435,14 +8503,7 @@ fn turn_peek(items: &[loft_protocol::Item], message: usize) -> (String, String) 
             1 => "Image".into(),
             n => format!("{n} images"),
         });
-    let reply = items
-        .iter()
-        .rev()
-        .filter(|it| it.parent_id.is_none() && it.turn_id == item.turn_id)
-        .find_map(|it| match &it.body {
-            loft_protocol::ItemBody::AssistantMessage { text } => Some(text.as_str()),
-            _ => None,
-        })
+    let reply = reply
         .map(|t| {
             // Plain text: no Markdown emphasis, code ticks or headings.
             // Only as much of the reply as can fill the card is looked at.

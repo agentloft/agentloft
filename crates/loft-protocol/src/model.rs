@@ -630,6 +630,16 @@ pub struct Usage {
     pub duration_ms: Option<u64>,
 }
 
+/// An earlier turn a thread's snapshot left out, as its outline shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnOutline {
+    /// The message that started it, whole.
+    pub message: Item,
+    /// The start of the agent's last reply in it, if it replied.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reply: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Item {
     pub id: ItemId,

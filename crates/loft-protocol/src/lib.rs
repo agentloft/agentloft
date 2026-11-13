@@ -983,6 +983,10 @@ pub enum Snapshot {
         /// earlier turns were left out.
         #[serde(default, skip_serializing_if = "is_false")]
         older: bool,
+        /// The earlier turns left out: each one's message and the start of
+        /// its reply (the turn markers beside the timeline, recall).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outline: Vec<TurnOutline>,
     },
     Terminal {
         seq: u64,

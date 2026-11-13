@@ -602,7 +602,10 @@ impl Core {
         })?;
         let (mut items, older) = match page {
             loft_protocol::ItemsPage::Steps { of } => (item_pages::steps(all, &of), false),
-            loft_protocol::ItemsPage::Before { ordinal } => item_pages::page(all, Some(ordinal)),
+            loft_protocol::ItemsPage::Before { ordinal } => {
+                let page = item_pages::page(all, Some(ordinal));
+                (page.items, page.older)
+            }
         };
         let live = self.live();
         for item in items.iter_mut() {
@@ -640,15 +643,16 @@ impl Core {
                 Topic::Thread(id) => match s.thread(id)? {
                     None => None,
                     Some(thread) => {
-                        let (items, older) = item_pages::page(s.items(id)?, None);
+                        let page = item_pages::page(s.items(id)?, None);
                         Some(Snapshot::Thread {
                             seq,
                             queue: s.queue(id)?,
                             turns: s.turns(id)?,
-                            items,
+                            items: page.items,
                             requests: s.requests(id)?,
                             thread,
-                            older,
+                            older: page.older,
+                            outline: page.outline,
                         })
                     }
                 },
