@@ -757,7 +757,7 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
-    /// A repository with a bare remote, a core whose PATH starts with a
+    /// A repository with a bare remote, a core whose isolated PATH has a
     /// stand-in `gh`, and one worktree thread.
     ///
     /// The stand-in: `pr create` prints pull request 7's address; `pr view`
@@ -805,16 +805,17 @@ mod tests {
             );
             std::fs::write(&gh, script).unwrap();
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-            // The stand-in is the only `gh` there is: this machine's own is
-            // never run, even once the stand-in is taken away.
+            // Only the tools this fixture needs. Removing PATH directories
+            // containing the real gh also hides git and cat on Ubuntu,
+            // where all three live in /usr/bin. Keep the stand-in as the
+            // only gh, even once a test takes it away.
             let mut env: HashMap<String, String> = std::env::vars().collect();
-            let rest = env.get("PATH").cloned().unwrap_or_default();
-            let rest: Vec<&str> = rest
-                .split(':')
-                .filter(|d| !Path::new(d).join("gh").exists())
-                .collect();
-            let path = format!("{}:{}", bin.display(), rest.join(":"));
-            env.insert("PATH".into(), path);
+            let search_path = env.get("PATH").cloned().unwrap_or_default();
+            for tool in ["git", "cat"] {
+                let found = loft_config::which(tool, &search_path).expect(tool);
+                std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
+            }
+            env.insert("PATH".into(), bin.to_string_lossy().into_owned());
             let core = Core::new(
                 Store::open(&dir.path().join("db.sqlite")).unwrap(),
                 vec![Arc::new(FakeHarness)],
