@@ -40,6 +40,29 @@ struct FileLink {
     label: String,
 }
 
+/// A Markdown link whose target is the path of a file on this machine
+/// (`/abs/path`, `~/path` or a path inside `cwd`, each with an optional
+/// `:line[:column]`): what the side panel should be asked for. `None` for
+/// anything else (http links, missing files), which is opened the usual way.
+pub(crate) fn link_file_target(target: &str, cwd: &str) -> Option<String> {
+    file_link(target, cwd, is_file).map(|l| l.open)
+}
+
+/// A Markdown link's target as a path on the computer the daemon runs on,
+/// when this one can't look there: any absolute path, or one relative to
+/// `cwd` (not `~/`, whose home is that computer's). Links with a scheme
+/// (`https:`, `mailto:`) aren't paths.
+pub(crate) fn link_path_target(target: &str, cwd: &str) -> Option<String> {
+    let target = target.trim();
+    let first = target.split('/').next().unwrap_or("");
+    if target.starts_with("~/") || target.starts_with('#') || first.contains(':') {
+        return None;
+    }
+    // Nothing to look at: a trailing `:line` is a line, not a name.
+    let path = line_suffix(target).map_or(target, |at| &target[..at]);
+    file_link(path, cwd, |_| true).map(|l| l.open)
+}
+
 /// `code` as a link, if it is the path of a file (alone, or followed by
 /// `:line` or `:line:column`).
 fn file_link(code: &str, cwd: &str, is_file: impl Fn(&Path) -> bool) -> Option<FileLink> {
@@ -87,6 +110,112 @@ fn line_suffix(code: &str) -> Option<usize> {
     }
 }
 
+/// What the daemon said about paths in replies of threads whose files
+/// aren't on this computer (a browser, a window on an SSH host), by thread
+/// and path: `None` while asking.
+type There = std::collections::HashMap<(ThreadId, PathBuf), Option<bool>>;
+
+fn there() -> std::sync::MutexGuard<'static, There> {
+    static THERE: std::sync::OnceLock<std::sync::Mutex<There>> = std::sync::OnceLock::new();
+    THERE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The paths in `text`'s inline code (`` `…` ``) that could be files, as
+/// `is_file` would be asked about them, not yet asked of the daemon for
+/// `thread`: marked as being asked.
+pub(crate) fn paths_to_ask(thread: &ThreadId, text: &str, cwd: &str) -> Vec<PathBuf> {
+    const MOST: usize = 4096;
+    let mut out = Vec::new();
+    let mut there = there();
+    if there.len() >= MOST {
+        there.retain(|_, known| known.is_none());
+    }
+    for code in inline_code(text) {
+        // Every path `file_link` would look at, the `:line` form included.
+        let wanted = std::cell::RefCell::new(Vec::new());
+        file_link(code, cwd, |path| {
+            wanted.borrow_mut().push(path.to_path_buf());
+            false
+        });
+        for path in wanted.into_inner() {
+            let key = (thread.clone(), path);
+            if !there.contains_key(&key) && out.len() < loft_protocol::MAX_FILES_EXIST {
+                out.push(key.1.clone());
+                there.insert(key, None);
+            }
+        }
+    }
+    out
+}
+
+/// The daemon's answers for `paths` (`None`: it couldn't say, ask again
+/// later). Whether any is a file (the reply then links it).
+pub(crate) fn record(thread: &ThreadId, paths: &[PathBuf], files: Option<&[bool]>) -> bool {
+    let mut there = there();
+    let mut any = false;
+    for (ix, path) in paths.iter().enumerate() {
+        let key = (thread.clone(), path.clone());
+        match files {
+            Some(files) => {
+                let file = files.get(ix).copied().unwrap_or(false);
+                any |= file;
+                there.insert(key, Some(file));
+            }
+            None => {
+                there.remove(&key);
+            }
+        }
+    }
+    any
+}
+
+/// The text of each inline code span in Markdown `text` (not fenced
+/// blocks).
+fn inline_code(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            let after = &rest[start..];
+            let ticks = after.len() - after.trim_start_matches('`').len();
+            let body = &after[ticks..];
+            let close = "`".repeat(ticks);
+            let Some(end) = body.find(&close) else {
+                break;
+            };
+            spans.push(body[..end].trim());
+            rest = &body[end + ticks..];
+        }
+    }
+    spans
+}
+
+/// Whether `path` (in a reply of `thread`) is a file: on this computer, by
+/// looking; on another, by what its daemon said (no until it has).
+fn is_file_in(path: &Path, thread: Option<&ThreadId>) -> bool {
+    if let Some(thread) = thread {
+        let key = (thread.clone(), path.to_path_buf());
+        if let Some(Some(known)) = there().get(&key) {
+            return *known;
+        }
+        if crate::host::thread_is_elsewhere(thread) {
+            return false;
+        }
+    }
+    is_file(path)
+}
+
 /// Whether `path` is a file, remembered for a few seconds: a reply is read
 /// again with every piece of it that arrives.
 fn is_file(path: &Path) -> bool {
@@ -125,7 +254,9 @@ impl MarkdownPlugin for FileLinks {
         let Node::InlineCode(code) = node else {
             return None;
         };
-        let link = file_link(&code.value, &self.cwd, is_file)?;
+        let link = file_link(&code.value, &self.cwd, |path| {
+            is_file_in(path, self.thread.as_ref())
+        })?;
         // Selecting and copying it gives the path as it was written.
         Some(MarkdownNode::new(NODE, link).text(code.value.clone()))
     }
@@ -185,6 +316,46 @@ impl MarkdownPlugin for FileLinks {
 mod tests {
     use super::*;
 
+    #[test]
+    fn paths_elsewhere_are_asked_once_and_linked_by_the_answer() {
+        let spans = inline_code(
+            "Run `cargo test` on `/srv/app/main.rs:12`.\n```\n`not this`\n```\n``a`b``",
+        );
+        assert_eq!(spans, ["cargo test", "/srv/app/main.rs:12", "a`b"]);
+
+        let thread = ThreadId::new();
+        let text = "See `/srv/app/main.rs:12` and `notes.md`, then `ls`.";
+        let asked = paths_to_ask(&thread, text, "/srv/app");
+        // Every form `file_link` looks at: the whole, then without `:12`.
+        assert!(asked.contains(&PathBuf::from("/srv/app/main.rs:12")));
+        assert!(asked.contains(&PathBuf::from("/srv/app/main.rs")));
+        assert!(asked.contains(&PathBuf::from("/srv/app/notes.md")));
+        // Asked once: while asking, and after, nothing new.
+        assert!(paths_to_ask(&thread, text, "/srv/app").is_empty());
+
+        let answers: Vec<bool> = asked
+            .iter()
+            .map(|p| p == Path::new("/srv/app/main.rs"))
+            .collect();
+        assert!(record(&thread, &asked, Some(&answers)));
+        assert!(is_file_in(Path::new("/srv/app/main.rs"), Some(&thread)));
+        assert!(!is_file_in(Path::new("/srv/app/notes.md"), Some(&thread)));
+        let link = file_link("/srv/app/main.rs:12", "/srv/app", |p| {
+            is_file_in(p, Some(&thread))
+        })
+        .unwrap();
+        assert_eq!(
+            (link.open.as_str(), link.label.as_str()),
+            ("main.rs", "main.rs:12")
+        );
+
+        // No answer (not connected): asked again next time.
+        let other = ThreadId::new();
+        let asked = paths_to_ask(&other, "`/x/y.rs`", "/x");
+        assert!(!record(&other, &asked, None));
+        assert_eq!(paths_to_ask(&other, "`/x/y.rs`", "/x"), asked);
+    }
+
     fn link(code: &str) -> Option<(String, String)> {
         let files = [
             "/w/proj/src/main.rs",
@@ -226,5 +397,22 @@ mod tests {
     fn a_relative_path_needs_a_folder() {
         assert_eq!(file_link("main.rs", "", |_| true), None);
         assert!(file_link("/main.rs", "", |_| true).is_some());
+    }
+
+    #[test]
+    fn a_markdown_link_to_a_file_opens_in_the_panel() {
+        // A Markdown link's target names the side panel's file, with any
+        // `:line` suffix dropped. (The real `is_file` runs here; these paths
+        // don't exist, so it never matches.)
+        assert_eq!(link_file_target("/does/not/exist.rs", "/w/proj"), None);
+        assert_eq!(link_file_target("https://pi.dev", "/w/proj"), None);
+        // On another computer, paths are taken at their word.
+        assert_eq!(
+            link_path_target("/srv/app/main.rs:12", "/srv/app").as_deref(),
+            Some("main.rs")
+        );
+        assert_eq!(link_path_target("https://pi.dev/x", "/srv/app"), None);
+        assert_eq!(link_path_target("mailto:me@x.y", "/srv/app"), None);
+        assert_eq!(link_path_target("~/notes.md", "/srv/app"), None);
     }
 }

@@ -16,7 +16,7 @@ use gpui_kit::{
     Styled as _, Task, div, prelude::FluentBuilder as _, px,
 };
 use loft_config::SettingValue;
-use loft_protocol::{Request, Response, WebSession, WebStatus};
+use loft_protocol::{Request, Response, WebAddress, WebSession, WebStatus};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -86,6 +86,40 @@ fn ago(ms: i64) -> String {
         s @ 60..=3599 => format!("{} min ago", s / 60),
         s @ 3600..=86_399 => format!("{} h ago", s / 3600),
         s => format!("{} d ago", s / 86_400),
+    }
+}
+
+/// `text` as a QR code: an SVG of black squares on white, with the quiet
+/// zone round it that scanners need.
+fn qr_svg(text: &str) -> Option<Vec<u8>> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let width = code.width();
+    let quiet = 4;
+    let size = width + 2 * quiet;
+    let mut path = String::new();
+    for (ix, color) in code.to_colors().into_iter().enumerate() {
+        if color == qrcode::Color::Dark {
+            let (x, y) = (ix % width + quiet, ix / width + quiet);
+            path.push_str(&format!("M{x} {y}h1v1h-1z"));
+        }
+    }
+    Some(
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" \
+             shape-rendering=\"crispEdges\"><rect width=\"{size}\" height=\"{size}\" \
+             fill=\"#fff\"/><path fill=\"#000\" d=\"{path}\"/></svg>"
+        )
+        .into_bytes(),
+    )
+}
+
+/// What an address is, in words.
+fn address_label(kind: &str) -> &'static str {
+    match kind {
+        "local" => "This computer",
+        "lan" => "Local network",
+        "tailnet" => "Tailscale",
+        _ => "Name",
     }
 }
 
@@ -200,6 +234,43 @@ impl SettingsView {
                 .child(div().size(px(7.)).rounded_full().bg(state.1))
                 .child(div().flex_1().min_w_0().child(state.0)),
         );
+
+        // -- network access: other devices at home or on the tailnet --------
+        let default_url = status
+            .addresses
+            .iter()
+            .find(|a| a.default && a.kind != "local")
+            .map(|a| a.url.clone());
+        page = page.child(row(
+            "Network access",
+            &match (&default_url, web.network && status.running) {
+                (Some(url), true) => format!("Reachable at {url}/"),
+                _ => "Let your phone or another computer on your local network or tailnet open \
+                      Agentloft. Connections from anywhere else are refused."
+                    .to_owned(),
+            },
+            Switch::new("web-network")
+                .checked(web.network)
+                .on_click(cx.listener(|this, on: &bool, _, cx| {
+                    let value = if *on {
+                        SettingValue::Bool(true)
+                    } else {
+                        SettingValue::Unset
+                    };
+                    // Turning it on turns web access on too.
+                    if *on && !this.config.web.enabled {
+                        this.set_web("enabled", SettingValue::Bool(true), cx);
+                    }
+                    this.set_web("network", value, cx);
+                }))
+                .into_any_element(),
+            p,
+        ));
+        if web.enabled && status.running && status.addresses.len() > 1 {
+            for address in &status.addresses {
+                page = page.child(self.address_row(address, p, cx));
+            }
+        }
         if web.enabled && status.running && !status.bundle {
             page = page.child(banner(
                 IconName::TriangleAlert,
@@ -218,7 +289,9 @@ impl SettingsView {
             let insecure = status.insecure_remote || plan.as_ref().is_ok_and(|p| p.insecure_remote);
             page = page.child(banner(
                 IconName::TriangleAlert,
-                if insecure {
+                if status.network {
+                    "Devices on your local network and tailnet can reach Agentloft, over plain HTTP. On a tailnet the connection is encrypted; on a home network anyone on it could read it, pairing link included. Turn this off on networks you don't trust.".into()
+                } else if insecure {
                     "Other devices on the network can reach Agentloft, and the connection is not encrypted: anyone on that network can read it, pairing link included. Use this only on a network that is itself private, like a VPN.".into()
                 } else {
                     "Other devices on the network can reach Agentloft. Anyone who gets the pairing link can run commands on this computer.".into()
@@ -259,6 +332,31 @@ impl SettingsView {
                         .overflow_hidden()
                         .child(shown),
                 )
+                // For a phone: point its camera at the link (hidden with
+                // it, being the same secret).
+                .when(status.remote && self.web.revealed, |d| {
+                    d.children(qr_svg(&link).map(|svg| {
+                        h_flex()
+                            .pt_3()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                gpui_kit::img(std::sync::Arc::new(gpui_kit::Image::from_bytes(
+                                    gpui_kit::ImageFormat::Svg,
+                                    svg,
+                                )))
+                                .size(px(168.))
+                                .rounded(px(8.)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(p.muted_foreground)
+                                    .child("Scan it with your phone's camera to open Agentloft there and sign it in."),
+                            )
+                    }))
+                })
                 .child(
                     h_flex()
                         .pt_2()
@@ -304,7 +402,11 @@ impl SettingsView {
                                 .small()
                                 .ghost()
                                 .icon(Icon::new(IconName::Eye))
-                                .label(if self.web.revealed { "Hide" } else { "Show" })
+                                .label(match (self.web.revealed, status.remote) {
+                                    (true, _) => "Hide",
+                                    (false, true) => "Show with QR code",
+                                    (false, false) => "Show",
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.web.revealed = !this.web.revealed;
                                     cx.notify();
@@ -424,7 +526,11 @@ impl SettingsView {
             ))
             .child(row(
                 "Address",
-                "127.0.0.1 keeps it to this computer. Any other address lets other devices connect, and needs a certificate.",
+                if web.network {
+                    "Network access listens on every address, so this one isn't used while it is on."
+                } else {
+                    "127.0.0.1 keeps it to this computer. Any other address lets other devices connect, and needs a certificate."
+                },
                 text_input(&self.input(Field::WebBind)),
                 p,
             ))
@@ -469,6 +575,58 @@ impl SettingsView {
                 p,
             ));
         page.into_any_element()
+    }
+
+    /// One place web access can be reached: what it is, its address, and
+    /// whether the pairing link uses it.
+    fn address_row(&self, address: &WebAddress, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let host = address.host.clone();
+        h_flex()
+            .py_2p5()
+            .pl_3()
+            .gap_3()
+            .items_center()
+            .border_b_1()
+            .border_color(p.border.opacity(0.6))
+            .when(address.default, |d| d.border_l_2().border_color(p.accent))
+            .child(
+                div()
+                    .w(px(120.))
+                    .text_sm()
+                    .child(address_label(&address.kind)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(p.muted_foreground)
+                    .child(format!("{}/", address.url)),
+            )
+            .child(if address.default {
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(p.accent)
+                    .text_xs()
+                    .text_color(p.accent)
+                    .child("Default")
+                    .into_any_element()
+            } else {
+                Button::new(SharedString::from(format!("web-address-{host}")))
+                    .small()
+                    .outline()
+                    .label("Set as default")
+                    .tooltip("The pairing link uses this address")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_web("link_host", SettingValue::Str(host.clone()), cx);
+                    }))
+                    .into_any_element()
+            })
+            .into_any_element()
     }
 
     fn session_row(&self, session: &WebSession, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -523,6 +681,13 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_qr_code_is_an_svg_of_the_link() {
+        let svg = String::from_utf8(qr_svg("http://192.168.1.2:4780/#token=abc").unwrap()).unwrap();
+        assert!(svg.starts_with("<svg") && svg.contains("<path fill=\"#000\" d=\"M"));
+        assert!(!svg.contains("abc"), "the link itself isn't in the picture");
+    }
 
     #[test]
     fn the_link_is_masked_until_revealed() {

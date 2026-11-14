@@ -15,18 +15,27 @@ use std::sync::Arc;
 /// An image to show: already in memory, or a file on disk.
 #[derive(Clone)]
 pub enum Pic {
-    Loaded { image: Arc<Image>, name: String },
-    File { path: PathBuf, name: String },
+    Loaded {
+        image: Arc<Image>,
+        name: String,
+    },
+    /// `thread`: the thread whose image it is (one on another computer
+    /// is fetched from its daemon).
+    File {
+        path: PathBuf,
+        name: String,
+        thread: Option<loft_protocol::ThreadId>,
+    },
 }
 
 impl Pic {
     /// A file, titled by its file name.
-    pub fn file(path: PathBuf) -> Self {
+    pub fn file(path: PathBuf, thread: Option<loft_protocol::ThreadId>) -> Self {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image".into());
-        Pic::File { path, name }
+        Pic::File { path, name, thread }
     }
 
     pub fn name(&self) -> String {
@@ -58,7 +67,9 @@ impl Pic {
     fn element(&self) -> gpui_kit::Img {
         match self {
             Pic::Loaded { image, .. } => img(image.clone()),
-            Pic::File { path, .. } => img(crate::host::image_or_blank(path, None)),
+            Pic::File { path, thread, .. } => {
+                img(crate::host::image_or_blank(path, thread.as_ref()))
+            }
         }
     }
 }

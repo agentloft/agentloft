@@ -18,14 +18,20 @@ pub struct AppEnv {
     pub paths: Paths,
     /// Open workspace windows and their stores (for session restore).
     open: Vec<(AnyWindowHandle, gpui_kit::WeakEntity<AppStore>)>,
+    /// A connection to this computer's daemon for Settings, when every
+    /// window shows another computer.
+    local: Option<gpui_kit::Entity<AppStore>>,
 }
 impl Global for AppEnv {}
 
 pub fn init(runtime: crate::host::Runtime, paths: Paths, cx: &mut App) {
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::host::init(cx);
     cx.set_global(AppEnv {
         runtime,
         paths,
         open: Vec::new(),
+        local: None,
     });
     // Remember the windows and tab groups for next launch.
     cx.on_app_quit(|cx| {
@@ -70,6 +76,10 @@ struct SavedWindow {
     /// Columns of stacked panes.
     #[serde(default)]
     layout: Vec<Vec<ThreadId>>,
+    /// The SSH host whose Agentloft the window shows (none: this
+    /// computer's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
 }
 
 /// Remember each window's threads and panes for next time.
@@ -90,6 +100,7 @@ pub fn save_session(cx: &mut App) {
             group: ix,
             panes: Vec::new(),
             layout: store.layout.clone(),
+            remote: store.remote().map(str::to_owned),
         });
     }
     if let Ok(json) = serde_json::to_vec_pretty(&saved) {
@@ -99,6 +110,15 @@ pub fn save_session(cx: &mut App) {
 
 /// Reopen last session's windows and tabs; a single window if none.
 pub fn restore(cx: &mut App) {
+    // A dev run on another computer only: `AGENTLOFT_DEV_REMOTE=<ssh host>`.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(host) = std::env::var("AGENTLOFT_DEV_REMOTE")
+        .ok()
+        .filter(|h| loft_client::valid_destination(h))
+    {
+        open_on(None, Some(host), cx);
+        return;
+    }
     let saved: Vec<SavedWindow> = cx
         .try_global::<AppEnv>()
         .and_then(|env| crate::host::load_session(&env.paths))
@@ -109,7 +129,9 @@ pub fn restore(cx: &mut App) {
         return;
     }
     // Windows that were tabs of one group come back as panes of one window.
-    let mut windows: Vec<(usize, Option<ThreadId>, Vec<Vec<ThreadId>>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut windows: Vec<(usize, Option<ThreadId>, Vec<Vec<ThreadId>>, Option<String>)> =
+        Vec::new();
     for w in saved {
         let mut layout = w.layout;
         if layout.is_empty() {
@@ -119,7 +141,7 @@ pub fn restore(cx: &mut App) {
             layout.extend(w.thread.clone().map(|t| vec![t]));
         }
         match windows.iter_mut().find(|(g, ..)| *g == w.group) {
-            Some((_, _, existing)) => {
+            Some((_, _, existing, _)) => {
                 for col in layout {
                     let col: Vec<ThreadId> = col
                         .into_iter()
@@ -130,11 +152,11 @@ pub fn restore(cx: &mut App) {
                     }
                 }
             }
-            None => windows.push((w.group, w.thread, layout)),
+            None => windows.push((w.group, w.thread, layout, w.remote)),
         }
     }
-    for (_, thread, layout) in windows {
-        if let Some(handle) = open(thread.clone(), Placement::Window, cx)
+    for (_, thread, layout, remote) in windows {
+        if let Some(handle) = open_on(thread.clone(), remote, cx)
             && let Some(env) = cx.try_global::<AppEnv>()
             && let Some(store) = env
                 .open
@@ -170,12 +192,73 @@ pub fn open(
     placement: Placement,
     cx: &mut App,
 ) -> Option<AnyWindowHandle> {
+    let Placement::Window = placement;
+    open_on(thread, None, cx)
+}
+
+/// A store connected to this computer's daemon: an open window's, else one
+/// of its own.
+pub fn local_store(cx: &mut App) -> Option<gpui_kit::Entity<AppStore>> {
+    let env = cx.try_global::<AppEnv>()?;
+    let open = env
+        .open
+        .iter()
+        .filter_map(|(_, s)| s.upgrade())
+        .find(|s| s.read(cx).remote().is_none());
+    if let Some(store) = open.or_else(|| env.local.clone()) {
+        return Some(store);
+    }
+    let (runtime, paths) = (env.runtime.clone(), env.paths.clone());
+    let store = cx.new(|cx| AppStore::new(runtime, paths, None, cx));
+    cx.global_mut::<AppEnv>().local = Some(store.clone());
+    Some(store)
+}
+
+/// Whether a window is open on SSH host `host`'s Agentloft.
+pub fn is_open_on(host: &str, cx: &App) -> bool {
+    cx.try_global::<AppEnv>().is_some_and(|env| {
+        env.open.iter().any(|(_, store)| {
+            store
+                .upgrade()
+                .is_some_and(|s| s.read(cx).remote() == Some(host))
+        })
+    })
+}
+
+/// Open a window on the Agentloft of SSH host `remote`, or bring the one
+/// already open on it to the front.
+pub fn open_remote(remote: String, cx: &mut App) -> Option<AnyWindowHandle> {
+    let existing = cx.try_global::<AppEnv>().and_then(|env| {
+        env.open.iter().find_map(|(handle, store)| {
+            let store = store.upgrade()?;
+            (store.read(cx).remote() == Some(remote.as_str())).then_some(*handle)
+        })
+    });
+    if let Some(handle) = existing {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+        return Some(handle);
+    }
+    crate::remote::remember(&remote, cx);
+    open_on(None, Some(remote), cx)
+}
+
+/// Open a workspace window on this computer's Agentloft or (`remote`) an
+/// SSH host's, optionally showing `thread`.
+fn open_on(
+    thread: Option<ThreadId>,
+    remote: Option<String>,
+    cx: &mut App,
+) -> Option<AnyWindowHandle> {
     let Some(env) = cx.try_global::<AppEnv>() else {
         tracing::error!("windows::init was not called");
         return None;
     };
     let (runtime, paths) = (env.runtime.clone(), env.paths.clone());
-    let store = cx.new(|cx| AppStore::new(runtime, paths, cx));
+    let title: gpui_kit::SharedString = match &remote {
+        Some(host) => format!("Agentloft — {host}").into(),
+        None => "Agentloft".into(),
+    };
+    let store = cx.new(|cx| AppStore::new(runtime, paths, remote, cx));
     if let Some(thread) = thread {
         store.update(cx, |s, cx| s.select_thread(thread, cx));
     }
@@ -185,7 +268,7 @@ pub fn open(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(720.), px(480.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Agentloft".into()),
+                title: Some(title),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(16.), px(18.))),
             }),
@@ -199,7 +282,6 @@ pub fn open(
     );
     match opened {
         Ok((handle, _)) => {
-            let Placement::Window = placement;
             let weak = store.downgrade();
             let env = cx.global_mut::<AppEnv>();
             env.open.retain(|(_, s)| s.upgrade().is_some());

@@ -20,6 +20,7 @@ use loft_protocol::Request;
 mod agents;
 mod appearance;
 mod browser;
+mod computers;
 mod projects;
 mod shortcuts;
 mod threads;
@@ -50,6 +51,12 @@ pub fn dev_scroll_to_end() {
 /// Open the settings window (optionally at a section), or bring the open
 /// one to the front.
 pub fn open(store: Entity<AppStore>, section: Option<Section>, cx: &mut App) {
+    // Settings are this computer's, even from a window on another one.
+    let store = if store.read(cx).remote().is_some() {
+        crate::windows::local_store(cx).unwrap_or(store)
+    } else {
+        store
+    };
     if crate::host::IS_WEB {
         open_in_window(store, section, cx);
         return;
@@ -361,6 +368,8 @@ pub enum Section {
     /// Agentloft in a browser (desktop only: a browser session may not
     /// manage its own access).
     Web,
+    /// Agentloft on other computers, over SSH (desktop only).
+    Computers,
     About,
 }
 
@@ -371,7 +380,7 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s) || sec.slug() == s)
     }
 
-    const ALL: [Section; 10] = [
+    const ALL: [Section; 11] = [
         Section::Appearance,
         Section::Agents,
         Section::Threads,
@@ -381,6 +390,7 @@ impl Section {
         Section::Shortcuts,
         Section::Usage,
         Section::Web,
+        Section::Computers,
         Section::About,
     ];
 
@@ -388,7 +398,9 @@ impl Section {
     fn all() -> Vec<Section> {
         Self::ALL
             .into_iter()
-            .filter(|section| !(crate::host::IS_WEB && *section == Section::Web))
+            .filter(|section| {
+                !(crate::host::IS_WEB && matches!(section, Section::Web | Section::Computers))
+            })
             .collect()
     }
 
@@ -404,6 +416,7 @@ impl Section {
             Section::Shortcuts => "shortcuts",
             Section::Usage => "usage",
             Section::Web => "web",
+            Section::Computers => "computers",
             Section::About => "about",
         }
     }
@@ -419,6 +432,7 @@ impl Section {
             Section::Shortcuts => "Shortcuts",
             Section::Usage => "Usage",
             Section::Web => "Web access",
+            Section::Computers => "Other computers",
             Section::About => "About",
         }
     }
@@ -434,6 +448,7 @@ impl Section {
             Section::Shortcuts => IconName::Keyboard,
             Section::Usage => IconName::ChartPie,
             Section::Web => IconName::GlobeLock,
+            Section::Computers => IconName::Server,
             Section::About => IconName::Sparkles,
         }
     }
@@ -612,6 +627,7 @@ pub struct SettingsView {
     projects: projects::ProjectsPage,
     shortcuts: shortcuts::ShortcutsPage,
     web: web::WebPage,
+    computers: computers::ComputersPage,
     browser: browser::BrowserPage,
     usage: usage::UsagePage,
     /// "Custom" is picked for deleting archived threads (its days field
@@ -694,6 +710,7 @@ impl SettingsView {
             projects: projects::ProjectsPage::default(),
             shortcuts: shortcuts::ShortcutsPage::default(),
             web: web::WebPage::default(),
+            computers: Default::default(),
             browser: browser::BrowserPage::default(),
             usage: usage::UsagePage::default(),
             archive_custom: false,
@@ -982,6 +999,7 @@ impl Render for SettingsView {
             Section::Shortcuts => self.shortcuts_page(&p, cx),
             Section::Usage => self.usage_page(&p, window, cx),
             Section::Web => self.web_page(&p, cx),
+            Section::Computers => self.computers_page(&p, window, cx),
             Section::About => self.about(&p, cx),
         };
         // In a window of its own the title bar closes it; drawn inside the

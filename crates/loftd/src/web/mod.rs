@@ -64,7 +64,7 @@ struct State {
 }
 
 pub(crate) struct Inner {
-    core: Arc<Core>,
+    pub(crate) core: Arc<Core>,
     shutdown: watch::Sender<bool>,
     pub(crate) auth: Arc<auth::Auth>,
     pub(crate) bundle: bundle::Bundle,
@@ -229,13 +229,22 @@ impl Web {
             } else {
                 "http"
             };
-            let url = format!(
-                "{scheme}://{}",
-                display_authority(&running.plan, running.addr)
-            );
+            status.addresses = addresses(&running.plan, running.addr, scheme);
+            let url = status
+                .addresses
+                .iter()
+                .find(|a| a.default)
+                .map(|a| a.url.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{scheme}://{}",
+                        display_authority(&running.plan, running.addr)
+                    )
+                });
             status.tls = running.plan.tls.is_some();
             status.remote = !running.addr.ip().is_loopback();
             status.insecure_remote = running.plan.insecure_remote;
+            status.network = running.plan.private_peers_only;
             // In the fragment: never sent to a server, kept out of logs.
             status.pairing_url = self
                 .inner
@@ -264,6 +273,128 @@ impl Web {
     pub fn revoke_all_sessions(&self) {
         self.inner.auth.revoke_all();
     }
+}
+
+/// Where the listener can be reached: on every interface, this computer's
+/// loopback, local network and tailnet addresses (public ones only when
+/// they're allowed to connect), and the names in `allowed_hosts`. The one
+/// `link_host` names is the default; else the local network's (the address
+/// on the default route), else the first.
+fn addresses(plan: &WebPlan, addr: SocketAddr, scheme: &str) -> Vec<loft_protocol::WebAddress> {
+    let port = addr.port();
+    let url = |host: &str| {
+        let authority = match host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => format!("[{host}]:{port}"),
+            _ => format!("{host}:{port}"),
+        };
+        format!("{scheme}://{authority}")
+    };
+    let mut found: Vec<loft_protocol::WebAddress> = Vec::new();
+    let mut add = |kind: &str, host: String| {
+        if !found.iter().any(|a| a.host == host) {
+            found.push(loft_protocol::WebAddress {
+                kind: kind.into(),
+                url: url(&host),
+                host,
+                default: false,
+            });
+        }
+    };
+    if addr.ip().is_unspecified() {
+        add("local", "127.0.0.1".into());
+        let mut ips = interface_addresses();
+        // The default route's first: the address others most likely see.
+        if let Some(main) = outbound_ip(false) {
+            ips.retain(|ip| *ip != main);
+            ips.insert(0, main);
+        }
+        for ip in ips {
+            if ip.is_loopback() || ip.is_unspecified() || !ip.is_ipv4() {
+                continue;
+            }
+            if loft_config::is_tailnet_address(ip) {
+                add("tailnet", ip.to_string());
+            } else if loft_config::is_private_address(ip) || !plan.private_peers_only {
+                // A public address only where public peers may connect.
+                add("lan", ip.to_string());
+            }
+        }
+    } else if addr.ip().is_loopback() {
+        add("local", addr.ip().to_string());
+    } else {
+        let kind = if loft_config::is_tailnet_address(addr.ip()) {
+            "tailnet"
+        } else {
+            "lan"
+        };
+        add(kind, addr.ip().to_string());
+    }
+    for name in &plan.allowed_hosts {
+        add("name", name.clone());
+    }
+    let chosen = plan
+        .link_host
+        .as_deref()
+        .and_then(|host| found.iter().position(|a| a.host == host));
+    let fallback = || {
+        // A named proxy in front of a loopback listener, as before.
+        if addr.ip().is_loopback() {
+            found.iter().position(|a| a.kind == "name")
+        } else {
+            found
+                .iter()
+                .position(|a| a.kind == "lan" || a.kind == "tailnet")
+        }
+        .or(if found.is_empty() { None } else { Some(0) })
+    };
+    if let Some(ix) = chosen.or_else(fallback) {
+        found[ix].default = true;
+    }
+    found
+}
+
+/// Whether a connection from `peer` that arrived at `local` may be served.
+fn admits(plan: &WebPlan, peer: IpAddr, local: Option<IpAddr>) -> bool {
+    !plan.private_peers_only
+        || loft_config::is_private_address(peer)
+            && local.is_some_and(loft_config::is_private_address)
+}
+
+/// This computer's interface addresses.
+fn interface_addresses() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list` with a linked list we only read and
+    // then free with freeifaddrs.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let entry = &*at;
+            let up = entry.ifa_flags & (libc::IFF_UP as libc::c_uint) != 0;
+            if up && !entry.ifa_addr.is_null() {
+                match i32::from((*entry.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let v4 = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                        out.push(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                            v4.sin_addr.s_addr,
+                        ))));
+                    }
+                    libc::AF_INET6 => {
+                        let v6 = &*(entry.ifa_addr as *const libc::sockaddr_in6);
+                        out.push(IpAddr::V6(std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            at = entry.ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    out
 }
 
 /// `host:port` to show and to put in the pairing link: the first configured
@@ -339,6 +470,14 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
+                    // Network access takes private networks only: both
+                    // the peer's address and the one it reached must be
+                    // private (a cloud VM's public address may be NATed
+                    // to a private interface; its peers still aren't).
+                    if !admits(&plan, peer.ip(), stream.local_addr().ok().map(|a| a.ip())) {
+                        tracing::warn!(%peer, "web access: refused a connection from outside private networks");
+                        continue;
+                    }
                     // Full: this connection is dropped unanswered.
                     let Ok(slot) = slots.clone().try_acquire_owned() else {
                         tracing::warn!(%peer, "web access: too many connections");
@@ -408,5 +547,74 @@ async fn serve_connection(stream: tokio::net::TcpStream, tls: Option<TlsAcceptor
             connection.as_mut().graceful_shutdown();
             let _ = tokio::time::timeout(Duration::from_secs(2), connection).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(toml: &str) -> WebPlan {
+        let config: WebConfig = toml::from_str(toml).unwrap();
+        config.plan().unwrap()
+    }
+
+    #[test]
+    fn network_access_serves_private_networks_only() {
+        let network = plan("enabled = true\nnetwork = true\n");
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let home = Some(ip("192.168.1.20"));
+        assert!(admits(&network, ip("192.168.1.30"), home));
+        assert!(admits(&network, ip("100.100.1.2"), Some(ip("100.64.0.7"))));
+        assert!(admits(&network, ip("127.0.0.1"), Some(ip("127.0.0.1"))));
+        assert!(!admits(&network, ip("203.0.113.9"), home), "a public peer");
+        assert!(
+            !admits(&network, ip("192.168.1.30"), Some(ip("203.0.113.1"))),
+            "reached at a public address"
+        );
+        assert!(!admits(&network, ip("192.168.1.30"), None));
+        // Without network access, who may connect is the address's business.
+        let tls = plan("enabled = true\nbind = \"0.0.0.0\"\nallow_insecure_remote = true\n");
+        assert!(admits(&tls, ip("203.0.113.9"), home));
+    }
+
+    #[test]
+    fn the_pairing_link_uses_the_chosen_address() {
+        let local = plan("enabled = true\n");
+        let found = addresses(&local, "127.0.0.1:4780".parse().unwrap(), "http");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].default && found[0].kind == "local");
+        assert_eq!(found[0].url, "http://127.0.0.1:4780");
+
+        // A name in front of a loopback listener is the default, unless
+        // another is chosen.
+        let named = plan("enabled = true\nallowed_hosts = [\"desk.example\"]\n");
+        let found = addresses(&named, "127.0.0.1:4780".parse().unwrap(), "https");
+        let default: Vec<_> = found
+            .iter()
+            .filter(|a| a.default)
+            .map(|a| &a.host)
+            .collect();
+        assert_eq!(default, ["desk.example"]);
+        let chosen =
+            plan("enabled = true\nallowed_hosts = [\"desk.example\"]\nlink_host = \"127.0.0.1\"\n");
+        let found = addresses(&chosen, "127.0.0.1:4780".parse().unwrap(), "https");
+        let default: Vec<_> = found
+            .iter()
+            .filter(|a| a.default)
+            .map(|a| &a.host)
+            .collect();
+        assert_eq!(default, ["127.0.0.1"]);
+
+        // Every interface: this computer's loopback is always one of them.
+        let network = plan("enabled = true\nnetwork = true\n");
+        let found = addresses(&network, "0.0.0.0:4780".parse().unwrap(), "http");
+        assert!(found.iter().any(|a| a.kind == "local"));
+        assert_eq!(found.iter().filter(|a| a.default).count(), 1);
+        assert!(
+            found.iter().all(
+                |a| a.kind != "lan" || loft_config::is_private_address(a.host.parse().unwrap())
+            )
+        );
     }
 }

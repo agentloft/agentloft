@@ -363,9 +363,10 @@ impl WorkbenchPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<BrowserView>> {
-        // The native web view is the desktop app's; a browser tab has the
-        // streamed page instead (`page`).
-        if crate::host::IS_WEB {
+        // The native web view is the desktop app's; a browser tab, or a
+        // window on another computer, has the streamed page instead
+        // (`page`).
+        if self.store.read(cx).is_elsewhere() {
             return None;
         }
         if let Some(view) = self.ensure_id(thread_id, window, cx)?.browser() {
@@ -623,7 +624,9 @@ impl WorkbenchPanel {
             Tab::Terminal => self.new_terminal(thread_id, false, true, window, cx),
             // No native web view in a browser tab: a streamed page of the
             // daemon's own browser instead.
-            Tab::Browser if crate::host::IS_WEB => {
+            // So does a window on another computer: this one's web view
+            // can't reach that one's `localhost`.
+            Tab::Browser if self.store.read(cx).is_elsewhere() => {
                 let store = self.store.clone();
                 let thread = thread_id.clone();
                 let view = cx.new(|cx| page::PageView::new(store, thread, window, cx));

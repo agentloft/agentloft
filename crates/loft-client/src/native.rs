@@ -39,6 +39,20 @@ impl Client {
         let stream = UnixStream::connect(socket)
             .await
             .with_context(|| format!("connect {}", socket.display()))?;
+        Self::connect_over(stream, kind, build, capabilities).await
+    }
+
+    /// Connect over any byte stream that reaches the daemon (its socket, or
+    /// a bridge to it on another computer).
+    pub async fn connect_over<S>(
+        stream: S,
+        kind: ClientKind,
+        build: &str,
+        capabilities: &[&str],
+    ) -> Result<(Client, mpsc::UnboundedReceiver<ClientEvent>)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
         let codec = LengthDelimitedCodec::builder()
             .max_frame_length(MAX_FRAME_LEN)
             .new_codec();

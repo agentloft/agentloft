@@ -221,6 +221,15 @@ pub enum ConnState {
 pub struct AppStore {
     runtime: crate::host::Runtime,
     paths: Paths,
+    /// The SSH host whose Agentloft this window shows; `None` for this
+    /// computer's own.
+    remote: Option<String>,
+    /// Connection attempts that failed in a row (the wait before the next
+    /// grows with them).
+    failures: u32,
+    /// On an SSH host: where Agentloft keeps its data there, the user's
+    /// home there, and its settings (asked for on connecting).
+    there: Option<There>,
     client: Option<Client>,
     pub conn: ConnState,
     pub workspace: WorkspaceModel,
@@ -307,8 +316,20 @@ pub struct AppStore {
     daemon_pid: Option<u32>,
 }
 
+/// Where things are on the SSH host a window shows.
+struct There {
+    paths: Paths,
+    user_home: std::path::PathBuf,
+    config: loft_config::Config,
+}
+
 impl AppStore {
-    pub fn new(runtime: crate::host::Runtime, paths: Paths, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: crate::host::Runtime,
+        paths: Paths,
+        remote: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let collapsed = load_collapsed(&paths);
         let folded_threads = load_folded_threads(&paths);
         let pinned_projects = load_list::<ProjectId>(&paths, "pinned_projects");
@@ -316,6 +337,9 @@ impl AppStore {
         let mut this = Self {
             runtime,
             paths,
+            remote,
+            failures: 0,
+            there: None,
             client: None,
             conn: ConnState::Connecting,
             workspace: WorkspaceModel::default(),
@@ -410,7 +434,12 @@ impl AppStore {
     fn connect(&mut self, cx: &mut Context<Self>) {
         self.conn = ConnState::Connecting;
         cx.notify();
-        let connecting = crate::host::connect(self.runtime.clone(), self.paths.clone(), BUILD);
+        let connecting = crate::host::connect(
+            self.runtime.clone(),
+            self.paths.clone(),
+            self.remote.clone(),
+            BUILD,
+        );
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut AsyncApp| match connecting.await {
                 Ok((client, rx)) => {
@@ -423,12 +452,27 @@ impl AppStore {
                 }
                 Err(err) => {
                     tracing::error!("connect failed: {err:#}");
-                    let _ = this.update(cx, |store, cx| {
+                    let Ok(wait) = this.update(cx, |store, cx| {
                         store.conn = ConnState::Disconnected(format!("{err:#}"));
+                        store.failures += 1;
                         cx.notify();
+                        // Another computer may be asleep or offline: try
+                        // less often the longer it stays away.
+                        if store.remote.is_some() {
+                            Duration::from_secs(2u64.pow(store.failures.min(5)).min(30))
+                        } else {
+                            Duration::from_secs(2)
+                        }
+                    }) else {
+                        return;
+                    };
+                    cx.background_executor().timer(wait).await;
+                    let _ = this.update(cx, |store, cx| {
+                        // Unless "Try again" already did.
+                        if matches!(store.conn, ConnState::Disconnected(_)) {
+                            store.connect(cx)
+                        }
                     });
-                    cx.background_executor().timer(Duration::from_secs(2)).await;
-                    let _ = this.update(cx, |store, cx| store.connect(cx));
                 }
             },
         )
@@ -438,6 +482,7 @@ impl AppStore {
     fn on_connected(&mut self, client: Client, cx: &mut Context<Self>) {
         tracing::info!(daemon = %client.welcome().daemon_build, pid = client.welcome().daemon_pid, "connected");
         self.conn = ConnState::Connected;
+        self.failures = 0;
         // Open threads are watched once the thread list is in (see
         // `on_workspace_snapshot`).
         self.subs.clear();
@@ -450,6 +495,13 @@ impl AppStore {
         self.terminals.retain(|_, pane| pane.upgrade().is_some());
         let terminals = std::mem::take(&mut self.terminals);
         crate::host::set_client(Some(client.clone()));
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(host) = &self.remote {
+            crate::host::set_remote_client(host, Some(client.clone()));
+        }
+        if self.remote.is_some() {
+            self.ask_where_things_are_there(&client, cx);
+        }
         self.client = Some(client);
         self.probe_harnesses(cx);
         // Model pickers (Codex asks its CLI; answers are cached daemon-side).
@@ -692,7 +744,14 @@ impl AppStore {
         self.client = None;
         self.ws_ready = false;
         crate::host::set_client(None);
-        self.conn = ConnState::Disconnected("connection to agentloftd lost".into());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(host) = &self.remote {
+            crate::host::set_remote_client(host, None);
+        }
+        self.conn = ConnState::Disconnected(match &self.remote {
+            Some(host) => format!("Lost the connection to {host}. Reconnecting…"),
+            None => "connection to agentloftd lost".into(),
+        });
         cx.notify();
         // Reconnect (respawning the daemon if it died).
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -726,6 +785,7 @@ impl AppStore {
                     }
                 } else if Some(sub_id) == self.ws_sub {
                     self.workspace.apply_snapshot(snapshot);
+                    self.note_where_things_are();
                     self.on_workspace_snapshot(cx);
                     self.refresh_badge();
                     // Reopen the most recently active thread on launch.
@@ -767,6 +827,12 @@ impl AppStore {
                         _ => true,
                     };
                     if self.workspace.apply_event(&event) {
+                        if matches!(
+                            event.event,
+                            Event::ThreadCreated { .. } | Event::ProjectAdded { .. }
+                        ) {
+                            self.note_where_things_are();
+                        }
                         if let Event::ThreadUpdated { thread } = &event.event {
                             self.on_status_change(&thread.id, before, thread.status, cx);
                             self.refresh_parent(&thread.id, cx);
@@ -953,7 +1019,12 @@ impl AppStore {
             return entity.clone();
         }
         let store = cx.entity().downgrade();
-        let entity = cx.new(|cx| ThreadState::new(id.clone(), store, cx));
+        let elsewhere = self.is_elsewhere();
+        let entity = cx.new(|cx| {
+            let mut thread = ThreadState::new(id.clone(), store, cx);
+            thread.elsewhere = elsewhere;
+            thread
+        });
         let live = self.live_spawned(id);
         entity.update(cx, |t, cx| t.set_live_spawned(live, cx));
         self.threads.insert(id.clone(), entity.clone());
@@ -964,6 +1035,19 @@ impl AppStore {
             self.subs.insert(sub, id.clone());
         }
         entity
+    }
+
+    /// In a window on another computer: its threads' and projects' images
+    /// come from its daemon.
+    fn note_where_things_are(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(host) = &self.remote {
+            crate::host::note_remote(
+                host,
+                self.workspace.threads.iter().map(|t| t.id.clone()),
+                self.workspace.projects.iter().map(|p| p.id.clone()),
+            );
+        }
     }
 
     /// The daemon's thread list is in: let go of threads it no longer has
@@ -1222,6 +1306,25 @@ impl AppStore {
         self.select_thread(thread, cx);
     }
 
+    /// The SSH host whose Agentloft this is, if not this computer's.
+    pub fn remote(&self) -> Option<&str> {
+        self.remote.as_deref()
+    }
+
+    /// The daemon runs on another computer: its files and apps aren't
+    /// this one's (no Finder, no editor, no reading its paths directly).
+    pub fn is_elsewhere(&self) -> bool {
+        crate::host::IS_WEB || self.remote.is_some()
+    }
+
+    /// Try to connect now (after a failure), rather than at the next retry.
+    pub fn retry_now(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.conn, ConnState::Connected | ConnState::Connecting) {
+            self.failures = 0;
+            self.connect(cx);
+        }
+    }
+
     pub fn paths(&self) -> &Paths {
         &self.paths
     }
@@ -1317,14 +1420,57 @@ impl AppStore {
         });
     }
 
+    /// On an SSH host, learn where things are on it: its Agentloft home,
+    /// its user's home, and its settings (for where projects go).
+    fn ask_where_things_are_there(&mut self, client: &Client, cx: &mut Context<Self>) {
+        let pending = client.request(Request::UiFiles { known: None });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Response::UiFiles { files: Some(files) }) = pending.await {
+                let config = toml::from_str(&files.config_toml).unwrap_or_default();
+                let _ = this.update(cx, |store, cx| {
+                    store.there = Some(There {
+                        paths: Paths::new(&files.home),
+                        user_home: files.user_home.into(),
+                        config,
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Agentloft's folders on the computer the daemon runs on.
+    fn daemon_paths(&self) -> Paths {
+        match (&self.remote, &self.there) {
+            (Some(_), Some(there)) => there.paths.clone(),
+            // Not known yet: nothing on this computer will do.
+            (Some(_), None) => Paths::new("~/.agentloft"),
+            (None, _) => self.paths.clone(),
+        }
+    }
+
+    /// The user's home folder on the computer the daemon runs on.
+    fn daemon_user_home(&self) -> std::path::PathBuf {
+        match (&self.remote, &self.there) {
+            (Some(_), Some(there)) => there.user_home.clone(),
+            (Some(_), None) => "~".into(),
+            (None, _) => crate::host::user_home(),
+        }
+    }
+
     /// A `[projects]` folder setting, `~` expanded, if set.
     fn projects_setting(
         &self,
         pick: impl Fn(&loft_config::ProjectsConfig) -> Option<String>,
     ) -> Option<std::path::PathBuf> {
-        let home = crate::host::user_home();
-        crate::host::load_config(&self.paths)
-            .ok()
+        let home = self.daemon_user_home();
+        let config = match (&self.remote, &self.there) {
+            (Some(_), Some(there)) => Some(there.config.clone()),
+            (Some(_), None) => None,
+            (None, _) => crate::host::load_config(&self.paths).ok(),
+        };
+        config
             .and_then(|c| pick(&c.projects))
             .map(|d| d.trim().to_owned())
             .filter(|d| !d.is_empty())
@@ -1338,14 +1484,14 @@ impl AppStore {
     /// Projects ▸ "Add project starts in", else the home folder.
     pub fn projects_base(&self) -> std::path::PathBuf {
         self.projects_setting(|p| p.base_dir.clone())
-            .unwrap_or_else(crate::host::user_home)
+            .unwrap_or_else(|| self.daemon_user_home())
     }
 
     /// Where new projects (made from a name) go: Settings ▸ Projects ▸ "New
     /// projects go in", else ~/.agentloft/projects.
     pub fn new_projects_dir(&self) -> std::path::PathBuf {
         self.projects_setting(|p| p.new_dir.clone())
-            .unwrap_or_else(|| self.paths.projects_dir())
+            .unwrap_or_else(|| self.daemon_paths().projects_dir())
     }
 
     pub fn projects_parent(&self) -> String {
@@ -1456,8 +1602,12 @@ impl AppStore {
     /// The built-in "Chats" project (threads without a project): its root
     /// is Agentloft's chats folder.
     pub fn is_chats(&self, project: &loft_protocol::Project) -> bool {
-        let dir = self.paths.chats_dir();
-        let canonical = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+        let dir = self.daemon_paths().chats_dir();
+        let canonical = if self.remote.is_some() {
+            dir.clone()
+        } else {
+            std::fs::canonicalize(&dir).unwrap_or(dir.clone())
+        };
         std::path::Path::new(&project.root_path) == dir
             || std::path::Path::new(&project.root_path) == canonical
     }
@@ -2297,6 +2447,9 @@ pub struct ThreadState {
     loading_older: bool,
     /// Subagents whose whole run has been asked for (since the snapshot).
     steps_asked: HashSet<ItemId>,
+    /// The daemon is on another computer (a browser, an SSH host): paths in
+    /// replies are asked about rather than looked at.
+    elsewhere: bool,
 }
 
 /// How close to the top of a thread's loaded turns the reader gets before
@@ -2336,6 +2489,7 @@ impl ThreadState {
             visible_messages: Default::default(),
             loading_older: false,
             steps_asked: HashSet::new(),
+            elsewhere: false,
         }
     }
 
@@ -2975,6 +3129,23 @@ impl ThreadState {
             self.sync_view(item, cx);
         }
         self.model = Some(model);
+        // Paths in the replies, now the thread's folder is known.
+        if self.elsewhere {
+            let replies: Vec<(ItemId, String)> = self
+                .model
+                .iter()
+                .flat_map(|m| &m.items)
+                .filter_map(|i| match &i.body {
+                    ItemBody::AssistantMessage { text } if text.contains('`') => {
+                        Some((i.id.clone(), text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (id, text) in replies {
+                self.ask_which_are_files(&id, &text, cx);
+            }
+        }
         self.rebuild_rows();
         self.ensure_ticker(cx);
         self.fetch_turn_diffs(cx);
@@ -3047,6 +3218,12 @@ impl ThreadState {
         if let ItemBody::AssistantMessage { text } = &item.body {
             // `set_text` appends incrementally when the new text extends the old.
             Self::sync_markdown_text(&mut self.markdown, &item.id, text, cx);
+            // A chunk that may close an inline code span, on a daemon
+            // elsewhere: what is in it might be a file there.
+            if self.elsewhere && delta.text.contains('`') {
+                let (id, text) = (item.id.clone(), text.clone());
+                self.ask_which_are_files(&id, &text, cx);
+            }
         }
         if let Some(row) = self.row_of_item(&delta.item_id) {
             self.scroller.update(cx, |s, cx| {
@@ -3136,7 +3313,68 @@ impl ThreadState {
     fn sync_markdown(&mut self, id: &ItemId, body: &ItemBody, cx: &mut Context<Self>) {
         if let ItemBody::AssistantMessage { text } = body {
             Self::sync_markdown_text(&mut self.markdown, id, text, cx);
+            self.ask_which_are_files(id, text, cx);
         }
+    }
+
+    /// On another computer (a browser, a window on an SSH host): ask its
+    /// daemon which paths in the reply are files, so they link to them as
+    /// they do on the desktop (`file_links`). The reply is read again once
+    /// one is.
+    fn ask_which_are_files(&mut self, id: &ItemId, text: &str, cx: &mut Context<Self>) {
+        // (Not the store's to say here: it may be mid-update, with this
+        // thread inside it.)
+        if !self.elsewhere {
+            return;
+        }
+        let Some(cwd) = self.model.as_ref().map(|m| m.thread.cwd.clone()) else {
+            return;
+        };
+        let paths = crate::file_links::paths_to_ask(&self.id, text, &cwd);
+        if paths.is_empty() {
+            return;
+        }
+        let body = Request::FilesExist {
+            paths: paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            thread_id: Some(self.id.clone()),
+        };
+        let item = id.clone();
+        self.fetch(body, cx, move |this, result, cx| {
+            let files = match result {
+                Ok(Response::FilesExist { files }) => Some(files),
+                _ => None,
+            };
+            if crate::file_links::record(&this.id, &paths, files.as_deref()) {
+                this.read_again(&item, cx);
+            }
+        });
+    }
+
+    /// Parse a reply's Markdown again (what its paths are has changed).
+    fn read_again(&mut self, item: &ItemId, cx: &mut Context<Self>) {
+        let Some(text) = self.model.as_ref().and_then(|m| {
+            m.items
+                .iter()
+                .find(|i| &i.id == item)
+                .and_then(|i| match &i.body {
+                    ItemBody::AssistantMessage { text } => Some(text.clone()),
+                    _ => None,
+                })
+        }) else {
+            return;
+        };
+        if let Some(md) = self.markdown.get(item) {
+            let text = crate::items::sized_images(&text).into_owned();
+            md.update(cx, |md, cx| {
+                // Set to something else first: the same text is no change.
+                md.set_text("", cx);
+                md.set_text(&text, cx);
+            });
+        }
+        cx.notify();
     }
 
     /// [`Self::sync_markdown`] for a reply's text, with only the documents

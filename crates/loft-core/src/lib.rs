@@ -1142,6 +1142,15 @@ impl Core {
                 .map_err(internal)??;
                 Ok(Response::File { file })
             }
+            Request::FilesExist { paths, thread_id } => {
+                let core = self.clone();
+                let files = tokio::task::spawn_blocking(move || {
+                    core.files_exist(&paths, thread_id.as_ref(), false)
+                })
+                .await
+                .map_err(internal)?;
+                Ok(Response::FilesExist { files })
+            }
             Request::ListDir { root, rel_path } => {
                 let core = self.clone();
                 let entries = tokio::task::spawn_blocking(move || core.list_dir(&root, &rel_path))

@@ -14,6 +14,20 @@ pub mod model;
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{connect_or_spawn, daemon_binary};
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ssh;
+
+/// Whether `destination` can be handed to `ssh` as a host: an alias from
+/// `~/.ssh/config`, `host`, `user@host`, `host:port` is not one (use an
+/// alias or `ssh://user@host:port`). Never an option (`-…`).
+pub fn valid_destination(destination: &str) -> bool {
+    !destination.is_empty()
+        && destination.len() <= 255
+        && !destination.starts_with('-')
+        && destination
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._-:/[]%+".contains(c))
+}
 
 #[cfg(target_arch = "wasm32")]
 pub mod web;

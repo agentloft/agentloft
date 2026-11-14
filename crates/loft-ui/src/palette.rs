@@ -4,9 +4,9 @@
 use crate::panel::Tab;
 use crate::workspace::QuoteSelection;
 use crate::workspace::{
-    AddProject, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings, ShowBrowser,
-    ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTerminal, ToggleTheme,
-    WorkspaceView, harness_name,
+    AddProject, ConnectToComputer, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings,
+    ShowBrowser, ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTerminal,
+    ToggleTheme, WorkspaceView, harness_name,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
@@ -563,7 +563,7 @@ fn build(
         groups.push(("This thread".to_owned(), Rc::new(items)));
     }
 
-    let app = vec![
+    let mut app = vec![
         entry(
             "New thread",
             IconName::SquarePen,
@@ -595,7 +595,7 @@ fn build(
             IconName::FolderPlus,
             Some(Box::new(AddProject)),
             |v, window, cx| {
-                v.add_project(window, cx);
+                v.add_project_here_or_there(window, cx);
             },
         ),
         entry(
@@ -659,6 +659,18 @@ fn build(
             |v, _, cx| v.open_settings(cx),
         ),
     ];
+    // Another computer's Agentloft opens in a window of the desktop app.
+    if !crate::host::IS_WEB {
+        app.insert(
+            4,
+            entry(
+                "Connect to another computer over SSH…",
+                IconName::Server,
+                Some(Box::new(ConnectToComputer)),
+                |_, window, cx| crate::remote::open(window, cx),
+            ),
+        );
+    }
     groups.push(("Agentloft".to_owned(), Rc::new(app)));
 
     // Projects: start a thread in one.

@@ -152,8 +152,13 @@ What a thread needs to keep going with nobody watching. Built after comparing wi
 - Settings ▸ Browser, in the app and in the browser: the search engine the address bar uses (seven by name, or an address of your own with `%s`), the home page new tabs open, and (desktop only) which browser app the daemon runs for the web client. Tried: picking Google and a home page in the web client, a new tab opening it, a search going to Google, and the same values showing in the desktop app's Settings.
 - Terminals, in the dock under the conversation and as side-panel tabs: the same widget and emulator as the desktop app (libghostty-vt built for wasm), on the daemon's PTYs. Tried: zsh with colours, CJK and emoji, vim, Ctrl+C, scrollback, a two-line paste (bracketed), select all and copy, two shells at once, the shell surviving a reconnect.
 - Images in replies that point at files in the project: fetched through the daemon. A path outside the project stays empty.
+- Videos (2026-11-14): in replies and in the file viewer, with the desktop's own controls (play, pause, scrub, volume). A hidden `<video>` streams the file from `GET /api/file?path=…` (signed-in sessions, our origin, the folders a session may read, byte ranges for seeking; CSP `media-src 'self'`), and each frame (at most 1280 wide, 30 a second) is copied through a canvas and drawn by GPUI, so it clips, scrolls and sits under menus like the rest. `video.rs` has one player over two backends (AVFoundation, the browser). Tried in headless Chrome: first frame, play, pause, scrub, the side panel; test `videos_stream_in_ranges_from_work_folders_only`.
+- Phones (2026-11-14): the window keeps to what the on-screen keyboard leaves visible (`Window::fully_visible_bounds`, `on_screen` in `workspace.rs`), so the composer stays above the keys; the model picker narrows to the screen and puts effort under the models. Under 640 px wide (`is_phone`) the sidebar is the whole screen and slides the conversation aside rather than squeezing it; tapping a thread (or opening the app on one) closes it.
+- Paths in replies link to their files as on the desktop: the client asks `Request::FilesExist` (confined like `ReadPath`), once per path, and the reply is read again when one is a file.
 - Light and dark themes; a 2× (HiDPI) screen; the tab title follows the thread; reconnecting after the daemon restarts.
 - Desktop app: Settings ▸ Web access (on/off, pairing link, signed-in browsers, sign out, address, port, TLS, warnings).
+- Network access (2026-11-14): one switch (`[web] network = true`) listens on every interface over plain HTTP and serves only private peers (loopback, RFC 1918, link-local, IPv6 ULA, tailnet `100.64.0.0/10` and `fd7a:115c:a1e0::/48`; both the peer's address and the one it reached). Settings lists the addresses (this computer, local network, Tailscale, names) with "Set as default" for the one the pairing link uses (`[web] link_host`), and shows the link as a QR code. Tests: `network_access_serves_private_networks_only`, `the_pairing_link_uses_the_chosen_address`, `network_access_listens_everywhere_for_private_networks_only`. Not yet tried from a real phone.
+- Other computers over SSH (2026-11-14, ADR-0014): Settings ▸ Other computers connects (typed, connected before, `~/.ssh/config` hosts without git services), forgets, and says whether Remote Login is on here and what others type to reach this Mac. Settings opened from a window on another computer are still this computer's.
 
 **How to try it**
 
@@ -181,7 +186,6 @@ target/debug/agentloftd web --home "$AGENTLOFT_HOME"     # prints the pairing li
 - Phone-sized layout: it is the desktop layout.
 - Not yet tried: Safari, Firefox, a real agent (Claude, Codex) through the browser, a non-loopback address (tests cover the refusal and TLS on loopback only, so no test opens a network port), `cargo xtask bundle` with the web client in it (the code is there; not run).
 - Dialogs show a few stray pixels at their bottom corners in the browser.
-- A QR code for the pairing link.
 - ADR-0014's device keys and Tailscale modes (the listener is ready for them).
 
 **Decisions to review** (details in [ADR-0016](adr/0016-web-client.md))

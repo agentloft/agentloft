@@ -26,7 +26,7 @@ use loft_protocol::{
 use std::cell::Cell;
 use std::path::PathBuf;
 
-const WIDTH: f32 = 340.;
+const WIDTH: f32 = 280.;
 const ROW: f32 = 34.;
 const PAD: f32 = 6.;
 const DIVIDER: f32 = 13.;
@@ -365,6 +365,9 @@ pub struct DetailsCard {
     /// Where the editor ⌄ is (its menu opens under it).
     editor_anchor: std::rc::Rc<Cell<Option<Bounds<Pixels>>>>,
     copied: bool,
+    /// The thread is on another computer (a browser session, or a window
+    /// on an SSH host): its folder isn't this computer's to open.
+    elsewhere: bool,
     /// Whether the card has (room for) the pull request's row: one found
     /// while it floats in a window of its own makes that window taller.
     pr_row: bool,
@@ -390,8 +393,11 @@ impl DetailsCard {
         // So do the threads it starts, and what each is doing.
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
         let local = matches!(info.workspace, ThreadWorkspace::Local);
-        if crate::host::IS_WEB && local {
-            // No git to ask in a browser: Agentloft knows the branch.
+        let elsewhere = store.read(cx).is_elsewhere();
+        let remote = store.read(cx).remote().map(str::to_owned);
+        if elsewhere && local {
+            // No git here to ask about that computer: Agentloft knows the
+            // branch.
             let project = info.project.clone();
             store.update(cx, |store, cx| store.fetch_branches(project, cx));
         }
@@ -421,33 +427,45 @@ impl DetailsCard {
             .detach();
         }
         let cwd = info.cwd.clone();
-        cx.spawn(async move |this, cx| {
-            let (computer, branch) = cx
-                .background_executor()
-                .spawn(async move {
-                    let run = |cmd: &str, args: &[&str]| {
-                        std::process::Command::new(cmd)
-                            .args(args)
-                            .output()
-                            .ok()
-                            .filter(|o| o.status.success())
-                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-                            .filter(|s| !s.is_empty())
-                    };
-                    let computer = run("scutil", &["--get", "ComputerName"]);
-                    let branch = local
-                        .then(|| run("git", &["-C", &cwd, "rev-parse", "--abbrev-ref", "HEAD"]))
-                        .flatten();
-                    (computer, branch)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.computer = computer;
-                this.local_branch = branch;
-                cx.notify();
-            });
-        })
-        .detach();
+        if elsewhere {
+            // Named after the host it was reached by.
+            let computer = remote;
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.computer = computer;
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            cx.spawn(async move |this, cx| {
+                let (computer, branch) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let run = |cmd: &str, args: &[&str]| {
+                            std::process::Command::new(cmd)
+                                .args(args)
+                                .output()
+                                .ok()
+                                .filter(|o| o.status.success())
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                                .filter(|s| !s.is_empty())
+                        };
+                        let computer = run("scutil", &["--get", "ComputerName"]);
+                        let branch = local
+                            .then(|| run("git", &["-C", &cwd, "rev-parse", "--abbrev-ref", "HEAD"]))
+                            .flatten();
+                        (computer, branch)
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.computer = computer;
+                    this.local_branch = branch;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         let counted_turn = store
             .read(cx)
             .threads
@@ -476,6 +494,7 @@ impl DetailsCard {
             editors: installed_editors(),
             editor_anchor: Default::default(),
             copied: false,
+            elsewhere,
             pr_row,
         };
         this.count_changes(cx);
@@ -654,7 +673,7 @@ impl Render for DetailsCard {
                             ),
                     )
                     // Showing the folder in Finder is this computer's to do.
-                    .when(!crate::host::IS_WEB, |d| {
+                    .when(!self.elsewhere, |d| {
                         d.child(
                             div()
                                 .id("details-reveal")
@@ -757,7 +776,7 @@ impl Render for DetailsCard {
                         .child("No editor found in Applications"),
                 ),
         };
-        if !crate::host::IS_WEB {
+        if !self.elsewhere {
             top = top.child(editor_row);
         }
         top = top.child(divider(&p));

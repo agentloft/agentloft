@@ -242,7 +242,8 @@ fn harden(response: &mut Response<Body>, host: Option<&str>, tls: bool) {
     // hidden text input with them; scripts and stylesheets are ours only.
     let csp = format!(
         "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; \
-         style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; \
+         style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self'; \
+         font-src 'self'; \
          connect-src 'self'{ws}; worker-src 'self' blob:; manifest-src 'self'; \
          base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
@@ -314,6 +315,7 @@ async fn route(request: Request<Incoming>, ctx: &Ctx, host: &str) -> Response<Bo
         (Method::POST, "/api/pair") => pair(request, ctx, host).await,
         (Method::POST, "/api/logout") => logout(request, ctx, host),
         (Method::GET, "/ws") => super::ws::upgrade(request, ctx, host),
+        (Method::GET | Method::HEAD, "/api/file") => file(request, ctx, host).await,
         (Method::GET | Method::HEAD, _) => asset(request, ctx, &path).await,
         // No CORS preflight is ever answered, and nothing else is offered.
         _ => text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n"),
@@ -434,6 +436,157 @@ fn logout(request: Request<Incoming>, ctx: &Ctx, host: &str) -> Response<Body> {
         }
     }
     response
+}
+
+/// What a browser is told a file is (for `<video>`, which needs to know).
+fn media_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A `Range: bytes=…` header as the span it asks for in a file of `len`
+/// bytes (one range only; what a `<video>` sends to seek). `None`: the
+/// whole file. `Err`: a range past the end.
+fn byte_range(header: Option<&str>, len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = header.and_then(|h| h.trim().strip_prefix("bytes=")) else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        // Several ranges: the whole file is a fine answer.
+        return Ok(None);
+    }
+    let (start, end) = spec.split_once('-').ok_or(())?;
+    let (start, end) = match (start.trim(), end.trim()) {
+        ("", "") => return Err(()),
+        // The last `n` bytes.
+        ("", n) => {
+            let n: u64 = n.parse().map_err(|_| ())?;
+            (len.saturating_sub(n), len.checked_sub(1).ok_or(())?)
+        }
+        (s, "") => (s.parse().map_err(|_| ())?, len.checked_sub(1).ok_or(())?),
+        (s, e) => {
+            let (s, e): (u64, u64) = (s.parse().map_err(|_| ())?, e.parse().map_err(|_| ())?);
+            (s, e.min(len.saturating_sub(1)))
+        }
+    };
+    if start >= len || start > end {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+/// `GET /api/file?path=…`: a file of the daemon's machine, streamed (and
+/// in ranges, so a `<video>` can seek): a video in the web client. Only
+/// what a browser session may read (`Core::file_for_remote`), only for our
+/// own page.
+async fn file(request: Request<Incoming>, ctx: &Ctx, host: &str) -> Response<Body> {
+    let headers = request.headers();
+    if session(ctx, headers).is_none() {
+        return text(StatusCode::UNAUTHORIZED, "Sign in first.\n");
+    }
+    // Another site can't make a browser fetch it with our cookie (it is
+    // SameSite=Strict), but say no outright when the browser says who asks.
+    if !from_our_origin(headers, host, false) {
+        return text(StatusCode::FORBIDDEN, "Cross-site request refused.\n");
+    }
+    let Some(path) = request.uri().query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "path").then(|| percent_decode(value))?
+        })
+    }) else {
+        return text(StatusCode::BAD_REQUEST, "Which file?\n");
+    };
+    let core = ctx.web.core.clone();
+    let found = tokio::task::spawn_blocking(move || core.file_for_remote(&path))
+        .await
+        .ok()
+        .flatten();
+    let Some(path) = found else {
+        return text(StatusCode::NOT_FOUND, "Not found.\n");
+    };
+    let Ok(mut file) = tokio::fs::File::open(&path).await else {
+        return text(StatusCode::NOT_FOUND, "Not found.\n");
+    };
+    let Ok(len) = file.metadata().await.map(|m| m.len()) else {
+        return text(StatusCode::NOT_FOUND, "Not found.\n");
+    };
+    let range = byte_range(
+        headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
+        len,
+    );
+    let mut response = Response::new(full(Bytes::new()));
+    let out = response.headers_mut();
+    out.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(media_type(&path)),
+    );
+    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let (start, count) = match range {
+        Err(()) => {
+            *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{len}")) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            return response;
+        }
+        Ok(None) => (0, len),
+        Ok(Some((start, end))) => {
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{len}")) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            (start, end - start + 1)
+        }
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(count));
+    if request.method() == Method::HEAD {
+        return response;
+    }
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return text(StatusCode::NOT_FOUND, "Not found.\n");
+    }
+    let stream = tokio_util::io::ReaderStream::with_capacity(file.take(count), 256 * 1024);
+    *response.body_mut() = StreamBody::new(stream.map_ok(Frame::data)).boxed();
+    response
+}
+
+/// `%XX` escapes (and `+` for a space) undone; `None` if what they spell
+/// isn't UTF-8.
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// A file of the web client.
@@ -597,6 +750,27 @@ mod tests {
         ] {
             assert!(!same_origin(origin, host), "{origin:?} vs {host:?}");
         }
+    }
+
+    #[test]
+    fn ranges_are_read_the_way_a_video_asks() {
+        assert_eq!(byte_range(None, 100), Ok(None));
+        assert_eq!(byte_range(Some("bytes=0-"), 100), Ok(Some((0, 99))));
+        assert_eq!(byte_range(Some("bytes=10-19"), 100), Ok(Some((10, 19))));
+        assert_eq!(byte_range(Some("bytes=90-500"), 100), Ok(Some((90, 99))));
+        assert_eq!(byte_range(Some("bytes=-10"), 100), Ok(Some((90, 99))));
+        assert_eq!(byte_range(Some("bytes=0-1,5-6"), 100), Ok(None));
+        assert_eq!(byte_range(Some("bytes=100-"), 100), Err(()));
+        assert_eq!(byte_range(Some("bytes=5-2"), 100), Err(()));
+        assert_eq!(byte_range(Some("bytes=x-"), 100), Err(()));
+        assert_eq!(byte_range(Some("bytes=0-"), 0), Err(()));
+        assert_eq!(
+            percent_decode("%2FUsers%2Fme%2Fmy%20reel.mp4").as_deref(),
+            Some("/Users/me/my reel.mp4")
+        );
+        assert_eq!(percent_decode("a+b").as_deref(), Some("a b"));
+        assert_eq!(percent_decode("%zz"), None);
+        assert_eq!(percent_decode("%2"), Some("%2".into()));
     }
 
     #[test]

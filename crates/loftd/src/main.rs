@@ -30,6 +30,10 @@ enum Cmd {
         #[arg(long)]
         thread: String,
     },
+    /// Carry the daemon's connection over stdin and stdout, starting the
+    /// daemon if it isn't running. Another computer's Agentloft runs this
+    /// over SSH to reach this one: SSH has already said who it is.
+    Bridge,
     /// Show web access as the running daemon has it: where it listens, the
     /// pairing link, and the browsers signed in.
     Web {
@@ -62,6 +66,15 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?;
         return runtime.block_on(loftd::mcp::run(paths, loft_protocol::ThreadId(thread)));
+    }
+    if let Some(Cmd::Bridge) = cli.cmd {
+        // stdout carries the connection: log to a file only.
+        paths.ensure_dirs()?;
+        init_file_tracing(&paths, "bridge.log");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return runtime.block_on(loftd::bridge::run(paths));
     }
     if let Some(Cmd::Web {
         new_link,

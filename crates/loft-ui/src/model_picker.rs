@@ -409,13 +409,22 @@ impl ModelPicker {
         list.into_any_element()
     }
 
-    fn render_efforts(&self, snap: &Snapshot, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let column = v_flex()
-            .w(px(176.))
-            .flex_none()
-            .border_l_1()
-            .border_color(p.border)
-            .p_1();
+    /// The effort ladder: a column beside the models, or (`narrow`, on a
+    /// phone) a row of choices under them.
+    fn render_efforts(
+        &self,
+        snap: &Snapshot,
+        narrow: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let column = v_flex().flex_none().border_color(p.border).p_1().map(|d| {
+            if narrow {
+                d.w_full().border_t_1()
+            } else {
+                d.w(px(176.)).border_l_1()
+            }
+        });
         let Some(model) = self.effort_model(snap) else {
             return column.into_any_element();
         };
@@ -460,12 +469,16 @@ impl ModelPicker {
             .as_ref()
             .and_then(|d| model.efforts.iter().position(|e| e == d))
             .map(|i| i + 1);
-        let mut ladder = v_flex()
-            .id("picker-efforts")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .gap_px();
+        let mut ladder = if narrow {
+            h_flex().id("picker-efforts").flex_wrap().gap_px()
+        } else {
+            v_flex()
+                .id("picker-efforts")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .gap_px()
+        };
         for level in 0..=total {
             let label = match level {
                 0 => "Auto",
@@ -486,7 +499,11 @@ impl ModelPicker {
                     .when(active, |d| d.bg(p.selected))
                     .when(!active, |d| d.hover(|d| d.bg(p.hover)))
                     .child(meter(level, total, default_level, p))
-                    .child(div().flex_1().min_w_0().truncate().child(label.to_owned()))
+                    .child(
+                        div()
+                            .when(!narrow, |d| d.flex_1().min_w_0().truncate())
+                            .child(label.to_owned()),
+                    )
                     .when(is_default, |d| {
                         d.child(
                             div()
@@ -626,15 +643,19 @@ pub fn mode_short(mode: Option<PermissionMode>) -> &'static str {
 }
 
 impl Render for ModelPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::component::input::{Enter, Escape, MoveDown, MoveLeft, MoveRight, MoveUp};
+        // As wide as the window allows (a phone's is narrower than the
+        // picker); too narrow for two columns, effort goes under the models.
+        let width = (f32::from(window.viewport_size().width) - 16.).clamp(280., 540.);
+        let narrow = width < 470.;
         let p = Palette::of(cx);
         let snap = self.snapshot(cx);
         if self.highlighted >= snap.models.len() {
             self.highlighted = snap.models.len().saturating_sub(1);
         }
         v_flex()
-            .w(px(540.))
+            .w(px(width))
             .rounded(px(14.))
             .overflow_hidden()
             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
@@ -684,11 +705,18 @@ impl Render for ModelPicker {
                     .child(self.render_agents(&snap, &p, cx)),
             )
             .child(
-                h_flex()
-                    .h(px(250.))
-                    .items_stretch()
-                    .child(self.render_models(&snap, &p, cx))
-                    .child(self.render_efforts(&snap, &p, cx)),
+                div()
+                    .flex()
+                    .when(narrow, |d| d.flex_col())
+                    .when(!narrow, |d| d.h(px(250.)).items_stretch())
+                    .child(
+                        div()
+                            .flex()
+                            .min_w_0()
+                            .map(|d| if narrow { d.h(px(200.)) } else { d.flex_1() })
+                            .child(self.render_models(&snap, &p, cx)),
+                    )
+                    .child(self.render_efforts(&snap, narrow, &p, cx)),
             )
             .child(self.render_permissions(&snap, &p, cx))
             .when(can_compact(&snap.harness), |d| {

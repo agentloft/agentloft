@@ -404,6 +404,14 @@ impl BrowserConfig {
 #[serde(default)]
 pub struct WebConfig {
     pub enabled: bool,
+    /// Network access: listen on every interface, plain HTTP allowed, and
+    /// take connections only from private networks (the local network,
+    /// a tailnet, this computer). Overrides `bind`.
+    pub network: bool,
+    /// The address the pairing link uses (`127.0.0.1`, a LAN or tailnet
+    /// address, a name from `allowed_hosts`). Unset: the local network's
+    /// with network access, else the listener's.
+    pub link_host: Option<String>,
     /// The address to listen on: an IP (`127.0.0.1`, `::1`, a LAN or
     /// tailnet address, `0.0.0.0`) or `localhost`.
     pub bind: String,
@@ -435,6 +443,8 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            network: false,
+            link_host: None,
             bind: "127.0.0.1".into(),
             port: WebConfig::DEFAULT_PORT,
             tls_cert: None,
@@ -460,6 +470,10 @@ pub struct WebPlan {
     pub session_ttl: Duration,
     pub allow_terminal: bool,
     pub allow_browser: bool,
+    /// Network access: connections from public addresses are dropped.
+    pub private_peers_only: bool,
+    /// The address the pairing link uses, if one was chosen.
+    pub link_host: Option<String>,
 }
 
 impl WebPlan {
@@ -476,7 +490,11 @@ impl WebConfig {
     /// Check the section against the safety rules. A non-loopback address
     /// is refused unless TLS is configured or `allow_insecure_remote` is set.
     pub fn plan(&self) -> Result<WebPlan, String> {
-        let bind = self.bind.trim();
+        let bind = if self.network {
+            "0.0.0.0"
+        } else {
+            self.bind.trim()
+        };
         let ip: std::net::IpAddr = if bind.eq_ignore_ascii_case("localhost") {
             std::net::Ipv4Addr::LOCALHOST.into()
         } else {
@@ -497,7 +515,10 @@ impl WebConfig {
             _ => return Err("TLS needs both a certificate and a key".into()),
         };
         let insecure_remote = !ip.is_loopback() && tls.is_none();
-        if insecure_remote && !self.allow_insecure_remote {
+        // Network access is plain HTTP on private networks: as private as
+        // the network itself (a tailnet is encrypted; a home network is
+        // only as safe as who is on it).
+        if insecure_remote && !self.allow_insecure_remote && !self.network {
             return Err(format!(
                 "{ip} is reachable from other machines: add a TLS certificate, \
                  or set allow_insecure_remote"
@@ -523,6 +544,13 @@ impl WebConfig {
             session_ttl: Duration::from_secs(u64::from(self.session_days.clamp(1, 365)) * 86_400),
             allow_terminal: false,
             allow_browser: false,
+            private_peers_only: self.network,
+            link_host: self
+                .link_host
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_ascii_lowercase),
         };
         // A shell, or a browser on this machine, is as much as this
         // machine's own user can already do, so both come with a local-only
@@ -530,6 +558,42 @@ impl WebConfig {
         plan.allow_terminal = self.allow_terminal.unwrap_or(plan.local_only());
         plan.allow_browser = self.allow_browser.unwrap_or(plan.local_only());
         Ok(plan)
+    }
+}
+
+/// An address on a private network: this computer, the local network
+/// (RFC 1918, IPv6 unique-local and link-local), or a tailnet (CGNAT
+/// `100.64.0.0/10`, Tailscale's `fd7a:115c:a1e0::/48`). What network access
+/// takes connections from, and listens on.
+pub fn is_private_address(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || a == 100 && (64..128).contains(&b)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_address(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+/// A tailnet address (Tailscale's ranges).
+pub fn is_tailnet_address(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            a == 100 && (64..128).contains(&b)
+        }
+        IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
@@ -933,6 +997,8 @@ fn stable_path_var(path: &str) -> String {
         .join(":")
 }
 
+// Runs a shell: never in a browser, so std's clock is fine here.
+#[allow(clippy::disallowed_methods)]
 fn run_login_shell_env(timeout: Duration) -> Result<HashMap<String, String>> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -1094,6 +1160,50 @@ mod tests {
             ..WebConfig::default()
         };
         assert!(!local.plan().unwrap().insecure_remote);
+    }
+
+    #[test]
+    fn network_access_listens_everywhere_for_private_networks_only() {
+        let network = WebConfig {
+            enabled: true,
+            network: true,
+            link_host: Some(" 192.168.1.20 ".into()),
+            ..WebConfig::default()
+        };
+        let plan = network.plan().unwrap();
+        assert!(plan.addr.ip().is_unspecified());
+        assert!(plan.insecure_remote && plan.private_peers_only);
+        assert_eq!(plan.link_host.as_deref(), Some("192.168.1.20"));
+        // Others can reach it: no shell unless asked for.
+        assert!(!plan.allow_terminal && !plan.allow_browser);
+        assert!(!WebConfig::default().plan().unwrap().private_peers_only);
+
+        let private = |ip: &str| is_private_address(ip.parse().unwrap());
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.209",
+            "169.254.1.1",
+            "100.101.102.103",
+            "::1",
+            "fd7a:115c:a1e0::1",
+            "fe80::1",
+            "::ffff:192.168.1.2",
+        ] {
+            assert!(private(ip), "{ip}");
+        }
+        for ip in [
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2001:db8::1",
+            "::ffff:1.1.1.1",
+        ] {
+            assert!(!private(ip), "{ip}");
+        }
+        assert!(is_tailnet_address("100.64.0.1".parse().unwrap()));
+        assert!(!is_tailnet_address("192.168.1.2".parse().unwrap()));
     }
 
     #[test]

@@ -191,14 +191,27 @@ mod imp {
         loft_config::write_setting(paths, key, value)
     }
 
-    /// Connect to the daemon, starting it if it isn't running.
+    /// Connect to the daemon, starting it if it isn't running: this
+    /// computer's, or the one on `remote` (an SSH host).
     pub async fn connect(
         runtime: Runtime,
         paths: Paths,
+        remote: Option<String>,
         build: &'static str,
     ) -> anyhow::Result<(Client, UnboundedReceiver<ClientEvent>)> {
         runtime
             .spawn(async move {
+                if let Some(host) = remote {
+                    // No "browser" capability: this computer's web view
+                    // can't reach pages on that one.
+                    return loft_client::ssh::connect_ssh(
+                        &host,
+                        loft_protocol::ClientKind::RemoteUi,
+                        build,
+                        &[],
+                    )
+                    .await;
+                }
                 loft_client::connect_or_spawn(
                     &paths,
                     &loft_client::daemon_binary(),
@@ -216,21 +229,235 @@ mod imp {
     /// routes its own requests through it).
     pub fn set_client(_client: Option<Client>) {}
 
-    /// Something to draw the image at `path` with. Always ready here: GPUI
-    /// loads local files itself. (`thread`: whose folder a relative path is
-    /// in, for the browser build.)
-    pub fn image(path: &Path, _thread: Option<&ThreadId>) -> Option<gpui_kit::ImageSource> {
+    /// Something to draw the image at `path` with. GPUI loads this
+    /// computer's files itself; one in a thread on another computer (a
+    /// window on an SSH host) is fetched from its daemon, and isn't ready
+    /// until it has come. (`thread`: whose image it is, and whose folder a
+    /// relative path is in.)
+    pub fn image(path: &Path, thread: Option<&ThreadId>) -> Option<gpui_kit::ImageSource> {
+        if let Some(thread) = thread
+            && let Some(client) = elsewhere::client_of_thread(thread)
+        {
+            let key = format!("{}\u{0}{}", thread.as_str(), path.display());
+            let (path, thread) = (path.to_path_buf(), thread.clone());
+            return elsewhere::picture(key, path.clone(), client, move || {
+                loft_protocol::Request::ReadPath {
+                    path: path.to_string_lossy().into_owned(),
+                    thread_id: Some(thread),
+                    offset: 0,
+                }
+            });
+        }
         Some(path.to_path_buf().into())
     }
 
     /// Something to draw a project's icon with, if it has one.
     pub fn project_icon(project: &loft_protocol::Project) -> Option<gpui_kit::ImageSource> {
+        if let Some(client) = elsewhere::client_of_project(&project.id) {
+            let key = format!(
+                "project-icon\u{0}{}\u{0}{}",
+                project.id.as_str(),
+                project.icon.as_deref().unwrap_or("")
+            );
+            let id = project.id.clone();
+            return elsewhere::picture(key, PathBuf::new(), client, move || {
+                loft_protocol::Request::ProjectIcon { project_id: id }
+            });
+        }
         crate::project_icon::image(project).map(Into::into)
     }
 
     /// Icons may have changed: look again.
     pub fn forget_project_icons() {
         crate::project_icon::forget();
+        elsewhere::forget_project_icons();
+    }
+
+    /// Whether `thread` is on another computer (a window on an SSH host):
+    /// its files aren't this computer's to look at.
+    pub fn thread_is_elsewhere(thread: &ThreadId) -> bool {
+        elsewhere::client_of_thread(thread).is_some()
+    }
+
+    /// Remember the app (to redraw when an image from another computer
+    /// arrives). Call once at startup.
+    pub fn init(cx: &mut gpui_kit::App) {
+        elsewhere::init(cx);
+    }
+
+    /// `host`'s daemon is reached with `client` now (`None`: not now).
+    pub fn set_remote_client(host: &str, client: Option<Client>) {
+        elsewhere::set_client(host, client);
+    }
+
+    /// These threads and projects are on SSH host `host`: their images
+    /// come from its daemon.
+    pub fn note_remote(
+        host: &str,
+        threads: impl IntoIterator<Item = ThreadId>,
+        projects: impl IntoIterator<Item = loft_protocol::ProjectId>,
+    ) {
+        elsewhere::note(host, threads, projects);
+    }
+
+    /// Images from other computers' daemons (windows on SSH hosts), by
+    /// whose they are.
+    mod elsewhere {
+        use super::*;
+        use loft_protocol::{ProjectId, Request, Response};
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        /// Images kept at once, in bytes, before the cache starts over.
+        const MAX_IMAGE_BYTES: usize = 96 * 1024 * 1024;
+
+        enum Picture {
+            Loading,
+            Ready(Arc<gpui_kit::Image>, usize),
+            Missing,
+        }
+
+        #[derive(Default)]
+        struct Elsewhere {
+            app: Option<gpui_kit::AsyncApp>,
+            clients: HashMap<String, Client>,
+            threads: HashMap<ThreadId, String>,
+            projects: HashMap<ProjectId, String>,
+            images: HashMap<String, Picture>,
+            image_bytes: usize,
+        }
+
+        thread_local! {
+            static ELSEWHERE: RefCell<Elsewhere> = RefCell::new(Elsewhere::default());
+        }
+
+        fn with<T>(f: impl FnOnce(&mut Elsewhere) -> T) -> T {
+            ELSEWHERE.with(|e| f(&mut e.borrow_mut()))
+        }
+
+        pub fn init(cx: &mut gpui_kit::App) {
+            let app = cx.to_async();
+            with(|e| e.app = Some(app));
+        }
+
+        pub fn set_client(host: &str, client: Option<Client>) {
+            with(|e| match client {
+                Some(client) => {
+                    e.clients.insert(host.to_owned(), client);
+                    // What failed while it was away may load now.
+                    e.images.retain(|_, p| !matches!(p, Picture::Missing));
+                }
+                None => {
+                    e.clients.remove(host);
+                }
+            });
+        }
+
+        pub fn note(
+            host: &str,
+            threads: impl IntoIterator<Item = ThreadId>,
+            projects: impl IntoIterator<Item = ProjectId>,
+        ) {
+            with(|e| {
+                for thread in threads {
+                    e.threads.insert(thread, host.to_owned());
+                }
+                for project in projects {
+                    e.projects.insert(project, host.to_owned());
+                }
+            });
+        }
+
+        /// `Some` for a thread on another computer: its daemon's
+        /// connection, if it is connected.
+        pub fn client_of_thread(thread: &ThreadId) -> Option<Option<Client>> {
+            with(|e| {
+                let host = e.threads.get(thread)?;
+                Some(e.clients.get(host).cloned())
+            })
+        }
+
+        pub fn client_of_project(project: &ProjectId) -> Option<Option<Client>> {
+            with(|e| {
+                let host = e.projects.get(project)?;
+                Some(e.clients.get(host).cloned())
+            })
+        }
+
+        pub fn forget_project_icons() {
+            with(|e| {
+                let mut freed = 0;
+                e.images.retain(|key, picture| {
+                    if !key.starts_with("project-icon\u{0}") {
+                        return true;
+                    }
+                    if let Picture::Ready(_, len) = picture {
+                        freed += *len;
+                    }
+                    false
+                });
+                e.image_bytes = e.image_bytes.saturating_sub(freed);
+            });
+        }
+
+        /// The picture cached under `key`; if there is none yet, `request`
+        /// is sent for it and the windows redraw when it arrives.
+        pub fn picture(
+            key: String,
+            name: PathBuf,
+            client: Option<Client>,
+            request: impl FnOnce() -> Request,
+        ) -> Option<gpui_kit::ImageSource> {
+            let cached = with(|e| match e.images.get(&key) {
+                Some(Picture::Ready(image, _)) => Some(Some(image.clone())),
+                Some(Picture::Loading | Picture::Missing) => Some(None),
+                None => None,
+            });
+            if let Some(found) = cached {
+                return found.map(Into::into);
+            }
+            let (Some(client), Some(app)) = (client, with(|e| e.app.clone())) else {
+                return None;
+            };
+            with(|e| e.images.insert(key.clone(), Picture::Loading));
+            let pending = client.request(request());
+            app.spawn(async move |cx| {
+                let picture = match pending.await {
+                    Ok(Response::File { file }) if !file.truncated => {
+                        let name = if name.as_os_str().is_empty() {
+                            PathBuf::from(&file.abs_path)
+                        } else {
+                            name
+                        };
+                        match image_format(&name, &file.bytes.0) {
+                            Some(format) => {
+                                let len = file.bytes.0.len();
+                                Picture::Ready(
+                                    Arc::new(gpui_kit::Image::from_bytes(format, file.bytes.0)),
+                                    len,
+                                )
+                            }
+                            None => Picture::Missing,
+                        }
+                    }
+                    _ => Picture::Missing,
+                };
+                with(|e| {
+                    if let Picture::Ready(_, len) = &picture {
+                        if e.image_bytes + len > MAX_IMAGE_BYTES {
+                            e.images.retain(|_, p| !matches!(p, Picture::Ready(..)));
+                            e.image_bytes = 0;
+                        }
+                        e.image_bytes += len;
+                    }
+                    e.images.insert(key, picture);
+                });
+                cx.update(|cx| cx.refresh_windows());
+            })
+            .detach();
+            None
+        }
     }
 
     /// The window layout to restore (`ui-session.json`).
@@ -326,6 +553,11 @@ mod imp {
         APPLE.store(apple, std::sync::atomic::Ordering::Relaxed);
         let app = cx.to_async();
         with(|h| h.app = Some(app));
+    }
+
+    /// Every thread is on the daemon's computer, not the browser's.
+    pub fn thread_is_elsewhere(_thread: &ThreadId) -> bool {
+        true
     }
 
     /// Take the daemon's copy of the settings files as the truth.
@@ -506,6 +738,7 @@ mod imp {
     pub async fn connect(
         _runtime: Runtime,
         _paths: Paths,
+        _remote: Option<String>,
         build: &'static str,
     ) -> anyhow::Result<(Client, UnboundedReceiver<ClientEvent>)> {
         loft_client::web::connect(loft_protocol::ClientKind::RemoteUi, build).await

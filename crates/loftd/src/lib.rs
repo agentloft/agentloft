@@ -1,6 +1,7 @@
 //! `agentloftd`: owns the store, harness sessions and the Unix socket that
 //! clients connect to (ADR-0001, PLAN §1.6).
 
+pub mod bridge;
 mod conn;
 pub mod mcp;
 mod mcp_automations;

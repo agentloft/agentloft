@@ -145,6 +145,11 @@ fn open_at(
                         store.update(cx, |s, cx| s.new_chat(cx));
                     }
                     Target::Sources => go(Step::Sources, window, cx),
+                    // Another computer's folders can't be browsed from
+                    // here: its path is typed instead.
+                    Target::Source(Source::Folder) if store.read(cx).remote().is_some() => {
+                        go(Step::Enter(Source::Folder), window, cx)
+                    }
                     Target::Source(Source::Folder) => {
                         window.close_dialog(cx);
                         let view = view.clone();
@@ -161,6 +166,10 @@ fn open_at(
                         window.close_dialog(cx);
                         let parent = store.read(cx).projects_parent();
                         let request = match src {
+                            Source::Folder => Request::AddProject {
+                                path: text,
+                                name: None,
+                            },
                             Source::New => Request::CreateProject {
                                 parent: Some(
                                     store
@@ -202,6 +211,7 @@ fn open_at(
                 Step::Sources => "Add a project from…",
                 Step::Enter(Source::New) => "Name of the new project",
                 Step::Enter(Source::GitHub) => "owner/repo",
+                Step::Enter(Source::Folder) => "Path of a folder there (~/code/app)",
                 Step::Enter(_) => "Git URL (https or ssh)",
             })
             .bordered(false)
@@ -348,12 +358,21 @@ fn rows(
                     "Start a new git repository from a name",
                     IconName::FolderGit2,
                 ),
-                Row::plain(
-                    Target::Source(Source::Folder),
-                    "Local folder",
-                    "Browse a folder on disk",
-                    IconName::FolderPlus,
-                ),
+                if let Some(host) = store.read(cx).remote() {
+                    Row::plain(
+                        Target::Source(Source::Folder),
+                        "Folder",
+                        &format!("A folder on {host}, by its path"),
+                        IconName::FolderPlus,
+                    )
+                } else {
+                    Row::plain(
+                        Target::Source(Source::Folder),
+                        "Local folder",
+                        "Browse a folder on disk",
+                        IconName::FolderPlus,
+                    )
+                },
                 Row::plain(
                     Target::Source(Source::Url),
                     "Git URL",
@@ -373,6 +392,29 @@ fn rows(
                 rows.retain(|row| !matches!(row.target, Target::Source(Source::Folder)));
             }
             rows
+        }
+        Step::Enter(Source::Folder) => {
+            let host = store
+                .read(cx)
+                .remote()
+                .unwrap_or("this computer")
+                .to_owned();
+            let text = query.trim();
+            vec![if text.is_empty() {
+                Row::plain(
+                    Target::Source(Source::Folder),
+                    &format!("Type the path of a folder on {host}"),
+                    "~ is your home folder there",
+                    IconName::Info,
+                )
+            } else {
+                Row::plain(
+                    Target::Submit(Source::Folder, text.to_owned()),
+                    &format!("Add {text}"),
+                    &format!("On {host}, then a new thread there"),
+                    IconName::FolderPlus,
+                )
+            }]
         }
         Step::Enter(Source::New) => {
             let dir = crate::workspace::tilde_path_str(

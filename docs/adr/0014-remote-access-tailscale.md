@@ -1,6 +1,6 @@
 # ADR-0014: Remote access over the user's own Tailscale tailnet, or SSH
 
-- **Status:** Accepted (design). Implementation is M8.
+- **Status:** Accepted (design). The `ssh` mode is implemented (2026-11-14, see the end); the Tailscale modes are still M8.
 - **Date:** 2026-11-09
 
 ## Context
@@ -78,3 +78,12 @@ The product owner wants a secure tunnel and suggested the user's own Tailscale. 
 - Tailscale `serve` / `funnel` docs
 - Tailscale LocalAPI `whois`
 - OpenSSH Unix-socket forwarding (`ssh -L path:path`)
+
+## Implementation notes
+
+**`ssh` mode (2026-11-14).** A desktop window opens on another computer's Agentloft (File ▸ Connect to Another Computer…). Changes from the design above:
+- The client runs `ssh -T -o BatchMode=yes <host> '<find agentloftd> bridge'` rather than forwarding the socket with `ssh -L`. `agentloftd bridge` starts the daemon there if it isn't running and joins its stdin and stdout to the daemon's socket. This needs no socket paths, no `AllowStreamLocalForwarding`, and nothing listening anywhere.
+- The connection is the daemon's ordinary local one (`Peer::Local`): whoever can sign in over SSH can already run a shell there, so no pairing and no second factor.
+- SSH runs without a terminal: password prompts and unknown host keys fail with a message saying to run `ssh <host>` in Terminal first. Signing in uses the user's keys, agent and `~/.ssh/config`.
+- One window shows one computer. Its store learns that computer's homes from `UiFiles`. Images and project icons come over `ReadPath` / `ProjectIcon`. The side panel's browser is the daemon's streamed page. Finder, editors, the folder browser and in-place video are left out.
+- Not yet: copying Agentloft to a computer that lacks it, password prompts, and Settings for the other computer (the Settings window is always this computer's).

@@ -7,10 +7,15 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first: commands, build speed, architectu
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets --features loft-terminal/test-support -- -D warnings`
 - `cargo test --workspace --features loft-terminal/test-support`
-- Browser-only code (`cfg(target_arch = "wasm32")`) is invisible to native clippy: `RUSTC_BOOTSTRAP=wasm_thread cargo clippy -p loft-web --target wasm32-unknown-unknown -- -D warnings`.
+- Browser-only code (`cfg(target_arch = "wasm32")`) is invisible to native clippy: `RUSTC_BOOTSTRAP=wasm_thread CLIPPY_CONF_DIR=.config/clippy-wasm cargo clippy -p loft-web --target wasm32-unknown-unknown -- -D warnings`. That config forbids `std::time::{Instant, SystemTime}::now`: they panic in the browser, which freezes the whole web client. Use `web_time`.
 - After touching dependencies or their features: `cargo hakari generate`.
 
 Run the full suite once, in the background if your tool allows it, saving the output to a file you can grep. Don't run it twice.
+
+## The web client is the same UI, built separately
+
+- The browser version is `loft-ui` compiled to wasm, served by the daemon from the app bundle's `Resources/web` (copied from `target/web`). `cargo xtask dev`, `bundle` and `install` build it too; only `--no-web` skips it. A web client that "doesn't have" a desktop fix is almost always a stale `target/web`: check its timestamp before debugging the code.
+- What differs on purpose is behind `host::IS_WEB` and `store.is_elsewhere()` (ADR-0016's table): Finder, editors, the native web view, file dialogs, in-place video.
 
 ## Dev and stable never share data
 
@@ -30,6 +35,12 @@ Run the full suite once, in the background if your tool allows it, saving the ou
 - Web client: `cargo xtask web [--release]` → `target/web`, served by the daemon (`[web] enabled = true` and a non-default `port` in the scratch home's `config.toml`; `agentloftd web --home <dir>` prints the pairing link). Drive it with headless Chrome over CDP using a fresh `--user-data-dir` per build, `Network.setCacheDisabled`, and `Page.bringToFront` (background tabs draw no frames).
 - A window that isn't changing paints nothing, so also test after 30+ s idle.
 - A test window covered by the maintainer's own windows is occluded: GPUI stops drawing it, and `screencapture -l` keeps returning its last frame. A screenshot that "doesn't update" is not a freeze until the window is known to be visible. Judge by what the store received (log it) or what the daemon answered, not by pixels.
+
+## Agentloft on another computer (SSH)
+
+- A window can show another computer's Agentloft: File ▸ Connect to Another Computer… runs `ssh <host> … agentloftd bridge` (`crates/loft-client/src/ssh.rs`, `crates/loftd/src/bridge.rs`). The bridge joins the SSH session to that daemon's Unix socket, so the connection is the same local one as on that machine. Each window has its own store, so a window is either this computer's or one host's (`AppStore::remote`).
+- In views, ask `store.is_elsewhere()` (a browser session or an SSH host), not `host::IS_WEB`, before reading the daemon's files from this disk or offering Finder, editors, the native web view or the video player.
+- Try it without a second Mac: the Docker host in `packaging/ssh-test/README.md`, with `AGENTLOFT_SSH` (a stand-in `ssh`) and `AGENTLOFT_DEV_REMOTE=<host>` (open only a window on that host; `AGENTLOFT_DEV_TAB` hooks then drive it).
 
 ## Gotchas
 

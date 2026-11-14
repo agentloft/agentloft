@@ -1459,3 +1459,79 @@ async fn tls_serves_https_with_secure_cookies() {
     assert_eq!(plain.status, 0, "{plain:?}");
     f.daemon.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Videos: files streamed to the page
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn videos_stream_in_ranges_from_work_folders_only() {
+    let f = start().await;
+    // A project with a "video" in it, added as the desktop app would.
+    let project = f.dir.path().join("reels");
+    std::fs::create_dir_all(&project).unwrap();
+    let video: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+    std::fs::write(project.join("my reel.mp4"), &video).unwrap();
+    let (local, _events) = Client::connect(&f.paths.socket_file(), ClientKind::Cli, "test")
+        .await
+        .unwrap();
+    local
+        .request(Request::AddProject {
+            path: project.to_string_lossy().into_owned(),
+            name: None,
+        })
+        .await
+        .unwrap();
+
+    let cookie = f.pair().await;
+    let url = |path: &std::path::Path| {
+        let encoded: String = path
+            .to_string_lossy()
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'_' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        format!("/api/file?path={encoded}")
+    };
+    let reel = url(&project.join("my reel.mp4"));
+
+    // Whole, typed for a <video>, saying it can seek.
+    let whole = f.get(&reel, &[("Cookie", &cookie)]).await;
+    assert_eq!(whole.status, 200, "{whole:?}");
+    assert_eq!(whole.body, video);
+    assert_eq!(whole.header("content-type"), Some("video/mp4"));
+    assert_eq!(whole.header("accept-ranges"), Some("bytes"));
+    // A range, as a <video> asks when it seeks.
+    let part = f
+        .get(&reel, &[("Cookie", &cookie), ("Range", "bytes=100-199")])
+        .await;
+    assert_eq!(part.status, 206);
+    assert_eq!(part.header("content-range"), Some("bytes 100-199/1000"));
+    assert_eq!(part.body, &video[100..200]);
+    let past = f
+        .get(&reel, &[("Cookie", &cookie), ("Range", "bytes=5000-")])
+        .await;
+    assert_eq!(past.status, 416);
+
+    // Not signed in; another site asking; a file outside the work folders.
+    assert_eq!(f.get(&reel, &[]).await.status, 401);
+    let cross = f
+        .get(
+            &reel,
+            &[("Cookie", &cookie), ("Sec-Fetch-Site", "cross-site")],
+        )
+        .await;
+    assert_eq!(cross.status, 403);
+    let secret = f.dir.path().join("secret.txt");
+    std::fs::write(&secret, "hunter2").unwrap();
+    let outside = f.get(&url(&secret), &[("Cookie", &cookie)]).await;
+    assert_eq!(outside.status, 404);
+    assert!(!String::from_utf8_lossy(&outside.body).contains("hunter2"));
+    // The page may play it: media from this origin is allowed.
+    let csp = whole.header("content-security-policy").unwrap_or_default();
+    assert!(csp.contains("media-src 'self'"), "{csp}");
+}

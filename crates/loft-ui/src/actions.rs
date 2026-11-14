@@ -404,7 +404,7 @@ impl WorkspaceView {
         self.on_store_event(&browse, window, cx);
         // The streamed page of the web client keeps the address it was
         // sent to, and says why it didn't load.
-        if crate::host::IS_WEB {
+        if self.store.read(cx).is_elsewhere() {
             return;
         }
         let (thread_id, url) = (thread_id.clone(), url.to_owned());

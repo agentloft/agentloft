@@ -33,6 +33,7 @@ mod project_icon;
 mod pull_request;
 mod quote;
 mod recall;
+mod remote;
 pub mod settings;
 mod shell_highlight;
 mod spinner;

@@ -19,6 +19,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 imagesize = "0.14"
 # Pictures of the daemon's browser pages (JPEG), decoded for GPUI.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# The web access pairing link as a QR code, for a phone's camera.
+qrcode = { version = "0.14", default-features = false }
 loft-protocol.workspace = true
 loft-view.workspace = true
 loft-client.workspace = true
@@ -46,7 +48,13 @@ gpui-kit = { workspace = true, features = ["syntect"] }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
 # The window layout lives in the browser's localStorage.
-web-sys = { version = "0.3", features = ["Event", "Storage", "Window"] }
+web-sys = { version = "0.3", features = [
+  "Event", "Storage", "Window",
+  # Videos (video.rs): a hidden <video>, its frames copied through a canvas.
+  "Document", "Element", "HtmlElement", "HtmlMediaElement", "HtmlVideoElement",
+  "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "MediaError", "Node",
+] }
+wasm-bindgen = "=0.2.130"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-macos-shots = { package = "gpui-pre-macos", version = "=0.3.11", features = ["test-support"], optional = true }

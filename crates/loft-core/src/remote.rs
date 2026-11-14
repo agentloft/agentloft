@@ -182,25 +182,76 @@ impl Core {
         confined: bool,
         offset: u64,
     ) -> CoreResult<FileContent> {
-        let not_found = || ErrorBody::new(ErrorCode::NotFound, "no such file");
+        let roots = if confined {
+            Some(self.readable_roots()?)
+        } else {
+            None
+        };
+        let full = self
+            .file_at(path, thread_id, roots.as_deref())
+            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "no such file"))?;
+        self.read_file_at(&full, path, offset)
+    }
+
+    /// Where the file `path` names is, if it is one: `~`, `file://` and
+    /// paths relative to the thread's folder allowed; inside `roots` only,
+    /// when given. One answer for "outside" and "missing": a remote session
+    /// can't probe which files exist elsewhere.
+    fn file_at(
+        &self,
+        path: &str,
+        thread_id: Option<&ThreadId>,
+        roots: Option<&[PathBuf]>,
+    ) -> Option<PathBuf> {
         let given = path.strip_prefix("file://").unwrap_or(path);
         let mut full = expand_tilde(given);
         if !full.is_absolute() {
-            let thread = thread_id.ok_or_else(not_found)?;
-            full = self.root_dir(&FsRoot::Thread(thread.clone()))?.join(full);
+            let thread = thread_id?;
+            full = self
+                .root_dir(&FsRoot::Thread(thread.clone()))
+                .ok()?
+                .join(full);
         }
-        let full = if confined {
-            // One answer for "outside" and "missing": a remote session can't
-            // probe which files exist elsewhere.
-            confine(&full, &self.readable_roots()?).ok_or_else(not_found)?
-        } else {
-            full
+        let full = match roots {
+            Some(roots) => confine(&full, roots)?,
+            None => full,
         };
-        let meta = std::fs::metadata(&full).map_err(|_| not_found())?;
-        if !meta.is_file() {
-            return Err(not_found());
-        }
-        self.read_file_at(&full, path, offset)
+        std::fs::metadata(&full)
+            .is_ok_and(|m| m.is_file())
+            .then_some(full)
+    }
+
+    /// The file a browser session may stream (a video in the web client):
+    /// `path` as for `ReadPath`, inside the folders such a session may
+    /// read. `None` for "outside" and "missing" alike.
+    pub fn file_for_remote(&self, path: &str) -> Option<PathBuf> {
+        let roots = self.readable_roots().ok()?;
+        self.file_at(path, None, Some(&roots))
+    }
+
+    /// `Request::FilesExist`: which of `paths` are files (see
+    /// [`Core::file_at`]).
+    pub(crate) fn files_exist(
+        &self,
+        paths: &[String],
+        thread_id: Option<&ThreadId>,
+        confined: bool,
+    ) -> Vec<bool> {
+        let roots = if confined {
+            match self.readable_roots() {
+                Ok(roots) => Some(roots),
+                Err(_) => return vec![false; paths.len()],
+            }
+        } else {
+            None
+        };
+        paths
+            .iter()
+            .take(loft_protocol::MAX_FILES_EXIST)
+            .map(|p| self.file_at(p, thread_id, roots.as_deref()).is_some())
+            .chain(std::iter::repeat(false))
+            .take(paths.len())
+            .collect()
     }
 
     /// Refuse what a remote session may not ask for; `Ok` means "go on".
@@ -268,6 +319,7 @@ impl Core {
             | Request::ThreadItems { .. }
             // Confined in `handle_remote`.
             | Request::ReadPath { .. }
+            | Request::FilesExist { .. }
             // The settings files (secrets hidden in `handle_remote`), shared
             // UI state, and icons the daemon finds itself.
             | Request::UiFiles { .. }
@@ -400,6 +452,15 @@ impl Core {
                 .await
                 .map_err(internal)??;
                 Ok(Response::File { file })
+            }
+            Request::FilesExist { paths, thread_id } => {
+                let core = self.clone();
+                let files = tokio::task::spawn_blocking(move || {
+                    core.files_exist(&paths, thread_id.as_ref(), true)
+                })
+                .await
+                .map_err(internal)?;
+                Ok(Response::FilesExist { files })
             }
             Request::GetSettings => self.handle(Request::GetSettings).await.map(redact_settings),
             Request::UiFiles { known } => Ok(Response::UiFiles {
@@ -548,6 +609,45 @@ mod tests {
             thread_id: thread_id.cloned(),
             offset: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn which_paths_are_files_is_answered_inside_work_folders_only() {
+        let (f, thread) = fixture().await;
+        std::fs::write(f.project.join("reel.mp4"), b"mp4").unwrap();
+        std::fs::create_dir_all(f.project.join("sub")).unwrap();
+        let secret = f.dir.path().join("secret.txt");
+        std::fs::write(&secret, b"hunter2").unwrap();
+        let abs = f.project.join("reel.mp4").to_string_lossy().into_owned();
+        let paths = vec![
+            abs,
+            "reel.mp4".to_owned(),
+            "sub".to_owned(),
+            "missing.txt".to_owned(),
+            secret.to_string_lossy().into_owned(),
+        ];
+        let ask = |paths: Vec<String>| Request::FilesExist {
+            paths,
+            thread_id: Some(thread.clone()),
+        };
+        // A browser session: the secret outside the work folders reads as
+        // missing; a folder isn't a file.
+        let Response::FilesExist { files } = remote(&f, ask(paths.clone())).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(files, [true, true, false, false, false]);
+        // This computer's own app sees every file.
+        let Response::FilesExist { files } = f.core.handle(ask(paths)).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(files, [true, true, false, false, true]);
+        // Too many: the rest are "no", one answer per path all the same.
+        let many = vec!["reel.mp4".to_owned(); loft_protocol::MAX_FILES_EXIST + 3];
+        let Response::FilesExist { files } = remote(&f, ask(many)).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(files.len(), loft_protocol::MAX_FILES_EXIST + 3);
+        assert!(!files[loft_protocol::MAX_FILES_EXIST]);
     }
 
     #[tokio::test]

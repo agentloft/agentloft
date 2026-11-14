@@ -618,6 +618,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_zero")]
         offset: u64,
     },
+    /// Which of `paths` are files, resolved as for `ReadPath` (and as
+    /// confined for a browser session, where "outside" reads as "no"): for
+    /// clients that can't look at the daemon's disk, so a path in a reply
+    /// can link to its file. At most [`MAX_FILES_EXIST`] paths. Answers
+    /// `Response::FilesExist`.
+    FilesExist {
+        paths: Vec<String>,
+        #[serde(default)]
+        thread_id: Option<ThreadId>,
+    },
     // -- what the desktop app reads from disk, for clients that can't -------
     /// The settings files a UI needs (config.toml, colour themes, sidebar
     /// state), unless they still match `known` (a `UiFiles::stamp`).
@@ -850,6 +860,10 @@ pub enum Response {
     },
     File {
         file: FileContent,
+    },
+    /// For `FilesExist`: one answer per path, in order.
+    FilesExist {
+        files: Vec<bool>,
     },
     Diff {
         diff: DiffResult,
@@ -1239,6 +1253,9 @@ pub struct UiFile {
     pub text: String,
 }
 
+/// The most paths one `Request::FilesExist` may ask about.
+pub const MAX_FILES_EXIST: usize = 128;
+
 /// Web access as the daemon sees it (Settings ▸ Web access).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WebStatus {
@@ -1271,6 +1288,28 @@ pub struct WebStatus {
     pub bundle: bool,
     #[serde(default)]
     pub sessions: Vec<WebSession>,
+    /// Network access is on: only private networks may connect.
+    #[serde(default)]
+    pub network: bool,
+    /// Where other devices (and this one) can reach it, the one the
+    /// pairing link uses marked `default`.
+    #[serde(default)]
+    pub addresses: Vec<WebAddress>,
+}
+
+/// One address web access can be reached at.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WebAddress {
+    /// `local` (this computer only), `lan` (the local network), `tailnet`
+    /// (Tailscale) or `name` (a name in `allowed_hosts`).
+    pub kind: String,
+    /// The host part (`192.168.1.209`), what `[web] link_host` names.
+    pub host: String,
+    /// `http://192.168.1.209:4780`.
+    pub url: String,
+    /// The pairing link uses this one.
+    #[serde(default)]
+    pub default: bool,
 }
 
 /// A browser signed in to web access.

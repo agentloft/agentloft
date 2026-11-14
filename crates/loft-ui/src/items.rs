@@ -41,10 +41,12 @@ pub(crate) fn local_image_path(raw: &str, cwd: &str) -> Option<std::path::PathBu
 /// from disk (see [`local_image_path`]); web addresses load as usual.
 pub(crate) fn local_images(
     cwd: String,
+    thread: Option<loft_protocol::ThreadId>,
 ) -> impl Fn(&gpui_kit::SharedUri) -> gpui_kit::ImageSource + Send + Sync + 'static {
     move |uri: &gpui_kit::SharedUri| match local_image_path(uri.as_ref(), &cwd) {
-        // From this computer's disk, or through the daemon in a browser.
-        Some(path) => crate::host::image_or_blank(&path, None),
+        // From this computer's disk, or through the daemon in a browser or
+        // a window on another computer.
+        Some(path) => crate::host::image_or_blank(&path, thread.as_ref()),
         None => gpui_kit::ImageSource::from(uri.clone()),
     }
 }
@@ -130,12 +132,39 @@ pub(crate) fn reply_text_view(
     use gpui_kit::component::menu::ContextMenuExt as _;
     use gpui_kit::component::text::MarkdownNode;
     let render_cwd = cwd.clone();
+    // A Markdown link to a local file ([name](/abs/path:line)) opens in the
+    // side panel, like the inline-code paths the FileLinks plugin makes. The
+    // default handler would hand the bare path (no scheme, a `:line` suffix)
+    // to the system, which can't open it (Finder error -50).
+    let link_cwd = cwd.clone();
+    let link_thread = thread.clone();
+    let image_thread = thread.clone();
+    let source_thread = thread.clone();
     code_blocks(view)
         .plugin(crate::file_links::FileLinks {
             cwd: cwd.clone(),
             thread,
         })
-        .image_source(local_images(cwd))
+        .on_link_click(move |url, _, window, cx| {
+            let store = crate::windows::store_of(window, cx);
+            // On another computer its files can't be looked at from here:
+            // a path is taken at its word, and the panel says if it isn't
+            // there.
+            let elsewhere = store.as_ref().is_some_and(|s| s.read(cx).is_elsewhere());
+            let target = if elsewhere {
+                crate::file_links::link_path_target(url, &link_cwd)
+            } else {
+                crate::file_links::link_file_target(url, &link_cwd)
+            };
+            match (target, store, link_thread.clone()) {
+                (Some(open), Some(store), Some(thread)) => {
+                    store.update(cx, |s, cx| s.open_file(thread, open, cx));
+                }
+                // Not a local file of ours (an http link, say): as before.
+                _ => cx.open_url(url),
+            }
+        })
+        .image_source(local_images(cwd, source_thread))
         .markdown_block_parser(|node, _| {
             let image = reply_image_block(node)?;
             let markdown = format!("![{}]({})", image.alt, image.src);
@@ -157,6 +186,8 @@ pub(crate) fn reply_text_view(
             // A video plays where it stands.
             if let Some(path) = local_image_path(&image.src, &render_cwd)
                 && crate::video::is_video(&path)
+                && !crate::windows::store_of(window, cx)
+                    .is_some_and(|s| s.read(cx).remote().is_some())
             {
                 return crate::video::player(id, path, window, cx);
             }
@@ -178,7 +209,7 @@ pub(crate) fn reply_text_view(
                         .and_then(|path| image_ratio(&path))
                         .unwrap_or(1.);
                     let w = REPLY_IMAGE_WIDTH as f32;
-                    gpui_kit::img(local_images(render_cwd.clone())(
+                    gpui_kit::img(local_images(render_cwd.clone(), image_thread.clone())(
                         &gpui_kit::SharedUri::from(image.src.clone()),
                     ))
                     .w(px(w))
@@ -187,7 +218,7 @@ pub(crate) fn reply_text_view(
                 });
             match local_image_path(&image.src, &render_cwd) {
                 Some(path) => {
-                    let pic = crate::image_preview::Pic::file(path);
+                    let pic = crate::image_preview::Pic::file(path, image_thread.clone());
                     let open = pic.clone();
                     frame
                         .on_click(move |_, window, cx| {
@@ -627,14 +658,18 @@ pub(crate) fn render_item(
                         .border_color(p.border)
                         .cursor_pointer()
                         .child(
-                            gpui_kit::img(crate::host::image_or_blank(&path, None))
-                                .size_full()
-                                .object_fit(gpui_kit::ObjectFit::Cover),
+                            gpui_kit::img(crate::host::image_or_blank(
+                                &path,
+                                Some(&item.thread_id),
+                            ))
+                            .size_full()
+                            .object_fit(gpui_kit::ObjectFit::Cover),
                         )
                         .on_click({
                             let pic = crate::image_preview::Pic::File {
                                 path: path.clone(),
                                 name: a.name.clone(),
+                                thread: Some(item.thread_id.clone()),
                             };
                             move |_, window, cx| crate::image_preview::open(pic.clone(), window, cx)
                         })
@@ -642,6 +677,7 @@ pub(crate) fn render_item(
                             crate::image_preview::Pic::File {
                                 path: path.clone(),
                                 name: a.name.clone(),
+                                thread: Some(item.thread_id.clone()),
                             },
                         )),
                 );
@@ -1000,7 +1036,7 @@ fn render_queued(
                 .child(
                     gpui_kit::img(crate::host::image_or_blank(
                         std::path::Path::new(&image.path),
-                        None,
+                        Some(thread_id),
                     ))
                     .size_full()
                     .object_fit(gpui_kit::ObjectFit::Cover),

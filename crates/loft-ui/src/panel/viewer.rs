@@ -99,7 +99,11 @@ impl FileViewer {
 
     /// Where the file is, if it is a video that plays here.
     fn video(&self, cx: &Context<Self>) -> Option<std::path::PathBuf> {
-        if !crate::video::is_video(std::path::Path::new(&self.rel_path)) {
+        // Played from its file: here, or streamed by the daemon to the web
+        // client. (A window on an SSH host has neither, yet.)
+        if !crate::video::is_video(std::path::Path::new(&self.rel_path))
+            || self.store.read(cx).remote().is_some()
+        {
             return None;
         }
         let cwd = match &self.root {
@@ -686,7 +690,7 @@ impl Render for FileViewer {
                     .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
             )
             // Finder and other apps are on the computer the file is on.
-            .when(!crate::host::IS_WEB, |d| {
+            .when(!self.store.read(cx).is_elsewhere(), |d| {
                 d.child(
                     header_icon("reveal", IconName::FolderOpen, "Reveal in Finder", &p)
                         .on_click(cx.listener(|this, _, _, cx| this.reveal(cx))),
@@ -747,8 +751,11 @@ impl Render for FileViewer {
             Content::Image(image) => div()
                 .id("viewer-image")
                 .context_menu(crate::image_preview::menu(match &self.abs_path {
-                    Some(path) => crate::image_preview::Pic::file(path.into()),
-                    None => crate::image_preview::Pic::Loaded {
+                    // Copied and saved from its file, if that is here.
+                    Some(path) if !self.store.read(cx).is_elsewhere() => {
+                        crate::image_preview::Pic::file(path.into(), None)
+                    }
+                    _ => crate::image_preview::Pic::Loaded {
                         image: image.clone(),
                         name: self
                             .rel_path
@@ -798,7 +805,7 @@ impl Render for FileViewer {
                 .text_color(p.muted_foreground)
                 .child(Icon::new(IconName::File).large())
                 .child(reason.clone())
-                .when(!crate::host::IS_WEB, |d| {
+                .when(!self.store.read(cx).is_elsewhere(), |d| {
                     d.child(
                         header_button(
                             "external-big",

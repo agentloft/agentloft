@@ -48,7 +48,8 @@ actions!(
         NewWindow,
         NewTab,
         OpenPalette,
-        SteerMessage
+        SteerMessage,
+        ConnectToComputer
     ]
 );
 
@@ -88,6 +89,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
             MenuItem::action("New Chat", NewChat),
             MenuItem::action("New Pane", NewTab),
             MenuItem::action("New Window", NewWindow),
+            MenuItem::action("Connect to Another Computer…", ConnectToComputer),
             MenuItem::separator(),
             MenuItem::action("Add Project…", AddProject),
         ]),
@@ -197,6 +199,11 @@ pub struct WorkspaceView {
     branch_picker: Option<Entity<crate::branch_picker::BranchPicker>>,
     branch_picker_open: bool,
     pub(crate) sidebar_open: bool,
+    /// What was shown last frame (thread, Automations): on a phone, picking
+    /// something else closes the sidebar that covers it.
+    shown: Option<(Option<ThreadId>, bool)>,
+    /// The sidebar's width this frame (the whole screen on a phone).
+    sidebar_width: f32,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
     /// Terminals docked under the conversation (Ctrl+`).
@@ -220,6 +227,10 @@ pub struct WorkspaceView {
     /// how much of the margin it takes, which the conversation keeps clear.
     /// Zero when it docks as a column beside the panes instead.
     details_inset: f32,
+    /// The card floats over the conversation (one pane) rather than
+    /// docking as a column. Apart from the inset, which may be zero while
+    /// it floats: the card's own width must not change the room measured.
+    details_float: bool,
     /// The side panel's width as last laid out (it slides, and reopens, at
     /// this width). Zero until it first opens, when it gets a share of the room.
     panel_width: std::rc::Rc<std::cell::Cell<f32>>,
@@ -353,6 +364,8 @@ impl WorkspaceView {
             ask_forms: HashMap::new(),
             drafts_restored: Default::default(),
             sidebar_open: true,
+            shown: None,
+            sidebar_width: SIDEBAR_WIDTH,
             panel,
             panel_open: false,
             dock,
@@ -372,6 +385,7 @@ impl WorkspaceView {
             details_slide: Slide::default(),
             details_amount: 0.,
             details_inset: 0.,
+            details_float: false,
             panel_width: std::rc::Rc::new(std::cell::Cell::new(0.)),
             details_card: None,
             details_room: Default::default(),
@@ -492,7 +506,7 @@ impl WorkspaceView {
                 self.panel_open = true;
                 self.panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx));
-                if crate::host::IS_WEB {
+                if self.store.read(cx).is_elsewhere() {
                     if let Some(page) = self.panel.update(cx, |p, cx| p.page(window, cx)) {
                         page.update(cx, |v, cx| v.go(url, cx));
                     }
@@ -1742,7 +1756,7 @@ impl WorkspaceView {
     ) -> AnyElement {
         let selected = self.store.read(cx).selected.clone();
         let amount = self.details_amount;
-        let float = self.details_inset > 0.;
+        let float = self.details_float;
         let dock = match (&selected, amount > 0.) {
             (Some(id), true) => {
                 if self
@@ -2687,6 +2701,20 @@ impl WorkspaceView {
             .update(cx, |s, cx| s.respond(req.thread_id, req.id, decision, cx));
     }
 
+    /// Add Project: the folder browser, or on another computer (whose
+    /// folders can't be browsed from here) the ways to add one there.
+    pub(crate) fn add_project_here_or_there(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.store.read(cx).is_elsewhere() {
+            crate::new_in::open_sources(cx.entity(), &self.store, window, cx);
+        } else {
+            self.add_project(window, cx);
+        }
+    }
+
     /// Add Project: the built-in folder browser.
     pub(crate) fn add_project(
         &mut self,
@@ -3017,10 +3045,16 @@ impl WorkspaceView {
         let multi = total > 1;
         // One conversation spans the width (its scrollbar at the edge) with
         // the card over its margin; several make room for it as a column.
+        // The conversation moves aside only as far as it must: where the
+        // empty margin beside the centred column already holds the card, it
+        // stays put.
+        self.details_float = !multi;
         self.details_inset = if multi {
             0.
         } else {
-            DOCK_WIDTH * self.details_amount
+            let card = DOCK_WIDTH * self.details_amount;
+            let room = self.details_room.get();
+            details_inset(card, f32::from(p.content_width), room)
         };
         let dragging = cx.has_active_drag();
         // Resizing keeps while the arrangement stays; a new one starts even.
@@ -3654,7 +3688,9 @@ impl WorkspaceView {
             )
         };
         let multi = &self.multi;
-        thread_row(
+        let phone = self.sidebar_width != SIDEBAR_WIDTH;
+        let renaming = self.renaming.as_ref().is_some_and(|(r, _, _)| r == id);
+        let row_view = thread_row(
             &self.store,
             thread,
             row.depth,
@@ -3674,7 +3710,21 @@ impl WorkspaceView {
             (multi.len() > 1 && multi.contains(id)).then(|| multi.clone()),
             p,
             cx,
-        )
+        );
+        if !phone || renaming {
+            return row_view;
+        }
+        // On a phone the sidebar covers the conversation: a tap on a row
+        // (the thread shown already, too) goes to it. Its buttons stop
+        // the click before it gets here.
+        div()
+            .id(SharedString::from(format!("phone-row-{}", id.as_str())))
+            .child(row_view)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar_open = false;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_sidebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -3962,10 +4012,19 @@ impl WorkspaceView {
             foot = foot.child(section);
         }
 
-        let (dot, status): (_, SharedString) = match &conn {
-            ConnState::Connecting => (p.warning, "Connecting…".into()),
-            ConnState::Connected => (p.success, "Connected".into()),
-            ConnState::Disconnected(_) => (p.danger, "Reconnecting…".into()),
+        // A window on another computer names it.
+        let remote = self.store.read(cx).remote().map(str::to_owned);
+        let (dot, status): (_, SharedString) = match (&conn, remote) {
+            (ConnState::Connecting, None) => (p.warning, "Connecting…".into()),
+            (ConnState::Connected, None) => (p.success, "Connected".into()),
+            (ConnState::Disconnected(_), None) => (p.danger, "Reconnecting…".into()),
+            (ConnState::Connecting, Some(host)) => {
+                (p.warning, format!("Connecting to {host}…").into())
+            }
+            (ConnState::Connected, Some(host)) => (p.success, format!("On {host}").into()),
+            (ConnState::Disconnected(_), Some(host)) => {
+                (p.danger, format!("Can't reach {host}").into())
+            }
         };
         let dark = p.dark;
 
@@ -3985,7 +4044,7 @@ impl WorkspaceView {
         };
 
         v_flex()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_shrink_0()
             .bg(p.sidebar)
@@ -4103,8 +4162,8 @@ impl WorkspaceView {
                     .text_xs()
                     .text_color(p.muted_foreground)
                     .child(crate::brand::app_icon(px(18.)))
-                    .child(div().size(px(6.)).rounded_full().bg(dot))
-                    .child(div().flex_1().child(status))
+                    .child(div().flex_none().size(px(6.)).rounded_full().bg(dot))
+                    .child(div().flex_1().min_w_0().truncate().child(status))
                     .child(self.usage_button(p, cx))
                     .child(icon_button(
                         "toggle-theme",
@@ -5960,13 +6019,34 @@ impl WorkspaceView {
     }
 }
 
+/// A browser on a phone-sized screen: too narrow for the sidebar beside the
+/// conversation.
+fn is_phone(width: f32) -> bool {
+    crate::host::IS_WEB && width < 640.
+}
+
+/// In a browser, the part of the page not covered by the on-screen keyboard
+/// (or the phone's notch), when that is less than the whole page.
+fn on_screen(window: &Window) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    if !crate::host::IS_WEB {
+        return None;
+    }
+    let visible = window.fully_visible_bounds();
+    let whole = window.viewport_size();
+    let min = px(120.);
+    (visible.size.width >= min
+        && visible.size.height >= min
+        && (visible.size != whole || visible.origin != gpui_kit::Point::default()))
+    .then_some(visible)
+}
+
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::panel::page::frame_drawn(window);
         let p = Palette::of(cx);
         if std::mem::take(&mut self.pending_add_project) {
             cx.defer_in(window, |this, window, cx| {
-                this.add_project(window, cx);
+                this.add_project_here_or_there(window, cx);
             });
         }
         let automations_open = self.store.read(cx).automations_open;
@@ -5983,6 +6063,17 @@ impl Render for WorkspaceView {
             self.apply_dev_tab(&dev, thread, window, cx);
         }
         let disconnected = matches!(self.store.read(cx).conn, ConnState::Disconnected(_));
+        // A window on another computer says which, and why it can't reach
+        // it (SSH's reason, put in words).
+        let remote_banner =
+            self.store
+                .read(cx)
+                .remote()
+                .and_then(|host| match &self.store.read(cx).conn {
+                    ConnState::Connected => None,
+                    ConnState::Connecting => Some((format!("Connecting to {host}…"), None)),
+                    ConnState::Disconnected(why) => Some((why.clone(), Some(host.to_owned()))),
+                });
 
         let header_title = selected.as_ref().and_then(|t| {
             let model = t.read(cx).model.as_ref()?;
@@ -5997,10 +6088,18 @@ impl Render for WorkspaceView {
             Some((project, model.thread.without_commands()))
         });
 
-        self.details_amount = self
-            .details_slide
-            .update(self.details_open && self.can_dock(), window);
+        // Until the conversation's width is first measured (a window's first
+        // frame) whether the card fits isn't known: leave the slide unstarted
+        // so the card is simply there once it is, not sliding in (and the
+        // conversation easing aside) as the window opens.
+        self.details_amount = if self.details_room.get() > 0. {
+            self.details_slide
+                .update(self.details_open && self.can_dock(), window)
+        } else {
+            0.
+        };
         self.details_inset = 0.;
+        self.details_float = false;
         let body = match selected {
             _ if automations_open => {
                 let store = self.store.clone();
@@ -6024,10 +6123,29 @@ impl Render for WorkspaceView {
         }
         let body = self.with_terminal_dock(body, show_dock, &p, window);
         let mut body_slot = Some(body);
+        // A phone: the sidebar is the whole screen, sliding the conversation
+        // aside (not squeezing it), and closes once something is picked.
+        let width = f32::from(window.viewport_size().width);
+        let phone = is_phone(width);
+        self.sidebar_width = if phone { width } else { SIDEBAR_WIDTH };
+        let shown = (self.store.read(cx).selected.clone(), automations_open);
+        // (Or opened on one: straight to the thread it was on.)
+        let picked = match &self.shown {
+            Some(before) => *before != shown,
+            None => shown.0.is_some(),
+        };
+        if phone && picked {
+            self.sidebar_open = false;
+        }
+        self.shown = Some(shown);
         let side = self.sidebar_slide.update(self.sidebar_open, window);
         self.sidebar_amount = side;
         // What the conversation and the side panel have to share.
-        let room = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH * side;
+        let room = if phone {
+            width
+        } else {
+            width - SIDEBAR_WIDTH * side
+        };
         // Not enough for both at a usable width: the panel takes the
         // conversation's place, as when it is asked to fill the window,
         // rather than squeeze the conversation to a sliver.
@@ -6054,7 +6172,7 @@ impl Render for WorkspaceView {
             div()
                 .flex_none()
                 .h_full()
-                .w(px(SIDEBAR_WIDTH * side))
+                .w(px(self.sidebar_width * side))
                 .overflow_hidden()
                 .child(self.render_sidebar(&p, cx))
         });
@@ -6096,6 +6214,9 @@ impl Render for WorkspaceView {
                     this.quote_selection(window, cx)
                 }),
             )
+            .on_action(
+                cx.listener(|_, _: &ConnectToComputer, window, cx| crate::remote::open(window, cx)),
+            )
             .on_action(cx.listener(|_, _: &NewWindow, _, cx| {
                 crate::windows::open(None, crate::windows::Placement::Window, cx);
             }))
@@ -6128,133 +6249,195 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &ShowBrowser, w, cx| this.show_tab(Tab::Browser, w, cx)),
             )
-            .size_full()
+            .map(|d| match on_screen(window) {
+                // A phone's keyboard covers the page's lower part (the
+                // browser shrinks only what is visible): keep the window
+                // to what is left, so the composer sits above the keys.
+                Some(visible) => d
+                    .absolute()
+                    .left(visible.origin.x)
+                    .top(visible.origin.y)
+                    .w(visible.size.width)
+                    .h(visible.size.height),
+                None => d.size_full(),
+            })
             .bg(p.background)
             .text_color(p.foreground)
             .child(
-                h_flex().flex_1().min_h_0().children(sidebar).child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(header)
-                        .when(disconnected, |d| {
-                            d.child(
-                                h_flex()
-                                    .justify_center()
-                                    .gap_2()
-                                    .py_1p5()
-                                    .bg(p.warning_soft)
-                                    .text_xs()
-                                    .text_color(p.warning)
-                                    .child(Spinner::new().xsmall().color(p.warning))
-                                    .child("Lost connection to agentloftd — reconnecting…"),
-                            )
-                        })
-                        .when(maximized, |d| {
-                            d.child(div().flex_1().min_h_0().w_full().child(self.panel.clone()))
-                        })
-                        .when(!maximized && panel_sliding, |d| {
-                            // Mid-slide: a plain row at the panel's width.
-                            let shown = self.panel_width.get() * panel_amount;
-                            // A web page is a native view (or the picture of
-                            // one): nothing can clip it, so it is made as
-                            // narrow as what shows. Everything else keeps
-                            // the panel's full width and is cut off at the
-                            // edge, as the dock is. Squeezed, a terminal was
-                            // told a new width on every frame of the slide,
-                            // and left two columns wide once the panel had
-                            // shut: whatever a program printed until it
-                            // opened again was wrapped at two.
-                            let squeezed = self.panel.read(cx).active_tab(cx) == Some(Tab::Browser);
-                            let panel = if squeezed {
-                                div()
-                                    .flex_none()
-                                    .h_full()
-                                    .w(px(shown))
-                                    .overflow_hidden()
-                                    .border_l_1()
-                                    .border_color(p.border)
-                                    .child(self.panel.clone())
-                            } else {
-                                div()
-                                    .flex_none()
-                                    .h_full()
-                                    .w(px(shown))
-                                    .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .h_full()
-                                            .w(px(self.panel_width.get()))
-                                            .border_l_1()
-                                            .border_color(p.border)
-                                            .child(self.panel.clone()),
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .children(sidebar)
+                    .child(
+                        v_flex()
+                            .map(|d| {
+                                // On a phone it keeps its width as the sidebar
+                                // pushes it off the screen.
+                                if phone {
+                                    d.flex_none().w(px(width))
+                                } else {
+                                    d.flex_1().min_w_0()
+                                }
+                            })
+                            .h_full()
+                            .child(header)
+                            .when_some(remote_banner, |d, (text, failed)| {
+                                d.child(
+                                    h_flex()
+                                        .justify_center()
+                                        .gap_2()
+                                        .px_4()
+                                        .py_1p5()
+                                        .bg(p.warning_soft)
+                                        .text_xs()
+                                        .text_color(p.warning)
+                                        .when(failed.is_none(), |d| {
+                                            d.child(Spinner::new().xsmall().color(p.warning))
+                                        })
+                                        .child(div().min_w_0().child(text))
+                                        .when(failed.is_some(), |d| {
+                                            d.child(
+                                                div()
+                                                    .id("remote-retry")
+                                                    .flex_none()
+                                                    .px_2()
+                                                    .rounded(px(5.))
+                                                    .border_1()
+                                                    .border_color(p.warning)
+                                                    .cursor_pointer()
+                                                    .child("Try again")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.store
+                                                            .update(cx, |s, cx| s.retry_now(cx))
+                                                    })),
+                                            )
+                                        }),
+                                )
+                            })
+                            .when(
+                                disconnected && self.store.read(cx).remote().is_none(),
+                                |d| {
+                                    d.child(
+                                        h_flex()
+                                            .justify_center()
+                                            .gap_2()
+                                            .py_1p5()
+                                            .bg(p.warning_soft)
+                                            .text_xs()
+                                            .text_color(p.warning)
+                                            .child(Spinner::new().xsmall().color(p.warning))
+                                            .child("Lost connection to agentloftd — reconnecting…"),
                                     )
-                            };
-                            d.child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .h_full()
-                                            .children(body_slot.take()),
-                                    )
-                                    .child(panel),
+                                },
                             )
-                        })
-                        .when(!maximized && !panel_sliding, |d| {
-                            // A box holding exactly the room under the header:
-                            // the group is "100% tall", and would otherwise
-                            // count the header too (and grow with tall content),
-                            // pushing the bottom of the panel off the window.
-                            d.child(
-                                div().flex_1().min_h_0().w_full().child(
-                                    h_resizable("workbench")
+                            .when(maximized, |d| {
+                                d.child(div().flex_1().min_h_0().w_full().child(self.panel.clone()))
+                            })
+                            .when(!maximized && panel_sliding, |d| {
+                                // Mid-slide: a plain row at the panel's width.
+                                let shown = self.panel_width.get() * panel_amount;
+                                // A web page is a native view (or the picture of
+                                // one): nothing can clip it, so it is made as
+                                // narrow as what shows. Everything else keeps
+                                // the panel's full width and is cut off at the
+                                // edge, as the dock is. Squeezed, a terminal was
+                                // told a new width on every frame of the slide,
+                                // and left two columns wide once the panel had
+                                // shut: whatever a program printed until it
+                                // opened again was wrapped at two.
+                                let squeezed =
+                                    self.panel.read(cx).active_tab(cx) == Some(Tab::Browser);
+                                let panel = if squeezed {
+                                    div()
+                                        .flex_none()
+                                        .h_full()
+                                        .w(px(shown))
+                                        .overflow_hidden()
+                                        .border_l_1()
+                                        .border_color(p.border)
+                                        .child(self.panel.clone())
+                                } else {
+                                    div()
+                                        .flex_none()
+                                        .h_full()
+                                        .w(px(shown))
+                                        .overflow_hidden()
                                         .child(
-                                            resizable_panel()
-                                                // Beside the panel, the
-                                                // conversation keeps a width
-                                                // it can be read and written
-                                                // at; alone, it has the lot.
-                                                .when(show_panel, |d| {
-                                                    d.size_range(px(CONVERSATION_MIN)..px(100_000.))
-                                                })
+                                            div()
+                                                .flex_none()
+                                                .h_full()
+                                                .w(px(self.panel_width.get()))
+                                                .border_l_1()
+                                                .border_color(p.border)
+                                                .child(self.panel.clone()),
+                                        )
+                                };
+                                d.child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .h_full()
                                                 .children(body_slot.take()),
                                         )
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(self.panel_width.get()))
-                                                .size_range(px(panel_min)..px(panel_max))
-                                                .visible(show_panel)
-                                                .child(
-                                                    div()
-                                                        .size_full()
-                                                        .relative()
-                                                        .border_l_1()
-                                                        .border_color(p.border)
-                                                        .child(self.panel.clone())
-                                                        .child(
-                                                            gpui_kit::canvas(
-                                                                move |bounds, _, _| {
-                                                                    panel_width.set(f32::from(
-                                                                        bounds.size.width,
-                                                                    ))
-                                                                },
-                                                                |_, _, _, _| {},
-                                                            )
-                                                            .absolute()
-                                                            .size_full(),
-                                                        ),
-                                                ),
-                                        ),
-                                ),
-                            )
-                        }),
-                ),
+                                        .child(panel),
+                                )
+                            })
+                            .when(!maximized && !panel_sliding, |d| {
+                                // A box holding exactly the room under the header:
+                                // the group is "100% tall", and would otherwise
+                                // count the header too (and grow with tall content),
+                                // pushing the bottom of the panel off the window.
+                                d.child(
+                                    div().flex_1().min_h_0().w_full().child(
+                                        h_resizable("workbench")
+                                            .child(
+                                                resizable_panel()
+                                                    // Beside the panel, the
+                                                    // conversation keeps a width
+                                                    // it can be read and written
+                                                    // at; alone, it has the lot.
+                                                    .when(show_panel, |d| {
+                                                        d.size_range(
+                                                            px(CONVERSATION_MIN)..px(100_000.),
+                                                        )
+                                                    })
+                                                    .children(body_slot.take()),
+                                            )
+                                            .child(
+                                                resizable_panel()
+                                                    .size(px(self.panel_width.get()))
+                                                    .size_range(px(panel_min)..px(panel_max))
+                                                    .visible(show_panel)
+                                                    .child(
+                                                        div()
+                                                            .size_full()
+                                                            .relative()
+                                                            .border_l_1()
+                                                            .border_color(p.border)
+                                                            .child(self.panel.clone())
+                                                            .child(
+                                                                gpui_kit::canvas(
+                                                                    move |bounds, _, _| {
+                                                                        panel_width.set(f32::from(
+                                                                            bounds.size.width,
+                                                                        ))
+                                                                    },
+                                                                    |_, _, _, _| {},
+                                                                )
+                                                                .absolute()
+                                                                .size_full(),
+                                                            ),
+                                                    ),
+                                            ),
+                                    ),
+                                )
+                            }),
+                    ),
             )
             // Where there is one window only (a browser tab): settings and
             // menus that otherwise get a window of their own.
@@ -7534,8 +7717,20 @@ fn default_panel_width(room: f32) -> f32 {
 
 /// The docked details card's width, and the conversation width (with it)
 /// needed to dock rather than float.
-const DOCK_WIDTH: f32 = 320.;
+const DOCK_WIDTH: f32 = 292.;
 const DOCK_MIN: f32 = 900.;
+
+/// How far a lone conversation, its column `content` wide at most and
+/// centred in `room`, moves aside to clear a `card` wide card at its right
+/// edge (with a little gap): nothing while the margin already holds it.
+fn details_inset(card: f32, content: f32, room: f32) -> f32 {
+    if card <= 0. {
+        return 0.;
+    }
+    // Rows are padded 24 a side, and 12 more keeps clear of the card. The
+    // column's right edge is (room − inset + content) / 2.
+    (content + 2. * card + 24. - room).clamp(0., card)
+}
 
 /// The picture attached with page notes (replaced as notes are added).
 const PAGE_NOTES_IMAGE: &str = "page-notes.png";
@@ -8659,6 +8854,19 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
 #[cfg(test)]
 mod tests {
     use super::pretty_model;
+
+    #[test]
+    fn the_details_card_moves_the_conversation_only_when_it_must() {
+        use super::details_inset;
+        // A wide window: the margin holds the card, nothing moves.
+        assert_eq!(details_inset(320., 800., 1600.), 0.);
+        // Closed: nothing moves.
+        assert_eq!(details_inset(0., 800., 900.), 0.);
+        // A little short: just enough to clear it.
+        assert_eq!(details_inset(320., 800., 1400.), 64.);
+        // Narrow: as far as the card is wide.
+        assert_eq!(details_inset(320., 800., 1000.), 320.);
+    }
 
     #[test]
     fn doc_notes_are_written_a_block_per_file() {
