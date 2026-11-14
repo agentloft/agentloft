@@ -1,0 +1,11 @@
+# Clippy settings for the browser build only (`CLIPPY_CONF_DIR=.config/clippy-wasm`
+# with `--target wasm32-unknown-unknown`, see AGENTS.md and CI).
+#
+# std's clock panics in the browser (wasm32-unknown-unknown has none), and a
+# panic there stops the whole web client: it freezes until the page is
+# reloaded. Use `web_time` instead. It is std's own type on native targets,
+# which is why this is checked on the wasm build alone.
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "panics in the browser: use web_time::Instant" },
+  { path = "std::time::SystemTime::now", reason = "panics in the browser: use web_time::SystemTime" },
+]

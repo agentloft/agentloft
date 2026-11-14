@@ -13,7 +13,8 @@ use gpui_kit::{
 };
 use loft_protocol::{AgentInfoKind, HarnessId, Request, Response, ThreadId, ThreadStatus};
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// The agents whose plan limits can be asked for, and how.
 pub(crate) const LIMIT_AGENTS: [(&str, &str, AgentInfoKind); 2] = [

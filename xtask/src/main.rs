@@ -63,7 +63,8 @@ fn main() -> Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|install|web|signing-identity>"
+                "usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|install|web|signing-identity>\n\
+                 dev, bundle and install build the web client too (`--no-web` skips it)"
             );
             Ok(())
         }
@@ -94,7 +95,10 @@ fn run(cmd: &mut Command) -> Result<()> {
 /// Build the browser client into `target/web`: the wasm module, its JS glue
 /// and the static shell (`crates/loft-web/static`). `--release` optimizes.
 fn web() -> Result<()> {
-    let release = std::env::args().skip(2).any(|a| a == "--release");
+    build_web(std::env::args().skip(2).any(|a| a == "--release"))
+}
+
+fn build_web(release: bool) -> Result<()> {
     let mut build = cargo();
     build
         .args(["build", "-p", "loft-web", "--target", WASM_TARGET])
@@ -173,8 +177,19 @@ fn dev_home() -> PathBuf {
     root().join(".dev-home")
 }
 
+/// Whether this build also makes the web client: always, unless asked not
+/// to with `--no-web`. The web client is the same UI built for the browser;
+/// left out, browsers get whatever `target/web` last held, a UI without the
+/// app's latest changes.
+fn with_web() -> bool {
+    !std::env::args().skip(2).any(|a| a == "--no-web")
+}
+
 fn dev() -> Result<()> {
     run(cargo().args(["build", "-p", "loft-app", "-p", "loftd"]))?;
+    if with_web() {
+        build_web(false)?;
+    }
     let bin = root().join("target/debug");
     // A daemon from an older build would keep serving stale code.
     stop_dev().ok();
@@ -208,6 +223,9 @@ fn install() -> Result<()> {
 fn bundle(stable: bool) -> Result<PathBuf> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let debug = args.iter().any(|a| a == "--debug");
+    if with_web() {
+        build_web(!debug)?;
+    }
     let profile = if debug { "debug" } else { "release" };
     let mut build = cargo();
     build.args(["build", "-p", "loft-app", "-p", "loftd"]);

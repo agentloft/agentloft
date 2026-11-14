@@ -12,6 +12,7 @@ cargo xtask live-claude  # end-to-end against the real `claude` CLI (costs token
 
 - The toolchain is pinned in `rust-toolchain.toml`.
 - `cargo xtask ci` needs `cargo install cargo-hakari cargo-deny`.
+- **The web client is built with the app.** `cargo xtask dev`, `bundle` and `install` also build the browser version of the UI into `target/web` (`install` and `bundle` in release), which the daemon serves. It is the same `loft-ui` code built for wasm, so a desktop build without it leaves browsers on an old UI that lacks the latest changes. `--no-web` skips it when you only need the desktop app.
 - **Always use an isolated `AGENTLOFT_HOME`** when running dev builds (`xtask dev` does this). Never point a dev daemon at your real `~/.agentloft`.
 
 ## Keeping builds fast

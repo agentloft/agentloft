@@ -26,7 +26,8 @@ use ghostty_vt::selection::gesture::{
 use ghostty_vt::style::{Palette, PaletteIndex, RgbColor, StyleColor};
 use ghostty_vt::terminal::{Mode, Point, PointCoordinate, ScrollViewport};
 use ghostty_vt::{RenderState, Terminal, TerminalOptions, focus, key, mouse, paste};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Scrollback budget in bytes (Ghostty's default `scrollback-limit`).
 const SCROLLBACK_BYTES: usize = 10_000_000;

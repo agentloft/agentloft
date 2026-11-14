@@ -70,6 +70,8 @@ jobs:
         run: cargo clippy -p loft-web --target wasm32-unknown-unknown -- -D warnings
         env:
           RUSTC_BOOTSTRAP: wasm_thread
+          # std's clock panics in the browser: forbidden there (see the file).
+          CLIPPY_CONF_DIR: .config/clippy-wasm
       # Builds crates/loft-web for wasm32-unknown-unknown and generates the
       # JS glue into target/web.
       - name: Build the web bundle
