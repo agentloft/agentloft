@@ -18,7 +18,7 @@ use gpui_kit::{
 use loft_config::{Config, SettingValue};
 use loft_protocol::Request;
 
-mod agents;
+pub(crate) mod agents;
 mod appearance;
 mod browser;
 mod computers;

@@ -735,6 +735,7 @@ impl AppStore {
             return;
         }
         let name = crate::workspace::harness_name(&harness);
+        crate::workspace::close_update_toast(&harness, cx);
         cx.emit(StoreEvent::Progress {
             message: Some(format!("Updating {name}…")),
         });
@@ -747,10 +748,16 @@ impl AppStore {
             cx.emit(StoreEvent::Progress { message: None });
             match result {
                 Ok(Response::HarnessStatus { status }) => {
-                    let version = status.version.clone().unwrap_or_default();
+                    let message = match status.version.as_deref() {
+                        Some(v) => format!(
+                            "{name} updated to v{}",
+                            crate::settings::agents::short_version(v).unwrap_or(v.to_owned())
+                        ),
+                        None => format!("{name} updated"),
+                    };
                     store.harness_status.insert(harness, status);
                     cx.emit(StoreEvent::Notify {
-                        message: format!("{name} is up to date: {version}"),
+                        message,
                         error: false,
                     });
                 }

@@ -47,7 +47,7 @@ impl AgentsPage {
 }
 
 /// `codex-cli 0.167.0` → `0.167.0`; `2.1.319 (Claude Code)` → `2.1.319`.
-fn short_version(v: &str) -> Option<String> {
+pub(crate) fn short_version(v: &str) -> Option<String> {
     v.split_whitespace()
         .map(|w| w.trim_start_matches('v'))
         .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))

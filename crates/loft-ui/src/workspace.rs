@@ -493,7 +493,6 @@ impl WorkspaceView {
                 use gpui_kit::component::WindowExt as _;
                 use gpui_kit::component::button::{Button, ButtonVariants as _};
                 use gpui_kit::component::notification::{Notification, NotificationType};
-                struct UpdateToast;
                 let name = harness_name(harness);
                 let store = self.store.clone();
                 let id = harness.clone();
@@ -517,7 +516,10 @@ impl WorkspaceView {
                                     // The progress toast takes over.
                                     let _ = note.update(cx, |n, cx| n.dismiss(window, cx));
                                 })
-                        });
+                        })
+                        // A toast with an action stays until closed unless told
+                        // otherwise; the settings dot keeps the news.
+                        .autohide(true);
                 } else {
                     let store = self.store.clone();
                     let id = harness.as_str().to_owned();
@@ -528,6 +530,9 @@ impl WorkspaceView {
                         });
                 }
                 window.push_notification(note, cx);
+                cx.default_global::<UpdateToasts>()
+                    .0
+                    .insert(harness.as_str().to_owned(), window.window_handle());
             }
             StoreEvent::Progress { message } => {
                 use gpui_kit::component::WindowExt as _;
@@ -1044,10 +1049,18 @@ impl WorkspaceView {
                 }
             }
             // `update:<harness>`: install that agent's newer release, as
-            // its Update button does.
+            // its Update button does, 4 s in (once its toast is up).
             Some(("update", harness)) => {
                 let harness = HarnessId(harness.to_owned());
-                self.store.update(cx, |s, cx| s.update_harness(harness, cx));
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(4))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.store.update(cx, |s, cx| s.update_harness(harness, cx))
+                    });
+                })
+                .detach();
             }
             Some(("attach", path)) => {
                 let paths = vec![std::path::PathBuf::from(path)];
@@ -7685,6 +7698,33 @@ fn search_snippet(hit: &loft_protocol::SearchHit, p: &Palette) -> AnyElement {
 }
 
 /// `claude-opus-5-5` → `Opus 5.5`.
+/// The toast saying a newer release of an agent is out.
+struct UpdateToast;
+
+/// Which window shows each agent's [`UpdateToast`].
+#[derive(Default)]
+struct UpdateToasts(HashMap<String, gpui_kit::AnyWindowHandle>);
+impl gpui_kit::Global for UpdateToasts {}
+
+/// Close the "newer release" toast for `harness` (an update has started),
+/// whichever window shows it.
+pub fn close_update_toast(harness: &HarnessId, cx: &mut gpui_kit::App) {
+    let Some(handle) = cx
+        .try_global::<UpdateToasts>()
+        .and_then(|t| t.0.get(harness.as_str()).copied())
+    else {
+        return;
+    };
+    let key = SharedString::from(harness.as_str().to_owned());
+    // Deferred: the caller may be inside that window's own update.
+    cx.defer(move |cx| {
+        let _ = handle.update(cx, |_, window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            window.remove_notification1::<UpdateToast>(key, cx);
+        });
+    });
+}
+
 pub fn harness_name(h: &HarnessId) -> &'static str {
     match h.as_str() {
         HarnessId::CLAUDE => "Claude",
