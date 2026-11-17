@@ -25,8 +25,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/worktree-changes.png" width="900" alt="A thread in its own worktree, with the turn's diff in the side panel">
+  <img src="docs/media/demo.gif" width="900" alt="Claude Code adds a testimonials section, opens the page in Agentloft's browser, switches it to a phone's size, finds the page scrolling sideways and fixes it">
 </p>
+<p align="center"><sub>Claude Code adds a section, then checks it in the browser on desktop and on a phone, finds a layout bug and fixes it (sped up; <a href="docs/media/demo.mp4">video</a>).</sub></p>
 
 > **Early preview.** Agentloft is used every day on macOS, and everyday features work end to end. The Windows and Linux builds are new. Per-feature status is in [docs/TRACKING.md](docs/TRACKING.md).
 
@@ -35,6 +36,7 @@
 - **Many agents at once, none in your way.** Every thread can work in its own git worktree, so five agents can change the same project without tripping over each other or your working copy.
 - **Agents driven properly.** Agentloft talks to each agent through its own structured protocol, never by scraping a terminal. You get exact streaming, tool calls, approvals, interrupts and resume, and your agents keep their own logins: Agentloft never sees an API key.
 - **Everything to review the work, next to the chat.** Per-turn diffs and undo, a real terminal, file and document previews, and a browser you and the agent share.
+- **A browser agents can really use.** They click, type and fill forms, check a page at a phone's size, take screenshots and compare them, read the network and console, and record video, in a tab you watch live. When only a person can go on (a login, a captcha) they hand the tab to you and wait.
 - **Agents keep working when you close the window.** A small daemon owns the agents, so closing or updating the app doesn't stop them, and you can follow along from your phone.
 - **Native and open source.** Rust and [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), GPU-rendered, Apache-2.0.
 
@@ -91,7 +93,7 @@ Shortcuts are shown with ⌘ here; on Windows and Linux they use Ctrl. <kbd>⌘K
 
 - **Files and documents.** A file tree; a syntax-highlighted viewer; Markdown and images; previews of Word, Excel, PowerPoint (slides drawn as laid out, charts included) and PDF. Leave a note on a slide, a cell, a passage or a spot on a page, and it goes to the agent with your next message.
 - **Terminal.** A real terminal, built on [Ghostty](https://ghostty.org)'s core, with tabs.
-- **Browser.** A tab the agent drives through Agentloft's built-in MCP server ([ADR-0017](docs/adr/0017-streamed-browser.md)). You watch the same tab and can step in at any time.
+- **Browser.** Tabs the agent drives through Agentloft's built-in MCP server ([ADR-0017](docs/adr/0017-streamed-browser.md)). You watch the same tabs and can step in at any time. Agents can click, type, fill forms, hover, drag, upload files, answer dialogs and wait for a page; take screenshots of any region (with numbered elements) and diff them; capture the network (credentials redacted) and the console; record a tab to video; emulate a phone, dark mode, a time zone or a slow network; open and name tabs of their own; and run a short script that does many steps in one call. For a login, a two-factor prompt or a captcha they hand the tab to you, and continue when you press **Continue**.
 - **Answers you can try.** Agents can answer with a live page of their own: a chart, a diagram, a calculator, options to pick from ([ADR-0018](docs/adr/0018-agent-drawn-views.md)). It appears as the agent writes it, and its buttons can reply for you.
 
 ### Built for long-running work
@@ -105,8 +107,8 @@ Shortcuts are shown with ⌘ here; on Windows and Linux they use Ctrl. <kbd>⌘K
 
 | | |
 |---|---|
-| ![Command palette](docs/screenshots/command-palette.png) | ![Forks nested under their parent](docs/screenshots/forks.png) |
-| ![Terminal running vim](docs/screenshots/terminal-vim.png) | ![Settings](docs/screenshots/settings-appearance.png) |
+| ![A thread's summary next to the diff of its last turn](docs/screenshots/changes.png) | ![An agent hands the browser tab to you for a sign-in](docs/screenshots/browser-handoff.png) |
+| ![A Codex thread with the terminal open below it](docs/screenshots/codex-terminal.png) | <img src="docs/screenshots/phone.png" width="260" alt="The same thread in a phone's browser"> |
 
 ## From your phone, or any browser
 
@@ -155,7 +157,9 @@ The app never spawns processes or touches the database: everything goes through 
 | `loft-harness*` | The agent adapters (Claude, Codex, ACP) |
 | `loft-git` | Checkpoints, diffs, worktrees |
 | `loft-terminal` | Terminal widget on libghostty-vt |
-| `loft-browser` | Embedded browser |
+| `loft-browser` | Native host of agents' views, and menus |
+| `loft-page-script` | Agents' browser commands and the helpers they run in a page |
+| `loft-page-exec` | Agents' browser scripts (`browser_execute`), run in a sandboxed JavaScript engine |
 | `loft-docs` | Office documents and PDFs, read for previews |
 
 ## Contributing
