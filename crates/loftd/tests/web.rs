@@ -57,6 +57,7 @@ async fn start_seeded(extra: &str, seed: impl FnOnce(&Paths)) -> Fixture {
         paths: paths.clone(),
         harnesses,
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: Some(bundle),
     })
@@ -334,6 +335,7 @@ async fn off_unless_enabled() {
         paths: paths.clone(),
         harnesses: vec![],
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })
@@ -1347,6 +1349,7 @@ async fn sessions_survive_a_daemon_restart() {
         paths: paths.clone(),
         harnesses: vec![],
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: Some(dir.path().join("bundle")),
     })

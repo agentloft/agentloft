@@ -17,6 +17,7 @@ async fn start(paths: &Paths) -> Daemon {
         paths: paths.clone(),
         harnesses,
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })
@@ -51,6 +52,7 @@ async fn full_turn_over_socket_with_reconnect() {
         paths: paths.clone(),
         harnesses: vec![],
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })

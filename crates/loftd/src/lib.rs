@@ -3,6 +3,7 @@
 
 pub mod bridge;
 mod conn;
+mod http;
 pub mod mcp;
 mod mcp_automations;
 mod mcp_tabs;
@@ -33,6 +34,8 @@ pub struct DaemonOptions {
     pub paths: Paths,
     pub harnesses: Vec<Arc<dyn Harness>>,
     pub capture_login_env: bool,
+    /// Ask npm and Homebrew for the agents' latest releases (off in tests).
+    pub check_agent_updates: bool,
     /// Attach `agentloftd mcp` to agent sessions (None in tests).
     pub mcp_bridge: Option<loft_core::McpBridge>,
     /// The web client's files, instead of the usual places (tests).
@@ -94,6 +97,10 @@ impl Daemon {
                 projects_dir: paths.projects_dir(),
                 config_file: Some(paths.config_file()),
                 attachments_dir: paths.attachments_dir(),
+                fetch: opts.check_agent_updates.then(|| {
+                    std::sync::Arc::new(|url: &str| http::get_text(url, 1 << 20))
+                        as loft_core::Fetcher
+                }),
                 ..CoreOptions::default()
             },
         );

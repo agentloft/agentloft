@@ -175,6 +175,13 @@ pub enum StoreEvent {
     },
     /// A transient message for the user (toast).
     Notify { message: String, error: bool },
+    /// A newer release of an agent's CLI is out (shown once per release).
+    AgentUpdate {
+        harness: HarnessId,
+        version: String,
+        /// Agentloft can install it (`UpdateHarness`).
+        can_update: bool,
+    },
     /// Show (`Some`) or take down (`None`) the "working on it" toast of a
     /// slow action, so its result doesn't sit beside a stale progress note.
     Progress { message: Option<String> },
@@ -287,6 +294,8 @@ pub struct AppStore {
     pub models: HashMap<HarnessId, Vec<loft_protocol::ModelInfo>>,
     /// Installed CLIs (`ProbeHarness`).
     pub harness_status: HashMap<HarnessId, loft_protocol::HarnessStatus>,
+    /// Agents whose CLI is being updated now (`UpdateHarness`).
+    pub updating_harnesses: std::collections::HashSet<HarnessId>,
     /// Worktrees and branches no active thread works in (Settings ▸
     /// Worktrees); `None` until asked, or while asking.
     pub worktree_leftovers: Option<Vec<loft_protocol::WorktreeLeftover>>,
@@ -370,6 +379,7 @@ impl AppStore {
             unread: Default::default(),
             models: HashMap::new(),
             harness_status: HashMap::new(),
+            updating_harnesses: Default::default(),
             worktree_leftovers: None,
             branches: HashMap::new(),
             branches_loading: Default::default(),
@@ -389,6 +399,22 @@ impl AppStore {
         this.reload_agent_prefs(cx);
         this.connect(cx);
         this.watch_settings(cx);
+        // Agents' new releases: the daemon asks npm or Homebrew at most
+        // every six hours, so a long-open window asks it that often too.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(6 * 60 * 60))
+                    .await;
+                if this
+                    .update(cx, |store, cx| store.probe_harnesses(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         this
     }
 
@@ -658,11 +684,81 @@ impl AppStore {
             };
             self.request_result(body, cx, move |store, result, cx| {
                 if let Ok(Response::HarnessStatus { status }) = result {
-                    store.harness_status.insert(harness, status);
+                    store.harness_status.insert(harness.clone(), status);
+                    store.notice_update(&harness, cx);
                     cx.notify();
                 }
             });
         }
+    }
+
+    /// The newer release of `harness`'s CLI, if one is out and the user
+    /// would want to hear of it: the agent is on, and the CLI is on this
+    /// computer (a browser or another computer's window can't update it).
+    pub fn agent_update(&self, harness: &HarnessId) -> Option<&loft_protocol::HarnessUpdate> {
+        if self.is_elsewhere() || self.disabled_agents.contains(harness.as_str()) {
+            return None;
+        }
+        self.harness_status.get(harness)?.update.as_ref()
+    }
+
+    /// Some agent has a newer release (the sidebar's settings dot).
+    pub fn any_agent_update(&self) -> bool {
+        self.harness_status
+            .keys()
+            .any(|h| self.agent_update(h).is_some())
+    }
+
+    /// Toast a newer release once per release, whichever window saw it.
+    fn notice_update(&mut self, harness: &HarnessId, cx: &mut Context<Self>) {
+        #[derive(Default)]
+        struct Noticed(std::collections::HashSet<(String, String)>);
+        impl gpui_kit::Global for Noticed {}
+        let Some(update) = self.agent_update(harness).cloned() else {
+            return;
+        };
+        let key = (harness.as_str().to_owned(), update.version.clone());
+        if !cx.default_global::<Noticed>().0.insert(key) {
+            return;
+        }
+        cx.emit(StoreEvent::AgentUpdate {
+            harness: harness.clone(),
+            version: update.version,
+            can_update: update.command.is_some(),
+        });
+    }
+
+    /// Install the newer release of `harness`'s CLI (the daemon runs its
+    /// package manager), with a progress toast until it's done.
+    pub fn update_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if !self.updating_harnesses.insert(harness.clone()) {
+            return;
+        }
+        let name = crate::workspace::harness_name(&harness);
+        cx.emit(StoreEvent::Progress {
+            message: Some(format!("Updating {name}…")),
+        });
+        cx.notify();
+        let body = Request::UpdateHarness {
+            harness: harness.clone(),
+        };
+        self.request_result(body, cx, move |store, result, cx| {
+            store.updating_harnesses.remove(&harness);
+            cx.emit(StoreEvent::Progress { message: None });
+            match result {
+                Ok(Response::HarnessStatus { status }) => {
+                    let version = status.version.clone().unwrap_or_default();
+                    store.harness_status.insert(harness, status);
+                    cx.emit(StoreEvent::Notify {
+                        message: format!("{name} is up to date: {version}"),
+                        error: false,
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => store.fail(format!("Couldn't update {name}. {}", err.message), cx),
+            }
+            cx.notify();
+        });
     }
 
     /// Route a terminal's replay/output/exit to `pane`.

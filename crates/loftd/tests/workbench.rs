@@ -55,6 +55,7 @@ async fn setup() -> Env {
         paths: paths.clone(),
         harnesses,
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })

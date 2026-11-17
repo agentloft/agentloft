@@ -2,6 +2,7 @@
 //! active thread that drives its harness session, persists domain events and
 //! fans them out on a broadcast bus together with ephemeral streaming deltas.
 
+mod agent_updates;
 mod automations;
 mod browser;
 mod cleanup;
@@ -128,7 +129,11 @@ pub struct CoreOptions {
     pub config_file: Option<PathBuf>,
     /// Where uploaded attachments are stored (`~/.agentloft/attachments`).
     pub attachments_dir: PathBuf,
+    /// Asks the web for the agents' latest releases (`None`: never asks).
+    pub fetch: Option<Fetcher>,
 }
+
+pub use agent_updates::Fetcher;
 
 impl Default for CoreOptions {
     fn default() -> Self {
@@ -142,6 +147,7 @@ impl Default for CoreOptions {
             projects_dir: std::env::temp_dir().join("agentloft-projects"),
             config_file: None,
             attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
+            fetch: None,
         }
     }
 }
@@ -189,6 +195,10 @@ pub struct Core {
     limit_wake: Arc<tokio::sync::Notify>,
     /// The id the next queued message gets.
     queued_ids: std::sync::atomic::AtomicU64,
+    /// The agents' latest releases, per channel (`agent_updates.rs`).
+    latest_releases: agent_updates::Latest,
+    /// Harnesses whose CLI is being updated now.
+    updating: Mutex<std::collections::HashSet<String>>,
     opts: CoreOptions,
     // Scripts (D)
     /// Agents' browser scripts: each tab's `state`, and how many run.
@@ -232,6 +242,8 @@ impl Core {
             limit_wake: Arc::new(tokio::sync::Notify::new()),
             // From the clock, so ids from before a restart aren't given again.
             queued_ids: std::sync::atomic::AtomicU64::new(now_ms().max(0) as u64),
+            latest_releases: Default::default(),
+            updating: Mutex::new(Default::default()),
             opts,
             // Scripts (D)
             scripts: scripts::Scripts::default(),
@@ -432,30 +444,45 @@ impl Core {
         Ok(files)
     }
 
-    /// Resolve the harness's CLI (config path or login PATH) and ask its
-    /// version.
-    async fn probe_harness(&self, harness: &HarnessId) -> CoreResult<Response> {
+    /// The harness's CLI: the configured path, or its name on the login
+    /// shell's PATH. `Err` names the binary that wasn't found.
+    fn harness_bin(&self, harness: &HarnessId) -> Result<PathBuf, String> {
         let bin = match harness.as_str() {
             HarnessId::CLAUDE => "claude",
             HarnessId::CODEX => "codex",
             other => other,
-        }
-        .to_owned();
+        };
         let hcfg = harness_config(&self.config(), harness);
+        let path = if hcfg.path != "auto" {
+            Some(PathBuf::from(&hcfg.path)).filter(|p| p.exists())
+        } else {
+            let env = &self.opts.env;
+            loft_config::which(bin, env.get("PATH").map(String::as_str).unwrap_or(""))
+        };
+        path.ok_or_else(|| bin.to_owned())
+    }
+
+    /// Resolve the harness's CLI (config path or login PATH), ask its
+    /// version, and whether a newer release is out on the channel it was
+    /// installed from.
+    async fn probe_harness(&self, harness: &HarnessId) -> CoreResult<Response> {
+        let path = self.harness_bin(harness);
         let env = self.opts.env.clone();
+        let fetch = self.opts.fetch.clone();
+        let latest = self.latest_releases.clone();
+        let id = harness.as_str().to_owned();
         let status = tokio::task::spawn_blocking(move || {
-            let path = if hcfg.path != "auto" {
-                Some(PathBuf::from(&hcfg.path)).filter(|p| p.exists())
-            } else {
-                loft_config::which(&bin, env.get("PATH").map(String::as_str).unwrap_or(""))
-            };
-            let Some(path) = path else {
-                return loft_protocol::HarnessStatus {
-                    installed: false,
-                    path: None,
-                    version: None,
-                    error: Some(format!("`{bin}` was not found on your login shell's PATH")),
-                };
+            let path = match path {
+                Ok(path) => path,
+                Err(bin) => {
+                    return loft_protocol::HarnessStatus {
+                        installed: false,
+                        path: None,
+                        version: None,
+                        error: Some(format!("`{bin}` was not found on your login shell's PATH")),
+                        update: None,
+                    };
+                }
             };
             let out = std::process::Command::new(&path)
                 .arg("--version")
@@ -477,16 +504,100 @@ impl Core {
                 ),
                 Err(e) => (None, Some(e.to_string())),
             };
+            let update = version
+                .as_deref()
+                .zip(fetch)
+                .and_then(|(installed, fetch)| {
+                    let install = agent_updates::locate(&id, &path, &env)?;
+                    let newest = latest.get(&install.source, &fetch)?;
+                    agent_updates::is_newer(&newest, installed).then(|| {
+                        loft_protocol::HarnessUpdate {
+                            version: newest,
+                            command: install.command_line(),
+                        }
+                    })
+                });
             loft_protocol::HarnessStatus {
                 installed: true,
                 path: Some(path.to_string_lossy().into_owned()),
                 version,
                 error,
+                update,
             }
         })
         .await
         .map_err(internal)?;
         Ok(Response::HarnessStatus { status })
+    }
+
+    /// Install the harness CLI's latest release with the package manager it
+    /// came from, then probe it again.
+    async fn update_harness(&self, harness: &HarnessId) -> CoreResult<Response> {
+        let failed = |msg: String| ErrorBody::new(ErrorCode::Internal, msg);
+        let path = self
+            .harness_bin(harness)
+            .map_err(|bin| failed(format!("`{bin}` isn't installed")))?;
+        let env = self.opts.env.clone();
+        let install = agent_updates::locate(harness.as_str(), &path, &env).ok_or_else(|| {
+            failed("Agentloft can't tell how this agent was installed; update it the way you installed it.".into())
+        })?;
+        let (program, args) = install.command.clone().ok_or_else(|| {
+            failed("Agentloft can't run this agent's package manager; update it the way you installed it.".into())
+        })?;
+        {
+            let mut updating = lock(&self.updating);
+            if !updating.insert(harness.as_str().to_owned()) {
+                return Err(failed("It's already being updated.".into()));
+            }
+        }
+        struct Done<'a>(&'a Core, String);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                lock(&self.0.updating).remove(&self.1);
+            }
+        }
+        let _done = Done(self, harness.as_str().to_owned());
+
+        // The package manager's own folder first, so npm finds the Node
+        // that owns the package.
+        let mut path_var = env.get("PATH").cloned().unwrap_or_default();
+        if let Some(dir) = program.parent() {
+            path_var = format!(
+                "{}{}{path_var}",
+                dir.to_string_lossy(),
+                loft_config::PATH_SEPARATOR
+            );
+        }
+        tracing::info!(harness = %harness.as_str(), command = ?install.command_line(), "updating an agent");
+        let child = tokio::process::Command::new(&program)
+            .args(&args)
+            .env_clear()
+            .envs(env.iter())
+            .env("PATH", path_var)
+            // Homebrew and npm ask nothing, but nobody could answer.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(Duration::from_secs(15 * 60), child)
+            .await
+            .map_err(|_| failed("The update took more than 15 minutes and was stopped.".into()))?
+            .map_err(|e| failed(format!("Couldn't run `{}`: {e}", program.display())))?;
+        if !out.status.success() {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let tail = lines[lines.len().saturating_sub(12)..].join("\n");
+            return Err(failed(format!(
+                "`{}` failed:\n{tail}",
+                install.command_line().unwrap_or_default()
+            )));
+        }
+        self.probe_harness(harness).await
     }
 
     /// Models a live session reported (ACP agents list theirs at start).
@@ -1506,6 +1617,7 @@ impl Core {
             Request::ListModels { harness } => self.list_models(&harness).await,
             Request::ListCommands { harness, cwd } => self.list_commands(&harness, cwd).await,
             Request::ProbeHarness { harness } => self.probe_harness(&harness).await,
+            Request::UpdateHarness { harness } => self.update_harness(&harness).await,
             Request::FindFiles { root, query, limit } => {
                 let dir = self.root_dir(&root)?;
                 let files = self.file_index(dir).await?;

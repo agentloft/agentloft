@@ -117,6 +117,7 @@ async fn run(paths: Paths) -> Result<()> {
         paths,
         harnesses,
         capture_login_env: true,
+        check_agent_updates: true,
         mcp_bridge,
         web_bundle: None,
     })

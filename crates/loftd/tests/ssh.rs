@@ -44,6 +44,7 @@ async fn a_daemon_elsewhere_is_reached_through_its_bridge() {
         paths: paths.clone(),
         harnesses,
         capture_login_env: false,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })

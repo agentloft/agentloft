@@ -22,6 +22,7 @@ async fn daemon(paths: &Paths) -> Daemon {
         paths: paths.clone(),
         harnesses,
         capture_login_env: true,
+        check_agent_updates: false,
         mcp_bridge: Some(loft_core::McpBridge {
             exe: env!("CARGO_BIN_EXE_agentloftd").into(),
             home: paths.home.clone(),

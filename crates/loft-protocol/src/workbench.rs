@@ -275,6 +275,22 @@ pub struct HarnessStatus {
     pub version: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// A newer release than the installed one, from the channel the CLI was
+    /// installed from (npm, Homebrew, Claude Code's own installer). `None`
+    /// when it's up to date or that can't be told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<HarnessUpdate>,
+}
+
+/// A newer release of an agent's CLI (`Request::UpdateHarness` installs it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessUpdate {
+    /// `0.170.0`.
+    pub version: String,
+    /// What updating runs (`npm install -g @openai/codex@latest`); `None`
+    /// when the install's package manager isn't one Agentloft can drive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// An image uploaded with a message (stored by the daemon).

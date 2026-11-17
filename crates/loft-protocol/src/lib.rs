@@ -426,6 +426,12 @@ pub enum Request {
     ProbeHarness {
         harness: HarnessId,
     },
+    /// Install the newer release `ProbeHarness` found (its
+    /// `HarnessUpdate::command`). Answers `Response::HarnessStatus` once
+    /// done; an error carries the end of the command's output.
+    UpdateHarness {
+        harness: HarnessId,
+    },
     /// Files under a root matching `query` fuzzily (composer `@` mentions).
     FindFiles {
         root: FsRoot,

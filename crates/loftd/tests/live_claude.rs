@@ -88,6 +88,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         paths: paths.clone(),
         harnesses,
         capture_login_env: true,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })
@@ -210,6 +211,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         paths: paths.clone(),
         harnesses,
         capture_login_env: true,
+        check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
     })

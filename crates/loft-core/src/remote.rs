@@ -427,6 +427,8 @@ impl Core {
             }
 
             Request::Shutdown { .. } => Err(forbidden("Stopping Agentloft")),
+            // Runs a package manager on the daemon's computer.
+            Request::UpdateHarness { .. } => Err(forbidden("Updating an agent")),
             Request::WebStatus
             | Request::WebRotateToken
             | Request::WebRevokeSession { .. }

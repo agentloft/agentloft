@@ -6,6 +6,7 @@
 use super::SettingsView;
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
@@ -260,6 +261,11 @@ impl SettingsView {
         let id = self.agents.selected;
         let store = self.store.read(cx);
         let statuses = store.harness_status.clone();
+        let updates: std::collections::HashMap<&str, loft_protocol::HarnessUpdate> = AGENTS
+            .iter()
+            .filter_map(|(a, _)| Some((*a, store.agent_update(&HarnessId((*a).into()))?.clone())))
+            .collect();
+        let updating = store.updating_harnesses.clone();
         let models: Vec<ModelInfo> = store
             .models
             .get(&HarnessId(id.into()))
@@ -284,6 +290,7 @@ impl SettingsView {
                 Some(_) => ("Not installed".to_owned(), false),
             };
             let active = aid == id;
+            let update = updates.get(aid).filter(|_| h.enabled);
             list = list.child(
                 h_flex()
                     .id(SharedString::from(format!("agent-{aid}")))
@@ -315,12 +322,18 @@ impl SettingsView {
                                     .text_color(p.muted_foreground)
                                     .child(div().size(px(6.)).rounded_full().bg(if !h.enabled {
                                         p.border
+                                    } else if update.is_some() {
+                                        p.accent
                                     } else if ok {
                                         p.success
                                     } else {
                                         p.warning
                                     }))
-                                    .child(if h.enabled { line } else { "Off".into() }),
+                                    .child(match update {
+                                        _ if !h.enabled => "Off".to_owned(),
+                                        Some(u) => format!("{line} → v{}", u.version),
+                                        None => line,
+                                    }),
                             ),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -337,6 +350,8 @@ impl SettingsView {
         let h = agent_config(&self.config, id);
         let status = statuses.get(&HarnessId(id.into())).cloned();
         let enabled = h.enabled;
+        let update = updates.get(id).cloned();
+        let is_updating = updating.contains(&HarnessId(id.into()));
         let header = h_flex()
             .gap_3()
             .items_center()
@@ -379,6 +394,33 @@ impl SettingsView {
                             }),
                     ),
             )
+            .when_some(update, |d, update| {
+                d.child(match update.command {
+                    Some(command) => gpui_kit::component::button::Button::new("agent-update")
+                        .small()
+                        .primary()
+                        .cursor_pointer()
+                        .loading(is_updating)
+                        .label(if is_updating {
+                            "Updating…".to_owned()
+                        } else {
+                            format!("Update to v{}", update.version)
+                        })
+                        .tooltip(format!("Runs `{command}`"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let harness = HarnessId(id.into());
+                            this.store.update(cx, |s, cx| s.update_harness(harness, cx));
+                        }))
+                        .into_any_element(),
+                    // Installed some way Agentloft can't drive.
+                    None => div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(p.accent)
+                        .child(format!("v{} is out", update.version))
+                        .into_any_element(),
+                })
+            })
             .child(
                 div()
                     .id("agent-recheck")

@@ -485,6 +485,50 @@ impl WorkspaceView {
                 };
                 window.push_notification(note, cx);
             }
+            StoreEvent::AgentUpdate {
+                harness,
+                version,
+                can_update,
+            } => {
+                use gpui_kit::component::WindowExt as _;
+                use gpui_kit::component::button::{Button, ButtonVariants as _};
+                use gpui_kit::component::notification::{Notification, NotificationType};
+                struct UpdateToast;
+                let name = harness_name(harness);
+                let store = self.store.clone();
+                let id = harness.clone();
+                let mut note = Notification::new()
+                    .id1::<UpdateToast>(SharedString::from(harness.as_str().to_owned()))
+                    .title(format!("{name} {version} is available"))
+                    .with_type(NotificationType::Info);
+                if *can_update {
+                    note = note
+                        .message("Update it now, or later from Settings ▸ Agents.")
+                        .action(move |_, _, cx| {
+                            let (store, id) = (store.clone(), id.clone());
+                            let note = cx.entity().downgrade();
+                            Button::new("agent-update")
+                                .small()
+                                .primary()
+                                .label("Update")
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| {
+                                    store.update(cx, |s, cx| s.update_harness(id.clone(), cx));
+                                    // The progress toast takes over.
+                                    let _ = note.update(cx, |n, cx| n.dismiss(window, cx));
+                                })
+                        });
+                } else {
+                    let store = self.store.clone();
+                    let id = harness.as_str().to_owned();
+                    note = note
+                        .message("Update it the way you installed it. Click for details.")
+                        .on_click(move |_, _, cx| {
+                            crate::settings::open_agent(store.clone(), &id, cx)
+                        });
+                }
+                window.push_notification(note, cx);
+            }
             StoreEvent::Progress { message } => {
                 use gpui_kit::component::WindowExt as _;
                 use gpui_kit::component::notification::{Notification, NotificationType};
@@ -990,6 +1034,20 @@ impl WorkspaceView {
                 if let Ok(spec) = std::env::var("AGENTLOFT_DEV_CLICK") {
                     dev_click(spec, window, cx);
                 }
+            }
+            // `agent:<harness>`: Settings ▸ Agents on that agent (and
+            // `AGENTLOFT_DEV_CLICK`, as for `settings:`).
+            Some(("agent", harness)) => {
+                crate::settings::open_agent(self.store.clone(), harness, cx);
+                if let Ok(spec) = std::env::var("AGENTLOFT_DEV_CLICK") {
+                    dev_click(spec, window, cx);
+                }
+            }
+            // `update:<harness>`: install that agent's newer release, as
+            // its Update button does.
+            Some(("update", harness)) => {
+                let harness = HarnessId(harness.to_owned());
+                self.store.update(cx, |s, cx| s.update_harness(harness, cx));
             }
             Some(("attach", path)) => {
                 let paths = vec![std::path::PathBuf::from(path)];
@@ -4248,12 +4306,30 @@ impl WorkspaceView {
                         p,
                         cx.listener(|_, _, _, cx| theme::toggle_mode(cx)),
                     ))
-                    .child(icon_button(
-                        "settings",
-                        IconName::Settings,
-                        p,
-                        cx.listener(|this, _, _, cx| this.open_settings(cx)),
-                    )),
+                    .child(
+                        div()
+                            .relative()
+                            .child(icon_button(
+                                "settings",
+                                IconName::Settings,
+                                p,
+                                cx.listener(|this, _, _, cx| this.open_settings(cx)),
+                            ))
+                            // An agent has a newer release (Settings ▸ Agents).
+                            .when(self.store.read(cx).any_agent_update(), |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(3.))
+                                        .right(px(3.))
+                                        .size(px(7.))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(p.sidebar)
+                                        .bg(p.accent),
+                                )
+                            }),
+                    ),
             )
             .into_any_element()
     }
