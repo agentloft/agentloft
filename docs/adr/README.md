@@ -23,5 +23,6 @@ Each ADR records one significant decision: its context, the decision, the conseq
 | [0017](0017-streamed-browser.md) | A browser the daemon runs, streamed to the web client | Accepted |
 | [0018](0018-agent-drawn-views.md) | Views agents draw in the chat (`show_ui`) | Proposed |
 | [0019](0019-website-and-cloudflare-tunnel.md) | Open your computers from a website: Cloudflare Tunnel for the connection, Google sign-in for finding them | Accepted |
+| [0020](0020-simulators-and-emulators.md) | iOS simulators and Android emulators, streamed like the browser | Proposed |
 
 To add an ADR, copy the structure of an existing one, use the next number, and add a row to this table.
