@@ -1,0 +1,32 @@
+# Agentloft's website (docs/adr/0019-website-and-cloudflare-tunnel.md).
+# Deploy: CLOUDFLARE_ACCOUNT_ID=<account> npx wrangler@4 deploy
+# Secrets (wrangler secret put): GOOGLE_CLIENT_SECRET, SECRETS_KEY.
+name = "agentloft-cloud"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+routes = [{ pattern = "agentloft.promptanddone.com", custom_domain = true }]
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+# The landing page is index.html (/), the signed-in app app.html (/app);
+# the Worker serves the app page for /link and /m/<id> too.
+not_found_handling = "404-page"
+run_worker_first = ["/api/*", "/auth/*", "/m/*", "/google9485b2468894ad69.html", "/link"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "agentloft-cloud"
+database_id = "bcc2afd5-94bb-4208-a3b6-c9cdea1d1cf4"
+migrations_dir = "migrations"
+
+[vars]
+# Public by nature: it is in every sign-in redirect.
+GOOGLE_CLIENT_ID = "575657614747-etudc209nmtlevb98r3nr125i77lihqt.apps.googleusercontent.com"
+# Comma-separated; empty lets any Google account sign in (each sees only
+# the computers it linked).
+ALLOWED_EMAILS = ""
+
+[observability]
+enabled = true

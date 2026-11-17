@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  macos:
+    name: macOS (full workspace)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # loft-terminal builds libghostty-vt, which needs Zig.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Format
+        run: cargo fmt --all --check
+      # `loft-terminal/test-support`: its view tests run on GPUI's test
+      # platform, which is a feature (crates/loft-terminal/Cargo.toml).
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features loft-terminal/test-support -- -D warnings
+      - name: Test
+        run: cargo test --workspace --features loft-terminal/test-support
+
+  linux-headless:
+    name: Linux (headless crates)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Test headless crates
+        run: >
+          cargo test
+          -p loft-protocol -p loft-config -p loft-store -p loft-git -p loft-harness
+          -p loft-harness-claude -p loft-harness-codex -p loft-core -p loft-client
+          -p loft-docs -p loftd
+
+  # The desktop app and daemon on the other two platforms the releases are
+  # built for (.github/workflows/release.yml).
+  linux-app:
+    name: Linux (app and daemon)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (GPUI)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libfontconfig1-dev libfreetype-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Clippy (app and daemon)
+        run: cargo clippy -p loft-app -p loftd --all-targets -- -D warnings
+
+  windows:
+    name: Windows (app and daemon)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Windows builds are slow (no Linux-speed disk): keep what was
+          # built even when a later step fails.
+          cache-on-failure: true
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Clippy (app and daemon)
+        run: cargo clippy -p loft-app -p loftd --all-targets -- -D warnings
+      - name: Test (config, client, daemon end to end)
+        run: |
+          cargo test -p loft-config -p loft-client --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p loftd --test e2e
+
+  web:
+    name: Web client (wasm32)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # The terminal in the browser is libghostty-vt built for wasm32, which
+      # needs Zig like the native build does.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      # The browser-only code paths (cfg(target_arch = "wasm32")) that the
+      # native clippy run never sees. RUSTC_BOOTSTRAP: see the `web` task in
+      # xtask/src/main.rs.
+      - name: Clippy (wasm32)
+        run: cargo clippy -p loft-web --target wasm32-unknown-unknown -- -D warnings
+        env:
+          RUSTC_BOOTSTRAP: wasm_thread
+          # std's clock panics in the browser: forbidden there (see the file).
+          CLIPPY_CONF_DIR: .config/clippy-wasm
+      # Builds crates/loft-web for wasm32-unknown-unknown and generates the
+      # JS glue into target/web.
+      - name: Build the web bundle
+        run: cargo xtask web
+
+  workspace-hack:
+    name: Dependency features (workspace-hack)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+      # crates/workspace-hack is what `cargo hakari generate` writes for the
+      # dependencies as they are now (.config/hakari.toml says what it is for).
+      - name: workspace-hack is up to date
+        run: cargo hakari generate --diff
+
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

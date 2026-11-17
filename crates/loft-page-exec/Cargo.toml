@@ -1,0 +1,23 @@
+[package]
+name = "loft-page-exec"
+description = "Agents' browser scripts (`browser_execute`): JavaScript in a sandboxed QuickJS that drives a page with the browser commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+loft-page-script.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+# QuickJS (MIT), compiled from C by its build script. Only the daemon's core
+# uses this crate: nothing the web client builds may depend on it.
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
+
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

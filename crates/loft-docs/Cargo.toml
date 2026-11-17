@@ -1,0 +1,25 @@
+[package]
+name = "loft-docs"
+description = "Pure-Rust reading of documents (docx, xlsx/ods/csv, pptx, pdf) into models and pictures a UI can show"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+calamine.workspace = true
+csv.workspace = true
+hayro.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

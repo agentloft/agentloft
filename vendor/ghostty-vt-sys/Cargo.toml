@@ -1,0 +1,48 @@
+[package]
+name = "ghostty-vt-sys"
+description = "Raw FFI bindings for libghostty-vt, built from Ghostty's official source tarball with Zig"
+version = "0.8.0+ghostty.1.4.0-main.83fb956"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/prabirshrestha/gpui-cn"
+rust-version = "1.96"
+publish = false
+readme = "README.md"
+keywords = ["ghostty", "terminal", "vt", "ffi"]
+categories = ["external-ffi-bindings"]
+links = "ghostty-vt"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[features]
+default = []
+pkg-config = ["dep:pkg-config"]
+bindgen-tool = ["dep:bindgen", "dep:heck"]
+
+[dependencies]
+bindgen = { version = "0.72", optional = true }
+heck = { version = "0.5", optional = true }
+
+[build-dependencies]
+flate2 = "1"
+pkg-config = { version = "0.3", optional = true }
+sha2 = "0.10"
+tar = "0.4"
+
+# The download uses the OS TLS stack on macOS and Windows hosts (no C build,
+# no nasm) and rustls with ring on every other host (no OpenSSL headers).
+[target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.build-dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[[bin]]
+name = "gen-bindings"
+path = "tools/gen_bindings.rs"
+required-features = ["bindgen-tool"]
+
+[package.metadata.docs.rs]
+all-features = false

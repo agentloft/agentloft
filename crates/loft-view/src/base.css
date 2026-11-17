@@ -1,0 +1,64 @@
+/* What a view starts from, so plain HTML already looks like part of the app.
+   Everything is in :where(), which weighs nothing: any rule of the page's
+   own wins. Colours and fonts come from the variables in #agentloft-theme. */
+:where(*, *::before, *::after) { box-sizing: border-box; }
+:where(html) {
+  background: var(--bg);
+  color: var(--fg);
+  font: var(--font-size) / 1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+:where(body) { margin: 0; padding: 16px 18px; overflow-wrap: anywhere; }
+:where(h1, h2, h3, h4) { margin: 0 0 0.5em; line-height: 1.25; font-weight: 600; }
+:where(h1) { font-size: 1.45em; }
+:where(h2) { font-size: 1.2em; }
+:where(h3) { font-size: 1.05em; }
+:where(h4) { font-size: 0.95em; color: var(--muted); }
+:where(p, ul, ol, pre, table, blockquote, figure) { margin: 0 0 0.9em; }
+:where(body > :last-child) { margin-bottom: 0; }
+:where(ul, ol) { padding-left: 1.4em; }
+:where(a) { color: var(--accent); text-decoration: none; }
+:where(a:hover) { text-decoration: underline; }
+:where(small, figcaption) { color: var(--muted); font-size: 0.86em; }
+:where(hr) { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
+:where(code, kbd, pre, samp) { font-family: var(--mono); font-size: 0.92em; }
+:where(code) { background: var(--surface); padding: 0.1em 0.35em; border-radius: 5px; }
+:where(pre) { background: var(--surface); padding: 10px 12px; border-radius: 10px; overflow: auto; }
+:where(pre code) { background: none; padding: 0; }
+:where(table) { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+:where(th, td) { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+:where(th) { color: var(--muted); font-weight: 500; font-size: 0.86em; }
+:where(tr:last-child > td) { border-bottom: 0; }
+:where(button, input, select, textarea) { font: inherit; color: inherit; }
+:where(button) {
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+}
+:where(button:hover) { background: var(--surface); }
+:where(button:active) { opacity: 0.8; }
+:where(button:disabled) { opacity: 0.5; cursor: default; }
+:where(button.primary, button[data-primary]) {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--accent-fg);
+}
+:where(button.primary:hover, button[data-primary]:hover) { background: var(--accent); opacity: 0.9; }
+:where(input:not([type]), input[type="text"], input[type="number"], input[type="search"],
+       input[type="email"], input[type="url"], input[type="password"], select, textarea) {
+  padding: 5px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  outline: none;
+}
+:where(input, select, textarea):focus-visible { border-color: var(--accent); }
+:where(button:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+:where(input[type="range"], input[type="checkbox"], input[type="radio"], progress) { accent-color: var(--accent); }
+:where(label) { color: var(--muted); }
+:where(img, svg, canvas, video) { max-width: 100%; }
+:where(::selection) { background: color-mix(in srgb, var(--accent) 30%, transparent); }

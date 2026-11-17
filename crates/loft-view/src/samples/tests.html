@@ -1,0 +1,53 @@
+<style>
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .tile { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .tile small { display: flex; align-items: center; gap: 6px; }
+  .tile b { display: block; font-size: 22px; line-height: 1.3; }
+  .tile i { font-style: normal; font-size: 12px; font-weight: 500; margin-left: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .bars { display: grid; grid-template-columns: max-content 1fr max-content; gap: 8px 12px; align-items: center; margin: 4px 0 14px; }
+  .bar { height: 10px; border-radius: 5px; background: var(--accent); transform-origin: left; animation: grow 0.6s ease-out both; }
+  @keyframes grow { from { transform: scaleX(0); } }
+  .note { display: flex; gap: 10px; padding: 10px 12px; border-radius: 10px; margin: 12px 0;
+          border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+          background: color-mix(in srgb, var(--warning) 9%, transparent); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  h3 { margin-top: 16px; color: var(--muted); font-size: 13px; font-weight: 500; }
+</style>
+
+<div class="tiles">
+  <div class="tile"><small><span class="dot" style="background:var(--success)"></span>Passed</small><b>412<i style="color:var(--success)">+9</i></b><small>since main</small></div>
+  <div class="tile"><small><span class="dot" style="background:var(--danger)"></span>Failed</small><b>3<i style="color:var(--danger)">+3</i></b><small>all in loft-core</small></div>
+  <div class="tile"><small>Skipped</small><b>7</b><small>live agent tests</small></div>
+  <div class="tile"><small>Duration</small><b>48.2s<i style="color:var(--success)">-12%</i></b><small>vs last run</small></div>
+</div>
+
+<h3>Slowest suites</h3>
+<div class="bars" id="bars"></div>
+
+<h3>Failures</h3>
+<table>
+  <tr><th>Test</th><th>Why</th><th style="text-align:right">Time</th></tr>
+  <tr><td>thread::resume_after_restart</td><td>session id not restored</td><td style="text-align:right">912ms</td></tr>
+  <tr><td>worktrees::merge_back_conflict</td><td>expected Conflict, got Ok</td><td style="text-align:right">340ms</td></tr>
+  <tr><td>forks::handoff_digest</td><td>digest is missing the open todos</td><td style="text-align:right">88ms</td></tr>
+</table>
+
+<div class="note">
+  <span>⚠︎</span>
+  <div><b>Two of these share a cause</b><br><code>resume_after_restart</code> and <code>handoff_digest</code> both read the session file before it is flushed.</div>
+</div>
+
+<div class="row">
+  <button class="primary" onclick="agentloft.send('Fix the session-file flush that breaks resume_after_restart and handoff_digest, then re-run the tests.')">Fix the shared cause</button>
+  <button onclick="agentloft.send('Explain why worktrees::merge_back_conflict fails before changing anything.')">Explain merge_back_conflict</button>
+  <button id="copy" onclick="agentloft.copy('cargo test --workspace'); this.textContent = 'Copied ✓'">Copy the command</button>
+</div>
+
+<script>
+  const suites = [["loft-core", 18400], ["loftd", 11200], ["loft-git", 7600], ["loft-ui", 5100], ["loft-store", 3200], ["loft-view", 400]];
+  const max = Math.max(...suites.map(([, ms]) => ms));
+  document.getElementById("bars").innerHTML = suites.map(([name, ms], i) =>
+    `<span>${name}</span><div class="bar" style="width:${Math.max(1, (ms / max) * 100)}%;animation-delay:${i * 60}ms"></div><small>${ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms"}</small>`
+  ).join("");
+</script>

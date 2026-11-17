@@ -1,0 +1,268 @@
+name: Release
+
+# Builds Agentloft for macOS, Windows and Linux.
+# - A tag `v*` publishes the builds as that GitHub release (a tag with a `-`,
+#   like v0.1.0-rc1, as a pre-release).
+# - A push to the `release-test` branch, or running it by hand, builds
+#   everything without publishing: the files are the run's artifacts.
+#
+# What it publishes (the website's download buttons link to these names):
+#   Agentloft-macos-arm64.dmg
+#   Agentloft-windows-x64-setup.exe, Agentloft-windows-x64.zip
+#   Agentloft-linux-x64.tar.gz
+#
+# The browser client (the same on every platform) and each platform's
+# binaries are built at the same time; packaging, which needs both, is quick.
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [release-test]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Web client
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-web
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: cargo xtask web --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: target/web
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS (Apple silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      # The stable bundle (the green icon, data in ~/.agentloft); the web
+      # client goes in when it is packaged.
+      - run: cargo xtask bundle --stable --no-web
+      - run: tar -C target/bundle/stable -cf Agentloft.app.tar Agentloft.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-macos
+          path: Agentloft.app.tar
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          # Windows builds are slow (no Linux-speed disk): keep what was
+          # built even when a later step fails.
+          cache-on-failure: true
+      # libghostty-vt (the terminal) is built with Zig.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: cargo build --release -p loft-app -p loftd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-windows
+          path: |
+            target/release/agentloft.exe
+            target/release/agentloftd.exe
+          if-no-files-found: error
+      # The daemon end to end on Windows (its named pipe, PATH lookups),
+      # reported without holding the release back.
+      - name: Test (config, client, daemon end to end)
+        continue-on-error: true
+        run: |
+          cargo test --release -p loft-config -p loft-client --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --release -p loftd --test e2e
+
+  build-linux:
+    name: Build Linux (x64)
+    # The oldest supported runner: the binaries then run on any distribution
+    # with glibc 2.35 or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (GPUI)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libfontconfig1-dev libfreetype-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+      - name: Install toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: cargo build --release -p loft-app -p loftd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-linux
+          path: |
+            target/release/agentloft
+            target/release/agentloftd
+          if-no-files-found: error
+
+  package-macos:
+    name: Package macOS
+    needs: [web, build-macos]
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: web
+          path: web
+      - name: Disk image
+        run: |
+          mkdir -p dmg
+          tar -C dmg -xf Agentloft.app.tar
+          ditto web dmg/Agentloft.app/Contents/Resources/web
+          # Signed again (ad-hoc) now that the web client is inside.
+          codesign --force --deep --sign - dmg/Agentloft.app
+          ln -s /Applications dmg/Applications
+          mkdir -p dist
+          hdiutil create -volname Agentloft -srcfolder dmg -ov -format UDZO dist/Agentloft-macos-arm64.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/Agentloft-macos-arm64.dmg
+          if-no-files-found: error
+
+  package-windows:
+    name: Package Windows
+    needs: [web, build-windows]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-windows
+          path: dist/Agentloft
+      - uses: actions/download-artifact@v4
+        with:
+          name: web
+          path: dist/Agentloft/web
+      - name: Zip
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md dist/Agentloft/
+          Compress-Archive -Path dist/Agentloft -DestinationPath dist/Agentloft-windows-x64.zip
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          # [workspace.package] version in Cargo.toml.
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$PWD\dist\Agentloft" "/DOutputDir=$PWD\dist" packaging/windows/agentloft.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/Agentloft-windows-x64-setup.exe
+            dist/Agentloft-windows-x64.zip
+          if-no-files-found: error
+
+  package-linux:
+    name: Package Linux
+    needs: [web, build-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-linux
+          path: dist/agentloft/bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: web
+          path: dist/agentloft/web
+      - name: Package
+        run: |
+          d=dist/agentloft
+          chmod +x $d/bin/*
+          mkdir -p $d/share/applications
+          cp packaging/linux/dev.agentloft.Agentloft.desktop $d/share/applications/
+          for s in 16 24 32 48 64 128 256 512; do
+            mkdir -p $d/share/icons/hicolor/${s}x${s}/apps
+            cp assets/icon/png/agentloft-$s.png $d/share/icons/hicolor/${s}x${s}/apps/dev.agentloft.Agentloft.png
+          done
+          cp packaging/linux/install.sh LICENSE THIRD_PARTY_NOTICES.md $d/
+          tar -C dist -czf dist/Agentloft-linux-x64.tar.gz agentloft
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/Agentloft-linux-x64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [package-macos, package-windows, package-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "{macos,windows,linux}"
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -la dist
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          cat > notes.md <<'EOF'
+          Agentloft for macOS (Apple silicon), Windows (x64) and Linux (x64). Early preview builds, not yet signed.
+
+          - **macOS:** open the .dmg and drag Agentloft to Applications. The first time, right-click the app and choose Open (or allow it in System Settings ▸ Privacy & Security).
+          - **Windows:** run the setup .exe (no administrator rights needed). SmartScreen may warn about an unrecognised app: choose More info ▸ Run anyway. The .zip is the same app without an installer.
+          - **Linux:** extract the .tar.gz and run `./agentloft/install.sh` (installs to ~/.local), or run `agentloft/bin/agentloft` in place.
+
+          Agentloft runs the coding agents you have installed (Claude Code, Codex, ACP agents): install and sign in to at least one first.
+          EOF
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "Agentloft $TAG" --notes-file notes.md $prerelease

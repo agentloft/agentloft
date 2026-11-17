@@ -1,0 +1,44 @@
+<style>
+  .options { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .option { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
+            transition: border-color 0.15s, transform 0.15s; }
+  .option:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .option h3 { margin: 0; }
+  .option p { margin: 0; flex: 1; font-size: 13px; }
+  .tags { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag { font-size: 11.5px; font-weight: 500; padding: 1px 8px; border-radius: 99px; background: var(--surface); color: var(--muted); }
+  .tag.good { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--fg); }
+  .tag.warn { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--fg); }
+  .more { margin-top: 12px; border: 0; color: var(--muted); }
+</style>
+
+<div class="options">
+  <div class="option">
+    <h3>Index on write</h3>
+    <div class="tags"><span class="tag good">Fastest reads</span><span class="tag">~2 days</span></div>
+    <p>Keep an FTS5 index current as items arrive. Reads drop to <b>~4 ms</b>; writes cost a little more.</p>
+    <button class="primary" data-say="Go with indexing on write (FTS5).">Go with this</button>
+  </div>
+  <div class="option">
+    <h3>Cache results</h3>
+    <div class="tags"><span class="tag good">Smallest change</span><span class="tag">~3 hours</span></div>
+    <p>Remember the last 200 queries. Repeats are instant; first searches stay at <b>~180 ms</b>.</p>
+    <button data-say="Go with caching recent search results.">Go with this</button>
+  </div>
+  <div class="option">
+    <h3>Search in a worker</h3>
+    <div class="tags"><span class="tag warn">No speedup</span><span class="tag">~1 day</span></div>
+    <p>Move the scan off the main thread. Just as slow, but typing never stutters.</p>
+    <button data-say="Go with moving search into a worker.">Go with this</button>
+  </div>
+</div>
+<button class="more" data-say="Compare the three search approaches in more depth before I pick.">Compare them in more depth first</button>
+
+<script>
+  document.addEventListener("click", (e) => {
+    const say = e.target.dataset && e.target.dataset.say;
+    if (!say) return;
+    agentloft.send(say);
+    e.target.textContent = "Sent ✓";
+  });
+</script>

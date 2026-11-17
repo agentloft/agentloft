@@ -1,0 +1,8 @@
+{
+  "manifest_version": 3,
+  "name": "Agentloft sound",
+  "description": "Mutes every tab of Agentloft's browser except those Agentloft says someone is listening to.",
+  "version": "1",
+  "permissions": ["debugger", "storage"],
+  "background": { "service_worker": "worker.js" }
+}

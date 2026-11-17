@@ -1,0 +1,4 @@
+target
+.dev-home
+.git
+**/node_modules

@@ -1,0 +1,43 @@
+# Dependency policy (ADR-0009): permissive licenses only; no GPL/LGPL/AGPL.
+[graph]
+all-features = false
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "BSL-1.0",
+  "MPL-2.0",
+  "OFL-1.1",
+  "Unlicense",
+  "0BSD",
+  "CDLA-Permissive-2.0",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[advisories]
+# Unmaintained notices for GPUI's transitive deps aren't actionable here;
+# only flag crates we depend on directly. Vulnerabilities always fail.
+unmaintained = "workspace"
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

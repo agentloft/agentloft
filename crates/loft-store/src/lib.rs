@@ -1,0 +1,1045 @@
+//! SQLite persistence (ADR-0006).
+//!
+//! Domain events are appended to `events` and applied to projection tables in
+//! the same transaction. Projections store the serialized entity in `data` plus
+//! a few indexed columns, so the wire model stays the single source of shape.
+
+use anyhow::{Context as _, Result};
+use loft_protocol::{
+    Automation, AutomationId, Event, EventEnvelope, Item, ItemId, Project, ProjectId,
+    RuntimeRequest, Thread, ThreadId, Turn,
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MIGRATIONS: &[&str] = &[
+    // 1: initial schema
+    r#"
+    CREATE TABLE events (
+        seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT,
+        at_ms     INTEGER NOT NULL,
+        type      TEXT NOT NULL,
+        payload   TEXT NOT NULL
+    );
+    CREATE INDEX events_thread ON events(thread_id, seq);
+
+    CREATE TABLE projects (
+        id            TEXT PRIMARY KEY,
+        root_path     TEXT NOT NULL UNIQUE,
+        created_at_ms INTEGER NOT NULL,
+        data          TEXT NOT NULL
+    );
+    CREATE TABLE threads (
+        id            TEXT PRIMARY KEY,
+        project_id    TEXT NOT NULL REFERENCES projects(id),
+        updated_at_ms INTEGER NOT NULL,
+        data          TEXT NOT NULL
+    );
+    CREATE INDEX threads_project ON threads(project_id);
+    CREATE TABLE turns (
+        id        TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        ordinal   INTEGER NOT NULL,
+        data      TEXT NOT NULL
+    );
+    CREATE INDEX turns_thread ON turns(thread_id, ordinal);
+    CREATE TABLE items (
+        id        TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        ordinal   INTEGER NOT NULL,
+        data      TEXT NOT NULL
+    );
+    CREATE INDEX items_thread ON items(thread_id, ordinal);
+    CREATE TABLE requests (
+        id        TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        data      TEXT NOT NULL
+    );
+    CREATE INDEX requests_thread ON requests(thread_id);
+    CREATE TABLE processes (
+        pid           INTEGER PRIMARY KEY,
+        started_at_ms INTEGER NOT NULL,
+        kind          TEXT NOT NULL,
+        thread_id     TEXT
+    );
+    "#,
+    // 2: what views remember (`agentloft.setState`, ADR-0018). Not an
+    // event: nobody needs its history, only its latest value.
+    r#"
+    CREATE TABLE view_state (
+        thread_id     TEXT NOT NULL,
+        item_id       TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        data          TEXT NOT NULL,
+        PRIMARY KEY (thread_id, item_id)
+    );
+    "#,
+    // 3: automations (prompts run on a schedule).
+    r#"
+    CREATE TABLE automations (
+        id            TEXT PRIMARY KEY,
+        created_at_ms INTEGER NOT NULL,
+        data          TEXT NOT NULL
+    );
+    "#,
+    // 4: each thread's queue (messages waiting for the running turn to end).
+    r#"
+    CREATE TABLE queues (
+        thread_id TEXT PRIMARY KEY,
+        data      TEXT NOT NULL
+    );
+    "#,
+];
+
+pub struct Store {
+    conn: Connection,
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+impl Store {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        Self::init(conn)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Self> {
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;",
+        )?;
+        let mut store = Self { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    fn migrate(&mut self) -> Result<()> {
+        let version: usize =
+            self.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
+            let tx = self.conn.transaction()?;
+            tx.execute_batch(sql)
+                .with_context(|| format!("migration {}", i + 1))?;
+            tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+            tx.commit()?;
+            tracing::info!(version = i + 1, "applied migration");
+        }
+        Ok(())
+    }
+
+    /// Online backup (`VACUUM INTO`), taken before upgrades.
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        self.conn
+            .execute("VACUUM INTO ?1", params![dest.to_string_lossy()])?;
+        Ok(())
+    }
+
+    // -- writes -------------------------------------------------------------
+
+    /// Append events and apply them to projections atomically.
+    pub fn commit(&mut self, events: Vec<Event>) -> Result<Vec<EventEnvelope>> {
+        let tx = self.conn.transaction()?;
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            let at_ms = now_ms();
+            let payload = logged(&tx, &event)?;
+            tx.execute(
+                "INSERT INTO events(thread_id, at_ms, type, payload) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    event.thread_id().map(|t| t.as_str()),
+                    at_ms,
+                    event_type(&event),
+                    payload
+                ],
+            )?;
+            let seq = tx.last_insert_rowid() as u64;
+            // A queue update says the whole queue: the ones before it tell
+            // a reader catching up nothing (and each holds every message).
+            if let Event::QueueUpdated { thread_id, .. } = &event {
+                tx.execute(
+                    "DELETE FROM events
+                     WHERE thread_id = ?1 AND type = 'queue_updated' AND seq < ?2",
+                    params![thread_id.as_str(), seq as i64],
+                )?;
+            }
+            apply(&tx, &event)?;
+            out.push(EventEnvelope { seq, at_ms, event });
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Projection-only update for a streaming item (no event appended).
+    pub fn snapshot_item(&mut self, item: &Item) -> Result<()> {
+        upsert_item(&self.conn, item)
+    }
+
+    pub fn record_process(&self, pid: u32, kind: &str, thread_id: Option<&ThreadId>) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO processes(pid, started_at_ms, kind, thread_id) VALUES (?1, ?2, ?3, ?4)",
+            params![pid, now_ms(), kind, thread_id.map(|t| t.as_str())],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_process(&self, pid: u32) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM processes WHERE pid = ?1", params![pid])?;
+        Ok(())
+    }
+
+    /// Keep what a view asked to remember (its latest value only).
+    pub fn set_view_state(
+        &self,
+        thread: &ThreadId,
+        item: &loft_protocol::ItemId,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO view_state(thread_id, item_id, updated_at_ms, data) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id, item_id) DO UPDATE SET
+                 updated_at_ms = excluded.updated_at_ms, data = excluded.data",
+            params![thread.as_str(), item.as_str(), now_ms(), json(state)?],
+        )?;
+        Ok(())
+    }
+
+    /// What a view remembered, if anything.
+    pub fn view_state(
+        &self,
+        thread: &ThreadId,
+        item: &loft_protocol::ItemId,
+    ) -> Result<Option<serde_json::Value>> {
+        let data: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM view_state WHERE thread_id = ?1 AND item_id = ?2",
+                params![thread.as_str(), item.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+    }
+
+    pub fn processes(&self) -> Result<Vec<(u32, String)>> {
+        let mut stmt = self.conn.prepare("SELECT pid, kind FROM processes")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    // -- reads --------------------------------------------------------------
+
+    pub fn max_seq(&self) -> Result<u64> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))?;
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
+    pub fn projects(&self) -> Result<Vec<Project>> {
+        self.query_data("SELECT data FROM projects ORDER BY created_at_ms", [])
+    }
+
+    pub fn project(&self, id: &ProjectId) -> Result<Option<Project>> {
+        self.query_one("SELECT data FROM projects WHERE id = ?1", [id.as_str()])
+    }
+
+    pub fn project_by_path(&self, root_path: &str) -> Result<Option<Project>> {
+        self.query_one(
+            "SELECT data FROM projects WHERE root_path = ?1",
+            [root_path],
+        )
+    }
+
+    /// Every turn that reported what it used, oldest first.
+    pub fn turns_with_usage(&self) -> Result<Vec<Turn>> {
+        self.query_data(
+            "SELECT data FROM turns WHERE json_extract(data, '$.usage') IS NOT NULL \
+             ORDER BY json_extract(data, '$.started_at_ms')",
+            [],
+        )
+    }
+
+    /// Every automation, oldest first.
+    pub fn automations(&self) -> Result<Vec<Automation>> {
+        self.query_data("SELECT data FROM automations ORDER BY created_at_ms", [])
+    }
+
+    pub fn automation(&self, id: &AutomationId) -> Result<Option<Automation>> {
+        self.query_one("SELECT data FROM automations WHERE id = ?1", [id.as_str()])
+    }
+
+    pub fn threads(&self) -> Result<Vec<Thread>> {
+        self.query_data("SELECT data FROM threads ORDER BY updated_at_ms DESC", [])
+    }
+
+    pub fn thread(&self, id: &ThreadId) -> Result<Option<Thread>> {
+        self.query_one("SELECT data FROM threads WHERE id = ?1", [id.as_str()])
+    }
+
+    pub fn turns(&self, thread: &ThreadId) -> Result<Vec<Turn>> {
+        self.query_data(
+            "SELECT data FROM turns WHERE thread_id = ?1 ORDER BY ordinal",
+            [thread.as_str()],
+        )
+    }
+
+    pub fn items(&self, thread: &ThreadId) -> Result<Vec<Item>> {
+        self.query_data(
+            "SELECT data FROM items WHERE thread_id = ?1 ORDER BY ordinal",
+            [thread.as_str()],
+        )
+    }
+
+    /// One item of a thread, by id.
+    pub fn item(&self, thread: &ThreadId, id: &ItemId) -> Result<Option<Item>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT data FROM items WHERE id = ?1 AND thread_id = ?2")?;
+        let data: Option<String> = stmt
+            .query_row([id.as_str(), thread.as_str()], |r| r.get(0))
+            .optional()?;
+        data.map(|d| serde_json::from_str(&d).map_err(Into::into))
+            .transpose()
+    }
+
+    /// A thread's items from the newest back, one at a time, until `pick`
+    /// takes one: "the last …" without reading the whole thread.
+    pub fn find_item_newest_first<T>(
+        &self,
+        thread: &ThreadId,
+        mut pick: impl FnMut(Item) -> Option<T>,
+    ) -> Result<Option<T>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT data FROM items WHERE thread_id = ?1 ORDER BY ordinal DESC")?;
+        let mut rows = stmt.query([thread.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let item: Item = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+            if let Some(found) = pick(item) {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// When any of a thread's items last changed.
+    pub fn last_item_update_ms(&self, thread: &ThreadId) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT MAX(json_extract(data, '$.updated_at_ms')) FROM items WHERE thread_id = ?1",
+        )?;
+        Ok(stmt.query_row([thread.as_str()], |r| r.get(0))?)
+    }
+
+    /// Messages (yours and the agent's) whose stored form mentions `text`
+    /// (case-insensitive for ASCII), in timeline order per thread. A coarse
+    /// prefilter: callers check the text itself. Only messages are read out:
+    /// tool calls match most short searches and hold most of the bytes.
+    pub fn messages_mentioning(&self, text: &str) -> Result<Vec<Item>> {
+        // Match the text as it appears inside the JSON (quotes, newlines
+        // and backslashes are escaped there), as a literal LIKE pattern.
+        let json = serde_json::to_string(text)?;
+        let inner = &json[1..json.len() - 1];
+        let mut pattern = String::from("%");
+        for c in inner.chars() {
+            if matches!(c, '%' | '_' | '|') {
+                pattern.push('|');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        self.query_data(
+            "SELECT data FROM items WHERE data LIKE ?1 ESCAPE '|'
+               AND json_extract(data, '$.body.kind') IN ('user_message', 'assistant_message')
+             ORDER BY thread_id, ordinal",
+            [pattern],
+        )
+    }
+
+    pub fn requests(&self, thread: &ThreadId) -> Result<Vec<RuntimeRequest>> {
+        self.query_data(
+            "SELECT data FROM requests WHERE thread_id = ?1",
+            [thread.as_str()],
+        )
+    }
+
+    /// The messages waiting in a thread's queue, in order.
+    pub fn queue(&self, thread: &ThreadId) -> Result<Vec<loft_protocol::QueuedMessage>> {
+        Ok(self
+            .query_one(
+                "SELECT data FROM queues WHERE thread_id = ?1",
+                [thread.as_str()],
+            )?
+            .unwrap_or_default())
+    }
+
+    /// All turns that were left running (crash recovery).
+    pub fn running_turns(&self) -> Result<Vec<Turn>> {
+        self.query_data(
+            "SELECT data FROM turns WHERE json_extract(data, '$.status') = 'running'",
+            [],
+        )
+    }
+
+    pub fn open_requests(&self) -> Result<Vec<RuntimeRequest>> {
+        self.query_data(
+            "SELECT data FROM requests WHERE json_extract(data, '$.status') = 'open'",
+            [],
+        )
+    }
+
+    pub fn in_progress_items(&self) -> Result<Vec<Item>> {
+        self.query_data(
+            "SELECT data FROM items WHERE json_extract(data, '$.status') = 'in_progress'",
+            [],
+        )
+    }
+
+    pub fn next_item_ordinal(&self, thread: &ThreadId) -> Result<u64> {
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT MAX(ordinal) FROM items WHERE thread_id = ?1",
+            [thread.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(max.map(|m| m as u64 + 1).unwrap_or(0))
+    }
+
+    pub fn next_turn_ordinal(&self, thread: &ThreadId) -> Result<u32> {
+        let max: Option<i64> = self.conn.query_row(
+            "SELECT MAX(ordinal) FROM turns WHERE thread_id = ?1",
+            [thread.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(max.map(|m| m as u32 + 1).unwrap_or(1))
+    }
+
+    /// Events after `seq`, optionally limited to one thread: as they were
+    /// committed, whatever the log left out to say them in less (see
+    /// [`logged`]).
+    pub fn events_after(&self, seq: u64, thread: Option<&ThreadId>) -> Result<Vec<EventEnvelope>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, at_ms, payload FROM events
+             WHERE seq > ?1 AND (?2 IS NULL OR thread_id = ?2) ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![seq as i64, thread.map(|t| t.as_str())], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        // Each thread's commands as of the events read so far.
+        let mut commands: std::collections::HashMap<ThreadId, Commands> = Default::default();
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, at_ms, payload) = row?;
+            let logged: serde_json::Value = serde_json::from_str(&payload)?;
+            let as_before = logged.get(COMMANDS).and_then(|c| c.as_str()) == Some(AS_BEFORE);
+            let mut event: Event = serde_json::from_value(logged)?;
+            if let Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } = &mut event {
+                if as_before {
+                    let (names, info) = match commands.get(&thread.id) {
+                        Some(known) => known.clone(),
+                        None => self.commands_before(&thread.id, seq)?,
+                    };
+                    thread.slash_commands = names;
+                    thread.command_info = info;
+                }
+                commands.insert(
+                    thread.id.clone(),
+                    (thread.slash_commands.clone(), thread.command_info.clone()),
+                );
+            }
+            out.push(EventEnvelope {
+                seq: seq as u64,
+                at_ms,
+                event,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A thread's commands as the log had them just before event `seq`:
+    /// those of the last event of the thread's that spelled them out.
+    fn commands_before(&self, thread: &ThreadId, seq: i64) -> Result<Commands> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM events
+                 WHERE thread_id = ?1 AND seq < ?2
+                   AND type IN ('thread_created', 'thread_updated')
+                   AND json_extract(payload, '$.commands') IS NULL
+                 ORDER BY seq DESC LIMIT 1",
+                params![thread.as_str(), seq],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(
+            match payload.map(|p| serde_json::from_str(&p)).transpose()? {
+                Some(Event::ThreadCreated { thread } | Event::ThreadUpdated { thread }) => {
+                    (thread.slash_commands, thread.command_info)
+                }
+                _ => Default::default(),
+            },
+        )
+    }
+
+    fn query_data<T: DeserializeOwned, P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        p: P,
+    ) -> Result<Vec<T>> {
+        let mut stmt = self.conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(p, |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    fn query_one<T: DeserializeOwned, P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        p: P,
+    ) -> Result<Option<T>> {
+        let data: Option<String> = self.conn.query_row(sql, p, |r| r.get(0)).optional()?;
+        data.map(|d| serde_json::from_str(&d).map_err(Into::into))
+            .transpose()
+    }
+}
+
+/// A thread's commands: their names, and what each does.
+type Commands = (Vec<String>, Vec<loft_protocol::SlashCommandInfo>);
+
+/// In a logged thread update, in place of the thread's commands: they are
+/// what they were. (`"commands": "as_before"` beside `"thread"`.)
+const COMMANDS: &str = "commands";
+const AS_BEFORE: &str = "as_before";
+
+/// An event as the log keeps it.
+///
+/// A thread carries its agent's commands with their descriptions, about
+/// 26 KB of it, and is logged whole every time anything about it changes: a
+/// status, a title, a draft saved after each pause in typing. In one real
+/// database that was 2,784 updates, 18 of which changed the commands, and
+/// 72 of the file's 113 MB. An update that leaves the commands as they were
+/// is logged without them and says so; [`Store::events_after`] puts them
+/// back. Projections and what subscribers are sent have the whole thread, as
+/// before.
+fn logged(conn: &Connection, event: &Event) -> Result<String> {
+    if let Event::ThreadUpdated { thread } = event
+        && !(thread.slash_commands.is_empty() && thread.command_info.is_empty())
+    {
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT data FROM threads WHERE id = ?1",
+                [thread.id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let before: Option<Thread> = before.and_then(|data| serde_json::from_str(&data).ok());
+        if before.is_some_and(|b| {
+            b.slash_commands == thread.slash_commands && b.command_info == thread.command_info
+        }) {
+            let mut bare = serde_json::to_value(Event::ThreadUpdated {
+                thread: thread.without_commands(),
+            })?;
+            bare[COMMANDS] = AS_BEFORE.into();
+            return Ok(serde_json::to_string(&bare)?);
+        }
+    }
+    Ok(serde_json::to_string(event)?)
+}
+
+fn event_type(event: &Event) -> &'static str {
+    match event {
+        Event::ProjectAdded { .. } => "project_added",
+        Event::ProjectUpdated { .. } => "project_updated",
+        Event::ProjectRemoved { .. } => "project_removed",
+        Event::ThreadCreated { .. } => "thread_created",
+        Event::ThreadUpdated { .. } => "thread_updated",
+        Event::TurnStarted { .. } => "turn_started",
+        Event::TurnUpdated { .. } => "turn_updated",
+        Event::ItemUpserted { .. } => "item_upserted",
+        Event::RequestOpened { .. } => "request_opened",
+        Event::RequestUpdated { .. } => "request_updated",
+        Event::ThreadDeleted { .. } => "thread_deleted",
+        Event::QueueUpdated { .. } => "queue_updated",
+        Event::AutomationUpdated { .. } => "automation_updated",
+        Event::AutomationDeleted { .. } => "automation_deleted",
+    }
+}
+
+fn json<T: Serialize>(v: &T) -> rusqlite::Result<String> {
+    serde_json::to_string(v).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+/// Apply one event to the projection tables.
+fn apply(conn: &Connection, event: &Event) -> Result<()> {
+    match event {
+        Event::ProjectAdded { project } => {
+            conn.execute(
+                "INSERT INTO projects(id, root_path, created_at_ms, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    project.id.as_str(),
+                    project.root_path,
+                    project.created_at_ms,
+                    json(project)?
+                ],
+            )?;
+        }
+        Event::ProjectUpdated { project } => {
+            conn.execute(
+                "UPDATE projects SET data = ?2 WHERE id = ?1",
+                params![project.id.as_str(), json(project)?],
+            )?;
+        }
+        Event::ProjectRemoved { project_id } => {
+            conn.execute(
+                "DELETE FROM projects WHERE id = ?1",
+                params![project_id.as_str()],
+            )?;
+        }
+        Event::ThreadCreated { thread } | Event::ThreadUpdated { thread } => {
+            conn.execute(
+                "INSERT INTO threads(id, project_id, updated_at_ms, data) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms, data = excluded.data",
+                params![thread.id.as_str(), thread.project_id.as_str(), thread.updated_at_ms, json(thread)?],
+            )?;
+        }
+        Event::TurnStarted { turn } | Event::TurnUpdated { turn } => {
+            conn.execute(
+                "INSERT INTO turns(id, thread_id, ordinal, data) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                params![
+                    turn.id.as_str(),
+                    turn.thread_id.as_str(),
+                    turn.ordinal,
+                    json(turn)?
+                ],
+            )?;
+        }
+        Event::ItemUpserted { item } => upsert_item(conn, item)?,
+        Event::ThreadDeleted { thread_id } => {
+            let id = thread_id.as_str();
+            for sql in [
+                "DELETE FROM items WHERE thread_id = ?1",
+                "DELETE FROM turns WHERE thread_id = ?1",
+                "DELETE FROM requests WHERE thread_id = ?1",
+                "DELETE FROM view_state WHERE thread_id = ?1",
+                "DELETE FROM queues WHERE thread_id = ?1",
+                "DELETE FROM threads WHERE id = ?1",
+                // The log keeps only the deletion itself.
+                "DELETE FROM events WHERE thread_id = ?1 AND type != 'thread_deleted'",
+            ] {
+                conn.execute(sql, params![id])?;
+            }
+        }
+        Event::RequestOpened { request } | Event::RequestUpdated { request } => {
+            conn.execute(
+                "INSERT INTO requests(id, thread_id, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                params![
+                    request.id.as_str(),
+                    request.thread_id.as_str(),
+                    json(request)?
+                ],
+            )?;
+        }
+        Event::QueueUpdated { thread_id, queue } => {
+            if queue.is_empty() {
+                conn.execute(
+                    "DELETE FROM queues WHERE thread_id = ?1",
+                    params![thread_id.as_str()],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO queues(thread_id, data) VALUES (?1, ?2)
+                     ON CONFLICT(thread_id) DO UPDATE SET data = excluded.data",
+                    params![thread_id.as_str(), json(queue)?],
+                )?;
+            }
+        }
+        Event::AutomationUpdated { automation } => {
+            conn.execute(
+                "INSERT INTO automations(id, created_at_ms, data) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                params![
+                    automation.id.as_str(),
+                    automation.created_at_ms,
+                    json(automation)?
+                ],
+            )?;
+        }
+        Event::AutomationDeleted { automation_id } => {
+            conn.execute(
+                "DELETE FROM automations WHERE id = ?1",
+                params![automation_id.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn upsert_item(conn: &Connection, item: &Item) -> Result<()> {
+    conn.execute(
+        "INSERT INTO items(id, thread_id, ordinal, data) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+        params![
+            item.id.as_str(),
+            item.thread_id.as_str(),
+            item.ordinal as i64,
+            json(item)?
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loft_protocol::*;
+
+    fn project() -> Project {
+        Project {
+            id: ProjectId::new(),
+            name: "p".into(),
+            root_path: "/tmp/p".into(),
+            created_at_ms: 1,
+            defaults: Default::default(),
+            icon: None,
+        }
+    }
+
+    fn thread(project: &Project) -> Thread {
+        Thread {
+            id: ThreadId::new(),
+            project_id: project.id.clone(),
+            title: "t".into(),
+            harness: HarnessId::claude(),
+            cwd: project.root_path.clone(),
+            model: None,
+            permission_mode: None,
+            effort: None,
+            native_session_id: None,
+            status: ThreadStatus::Idle,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            workspace: Default::default(),
+            parent: None,
+            slash_commands: Vec::new(),
+            command_info: Vec::new(),
+            started_at_ms: None,
+            draft: None,
+            waiting_on: Vec::new(),
+            limit: None,
+            automation_id: None,
+            pull_request: None,
+            landed: false,
+            suggestion: None,
+            handover: None,
+        }
+    }
+
+    #[test]
+    fn commit_applies_projections_and_assigns_seq() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let mut t = thread(&p);
+        let env = store
+            .commit(vec![
+                Event::ProjectAdded { project: p.clone() },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        assert_eq!(env.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        t.status = ThreadStatus::Running;
+        store
+            .commit(vec![Event::ThreadUpdated { thread: t.clone() }])
+            .unwrap();
+
+        assert_eq!(store.projects().unwrap(), vec![p.clone()]);
+        assert_eq!(
+            store.thread(&t.id).unwrap().unwrap().status,
+            ThreadStatus::Running
+        );
+        assert_eq!(store.project_by_path("/tmp/p").unwrap().unwrap().id, p.id);
+        assert_eq!(store.max_seq().unwrap(), 3);
+        assert_eq!(store.events_after(1, Some(&t.id)).unwrap().len(), 2);
+        assert_eq!(store.events_after(0, None).unwrap().len(), 3);
+    }
+
+    /// A thread whose agent has commands worth not repeating.
+    fn thread_with_commands(project: &Project, described: &str) -> Thread {
+        let mut t = thread(project);
+        t.slash_commands = vec!["help".into(), "compact".into()];
+        t.command_info = vec![
+            SlashCommandInfo {
+                name: "help".into(),
+                description: described.into(),
+                ..Default::default()
+            },
+            SlashCommandInfo {
+                name: "compact".into(),
+                description: "Summarize the conversation so far".into(),
+                ..Default::default()
+            },
+        ];
+        t
+    }
+
+    fn logged_payloads(store: &Store) -> Vec<String> {
+        store
+            .conn
+            .prepare("SELECT payload FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn the_log_says_a_threads_commands_once_and_reads_back_whole() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let mut t = thread_with_commands(&p, "What you can do here");
+        let mut committed = store
+            .commit(vec![
+                Event::ProjectAdded { project: p.clone() },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        // Two updates that leave the commands alone, one that changes
+        // them, one more that doesn't (two of them in one commit).
+        t.status = ThreadStatus::Running;
+        committed.extend(
+            store
+                .commit(vec![Event::ThreadUpdated { thread: t.clone() }])
+                .unwrap(),
+        );
+        t.draft = Some("half a thought".into());
+        committed.extend(
+            store
+                .commit(vec![Event::ThreadUpdated { thread: t.clone() }])
+                .unwrap(),
+        );
+        t.command_info[0].description = "Something else entirely".into();
+        let changed = t.clone();
+        t.status = ThreadStatus::Idle;
+        committed.extend(
+            store
+                .commit(vec![
+                    Event::ThreadUpdated { thread: changed },
+                    Event::ThreadUpdated { thread: t.clone() },
+                ])
+                .unwrap(),
+        );
+
+        // In the log: spelled out when the thread is made and when they
+        // change, and not otherwise.
+        let payloads = logged_payloads(&store);
+        let spelled: Vec<bool> = payloads[1..]
+            .iter()
+            .map(|p| p.contains("Summarize the conversation"))
+            .collect();
+        assert_eq!(spelled, [true, false, false, true, false], "{payloads:#?}");
+        assert!(payloads[2].contains(r#""commands":"as_before""#));
+        assert!(payloads[2].contains("running"));
+
+        // Read back: every event as it was committed.
+        assert_eq!(store.events_after(0, None).unwrap(), committed);
+        assert_eq!(store.events_after(0, Some(&t.id)).unwrap(), committed[1..]);
+        // From the middle too, where the first event read is one that
+        // leaves the commands out: before the change, and after it.
+        for from in 2..committed.len() {
+            assert_eq!(
+                store.events_after(from as u64, Some(&t.id)).unwrap(),
+                committed[from..],
+                "from {from}"
+            );
+        }
+        // The thread itself (what the app is given) always has them.
+        assert_eq!(store.thread(&t.id).unwrap().unwrap(), t);
+    }
+
+    #[test]
+    fn a_log_written_before_commands_were_left_out_still_reads() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let mut t = thread_with_commands(&p, "As it was written then");
+        store
+            .commit(vec![
+                Event::ProjectAdded { project: p.clone() },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        // An update logged whole, as every update used to be.
+        t.status = ThreadStatus::Running;
+        let whole = Event::ThreadUpdated { thread: t.clone() };
+        store
+            .conn
+            .execute(
+                "INSERT INTO events(thread_id, at_ms, type, payload) VALUES (?1, 5, 'thread_updated', ?2)",
+                params![t.id.as_str(), serde_json::to_string(&whole).unwrap()],
+            )
+            .unwrap();
+        // And one from now, on top of it.
+        apply(&store.conn, &whole).unwrap();
+        t.status = ThreadStatus::Idle;
+        let now = Event::ThreadUpdated { thread: t.clone() };
+        store.commit(vec![now.clone()]).unwrap();
+
+        let events: Vec<Event> = store
+            .events_after(2, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        assert_eq!(events, [whole, now]);
+    }
+
+    #[test]
+    fn running_turn_queries() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let t = thread(&p);
+        let turn = Turn {
+            id: TurnId::new(),
+            thread_id: t.id.clone(),
+            ordinal: store.next_turn_ordinal(&t.id).unwrap(),
+            status: TurnStatus::Running,
+            started_at_ms: 1,
+            ended_at_ms: None,
+            usage: None,
+            error: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            native_turn: None,
+            changes: None,
+            context: None,
+            model: None,
+        };
+        store
+            .commit(vec![
+                Event::ProjectAdded { project: p },
+                Event::ThreadCreated { thread: t.clone() },
+                Event::TurnStarted { turn: turn.clone() },
+            ])
+            .unwrap();
+        assert_eq!(turn.ordinal, 1);
+        assert_eq!(store.running_turns().unwrap().len(), 1);
+        assert_eq!(store.next_turn_ordinal(&t.id).unwrap(), 2);
+    }
+
+    #[test]
+    fn reopening_keeps_data_and_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .commit(vec![Event::ProjectAdded { project: project() }])
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.projects().unwrap().len(), 1);
+        store.backup_to(&dir.path().join("backup.sqlite")).unwrap();
+    }
+
+    #[test]
+    fn views_remember_until_their_thread_goes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project, item) = (project(), ItemId::new());
+        let thread = thread(&project);
+        store
+            .commit(vec![
+                Event::ProjectAdded {
+                    project: project.clone(),
+                },
+                Event::ThreadCreated {
+                    thread: thread.clone(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), None);
+        let first = serde_json::json!({ "seats": 12 });
+        store.set_view_state(&thread.id, &item, &first).unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), Some(first));
+        // Only the latest is kept.
+        let second = serde_json::json!({ "seats": 57, "tier": "scale" });
+        store.set_view_state(&thread.id, &item, &second).unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), Some(second));
+        assert_eq!(store.view_state(&thread.id, &ItemId::new()).unwrap(), None);
+        store
+            .commit(vec![Event::ThreadDeleted {
+                thread_id: thread.id.clone(),
+            }])
+            .unwrap();
+        assert_eq!(store.view_state(&thread.id, &item).unwrap(), None);
+    }
+
+    #[test]
+    fn a_queue_is_kept_as_it_last_was() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = project();
+        let t = thread(&p);
+        store
+            .commit(vec![
+                Event::ProjectAdded { project: p },
+                Event::ThreadCreated { thread: t.clone() },
+            ])
+            .unwrap();
+        assert!(store.queue(&t.id).unwrap().is_empty());
+        let message = |id: u64, text: &str| loft_protocol::QueuedMessage {
+            id,
+            text: text.into(),
+            attachments: vec![],
+            queued_at_ms: 1,
+        };
+        let update = |queue: Vec<loft_protocol::QueuedMessage>| Event::QueueUpdated {
+            thread_id: t.id.clone(),
+            queue,
+        };
+        store.commit(vec![update(vec![message(1, "a")])]).unwrap();
+        let two = vec![message(1, "a"), message(2, "b")];
+        store.commit(vec![update(two.clone())]).unwrap();
+        assert_eq!(store.queue(&t.id).unwrap(), two);
+        // The log keeps the latest only: each says the whole queue.
+        let logged: Vec<Event> = store
+            .events_after(0, Some(&t.id))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event)
+            .filter(|e| matches!(e, Event::QueueUpdated { .. }))
+            .collect();
+        assert_eq!(logged, [update(two)]);
+        store.commit(vec![update(vec![])]).unwrap();
+        assert!(store.queue(&t.id).unwrap().is_empty());
+        // Gone with its thread.
+        store.commit(vec![update(vec![message(3, "c")])]).unwrap();
+        store
+            .commit(vec![Event::ThreadDeleted {
+                thread_id: t.id.clone(),
+            }])
+            .unwrap();
+        assert!(store.queue(&t.id).unwrap().is_empty());
+    }
+}

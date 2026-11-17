@@ -1,0 +1,26 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Agentloft build, macOS version, harness CLI versions (`claude --version`, `codex --version`)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from ~/.agentloft/logs/agentloftd.log and agentloft.log
+      render: text

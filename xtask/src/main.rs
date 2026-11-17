@@ -1,0 +1,575 @@
+//! Developer tasks: `cargo xtask <task>`.
+//!
+//! - `dev`: build both binaries and run the app against `./.dev-home`
+//!   (the app starts its own isolated `agentloftd`).
+//! - `stop-dev`: ask the dev daemon to shut down.
+//! - `live-claude`: run the live Claude end-to-end test (uses real tokens).
+//! - `web [--release]`: build the browser client into `target/web`
+//!   (wasm + JS glue + static shell); `agentloftd` serves that folder.
+//! - `ci`: fmt check, clippy, tests, workspace-hack check, cargo-deny — what
+//!   CI runs (needs `cargo-hakari` and `cargo-deny` installed).
+//! - `bundle [--debug] [--open] [--stable]`: build
+//!   `target/bundle/Agentloft.app` (macOS; both binaries, the icon,
+//!   Info.plist, signature). A dev build: its icon is blue and its data
+//!   is in `~/.agentloft-dev`, apart from the installed app's; `--stable` builds
+//!   `target/bundle/stable/Agentloft.app` with the real icon instead.
+//! - `install`: build the stable bundle and put it in `/Applications`.
+//! - `cross-check <linux|windows>`: clippy for the Linux or Windows build of
+//!   the whole workspace, from a Mac (see the function for what it needs).
+
+use anyhow::{Context as _, Result, bail};
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() -> Result<()> {
+    let task = std::env::args().nth(1).unwrap_or_default();
+    match task.as_str() {
+        "dev" => dev(),
+        "bundle" => {
+            let stable = std::env::args().any(|a| a == "--stable");
+            bundle(stable).map(|_| ())
+        }
+        "install" => install(),
+        "stop-dev" => stop_dev(),
+        "web" => web(),
+        "cross-check" => cross_check(std::env::args().nth(2).as_deref()),
+        "signing-identity" => make_signing_identity(),
+        "live-claude" => run(cargo().args([
+            "test",
+            "-p",
+            "loftd",
+            "--test",
+            "live_claude",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ])),
+        "ci" => {
+            run(cargo().args(["fmt", "--all", "--check"]))?;
+            // loft-terminal's view tests need GPUI's test platform, which
+            // is a feature (crates/loft-terminal/Cargo.toml says why).
+            const VIEW_TESTS: &str = "loft-terminal/test-support";
+            run(cargo().args([
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--features",
+                VIEW_TESTS,
+                "--",
+                "-D",
+                "warnings",
+            ]))?;
+            run(cargo().args(["test", "--workspace", "--features", VIEW_TESTS]))?;
+            // crates/workspace-hack as `cargo hakari generate` would write it.
+            run(cargo().args(["hakari", "generate", "--diff"]))?;
+            run(cargo().args(["deny", "check"]))
+        }
+        _ => {
+            eprintln!(
+                "usage: cargo xtask <dev|stop-dev|live-claude|ci|bundle|install|web|signing-identity|cross-check>\n\
+                 dev, bundle and install build the web client too (`--no-web` skips it)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `cargo xtask cross-check <linux|windows>`: `cargo clippy` of the whole
+/// workspace for x86_64 Linux or Windows, without leaving this computer.
+/// It compiles nothing to run: it is for the code behind `cfg(windows)`,
+/// `cfg(unix)` and `cfg(target_os = …)` that the native build never sees.
+///
+/// - linux: needs `zig` (it is the C compiler); fontconfig is looked up at
+///   run time, so no Linux system libraries are needed.
+/// - windows: needs `cargo install cargo-xwin` (it downloads Microsoft's
+///   SDK headers on first use, accepting their license) and LLVM's `llvm-rc`
+///   on PATH or in Homebrew's llvm. libghostty-vt can't be built for
+///   Windows here (Zig needs the MSVC headers), so a stand-in with its real
+///   headers and an empty archive takes its place: fine for checking, not
+///   for linking.
+fn cross_check(target: Option<&str>) -> Result<()> {
+    let cross = root().join("target/cross");
+    std::fs::create_dir_all(&cross)?;
+    let lint = ["--workspace", "--all-targets", "--", "-D", "warnings"];
+    match target {
+        Some("linux") => {
+            #[cfg(unix)]
+            for (name, tool) in [("cc-linux", "cc"), ("cxx-linux", "c++")] {
+                use std::os::unix::fs::PermissionsExt as _;
+                let path = cross.join(name);
+                // cc-rs passes its own `--target=`, which Zig doesn't read.
+                std::fs::write(
+                    &path,
+                    format!(
+                        "#!/bin/bash\nargs=()\nfor a in \"$@\"; do case \"$a\" in --target=*) ;; *) args+=(\"$a\");; esac; done\nexec zig {tool} -target x86_64-linux-gnu \"${{args[@]}}\"\n"
+                    ),
+                )?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            let ar = Command::new("xcrun")
+                .args(["-f", "ar"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_else(|| "ar".into());
+            run(cargo()
+                .args(["clippy", "--target", "x86_64-unknown-linux-gnu"])
+                .args(lint)
+                .env("CC_x86_64_unknown_linux_gnu", cross.join("cc-linux"))
+                .env("CXX_x86_64_unknown_linux_gnu", cross.join("cxx-linux"))
+                .env("AR_x86_64_unknown_linux_gnu", ar)
+                .env("RUST_FONTCONFIG_DLOPEN", "on")
+                .env("PKG_CONFIG_ALLOW_CROSS", "1"))
+        }
+        Some("windows") => {
+            // libghostty-vt's stand-in, under the name its build script looks for.
+            let lock = std::fs::read_to_string(root().join("vendor/ghostty-vt-sys/GHOSTTY.lock"))?;
+            let sha = lock
+                .lines()
+                .find_map(|l| l.strip_prefix("sha256 = "))
+                .map(|v| v.trim().trim_matches('"').to_owned())
+                .context("sha256 in GHOSTTY.lock")?;
+            let key = format!("{}-x86_64-windows-msvc-baseline-r1", &sha[..16]);
+            let fake = cross.join("ghostty").join(&key);
+            if !fake.join(".key").is_file() {
+                let headers = root().join("vendor/ghostty-vt-sys/include");
+                let headers = if headers.is_dir() {
+                    headers
+                } else {
+                    // The headers of any native build of the same source.
+                    std::fs::read_dir(
+                        std::env::home_dir()
+                            .context("home")?
+                            .join("Library/Caches/ghostty-vt-sys"),
+                    )?
+                    .flatten()
+                    .map(|e| e.path().join("include"))
+                    .find(|p| p.join("ghostty/vt.h").is_file())
+                    .context("no libghostty-vt headers: build the app natively once first")?
+                };
+                std::fs::create_dir_all(fake.join("lib"))?;
+                copy_dir(&headers, &fake.join("include"))?;
+                std::fs::write(fake.join("lib/ghostty-vt-static.lib"), "")?;
+                std::fs::write(fake.join(".key"), &key)?;
+            }
+            let path = format!(
+                "{}:/opt/homebrew/opt/llvm/bin",
+                std::env::var("PATH").unwrap_or_default()
+            );
+            run(cargo()
+                .args(["xwin", "clippy", "--target", "x86_64-pc-windows-msvc"])
+                .args(lint)
+                .env("GHOSTTY_VT_CACHE_DIR", cross.join("ghostty"))
+                .env("PATH", path))
+        }
+        _ => bail!("usage: cargo xtask cross-check <linux|windows>"),
+    }
+}
+
+fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn cargo() -> Command {
+    let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    c.current_dir(root());
+    c
+}
+
+fn run(cmd: &mut Command) -> Result<()> {
+    let status = cmd.status().with_context(|| format!("run {cmd:?}"))?;
+    if !status.success() {
+        bail!("{cmd:?} failed with {status}");
+    }
+    Ok(())
+}
+
+/// Build the browser client into `target/web`: the wasm module, its JS glue
+/// and the static shell (`crates/loft-web/static`). `--release` optimizes.
+fn web() -> Result<()> {
+    build_web(std::env::args().skip(2).any(|a| a == "--release"))
+}
+
+fn build_web(release: bool) -> Result<()> {
+    let mut build = cargo();
+    build
+        .args(["build", "-p", "loft-web", "--target", WASM_TARGET])
+        // gpui-pre-web always compiles `wasm_thread`, which uses one unstable
+        // feature gate. Allow it for that crate only (ADR-0016).
+        .env("RUSTC_BOOTSTRAP", "wasm_thread");
+    let profile = if release {
+        build.args(["--profile", "web-release"]);
+        "web-release"
+    } else {
+        "debug"
+    };
+    run(&mut build)?;
+
+    let out = root().join("target/web");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out)?;
+    let wasm = root()
+        .join("target")
+        .join(WASM_TARGET)
+        .join(profile)
+        .join("loft_web.wasm");
+    wasm_bindgen_cli_support::Bindgen::new()
+        .input_path(&wasm)
+        .web(true)?
+        .typescript(false)
+        .remove_name_section(release)
+        .remove_producers_section(release)
+        .generate(&out)
+        .context("wasm-bindgen")?;
+    copy_dir(&root().join("crates/loft-web/static"), &out)?;
+    std::fs::copy(
+        root().join("assets/icon/png/agentloft-128.png"),
+        out.join("icon.png"),
+    )
+    .context("copy the icon")?;
+    // The daemon serves `<file>.br` or `<file>.gz` to browsers that accept
+    // them: the wasm module shrinks to about a quarter or a third. Over
+    // a slow link (1 MB/s) that is seconds of a first load.
+    for name in ["loft_web_bg.wasm", "loft_web.js"] {
+        gzip(&out.join(name))?;
+        if release {
+            brotli(&out.join(name))?;
+        }
+    }
+    println!("{}", out.display());
+    Ok(())
+}
+
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+/// Write `<file>.gz` next to `file`.
+fn gzip(file: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let mut name = file.as_os_str().to_owned();
+    name.push(".gz");
+    let out = std::fs::File::create(&name)?;
+    let mut encoder = flate2::write::GzEncoder::new(out, flate2::Compression::new(6));
+    encoder.write_all(&bytes)?;
+    encoder.finish()?;
+    Ok(())
+}
+
+/// Write `<file>.br` next to `file`. Quality 9: 2 s for the release wasm,
+/// 24% smaller than gzip; 10 and 11 save a little more but take 25 and 45 s.
+fn brotli(file: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    let bytes = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+    let mut name = file.as_os_str().to_owned();
+    name.push(".br");
+    let out = std::fs::File::create(&name)?;
+    let mut encoder = brotli::CompressorWriter::new(out, 1 << 16, 9, 24);
+    encoder.write_all(&bytes)?;
+    encoder.flush()?;
+    Ok(())
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn dev_home() -> PathBuf {
+    root().join(".dev-home")
+}
+
+/// Whether this build also makes the web client: always, unless asked not
+/// to with `--no-web`. The web client is the same UI built for the browser;
+/// left out, browsers get whatever `target/web` last held, a UI without the
+/// app's latest changes.
+fn with_web() -> bool {
+    !std::env::args().skip(2).any(|a| a == "--no-web")
+}
+
+fn dev() -> Result<()> {
+    run(cargo().args(["build", "-p", "loft-app", "-p", "loftd"]))?;
+    if with_web() {
+        build_web(false)?;
+    }
+    let bin = root().join("target/debug");
+    // A daemon from an older build would keep serving stale code.
+    stop_dev().ok();
+    run(Command::new(bin.join("agentloft"))
+        .env("AGENTLOFT_HOME", dev_home())
+        .env("AGENTLOFT_DAEMON_BIN", bin.join("agentloftd")))
+}
+
+const BUNDLE_ID: &str = "dev.agentloft.Agentloft";
+
+/// `cargo xtask install`: the stable bundle, copied to `/Applications`
+/// (swapped in by rename, so a running copy keeps its files until it quits).
+fn install() -> Result<()> {
+    let app = bundle(true)?;
+    let dest = PathBuf::from("/Applications/Agentloft.app");
+    let staged = PathBuf::from("/Applications/Agentloft.app.new");
+    let old = PathBuf::from("/Applications/Agentloft.app.old");
+    let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(&old);
+    // `ditto` keeps the signature's extended attributes.
+    run(Command::new("ditto").arg(&app).arg(&staged))?;
+    if dest.exists() {
+        std::fs::rename(&dest, &old).context("move the installed app aside")?;
+    }
+    std::fs::rename(&staged, &dest).context("install the app")?;
+    let _ = std::fs::remove_dir_all(&old);
+    println!("{}", dest.display());
+    Ok(())
+}
+
+fn bundle(stable: bool) -> Result<PathBuf> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let debug = args.iter().any(|a| a == "--debug");
+    if with_web() {
+        build_web(!debug)?;
+    }
+    let profile = if debug { "debug" } else { "release" };
+    let mut build = cargo();
+    build.args(["build", "-p", "loft-app", "-p", "loftd"]);
+    if !debug {
+        build.arg("--release");
+    }
+    run(&mut build)?;
+
+    let target = root().join("target");
+    let app = target.join(if stable {
+        "bundle/stable/Agentloft.app"
+    } else {
+        "bundle/Agentloft.app"
+    });
+    let contents = app.join("Contents");
+    let _ = std::fs::remove_dir_all(&app);
+    std::fs::create_dir_all(contents.join("MacOS"))?;
+    std::fs::create_dir_all(contents.join("Resources"))?;
+    for bin in ["agentloft", "agentloftd"] {
+        std::fs::copy(
+            target.join(profile).join(bin),
+            contents.join("MacOS").join(bin),
+        )
+        .with_context(|| format!("copy {bin}"))?;
+    }
+    std::fs::copy(
+        // Blue for a dev bundle, so it can't be taken for the installed app.
+        root().join(if stable {
+            "assets/icon/AppIcon.icns"
+        } else {
+            "assets/icon/dev/AppIcon.icns"
+        }),
+        contents.join("Resources/AppIcon.icns"),
+    )
+    .context("copy AppIcon.icns")?;
+    std::fs::write(
+        contents.join("Info.plist"),
+        info_plist(env!("CARGO_PKG_VERSION")),
+    )?;
+    std::fs::write(contents.join("PkgInfo"), "APPL????")?;
+    if !stable {
+        // What tells the binaries they are a dev build: their own data
+        // home (~/.agentloft-dev), never the installed app's
+        // (`loft_config::is_dev_build`).
+        std::fs::write(contents.join("Resources/dev-build"), "")?;
+    }
+    // The web client (`cargo xtask web --release`), if it has been built:
+    // agentloftd looks for it in Resources/web.
+    let web = target.join("web");
+    if web.join("index.html").is_file() {
+        copy_dir(&web, &contents.join("Resources/web")).context("copy the web client")?;
+    } else {
+        eprintln!("note: no web client in the bundle (build it with `cargo xtask web --release`)");
+    }
+
+    // Signed with the same identity every build, when there is one: macOS
+    // keeps what the user allowed the app (screen recording, folders,
+    // notifications) per signer. An ad-hoc signature is a different app to
+    // it after every build, so each rebuild quietly loses those grants.
+    let identity = signing_identity();
+    let signed = Command::new("codesign")
+        .args(["--force", "--deep", "--sign", &identity])
+        .arg(&app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !signed {
+        eprintln!("warning: codesign failed; the bundle is unsigned");
+    } else if identity == "-" {
+        eprintln!(
+            "note: ad-hoc signed. macOS will forget what this app was allowed (screen recording, …) on the next build; `cargo xtask signing-identity` makes a signer that lasts."
+        );
+    }
+    println!("{}", app.display());
+    if args.iter().any(|a| a == "--open") {
+        run(Command::new("open").arg(&app))?;
+    }
+    Ok(app)
+}
+
+/// The name of the self-signed certificate local builds are signed with.
+const DEV_IDENTITY: &str = "Agentloft Dev";
+
+/// Whose signature the bundle gets: `AGENTLOFT_SIGN_IDENTITY` if set, else
+/// the local [`DEV_IDENTITY`] if the keychain has it, else ad-hoc (`-`).
+fn signing_identity() -> String {
+    if let Some(identity) = std::env::var("AGENTLOFT_SIGN_IDENTITY")
+        .ok()
+        .filter(|i| !i.trim().is_empty())
+    {
+        return identity;
+    }
+    if has_dev_identity() {
+        DEV_IDENTITY.to_owned()
+    } else {
+        "-".to_owned()
+    }
+}
+
+fn has_dev_identity() -> bool {
+    Command::new("security")
+        .args(["find-identity", "-p", "codesigning"])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout).contains(&format!("\"{DEV_IDENTITY}\""))
+        })
+}
+
+/// `cargo xtask signing-identity`: make the certificate local builds are
+/// signed with (once per machine). It is self-signed and lives in the
+/// login keychain; only `codesign` may use its key without asking.
+fn make_signing_identity() -> Result<()> {
+    if has_dev_identity() {
+        println!("\"{DEV_IDENTITY}\" is already in the keychain");
+        return Ok(());
+    }
+    let dir = std::env::temp_dir().join(format!("agentloft-signing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let made = (|| {
+        let file = |name: &str| dir.join(name);
+        std::fs::write(
+            file("req.cnf"),
+            format!(
+                "[req]\ndistinguished_name = dn\nx509_extensions = ext\nprompt = no\n[dn]\nCN = {DEV_IDENTITY}\n[ext]\nbasicConstraints = critical, CA:false\nkeyUsage = critical, digitalSignature\nextendedKeyUsage = critical, codeSigning\n"
+            ),
+        )?;
+        // The system's own openssl: a newer one writes a .p12 the keychain
+        // can't read.
+        run(Command::new("/usr/bin/openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            ])
+            .arg("-config")
+            .arg(file("req.cnf"))
+            .arg("-keyout")
+            .arg(file("key.pem"))
+            .arg("-out")
+            .arg(file("cert.pem"))
+            .stderr(std::process::Stdio::null()))?;
+        // The .p12 exists for the moment it takes to import it.
+        let pass = format!(
+            "{:x}{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        run(Command::new("/usr/bin/openssl")
+            .args(["pkcs12", "-export", "-name", DEV_IDENTITY])
+            .arg("-inkey")
+            .arg(file("key.pem"))
+            .arg("-in")
+            .arg(file("cert.pem"))
+            .arg("-out")
+            .arg(file("id.p12"))
+            .arg("-passout")
+            .arg(format!("pass:{pass}")))?;
+        run(Command::new("security")
+            .arg("import")
+            .arg(file("id.p12"))
+            .args(["-P", &pass, "-T", "/usr/bin/codesign"]))
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    made?;
+    println!(
+        "made \"{DEV_IDENTITY}\": `cargo xtask bundle` signs with it from now on. Allow the app once more where macOS asks; it will remember."
+    );
+    Ok(())
+}
+
+fn info_plist(version: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Agentloft</string>
+  <key>CFBundleDisplayName</key><string>Agentloft</string>
+  <key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
+  <key>CFBundleExecutable</key><string>agentloft</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>CFBundleVersion</key><string>{version}</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSHumanReadableCopyright</key><string>Apache-2.0 — github.com/agentloft/agentloft</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+#[cfg(not(unix))]
+fn stop_dev() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_dev() -> Result<()> {
+    let socket = dev_home().join("run/agentloftd.sock");
+    if !socket.exists() {
+        return Ok(());
+    }
+    // Minimal protocol client: hello + shutdown request.
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(&socket)?;
+    let send = |s: &mut std::os::unix::net::UnixStream, json: &str| -> Result<()> {
+        s.write_all(&(json.len() as u32).to_be_bytes())?;
+        s.write_all(json.as_bytes())?;
+        Ok(())
+    };
+    send(
+        &mut s,
+        r#"{"type":"hello","protocol_version":1,"client_kind":"cli","client_build":"xtask"}"#,
+    )?;
+    send(
+        &mut s,
+        r#"{"type":"request","id":1,"body":{"op":"shutdown","reason":"upgrade"}}"#,
+    )?;
+    let mut buf = [0u8; 256];
+    let _ = s.read(&mut buf);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    Ok(())
+}

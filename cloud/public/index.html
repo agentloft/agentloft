@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="no-referrer">
+<title>Agentloft: run your coding agents side by side</title>
+<meta name="description" content="A native desktop app for Claude Code, Codex and ACP agents. Parallel threads, each in its own git worktree, with live diffs, a real terminal and a browser the agent can drive. Open source.">
+<meta property="og:title" content="Agentloft">
+<meta property="og:description" content="Run your coding agents side by side. A native, open-source desktop app for Claude Code, Codex and ACP agents.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://agentloft.promptanddone.com/">
+<meta property="og:image" content="https://agentloft.promptanddone.com/apple-touch-icon.png">
+<meta name="theme-color" content="#0a0d0c" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f7f9f8" media="(prefers-color-scheme: light)">
+<link rel="icon" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/landing.css">
+<script type="module" src="/landing.js"></script>
+</head>
+<body>
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></symbol>
+  <symbol id="i-fork" viewBox="0 0 24 24"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="i-panels" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol>
+  <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="4" y="4.5" width="16" height="11" rx="1.6"/><path d="M2 19.5h20"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+  <symbol id="i-github" viewBox="0 0 24 24"><path class="solid" d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.8 1.3 3.49 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .32.21.7.82.58A12 12 0 0 0 12 .3"/></symbol>
+  <symbol id="i-windows" viewBox="0 0 24 24"><path class="solid" d="M3 5.1 10.4 4v7.2H3zm0 13.8 7.4 1.1v-7.1H3zm8.3 1.2L21 21.5v-8.6h-9.7zm0-16.2v7.3H21V2.5z"/></symbol>
+</svg>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="/"><img src="/icon.png" alt="" width="28" height="28"><span>Agentloft</span></a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#features">Features</a>
+      <a href="#agents">Agents</a>
+      <a href="#anywhere">Anywhere</a>
+      <a href="https://github.com/agentloft/agentloft">GitHub</a>
+    </nav>
+    <div class="nav-end">
+      <a id="account" class="nav-account" href="/app">Sign in</a>
+      <a class="btn btn-small btn-primary nav-download" href="#download">Download</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="hero-glow" aria-hidden="true"></div>
+    <div class="wrap hero-copy">
+      <p class="eyebrow"><span class="dot"></span>Early preview · Open source · Apache-2.0</p>
+      <h1>Run your coding agents <br><span class="soft">side by side.</span></h1>
+      <p class="lead">Agentloft is a native desktop app for Claude&nbsp;Code, Codex and ACP agents. Every thread gets its own git worktree, live diffs, a real terminal and a browser the agent can drive. And it keeps working when you close the window.</p>
+      <div class="downloads" id="download">
+        <a class="btn btn-primary" data-os="mac" href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-macos-arm64.dmg"><svg class="icon"><use href="#i-download"/></svg><span>Download for macOS</span></a>
+        <a class="btn" data-os="windows" href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-windows-x64-setup.exe"><svg class="icon"><use href="#i-download"/></svg><span>Windows</span></a>
+        <a class="btn" data-os="linux" href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-linux-x64.tar.gz"><svg class="icon"><use href="#i-download"/></svg><span>Linux</span></a>
+      </div>
+      <p class="fineprint">
+        <span data-note="mac">macOS on Apple silicon (.dmg)</span><span data-note="windows" hidden>Windows x64 installer · <a href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-windows-x64.zip">portable .zip</a></span><span data-note="linux" hidden>Linux x64 (.tar.gz)</span>
+        · <a href="https://github.com/agentloft/agentloft/releases/latest">All downloads</a>
+      </p>
+      <p class="phone-note" hidden>On your phone? Agentloft runs on your computer. Once it is linked, <a href="/app">open it from here</a>.</p>
+    </div>
+
+    <div class="wrap shot-wrap">
+      <div class="window" role="img" aria-label="The Agentloft window: threads in the sidebar, a conversation with Claude, and the thread's changes beside it">
+        <aside class="w-side">
+          <div class="w-lights"><i></i><i></i><i></i></div>
+          <div class="w-search"><svg class="icon"><use href="#i-search"/></svg>Search threads</div>
+          <div class="w-label">Projects</div>
+          <div class="w-project"><svg class="icon"><use href="#i-folder"/></svg>storefront</div>
+          <div class="w-thread active"><span class="w-title">Fix cart rounding</span><span class="spin"></span></div>
+          <div class="w-thread"><span class="w-title">Add dark mode to settings</span><span class="badge">Needs you</span></div>
+          <div class="w-thread"><span class="w-title">Upgrade the router</span><span class="unread"></span><span class="w-time">12m</span></div>
+          <div class="w-thread"><span class="w-title">E2E tests for checkout</span><span class="w-time">1h</span></div>
+          <div class="w-project"><svg class="icon"><use href="#i-folder"/></svg>api</div>
+          <div class="w-thread"><span class="w-title">Rate-limit the login route</span><span class="w-time">2h</span></div>
+          <div class="w-thread sub"><span class="w-title">Fork: try a token bucket</span><span class="w-time">2h</span></div>
+          <div class="w-foot"><span class="on-dot"></span>Connected</div>
+        </aside>
+
+        <div class="w-main">
+          <div class="w-bar">
+            <span class="w-crumb">storefront <span class="faint">/</span> <b>Fix cart rounding</b></span>
+            <span class="w-chip">Claude</span>
+            <span class="w-chip mono"><svg class="icon"><use href="#i-branch"/></svg>agentloft/fix-rounding</span>
+          </div>
+          <div class="w-chat">
+            <div class="bubble">Cart totals are a cent off when a discount applies. Find out why and fix it, with a test.</div>
+            <div class="w-tools"><svg class="icon"><use href="#i-check"/></svg>Read 4 files, edited 2, ran 2 commands<svg class="icon"><use href="#i-chevron"/></svg></div>
+            <p>The discount was applied to each line and every line was rounded on its own, so three items could lose a cent between them.</p>
+            <ul>
+              <li><code>totals.ts</code>: discount the subtotal, round once</li>
+              <li><code>totals.test.ts</code>: three items at 33% off</li>
+            </ul>
+            <p>All 24 tests pass. Nothing is committed yet.</p>
+            <div class="w-done"><svg class="icon"><use href="#i-check"/></svg>Done · 48s</div>
+          </div>
+          <div class="w-composer">
+            <span class="faint">Ask Claude to build, fix or explain something…</span>
+            <div class="w-composer-row">
+              <span class="w-pill">Opus</span><span class="w-pill">Auto-accept edits</span>
+              <span class="send"><svg class="icon"><use href="#i-up"/></svg></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="w-panel">
+          <div class="w-tabs"><span class="on">Changes</span><span>Terminal</span><span>Browser</span><span>Files</span></div>
+          <div class="w-seg"><span class="on">This thread</span><span>Last turn</span><span>Uncommitted</span><span class="w-stat"><b class="add">+9</b> <b class="del">−4</b></span></div>
+          <div class="w-file"><span>src/cart/totals.ts</span><span class="w-stat"><b class="add">+5</b> <b class="del">−4</b></span></div>
+          <pre class="w-diff"><span class="hunk">@@ -12,10 +12,11 @@</span>
+<span class="ctx"><i>12</i>  export function total(cart: Cart) {</span>
+<span class="del"><i>13</i>-   const lines = cart.items.map((item) =&gt;</span>
+<span class="del"><i>14</i>-     round(item.price * (1 - cart.discount))</span>
+<span class="del"><i>15</i>-   );</span>
+<span class="del"><i>16</i>-   return sum(lines);</span>
+<span class="add"><i>13</i>+   const subtotal = sum(</span>
+<span class="add"><i>14</i>+     cart.items.map((item) =&gt; item.price)</span>
+<span class="add"><i>15</i>+   );</span>
+<span class="add"><i>16</i>+   const off = subtotal * cart.discount;</span>
+<span class="add"><i>17</i>+   return round(subtotal - off);</span>
+<span class="ctx"><i>18</i>  }</span></pre>
+          <div class="w-file"><span>src/cart/totals.test.ts</span><span class="w-stat"><b class="add">+4</b> <b class="del">−0</b></span></div>
+          <pre class="w-diff"><span class="add"><i>31</i>+ test("rounds once", () =&gt; {</span>
+<span class="add"><i>32</i>+   const c = cart([10, 10, 10], 0.33);</span>
+<span class="add"><i>33</i>+   expect(total(c)).toBe(20.1);</span>
+<span class="add"><i>34</i>+ });</span></pre>
+          <div class="w-term"><span class="prompt">$</span> npm test<br><span class="ok">✓</span> 24 passed <span class="faint">(1.8s)</span><span class="caret"></span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="agents wrap" id="agents">
+    <div class="split-head">
+      <h2>Your agents, <span class="soft">your logins.</span></h2>
+      <p>Agentloft drives each agent through its own structured protocol, never by scraping a terminal: exact streaming, tool calls, approvals, interrupts and resume. Agents sign in with their own CLI, so Agentloft never sees an API key.</p>
+    </div>
+    <ul class="agent-row">
+      <li><b>Claude Code</b><span>stream-json control</span></li>
+      <li><b>Codex</b><span>codex app-server</span></li>
+      <li><b>Gemini CLI</b><span>Agent Client Protocol</span></li>
+      <li><b>OpenCode</b><span>Agent Client Protocol</span></li>
+      <li class="more"><b>Any ACP agent</b><span>same protocol</span></li>
+    </ul>
+    <ul class="checks">
+      <li><svg class="icon"><use href="#i-check"/></svg>Model and permission mode per thread</li>
+      <li><svg class="icon"><use href="#i-check"/></svg>Queue messages while a turn runs</li>
+      <li><svg class="icon"><use href="#i-check"/></svg>Agents can start and read other threads</li>
+    </ul>
+  </section>
+
+  <section class="features wrap" id="features">
+    <h2>A workbench around <span class="soft">every thread.</span></h2>
+    <div class="grid">
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-branch"/></svg>
+        <h3>A worktree per thread</h3>
+        <p>Each thread can work in its own git worktree on an <code>agentloft/…</code> branch. Merge back with a squash, or open a pull request and watch its checks.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-history"/></svg>
+        <h3>Every turn checkpointed</h3>
+        <p>Diffs for the last turn or the whole thread, and Undo changes on any turn. Checkpoints live in hidden git refs, out of your history.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-terminal"/></svg>
+        <h3>A real terminal</h3>
+        <p>Ghostty-powered, with tabs. Project actions put the commands your project runs often one click away, with their preview in the browser panel.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-globe"/></svg>
+        <h3>A browser the agent drives</h3>
+        <p>Agents open pages, click and type through Agentloft's built-in MCP server. You watch the same tab, and can step in.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-file"/></svg>
+        <h3>Files and documents</h3>
+        <p>Code, Markdown and images, plus Word, Excel, PowerPoint and PDF previews. Leave a note on a slide, a cell or a passage and it goes to the agent.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-fork"/></svg>
+        <h3>Fork to any agent</h3>
+        <p>Fork a thread to the same agent with its full context, or hand it to another agent with a summary you review first.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-activity"/></svg>
+        <h3>Agents keep running</h3>
+        <p>A small daemon owns agents, terminals and git. Close or update the app and the work carries on; a thread out of usage resumes when its limit resets.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-clock"/></svg>
+        <h3>Automations</h3>
+        <p>Run a prompt on a schedule: every few hours, weekdays at nine, or by cron. Each run is a new thread you can open.</p>
+      </article>
+      <article class="card">
+        <svg class="icon card-icon"><use href="#i-panels"/></svg>
+        <h3>Answers you can try</h3>
+        <p>Agents can reply with a live page of their own making, right in the thread: a chart, a diagram, options to pick from.</p>
+      </article>
+    </div>
+    <ul class="facts">
+      <li><b>Native</b><span>Rust and GPUI, drawn on the GPU</span></li>
+      <li><b>Yours</b><span>Your agents' own logins, no telemetry</span></li>
+      <li><b>Keyboard-first</b><span>Command palette, windows and tab groups</span></li>
+      <li><b>Open</b><span>Apache-2.0, built in the open</span></li>
+    </ul>
+  </section>
+
+  <section class="anywhere" id="anywhere">
+    <div class="wrap anywhere-inner">
+      <div class="anywhere-copy">
+        <h2>Your computer, <span class="soft">from your phone.</span></h2>
+        <p>Turn on web access and the same interface runs in any browser, served by Agentloft on your computer. Link it to your Google account here and open it from anywhere.</p>
+        <ul class="checks stacked">
+          <li><svg class="icon"><use href="#i-check"/></svg>The same app, compiled to WebAssembly: terminals and the browser tab too</li>
+          <li><svg class="icon"><use href="#i-check"/></svg>Cloudflare Tunnel connects the browser straight to your computer</li>
+          <li><svg class="icon"><use href="#i-check"/></svg>This site only signs you in; your work never passes through it</li>
+          <li><svg class="icon"><use href="#i-check"/></svg>Or open another computer's Agentloft over SSH</li>
+        </ul>
+        <a class="btn" id="anywhere-cta" href="/app"><span>Open your computers</span><svg class="icon"><use href="#i-arrow"/></svg></a>
+      </div>
+      <div class="phone" aria-hidden="true">
+        <div class="phone-screen">
+          <div class="p-status"><span>9:41</span><span class="p-island"></span><span class="p-bars"><i></i><i></i><i></i></span></div>
+          <div class="p-url">agentloft.promptanddone.com</div>
+          <div class="p-head"><img src="/icon.png" alt="" width="22" height="22"><b>Agentloft</b></div>
+          <div class="p-title">Your computers</div>
+          <div class="p-list">
+            <div class="p-item"><svg class="icon"><use href="#i-laptop"/></svg><div><b>MacBook</b><span class="p-on">Online</span><small>studio.example.dev</small></div><span class="p-open">Open</span></div>
+            <div class="p-item"><svg class="icon"><use href="#i-laptop"/></svg><div><b>Mac mini</b><span class="p-on">Online</span><small>build.example.dev</small></div><span class="p-open">Open</span></div>
+            <div class="p-item dim"><svg class="icon"><use href="#i-laptop"/></svg><div><b>Workstation</b><span class="p-seen">Seen 2 h ago</span><small>home network only</small></div><span class="p-open">Open</span></div>
+          </div>
+          <p class="p-note">Agentloft's traffic doesn't go through this site; it only signs you in.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="source wrap" id="source">
+    <div class="source-copy">
+      <h2>Open source, <span class="soft">top to bottom.</span></h2>
+      <p>The app, the daemon, the agent adapters and this website are Apache-2.0. Read the code and the design decisions behind it, file an issue, or build it yourself.</p>
+      <div class="row">
+        <a class="btn btn-primary" href="https://github.com/agentloft/agentloft"><svg class="icon"><use href="#i-github"/></svg><span>agentloft/agentloft</span></a>
+        <a class="btn btn-ghost" href="https://github.com/agentloft/agentloft/blob/main/docs/adr/README.md"><span>Design decisions</span><svg class="icon"><use href="#i-arrow"/></svg></a>
+      </div>
+    </div>
+    <div class="term" aria-label="Building Agentloft from source">
+      <div class="term-bar"><i></i><i></i><i></i><span>~/code</span></div>
+<pre><span class="prompt">$</span> git clone https://github.com/agentloft/agentloft
+<span class="prompt">$</span> cd agentloft
+<span class="prompt">$</span> cargo xtask bundle --open
+<span class="faint">  Building the app, the daemon and the web client…</span>
+<span class="ok">  ✓</span> target/bundle/Agentloft.app</pre>
+    </div>
+  </section>
+
+  <section class="final wrap">
+    <img src="/icon.png" alt="" width="72" height="72" class="final-icon">
+    <h2>Give your agents a loft.</h2>
+    <p class="lead">Free, open source, and early: expect rough edges, and tell us about them.</p>
+    <div class="downloads">
+      <a class="btn btn-primary" data-os="mac" href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-macos-arm64.dmg"><svg class="icon"><use href="#i-download"/></svg><span>Download for macOS</span></a>
+      <a class="btn" data-os="windows" href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-windows-x64-setup.exe"><svg class="icon"><use href="#i-download"/></svg><span>Windows</span></a>
+      <a class="btn" data-os="linux" href="https://github.com/agentloft/agentloft/releases/latest/download/Agentloft-linux-x64.tar.gz"><svg class="icon"><use href="#i-download"/></svg><span>Linux</span></a>
+    </div>
+    <p class="fineprint"><a href="https://github.com/agentloft/agentloft/releases/latest">All downloads and release notes</a></p>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <a class="brand" href="/"><img src="/icon.png" alt="" width="22" height="22"><span>Agentloft</span></a>
+    <nav aria-label="Footer">
+      <a href="https://github.com/agentloft/agentloft">GitHub</a>
+      <a href="https://github.com/agentloft/agentloft/releases/latest">Releases</a>
+      <a href="https://github.com/agentloft/agentloft/issues">Issues</a>
+      <a href="/privacy">Privacy</a>
+      <a href="/app">Your computers</a>
+    </nav>
+    <span class="faint">Apache-2.0</span>
+  </div>
+</footer>
+</body>
+</html>

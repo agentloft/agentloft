@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Privacy policy · Agentloft</title>
+<meta name="description" content="What Agentloft's website stores, why, and how to delete it.">
+<link rel="icon" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="stylesheet" href="/landing.css">
+</head>
+<body>
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="/"><img src="/icon.png" alt="" width="28" height="28"><span>Agentloft</span></a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="/">Home</a>
+      <a href="https://github.com/agentloft/agentloft">GitHub</a>
+    </nav>
+    <div class="nav-end">
+      <a class="nav-account" href="/app">Your computers</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap legal">
+  <h1>Privacy policy</h1>
+  <p class="legal-date">Last updated 17 November 2026</p>
+
+  <p>This policy covers the website at <b>agentloft.promptanddone.com</b> ("the website"), which lets you sign in with Google and open Agentloft running on your own computers from any browser. Agentloft itself is an open-source desktop app (<a href="https://github.com/agentloft/agentloft">github.com/agentloft/agentloft</a>) that runs on your computer; what it does there stays there.</p>
+
+  <h2>What the website stores</h2>
+  <ul>
+    <li><b>Your Google account's basic profile</b>, when you sign in with Google: its stable account id, email address, name and profile picture address. We ask Google for nothing else (the <code>openid</code>, <code>email</code> and <code>profile</code> scopes only): no access to your Gmail, Drive, contacts or anything else.</li>
+    <li><b>Your sign-in sessions:</b> a hash of each session's secret and when it expires (30 days at most). The secret itself lives only in your browser's cookie.</li>
+    <li><b>The computers you link:</b> each one's name, operating system, Agentloft version, the address it can be reached at (which it reports itself), when it last checked in, and a key it shares with the website, stored encrypted. The key lets the website give your browser a short-lived, one-time ticket to open that computer.</li>
+    <li><b>Pending links</b> while you approve one (a few minutes): the computer's name and operating system, a short code to compare, and the requesting address, used to limit abuse.</li>
+  </ul>
+
+  <h2>What it doesn't</h2>
+  <ul>
+    <li><b>Your work.</b> What you do in Agentloft (your projects, files, conversations with agents, terminals) never passes through the website. Your browser connects to your computer directly, through the address your computer reported; the website only signs you in and hands out the tickets.</li>
+    <li><b>Tracking.</b> No analytics, no advertising, no third-party scripts or trackers, and nothing is sold or shared.</li>
+  </ul>
+
+  <h2>Who processes it</h2>
+  <ul>
+    <li><b>Google</b> signs you in (<a href="https://policies.google.com/privacy">Google's privacy policy</a>).</li>
+    <li><b>Cloudflare</b> hosts the website and its database, and keeps short-lived request logs for operating it (<a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy policy</a>).</li>
+    <li>If you make a computer public, its address is a <b>Cloudflare Tunnel</b>: Cloudflare carries the connection between your browser and your computer, encrypted between your browser and Cloudflare.</li>
+  </ul>
+
+  <h2>How long, and how to delete it</h2>
+  <ul>
+    <li>Sessions end when you sign out or after 30 days. Pending links are deleted once they expire.</li>
+    <li>A linked computer is removed when you unlink it (in Agentloft, or with <b>Remove</b> on the website).</li>
+    <li><b>Delete your account</b> at any time: sign in at <a href="/app">agentloft.promptanddone.com/app</a> and choose <b>Delete account</b> at the bottom of the page. Everything above about you is deleted at once, and your computers stop being reachable through the website.</li>
+  </ul>
+
+  <h2>Changes and contact</h2>
+  <p>If this policy changes, the date above changes with it, and the history is public in the <a href="https://github.com/agentloft/agentloft/commits/main/cloud/public/privacy.html">project's repository</a>. Questions or requests: <a href="https://github.com/agentloft/agentloft/issues">open an issue on GitHub</a>.</p>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <a class="brand" href="/"><img src="/icon.png" alt="" width="22" height="22"><span>Agentloft</span></a>
+    <nav aria-label="Footer">
+      <a href="https://github.com/agentloft/agentloft">GitHub</a>
+      <a href="/privacy">Privacy</a>
+      <a href="/app">Your computers</a>
+    </nav>
+    <span class="faint">Apache-2.0</span>
+  </div>
+</footer>
+</body>
+</html>

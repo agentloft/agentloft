@@ -1,0 +1,43 @@
+# Settings for `cargo hakari`, which writes crates/workspace-hack.
+#
+# Why that crate exists: Cargo decides a dependency's features from the
+# packages named on the command line, so `cargo test -p loft-ui`,
+# `cargo build -p loft-app -p loftd` and `cargo clippy --workspace` each asked
+# for slightly different builds of the same crates, and GPUI and everything on
+# top of it (most of the build) was compiled once per kind of command: five
+# times over in an ordinary session, 40 to 60 s each. Every crate of ours
+# depends on workspace-hack, which names those dependencies with all their
+# features, so there is one build of each whatever the command.
+#
+# After changing dependencies or their features: `cargo hakari generate`
+# (CI and `cargo xtask ci` fail until it has been run).
+# See https://docs.rs/cargo-hakari/latest/cargo_hakari/config for the options.
+
+hakari-package = "workspace-hack"
+dep-format-version = "4"
+# Cargo's v2 and v3 resolvers are the same to hakari.
+resolver = "2"
+
+# Where the app is built and tested day to day. Our crates depend on
+# workspace-hack on macOS only (`[target.'cfg(target_os = "macos")']` in each
+# Cargo.toml, written by hand: `cargo hakari manage-deps` would make it
+# unconditional), so the headless Linux tests and the wasm32 web client build
+# exactly what they would without it.
+platforms = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+[final-excludes]
+# xtask's dependencies count (it is part of `--workspace` builds), but xtask
+# itself is a build tool and shouldn't have to wait for the app's.
+workspace-members = ["xtask"]
+# What loft-terminal's `test-support` feature switches on (GPUI's test
+# platform, for tests/view.rs). Unified, it would be compiled into the app.
+third-party = [
+    { name = "gpui-pre" },
+    { name = "gpui-pre-collections" },
+    { name = "gpui-pre-http-client" },
+    { name = "rand" },
+    { name = "schemars" },
+]

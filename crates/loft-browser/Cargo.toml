@@ -1,0 +1,29 @@
+[package]
+name = "loft-browser"
+description = "Native web content in GPUI windows: views agents make (WKWebView via wry), and menus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tracing.workspace = true
+loft-page-script.workspace = true
+# `Instant` that also works in the browser build (std's panics there).
+web-time = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+wry.workspace = true
+objc2.workspace = true
+block2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-web-kit.workspace = true
+
+[lints]
+workspace = true

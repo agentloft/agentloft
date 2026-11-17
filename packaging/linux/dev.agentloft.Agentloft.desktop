@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Agentloft
+GenericName=Coding Agent Workbench
+Comment=Run Claude Code, Codex and other coding agents side by side
+Exec=agentloft %U
+Icon=dev.agentloft.Agentloft
+Terminal=false
+Categories=Development;IDE;
+Keywords=AI;agent;claude;codex;coding;
+StartupWMClass=agentloft

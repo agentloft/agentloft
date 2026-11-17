@@ -1,0 +1,25 @@
+[package]
+name = "loft-protocol"
+description = "Wire types shared by agentloftd and its clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+base64.workspace = true
+loft-view.workspace = true
+
+# In the browser, ids get their randomness from the page's crypto API.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+
+[lints]
+workspace = true
