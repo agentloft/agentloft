@@ -170,6 +170,9 @@ pub struct Core {
     config: std::sync::RwLock<loft_config::Config>,
     /// `ListModels` answers per harness (probing Codex starts its CLI).
     models: Mutex<HashMap<String, Vec<loft_protocol::ModelInfo>>>,
+    /// Harnesses whose `list_models` answered (with effort levels, which a
+    /// session's own list lacks).
+    models_listed: Mutex<std::collections::HashSet<String>>,
     /// Slash commands per (harness, folder), with when they were asked.
     commands: Mutex<CommandCache>,
     /// Worktree setup commands to run before a thread's first prompt.
@@ -230,6 +233,7 @@ impl Core {
             pull_requests: Default::default(),
             config: std::sync::RwLock::new(opts.config.clone()),
             models: Mutex::new(HashMap::new()),
+            models_listed: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
             pending_notes: Mutex::new(HashMap::new()),
@@ -601,12 +605,30 @@ impl Core {
     }
 
     /// Models a live session reported (ACP agents list theirs at start).
-    pub(crate) fn set_models(&self, harness: &HarnessId, models: Vec<loft_protocol::ModelInfo>) {
-        lock(&self.models).insert(harness.as_str().to_owned(), models);
+    /// A session's list has no effort levels (ACP reports them only for
+    /// the current model): those `list_models` found are kept.
+    pub(crate) fn set_models(
+        &self,
+        harness: &HarnessId,
+        mut models: Vec<loft_protocol::ModelInfo>,
+    ) {
+        let mut all = lock(&self.models);
+        if let Some(known) = all.get(harness.as_str()) {
+            for m in models.iter_mut().filter(|m| m.efforts.is_empty()) {
+                if let Some(k) = known.iter().find(|k| k.id == m.id) {
+                    m.efforts = k.efforts.clone();
+                    m.default_effort = m.default_effort.take().or(k.default_effort.clone());
+                }
+            }
+        }
+        all.insert(harness.as_str().to_owned(), models);
     }
 
     async fn list_models(&self, harness: &HarnessId) -> CoreResult<Response> {
-        if let Some(models) = lock(&self.models).get(harness.as_str()) {
+        let cached = lock(&self.models).get(harness.as_str()).cloned();
+        if let Some(models) = &cached
+            && lock(&self.models_listed).contains(harness.as_str())
+        {
             return Ok(Response::Models {
                 models: models.clone(),
             });
@@ -620,15 +642,28 @@ impl Core {
         let hcfg = harness_config(&self.config(), harness);
         let binary = (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path));
         let env = agent_env(&self.opts.env, &hcfg);
-        let models = tokio::task::spawn_blocking(move || h.list_models(&env, binary))
+        let models = match tokio::task::spawn_blocking(move || h.list_models(&env, binary))
             .await
             .map_err(internal)?
-            .map_err(|e| ErrorBody::new(ErrorCode::Harness, format!("{e:#}")))?;
-        // An empty answer isn't cached: ACP agents report theirs once a
+        {
+            Ok(models) => models,
+            // What a session reported is better than nothing.
+            Err(_) if cached.is_some() => {
+                return Ok(Response::Models {
+                    models: cached.unwrap_or_default(),
+                });
+            }
+            Err(e) => return Err(ErrorBody::new(ErrorCode::Harness, format!("{e:#}"))),
+        };
+        // An empty answer isn't kept: ACP agents report theirs once a
         // session starts.
-        if !models.is_empty() {
-            lock(&self.models).insert(harness.as_str().to_owned(), models.clone());
+        if models.is_empty() {
+            return Ok(Response::Models {
+                models: cached.unwrap_or_default(),
+            });
         }
+        lock(&self.models).insert(harness.as_str().to_owned(), models.clone());
+        lock(&self.models_listed).insert(harness.as_str().to_owned());
         Ok(Response::Models { models })
     }
 

@@ -139,16 +139,17 @@ fn help_text(binary: &Path, env: &HashMap<String, String>) -> Option<String> {
     Some(text)
 }
 
-/// A short-lived agent's `session/new` result, for what a session offers.
-/// The session is deleted again if the agent can (`sessionCapabilities.
-/// delete`), so it doesn't show in the agent's own history.
+/// The models a short-lived session offers, each with its effort levels
+/// (read by switching the session to each model in turn). The session is
+/// deleted again if the agent can (`sessionCapabilities.delete`), so it
+/// doesn't show in the agent's own history.
 // Runs a CLI: never in a browser, so std's clock is fine here.
 #[allow(clippy::disallowed_methods)]
 fn probe_session(
     binary: &Path,
     args: &[String],
     env: &HashMap<String, String>,
-) -> Result<serde_json::Value> {
+) -> Result<Vec<loft_protocol::ModelInfo>> {
     use std::io::{BufRead as _, Write as _};
     let cwd = std::env::temp_dir();
     let mut cmd = std::process::Command::new(binary);
@@ -180,11 +181,11 @@ fn probe_session(
             }
         }
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut call = |id: u64,
                     method: &str,
                     params: serde_json::Value|
      -> Result<serde_json::Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let msg =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         writeln!(stdin, "{msg}")?;
@@ -209,13 +210,44 @@ fn probe_session(
             "session/new",
             serde_json::json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
         )?;
+        let id = session.get("sessionId").cloned().unwrap_or_default();
+        let mut models = translate::offered_models(&session);
+        let mut next = 2;
+        if translate::offered_efforts(&session).is_some() {
+            let current = models.iter().position(|m| m.is_default);
+            for m in &mut models {
+                let reply = call(
+                    next,
+                    "session/set_config_option",
+                    serde_json::json!({ "sessionId": id, "configId": "model", "value": m.id }),
+                );
+                next += 1;
+                if let Some(efforts) = reply.ok().as_ref().and_then(translate::offered_efforts) {
+                    m.efforts = efforts;
+                }
+            }
+            // Leave nothing changed behind (some agents remember the last
+            // model for new sessions).
+            if let Some(m) = current.map(|i| models[i].id.clone()) {
+                let _ = call(
+                    next,
+                    "session/set_config_option",
+                    serde_json::json!({ "sessionId": id, "configId": "model", "value": m }),
+                );
+                next += 1;
+            }
+        }
         let deletes = init
             .pointer("/agentCapabilities/sessionCapabilities/delete")
             .is_some();
-        if deletes && let Some(id) = session.get("sessionId").cloned() {
-            let _ = call(2, "session/delete", serde_json::json!({ "sessionId": id }));
+        if deletes {
+            let _ = call(
+                next,
+                "session/delete",
+                serde_json::json!({ "sessionId": id }),
+            );
         }
-        Ok(session)
+        Ok(models)
     })();
     // The agent exits when its input ends; its helpers go with the group.
     drop(stdin);
@@ -257,7 +289,8 @@ impl Harness for AcpHarness {
             // ACP has no steering; `session/fork` is still unstable.
             steer: false,
             native_fork: false,
-            // ACP has no effort setting; nothing to apply or restart for.
+            // Effort is a session config option (`thought_level`) where the
+            // agent offers one, set on the live session.
             live_effort_switch: true,
             // Only some agents advertise model/mode selectors (OpenCode does,
             // via `configOptions`); the session applies them when offered and
@@ -281,8 +314,7 @@ impl Harness for AcpHarness {
             Some(b) => b,
             None => self.which(env)?,
         };
-        let result = probe_session(&binary, &self.agent_args(&binary, env), env)?;
-        Ok(translate::offered_models(&result))
+        probe_session(&binary, &self.agent_args(&binary, env), env)
     }
 
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
@@ -314,6 +346,7 @@ impl Harness for AcpHarness {
             cfg.resume.clone(),
             cfg.mcp_servers.clone(),
         );
+        translator.effort = cfg.effort.clone();
         // `mcp__agentloft` in allowed_tools → auto-approve that server's tools.
         translator.auto_allow_mcp = cfg
             .allowed_tools
@@ -392,7 +425,7 @@ async fn run(
                         t.respond(&native_request_id, decision)
                     }
                     Some(SessionCommand::SetModel(model)) => t.set_model(model),
-                    Some(SessionCommand::SetEffort(_)) => vec![],
+                    Some(SessionCommand::SetEffort(effort)) => t.set_effort(effort),
                     Some(SessionCommand::SetPermissionMode(mode)) => t.set_permission_mode(mode),
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 };

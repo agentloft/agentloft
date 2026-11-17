@@ -165,6 +165,9 @@ pub struct Translator {
     pub cwd: String,
     pub model: Option<String>,
     pub mode: Option<PermissionMode>,
+    /// Reasoning effort wanted (a `thought_level` value); `None` = the
+    /// agent's default.
+    pub effort: Option<String>,
     resume: Option<String>,
     mcp_servers: Vec<McpServer>,
     /// MCP servers whose tool calls are approved automatically.
@@ -183,6 +186,9 @@ pub struct Translator {
     replaying: bool,
     model_setting: Option<Setting>,
     mode_setting: Option<Setting>,
+    /// The `thought_level` option (OpenCode's `effort`). Its values depend
+    /// on the model, and switching models resets it.
+    effort_setting: Option<Setting>,
     /// Setting changes in flight; prompts wait for them.
     settings_in_flight: usize,
     /// Prompts queued until the session exists, with `(mime, base64)` images.
@@ -421,6 +427,14 @@ impl Translator {
         self.apply_model(true)
     }
 
+    pub fn set_effort(&mut self, effort: Option<String>) -> Vec<Out> {
+        self.effort = effort;
+        if self.session_id.is_none() {
+            return vec![];
+        }
+        self.apply_effort(true)
+    }
+
     pub fn set_permission_mode(&mut self, mode: Option<PermissionMode>) -> Vec<Out> {
         self.mode = mode;
         if self.session_id.is_none() {
@@ -478,6 +492,45 @@ impl Translator {
         let req = self.setting_request(&setting, &value);
         setting.set_current(&value);
         self.model_setting = Some(setting);
+        vec![Out::Send(req)]
+    }
+
+    /// Ask the agent for `self.effort` (or, asked explicitly for none, its
+    /// `default`), if the current model offers it.
+    fn apply_effort(&mut self, explicit: bool) -> Vec<Out> {
+        let Some(mut setting) = self.effort_setting.clone() else {
+            return if explicit && self.effort.is_some() {
+                vec![Self::notice(
+                    NoticeLevel::Warning,
+                    format!("{} doesn't offer effort levels over ACP.", self.agent),
+                )]
+            } else {
+                vec![]
+            };
+        };
+        let value = match &self.effort {
+            Some(e) if setting.values().contains(e) => e.clone(),
+            Some(e) => {
+                return if explicit {
+                    vec![Self::notice(
+                        NoticeLevel::Warning,
+                        format!("{}'s model doesn't offer the effort `{e}`.", self.agent),
+                    )]
+                } else {
+                    vec![]
+                };
+            }
+            None if explicit && setting.values().iter().any(|v| v == "default") => {
+                "default".to_owned()
+            }
+            None => return vec![],
+        };
+        if setting.current() == value {
+            return vec![];
+        }
+        let req = self.setting_request(&setting, &value);
+        setting.set_current(&value);
+        self.effort_setting = Some(setting);
         vec![Out::Send(req)]
     }
 
@@ -625,18 +678,30 @@ impl Translator {
                         .filter(|m| !m.is_empty()),
                     slash_commands: vec![],
                 })];
-                out.extend(self.apply_model(false));
+                let model = self.apply_model(false);
+                // A model switch resets the effort: it is applied when the
+                // switch is answered (`Pending::Setting`).
+                let switching = model.iter().any(|o| matches!(o, Out::Send(_)));
+                out.extend(model);
                 out.extend(self.apply_mode(false));
+                if !switching {
+                    out.extend(self.apply_effort(false));
+                }
                 out.extend(self.flush_queue());
                 out
             }
             Pending::Prompt => self.finish_prompt(result),
             Pending::Setting => {
                 self.settings_in_flight = self.settings_in_flight.saturating_sub(1);
+                let mut out = Vec::new();
                 if result.get("configOptions").is_some() {
                     self.read_settings(result);
+                    // After a model switch the effort is back at the
+                    // model's default.
+                    out.extend(self.apply_effort(false));
                 }
-                self.flush_queue()
+                out.extend(self.flush_queue());
+                out
             }
         }
     }
@@ -721,6 +786,7 @@ impl Translator {
                 match category {
                     Some("model") => self.model_setting = Some(setting),
                     Some("mode") => self.mode_setting = Some(setting),
+                    Some("thought_level") => self.effort_setting = Some(setting),
                     _ => {}
                 }
             }
@@ -1654,6 +1720,21 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
     }
 }
 
+/// The effort levels a session's current model offers (its `thought_level`
+/// select, without `default`), in the agent's order; `None` when it has no
+/// such option.
+pub fn offered_efforts(result: &Value) -> Option<Vec<String>> {
+    let opt = result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))?;
+    let Setting::ConfigOption { values, .. } = config_select(opt)? else {
+        return None;
+    };
+    Some(values.into_iter().filter(|v| v != "default").collect())
+}
+
 /// `initialize`'s params: what Agentloft is and what it offers the agent.
 pub fn initialize_params() -> Value {
     json!({
@@ -2298,6 +2379,66 @@ mod tests {
         assert!(t.set_permission_mode(None).is_empty());
         // An unknown model is reported, not sent.
         let out = t.set_model(Some("gpt-nope".into()));
+        assert!(sends(&out).is_empty());
+        assert!(matches!(events(&out)[0], HarnessEvent::Notice { .. }));
+    }
+
+    /// OpenCode 2.3.0: `effort` (`thought_level`) whose values depend on
+    /// the model and reset to `default` when the model changes.
+    #[test]
+    fn effort_follows_the_model() {
+        let options = |model: &str, effort: &str, efforts: &[&str]| {
+            json!([
+                { "id": "model", "category": "model", "type": "select", "currentValue": model,
+                  "options": [{ "value": "opencode/free", "name": "Free" },
+                              { "value": "anthropic/claude-opus-5-5", "name": "Opus" }] },
+                { "id": "effort", "category": "thought_level", "type": "select", "currentValue": effort,
+                  "options": efforts.iter().map(|e| json!({ "value": e, "name": e })).collect::<Vec<_>>() },
+            ])
+        };
+        let opus = ["low", "medium", "high", "xhigh", "max", "default"];
+        let mut t = Translator::new(
+            "OpenCode",
+            "/tmp/probe".into(),
+            Some("anthropic/claude-opus-5-5".into()),
+            None,
+            None,
+            vec![],
+        );
+        t.effort = Some("max".into());
+        t.initialize();
+        t.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}"#);
+        let session = json!({ "sessionId": "S",
+            "configOptions": options("opencode/free", "default", &["none", "high", "default"]) });
+        assert_eq!(
+            offered_efforts(&session),
+            Some(vec!["none".to_owned(), "high".to_owned()])
+        );
+        let out = t.on_line(&json!({ "jsonrpc": "2.0", "id": 2, "result": session }).to_string());
+        // The free model has no `max`: only the model is switched for now.
+        let s = sends(&out);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0]["params"]["configId"], "model");
+        // The switch answers with Opus's efforts, back at `default`.
+        let reply = json!({ "jsonrpc": "2.0", "id": 3,
+            "result": { "configOptions": options("anthropic/claude-opus-5-5", "default", &opus) } });
+        let out = t.on_line(&reply.to_string());
+        let s = sends(&out);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(
+            s[0]["params"],
+            json!({ "sessionId": "S", "configId": "effort", "value": "max" })
+        );
+        let reply = json!({ "jsonrpc": "2.0", "id": 4,
+            "result": { "configOptions": options("anthropic/claude-opus-5-5", "max", &opus) } });
+        assert!(sends(&t.on_line(&reply.to_string())).is_empty());
+        // Live changes; none = the agent's own default.
+        let out = t.set_effort(Some("low".into()));
+        assert_eq!(sends(&out)[0]["params"]["value"], "low");
+        let out = t.set_effort(None);
+        assert_eq!(sends(&out)[0]["params"]["value"], "default");
+        // One the model doesn't offer is reported, not sent.
+        let out = t.set_effort(Some("ultra".into()));
         assert!(sends(&out).is_empty());
         assert!(matches!(events(&out)[0], HarnessEvent::Notice { .. }));
     }

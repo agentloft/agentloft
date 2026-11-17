@@ -203,6 +203,15 @@ async fn live_opencode_turn_approval_interrupt_mcp_resume() {
     else {
         panic!()
     };
+    // The free default model offers `none` and `high`; set before the
+    // session starts, applied when it opens.
+    client
+        .request(Request::SetEffort {
+            thread_id: thread.id.clone(),
+            effort: Some("high".into()),
+        })
+        .await
+        .unwrap();
     client.subscribe(Topic::Thread(thread.id.clone()));
     let ClientEvent::Snapshot { snapshot, .. } = rx.recv().await.unwrap() else {
         panic!()
@@ -224,6 +233,18 @@ async fn live_opencode_turn_approval_interrupt_mcp_resume() {
             .any(|(tool, _, s)| tool == "Shell" && *s == ItemStatus::Completed),
         "{:?}",
         tools(&model)
+    );
+    let notices: Vec<_> = model
+        .items
+        .iter()
+        .filter_map(|i| match &i.body {
+            ItemBody::Notice { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !notices.iter().any(|n| n.contains("effort")),
+        "effort refused: {notices:?}"
     );
     let session = model
         .thread
@@ -327,4 +348,11 @@ fn live_opencode_lists_models_before_any_session() {
     );
     assert!(models.len() > 1, "{models:?}");
     assert!(models.iter().any(|m| m.is_default), "{models:?}");
+    let with_effort: Vec<_> = models
+        .iter()
+        .filter(|m| !m.efforts.is_empty())
+        .map(|m| format!("{} {:?}", m.id, m.efforts))
+        .collect();
+    println!("{}", with_effort.join("\n"));
+    assert!(!with_effort.is_empty(), "no model offered effort levels");
 }
