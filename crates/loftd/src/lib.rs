@@ -79,7 +79,7 @@ impl Daemon {
             .await?;
             Arc::new(env)
         } else {
-            Arc::new(std::env::vars().collect())
+            Arc::new(loft_config::process_env())
         };
         let config = loft_config::Config::load(&paths).unwrap_or_else(|err| {
             tracing::warn!(%err, "invalid config.toml; using defaults");

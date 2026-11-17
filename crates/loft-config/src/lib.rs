@@ -1069,7 +1069,7 @@ pub fn edit_setting(text: &str, key: &[&str], value: SettingValue) -> Result<Str
 /// On Windows there is no login shell to ask: programs see the user's PATH
 /// whoever starts them, so this process's environment is the one.
 pub fn capture_login_env(timeout: Duration) -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = std::env::vars().collect();
+    let mut env = process_env();
     if cfg!(windows) {
         // Windows' variable names aren't case-sensitive: one `PATH` key,
         // whatever its spelling here (`Path` is usual).
@@ -1080,7 +1080,8 @@ pub fn capture_login_env(timeout: Duration) -> HashMap<String, String> {
         return env;
     }
     match run_login_shell_env(timeout) {
-        Ok(captured) if captured.contains_key("PATH") => {
+        Ok(mut captured) if captured.contains_key("PATH") => {
+            forget_working_dir(&mut captured);
             env.extend(captured);
         }
         Ok(_) => tracing::warn!("login shell env had no PATH; using fallback"),
@@ -1089,6 +1090,24 @@ pub fn capture_login_env(timeout: Duration) -> HashMap<String, String> {
     let path = env.get("PATH").cloned().unwrap_or_default();
     env.insert("PATH".into(), with_fallback_dirs(&stable_path_var(&path)));
     env
+}
+
+/// This process's environment, for the processes it starts in folders of
+/// their own: without `PWD` and `OLDPWD`.
+pub fn process_env() -> HashMap<String, String> {
+    let mut env = std::env::vars().collect();
+    forget_working_dir(&mut env);
+    env
+}
+
+/// `PWD` and `OLDPWD` name the folder of the shell they were captured from.
+/// Passed on, they contradict a child's real working directory, and some
+/// CLIs believe them over it: OpenCode's `opencode run` asks its background
+/// service for `$PWD`, which fails (`UnexpectedStatus: 500`) when that
+/// folder can't be read. Shells set both again when they start.
+fn forget_working_dir(env: &mut HashMap<String, String>) {
+    env.remove("PWD");
+    env.remove("OLDPWD");
 }
 
 /// `PATH` with fnm's per-session directories resolved (see [`stable_path`]),
@@ -1761,6 +1780,15 @@ name = "No command"
         assert_eq!(env["PATH"], "/a:/b");
         assert_eq!(env["MULTI"], "a=b");
         assert!(!env.contains_key("junk"));
+    }
+
+    #[test]
+    fn agents_env_has_no_working_dir() {
+        let mut env = parse_env_nul(b"PATH=/a\0PWD=/somewhere\0OLDPWD=/before\0");
+        forget_working_dir(&mut env);
+        assert_eq!(env.keys().collect::<Vec<_>>(), vec!["PATH"]);
+        let env = process_env();
+        assert!(!env.contains_key("PWD") && !env.contains_key("OLDPWD"));
     }
 
     #[test]

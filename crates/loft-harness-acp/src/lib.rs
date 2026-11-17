@@ -57,7 +57,7 @@ impl AcpHarness {
         }
     }
 
-    /// OpenCode: `opencode acp` (verified against 2.2.5).
+    /// OpenCode: `opencode acp` (verified against 2.3.0).
     pub fn opencode() -> Self {
         Self::new(
             HarnessId::OPENCODE,

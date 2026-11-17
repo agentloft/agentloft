@@ -138,7 +138,7 @@ pub use agent_updates::Fetcher;
 impl Default for CoreOptions {
     fn default() -> Self {
         Self {
-            env: Arc::new(std::env::vars().collect()),
+            env: Arc::new(loft_config::process_env()),
             config: loft_config::Config::default(),
             flush_interval: Duration::from_millis(250),
             mcp_bridge: None,
