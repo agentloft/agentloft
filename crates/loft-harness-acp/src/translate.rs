@@ -248,19 +248,7 @@ impl Translator {
     // -- outgoing -----------------------------------------------------------
 
     pub fn initialize(&mut self) -> Value {
-        self.request(
-            Pending::Initialize,
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                // The agent uses its own file system and shell tools.
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false,
-                },
-                "clientInfo": { "name": "agentloft", "title": "Agentloft", "version": env!("CARGO_PKG_VERSION") },
-            }),
-        )
+        self.request(Pending::Initialize, "initialize", initialize_params())
     }
 
     fn mcp_servers_json(&self) -> Value {
@@ -1666,9 +1654,22 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
     }
 }
 
+/// `initialize`'s params: what Agentloft is and what it offers the agent.
+pub fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        // The agent uses its own file system and shell tools.
+        "clientCapabilities": {
+            "fs": { "readTextFile": false, "writeTextFile": false },
+            "terminal": false,
+        },
+        "clientInfo": { "name": "agentloft", "title": "Agentloft", "version": env!("CARGO_PKG_VERSION") },
+    })
+}
+
 /// The models a session offers: a `configOptions` model select (flat or
 /// grouped options) or the legacy `models.availableModels` list.
-fn offered_models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
+pub fn offered_models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
     let info = |id: &str, name: Option<&str>, current: Option<&str>| loft_protocol::ModelInfo {
         id: id.to_owned(),
         display_name: name.unwrap_or(id).to_owned(),

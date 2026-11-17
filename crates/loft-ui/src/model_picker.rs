@@ -324,9 +324,9 @@ impl ModelPicker {
             .track_scroll(&self.scroll);
         if snap.models.is_empty() {
             let text = if self.query.is_empty() {
-                "Asking the agent for its models…"
+                self.store.read(cx).models_note(&snap.harness)
             } else {
-                "No models match."
+                "No models match.".into()
             };
             return list
                 .child(

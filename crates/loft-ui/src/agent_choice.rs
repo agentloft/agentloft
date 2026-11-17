@@ -66,11 +66,12 @@ impl AgentChoice {
 impl Render for AgentChoice {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
-        let (agents, models) = {
+        let (agents, models, models_note) = {
             let store = self.store.read(cx);
             (
                 store.available_harnesses(),
                 store.models.get(&self.harness).cloned().unwrap_or_default(),
+                store.models_note(&self.harness),
             )
         };
         let mut tabs = h_flex().gap(px(2.)).p(px(2.)).rounded(px(9.)).bg(p.muted);
@@ -168,7 +169,7 @@ impl Render for AgentChoice {
                     .p_2()
                     .text_xs()
                     .text_color(p.faint_foreground)
-                    .child("Asking the agent for its models…"),
+                    .child(models_note),
             );
         }
         for m in &models {

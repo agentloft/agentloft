@@ -312,3 +312,19 @@ async fn live_opencode_turn_approval_interrupt_mcp_resume() {
     println!("resume ok: {:?} (+{new_items} items)", last_text(&model));
     d.shutdown().await;
 }
+
+#[test]
+#[ignore = "drives the real opencode CLI"]
+fn live_opencode_lists_models_before_any_session() {
+    let env = loft_config::capture_login_env(Duration::from_secs(5));
+    let models = loft_harness_acp::AcpHarness::opencode()
+        .list_models(&env, None)
+        .unwrap();
+    println!(
+        "{} models, default {:?}",
+        models.len(),
+        models.iter().find(|m| m.is_default).map(|m| &m.id)
+    );
+    assert!(models.len() > 1, "{models:?}");
+    assert!(models.iter().any(|m| m.is_default), "{models:?}");
+}

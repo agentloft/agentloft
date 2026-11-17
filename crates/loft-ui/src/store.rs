@@ -292,6 +292,8 @@ pub struct AppStore {
     pub unread: std::collections::HashSet<ThreadId>,
     /// Model pickers' options per harness (`ListModels`).
     pub models: HashMap<HarnessId, Vec<loft_protocol::ModelInfo>>,
+    /// Why the last `ListModels` for a harness failed.
+    model_errors: HashMap<HarnessId, String>,
     /// Installed CLIs (`ProbeHarness`).
     pub harness_status: HashMap<HarnessId, loft_protocol::HarnessStatus>,
     /// Agents whose CLI is being updated now (`UpdateHarness`).
@@ -378,6 +380,7 @@ impl AppStore {
             forking: false,
             unread: Default::default(),
             models: HashMap::new(),
+            model_errors: HashMap::new(),
             harness_status: HashMap::new(),
             updating_harnesses: Default::default(),
             worktree_leftovers: None,
@@ -602,11 +605,30 @@ impl AppStore {
             harness: harness.clone(),
         };
         self.request_result(body, cx, move |store, result, cx| {
-            if let Ok(Response::Models { models }) = result {
-                store.models.insert(harness, models);
-                cx.notify();
+            match result {
+                Ok(Response::Models { models }) => {
+                    store.model_errors.remove(&harness);
+                    store.models.insert(harness, models);
+                }
+                Ok(_) => return,
+                Err(err) => {
+                    store.model_errors.insert(harness, err.message);
+                }
             }
+            cx.notify();
         });
+    }
+
+    /// What a model list shows while `harness` has no models: still
+    /// asking, why asking failed, or that it offered none.
+    pub fn models_note(&self, harness: &HarnessId) -> String {
+        if let Some(err) = self.model_errors.get(harness) {
+            return format!("Couldn't get the agent's models: {err}");
+        }
+        match self.models.get(harness) {
+            Some(_) => "The agent didn't list any models. It uses its own default.".into(),
+            None => "Asking the agent for its models…".into(),
+        }
     }
 
     /// Agents to offer: Claude Code and Codex always, ACP agents (OpenCode,

@@ -271,6 +271,7 @@ impl SettingsView {
             .get(&HarnessId(id.into()))
             .cloned()
             .unwrap_or_default();
+        let models_note = store.models_note(&HarnessId(id.into()));
 
         // The list.
         let mut list = v_flex().w(px(176.)).flex_none().gap_1();
@@ -623,7 +624,7 @@ impl SettingsView {
                     .py_2()
                     .text_sm()
                     .text_color(p.muted_foreground)
-                    .child("Asking the agent for its models…"),
+                    .child(models_note),
             );
         }
         for m in &models {

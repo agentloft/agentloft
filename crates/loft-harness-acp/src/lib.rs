@@ -15,6 +15,7 @@ use loft_harness::{
     Capabilities, Harness, HarnessEvent, SessionCommand, SessionConfig, SessionEnds, SessionHandle,
 };
 use loft_protocol::HarnessId;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -77,10 +78,14 @@ impl AcpHarness {
     }
 
     fn resolve_binary(&self, cfg: &SessionConfig) -> Result<PathBuf> {
-        if let Some(bin) = &cfg.binary {
-            return Ok(bin.clone());
+        match &cfg.binary {
+            Some(bin) => Ok(bin.clone()),
+            None => self.which(&cfg.env),
         }
-        let path = cfg.env.get("PATH").map(String::as_str).unwrap_or_default();
+    }
+
+    fn which(&self, env: &HashMap<String, String>) -> Result<PathBuf> {
+        let path = env.get("PATH").map(String::as_str).unwrap_or_default();
         loft_config::which(&self.binary_name, path).with_context(|| {
             format!(
                 "`{}` not found on PATH — install {} or set its binary path",
@@ -91,14 +96,14 @@ impl AcpHarness {
 
     /// `args`, or `legacy_args` when the installed CLI predates `args[0]`.
     /// Probed once per daemon run.
-    fn agent_args(&self, binary: &Path, cfg: &SessionConfig) -> Vec<String> {
+    fn agent_args(&self, binary: &Path, env: &HashMap<String, String>) -> Vec<String> {
         let Some(legacy) = &self.legacy_args else {
             return self.args.clone();
         };
         self.resolved_args
             .get_or_init(|| {
                 let flag = self.args.first().cloned().unwrap_or_default();
-                match help_text(binary, cfg) {
+                match help_text(binary, env) {
                     Some(help) if mentions_flag(&help, &flag) => self.args.clone(),
                     Some(_) => legacy.clone(),
                     // Can't tell: use the current spelling.
@@ -109,18 +114,18 @@ impl AcpHarness {
     }
 
     pub fn build_args(&self, binary: &Path, cfg: &SessionConfig) -> Vec<String> {
-        let mut args = self.agent_args(binary, cfg);
+        let mut args = self.agent_args(binary, &cfg.env);
         args.extend(cfg.extra_args.iter().cloned());
         args
     }
 }
 
 /// `<binary> --help` output (stdout + stderr), bounded by a timeout.
-fn help_text(binary: &Path, cfg: &SessionConfig) -> Option<String> {
+fn help_text(binary: &Path, env: &HashMap<String, String>) -> Option<String> {
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("--help")
         .env_clear()
-        .envs(cfg.env.iter())
+        .envs(env.iter())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -132,6 +137,99 @@ fn help_text(binary: &Path, cfg: &SessionConfig) -> Option<String> {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Some(text)
+}
+
+/// A short-lived agent's `session/new` result, for what a session offers.
+/// The session is deleted again if the agent can (`sessionCapabilities.
+/// delete`), so it doesn't show in the agent's own history.
+// Runs a CLI: never in a browser, so std's clock is fine here.
+#[allow(clippy::disallowed_methods)]
+fn probe_session(
+    binary: &Path,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> Result<serde_json::Value> {
+    use std::io::{BufRead as _, Write as _};
+    let cwd = std::env::temp_dir();
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(args)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(env.iter())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let mut stdin = child.stdin.take().context("ACP agent stdin")?;
+    let stdout = child.stdout.take().context("ACP agent stdout")?;
+    // Read on a thread so a stuck agent can't hang us past the deadline.
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut call = |id: u64,
+                    method: &str,
+                    params: serde_json::Value|
+     -> Result<serde_json::Value> {
+        let msg =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        writeln!(stdin, "{msg}")?;
+        stdin.flush()?;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx
+                .recv_timeout(left)
+                .with_context(|| format!("the agent didn't answer `{method}`"))?;
+            if v.get("id") == Some(&serde_json::json!(id)) && v.get("method").is_none() {
+                if let Some(err) = v.get("error") {
+                    anyhow::bail!("{method}: {err}");
+                }
+                return Ok(v.get("result").cloned().unwrap_or_default());
+            }
+        }
+    };
+    let result = (|| {
+        let init = call(0, "initialize", translate::initialize_params())?;
+        let session = call(
+            1,
+            "session/new",
+            serde_json::json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+        )?;
+        let deletes = init
+            .pointer("/agentCapabilities/sessionCapabilities/delete")
+            .is_some();
+        if deletes && let Some(id) = session.get("sessionId").cloned() {
+            let _ = call(2, "session/delete", serde_json::json!({ "sessionId": id }));
+        }
+        Ok(session)
+    })();
+    // The agent exits when its input ends; its helpers go with the group.
+    drop(stdin);
+    let pid = child.id();
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    loft_harness::process::signal_group(pid, loft_harness::process::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 /// Whether help text lists `flag` as its own option (`--acp`, not
@@ -168,6 +266,23 @@ impl Harness for AcpHarness {
             live_mode_switch: false,
             compact: false,
         }
+    }
+
+    /// ACP has no call for this: open a session in the temp folder, read
+    /// the models it offers, and delete it again (when the agent can), so
+    /// the picker has them before the first thread. Sessions report their
+    /// own list once they start.
+    fn list_models(
+        &self,
+        env: &HashMap<String, String>,
+        binary: Option<PathBuf>,
+    ) -> Result<Vec<loft_protocol::ModelInfo>> {
+        let binary = match binary {
+            Some(b) => b,
+            None => self.which(env)?,
+        };
+        let result = probe_session(&binary, &self.agent_args(&binary, env), env)?;
+        Ok(translate::offered_models(&result))
     }
 
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
@@ -365,6 +480,51 @@ mod tests {
         // No runnable binary to probe: the current flag spelling is used.
         let args = gem.build_args(Path::new("/nonexistent/gemini"), &cfg(vec![]));
         assert_eq!(args, vec!["--acp"]);
+    }
+
+    /// A stand-in ACP agent: answers `initialize` and `session/new` with
+    /// two models, writes what it gets next (the delete) to a file.
+    #[cfg(unix)]
+    #[test]
+    fn lists_models_from_a_short_lived_session() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "agentloft-acp-models-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("after.txt");
+        let agent = dir.join("agent");
+        std::fs::write(
+            &agent,
+            format!(
+                r#"#!/bin/sh
+read l; echo '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{"sessionCapabilities":{{"delete":{{}}}}}}}}}}'
+read l; echo '{{"jsonrpc":"2.0","method":"session/update","params":{{}}}}'
+echo '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"s1","configOptions":[{{"id":"model","category":"model","currentValue":"p/b","options":[{{"value":"p/a","name":"A"}},{{"value":"p/b","name":"B"}}]}}]}}}}'
+read l; echo "$l" > '{}'; echo '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
+read l
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: HashMap<String, String> = [("PATH".into(), "/usr/bin:/bin".into())].into();
+        let models = AcpHarness::opencode()
+            .list_models(&env, Some(agent))
+            .unwrap();
+        let ids: Vec<_> = models
+            .iter()
+            .map(|m| (m.id.as_str(), m.is_default))
+            .collect();
+        assert_eq!(ids, vec![("p/a", false), ("p/b", true)]);
+        assert_eq!(models[0].display_name, "A");
+        let after = std::fs::read_to_string(&log).unwrap();
+        assert!(after.contains(r#""method":"session/delete""#), "{after}");
+        assert!(after.contains(r#""sessionId":"s1""#), "{after}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
