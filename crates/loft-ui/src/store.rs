@@ -1048,6 +1048,11 @@ impl AppStore {
             ClientEvent::PageTabs { thread_id, pages } => {
                 cx.emit(StoreEvent::PageTabs { thread_id, pages });
             }
+            // Not shown yet: the device panel (ADR-0020) takes these.
+            ClientEvent::DeviceFrame { .. }
+            | ClientEvent::DeviceState { .. }
+            | ClientEvent::DeviceList { .. }
+            | ClientEvent::DeviceDriven { .. } => {}
             ClientEvent::Fatal(err) => self.fail(err.message, cx),
             ClientEvent::Disconnected => self.on_disconnected(cx),
         }

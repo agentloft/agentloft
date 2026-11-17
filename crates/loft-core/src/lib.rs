@@ -6,6 +6,7 @@ mod agent_updates;
 mod automations;
 mod browser;
 mod cleanup;
+pub mod devices;
 mod forks;
 mod handoff;
 mod item_pages;
@@ -88,6 +89,22 @@ pub enum BusMsg {
         thread_id: ThreadId,
         page: loft_protocol::PageInfo,
     },
+    /// A device's screen has a new picture, numbered `seq` (ADR-0020).
+    DeviceFrame {
+        id: loft_protocol::DeviceId,
+        seq: u64,
+    },
+    /// A device's state, size or error changed.
+    DeviceState {
+        id: loft_protocol::DeviceId,
+    },
+    /// The list of devices changed.
+    DevicesChanged,
+    /// An agent of `thread_id` is using a device (at most once a second).
+    DeviceDriven {
+        thread_id: ThreadId,
+        device: loft_protocol::DeviceInfo,
+    },
     /// The thread's tabs changed (one opened or closed): all of them.
     PageTabs {
         thread_id: ThreadId,
@@ -131,6 +148,9 @@ pub struct CoreOptions {
     pub attachments_dir: PathBuf,
     /// Asks the web for the agents' latest releases (`None`: never asks).
     pub fetch: Option<Fetcher>,
+    /// Simulators and emulators (ADR-0020): `devices::system_backends` in
+    /// the daemon, none (or fakes) in tests.
+    pub device_backends: Vec<Arc<dyn devices::Backend>>,
 }
 
 pub use agent_updates::Fetcher;
@@ -148,6 +168,7 @@ impl Default for CoreOptions {
             config_file: None,
             attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
             fetch: None,
+            device_backends: Vec::new(),
         }
     }
 }
@@ -162,6 +183,8 @@ pub struct Core {
     terminals: terminals::Terminals,
     /// The daemon's own browser and its pages (ADR-0017).
     pages: pages::Pages,
+    /// Simulators and emulators (ADR-0020).
+    devices: Arc<devices::Devices>,
     /// Serializes worktree creation (two first messages racing).
     worktree_lock: tokio::sync::Mutex<()>,
     /// Which threads' pull requests are followed, and when each is due.
@@ -221,7 +244,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Core {
     pub fn new(store: Store, harnesses: Vec<Arc<dyn Harness>>, opts: CoreOptions) -> Arc<Self> {
         let (bus, _) = broadcast::channel(4096);
+        let devices = Arc::new(devices::Devices::new(
+            opts.device_backends.clone(),
+            bus.clone(),
+        ));
         Arc::new(Self {
+            devices,
             store: Mutex::new(store),
             bus,
             harnesses: harnesses.into_iter().map(|h| (h.id().0, h)).collect(),
@@ -256,6 +284,27 @@ impl Core {
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusMsg> {
         self.bus.subscribe()
+    }
+
+    /// Simulators and emulators (ADR-0020).
+    pub fn devices(&self) -> &Arc<devices::Devices> {
+        &self.devices
+    }
+
+    /// A subscription's first message for [`Topic::Devices`] or
+    /// [`Topic::Device`].
+    pub async fn device_snapshot(&self, topic: &Topic) -> CoreResult<Snapshot> {
+        match topic {
+            Topic::Devices => {
+                let (devices, support) = self.devices.list().await;
+                Ok(Snapshot::Devices { devices, support })
+            }
+            Topic::Device(id) => {
+                let (device, frame, seq) = self.devices.snapshot(id).await?;
+                Ok(Snapshot::Device { seq, device, frame })
+            }
+            _ => Err(ErrorBody::new(ErrorCode::BadRequest, "not a device topic")),
+        }
     }
 
     /// Append events, update projections and broadcast — atomically ordered.
@@ -823,6 +872,12 @@ impl Core {
                 replay: replay.into(),
             });
         }
+        if matches!(topic, Topic::Devices | Topic::Device(_)) {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "devices are snapshotted with `device_snapshot`",
+            ));
+        }
         if let Topic::Page(id) = topic {
             let (page, frame, seq) = self.pages.snapshot(id)?;
             return Ok(Snapshot::Page { seq, page, frame });
@@ -837,7 +892,7 @@ impl Core {
                     threads: s.threads()?,
                     automations: s.automations()?,
                 }),
-                Topic::Terminal(_) | Topic::Page(_) => None,
+                Topic::Terminal(_) | Topic::Page(_) | Topic::Devices | Topic::Device(_) => None,
                 Topic::Thread(id) => match s.thread(id)? {
                     None => None,
                     Some(thread) => {
@@ -1512,6 +1567,37 @@ impl Core {
                     )
                     .await?;
                 Ok(Response::Page { page })
+            }
+            Request::DeviceList => {
+                let (devices, support) = self.devices.refresh().await;
+                Ok(Response::Devices { devices, support })
+            }
+            Request::DeviceBoot { id, thread_id } => {
+                self.devices.boot(&id, thread_id.as_ref()).await?;
+                Ok(Response::Ok)
+            }
+            Request::DeviceShutdown { id } => {
+                self.devices.shutdown(&id).await?;
+                Ok(Response::Ok)
+            }
+            Request::DeviceInput {
+                id,
+                input,
+                thread_id,
+            } => {
+                self.devices.input(&id, input, thread_id.as_ref()).await?;
+                Ok(Response::Ok)
+            }
+            Request::DeviceCapture { id } => Ok(Response::Picture {
+                png: self.devices.capture(&id, None).await?.into(),
+            }),
+            Request::DeviceApp { id, app, thread_id } => {
+                self.devices.app(&id, app, thread_id.as_ref()).await?;
+                Ok(Response::Ok)
+            }
+            Request::DeviceSet { id, setting } => {
+                self.devices.set(&id, setting).await?;
+                Ok(Response::Ok)
             }
             Request::PageList { thread_id } => Ok(Response::Pages {
                 pages: self.pages.tabs(&thread_id),

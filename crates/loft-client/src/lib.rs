@@ -96,6 +96,28 @@ pub enum ClientEvent {
         thread_id: loft_protocol::ThreadId,
         page: loft_protocol::PageInfo,
     },
+    /// A new picture of a device's screen (`ServerMsg::DeviceFrame`):
+    /// acknowledge `seq` with `Client::page_frame_ack`.
+    DeviceFrame {
+        sub_id: u64,
+        id: loft_protocol::DeviceId,
+        seq: u64,
+        jpeg: Vec<u8>,
+    },
+    DeviceState {
+        sub_id: u64,
+        device: loft_protocol::DeviceInfo,
+    },
+    DeviceList {
+        sub_id: u64,
+        devices: Vec<loft_protocol::DeviceInfo>,
+        support: loft_protocol::DeviceSupport,
+    },
+    /// An agent is using a device for a thread (`ServerMsg::DeviceDriven`).
+    DeviceDriven {
+        thread_id: loft_protocol::ThreadId,
+        device: loft_protocol::DeviceInfo,
+    },
     /// A thread's browser tabs changed (`ServerMsg::PageTabs`).
     PageTabs {
         thread_id: loft_protocol::ThreadId,
@@ -166,6 +188,25 @@ pub(crate) fn dispatch(
         }
         ServerMsg::PageDriven { thread_id, page } => ClientEvent::PageDriven { thread_id, page },
         ServerMsg::PageTabs { thread_id, pages } => ClientEvent::PageTabs { thread_id, pages },
+        ServerMsg::DeviceFrame { sub_id, id, frame } => ClientEvent::DeviceFrame {
+            sub_id,
+            id,
+            seq: frame.seq,
+            jpeg: frame.jpeg.0,
+        },
+        ServerMsg::DeviceState { sub_id, device } => ClientEvent::DeviceState { sub_id, device },
+        ServerMsg::DeviceList {
+            sub_id,
+            devices,
+            support,
+        } => ClientEvent::DeviceList {
+            sub_id,
+            devices,
+            support,
+        },
+        ServerMsg::DeviceDriven { thread_id, device } => {
+            ClientEvent::DeviceDriven { thread_id, device }
+        }
         ServerMsg::Fatal(e) => ClientEvent::Fatal(e),
         ServerMsg::Welcome(_) => return true,
     };

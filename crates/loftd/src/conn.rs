@@ -122,6 +122,10 @@ fn msg_kind(msg: &ServerMsg) -> &'static str {
         ServerMsg::PageAction { .. } => "page_action",
         ServerMsg::PageDriven { .. } => "page_driven",
         ServerMsg::PageTabs { .. } => "page_tabs",
+        ServerMsg::DeviceFrame { .. } => "device_frame",
+        ServerMsg::DeviceState { .. } => "device_state",
+        ServerMsg::DeviceList { .. } => "device_list",
+        ServerMsg::DeviceDriven { .. } => "device_driven",
         ServerMsg::Fatal(_) => "fatal",
     }
 }
@@ -418,6 +422,20 @@ pub(crate) async fn run<S>(
                             acks,
                         ))
                     }
+                    Topic::Device(device) => {
+                        let (acked, acks) = watch::channel(0);
+                        registered.page_acks.insert(sub_id, acked);
+                        tokio::spawn(forward_device(
+                            core.clone(),
+                            sub_id,
+                            device,
+                            out_tx.clone(),
+                            acks,
+                        ))
+                    }
+                    Topic::Devices => {
+                        tokio::spawn(forward_devices(core.clone(), sub_id, out_tx.clone()))
+                    }
                     topic => {
                         // A browser session that may not use the browser isn't
                         // told about pages.
@@ -558,7 +576,9 @@ async fn forward(
             Snapshot::Workspace { seq, .. }
             | Snapshot::Thread { seq, .. }
             | Snapshot::Terminal { seq, .. }
-            | Snapshot::Page { seq, .. } => *seq,
+            | Snapshot::Page { seq, .. }
+            | Snapshot::Device { seq, .. } => *seq,
+            Snapshot::Devices { .. } => 0,
         };
         if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
             return;
@@ -623,6 +643,16 @@ async fn forward(
                         return;
                     }
                 }
+                Ok(BusMsg::DeviceDriven { thread_id, device }) => {
+                    if pages
+                        && topic == Topic::Thread(thread_id.clone())
+                        && out
+                            .send(ServerMsg::DeviceDriven { thread_id, device })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
                 Ok(BusMsg::PageTabs {
                     thread_id,
                     pages: tabs,
@@ -639,12 +669,16 @@ async fn forward(
                         return;
                     }
                 }
-                // Pages have a forwarder of their own (`forward_page`).
+                // Pages and devices have forwarders of their own
+                // (`forward_page`, `forward_device`, `forward_devices`).
                 Ok(
                     BusMsg::PageFrame { .. }
                     | BusMsg::PageState { .. }
                     | BusMsg::PageClosed { .. }
-                    | BusMsg::PageAction { .. },
+                    | BusMsg::PageAction { .. }
+                    | BusMsg::DeviceFrame { .. }
+                    | BusMsg::DeviceState { .. }
+                    | BusMsg::DevicesChanged,
                 ) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(n, sub_id, "subscriber lagged; resending snapshot");
@@ -892,7 +926,152 @@ fn matches_topic(topic: &Topic, event: &loft_protocol::Event) -> bool {
     match topic {
         Topic::Workspace => event.is_workspace_event(),
         Topic::Thread(id) => event.thread_id() == Some(id),
-        Topic::Terminal(_) | Topic::Page(_) => false,
+        Topic::Terminal(_) | Topic::Page(_) | Topic::Devices | Topic::Device(_) => false,
+    }
+}
+
+/// A subscriber of the list of simulators and emulators (ADR-0020): the
+/// list now, then again whenever it changes. The list is read again every
+/// few seconds while anyone subscribes.
+async fn forward_devices(core: Arc<Core>, sub_id: u64, out: mpsc::UnboundedSender<ServerMsg>) {
+    let mut bus = core.subscribe();
+    let devices = core.devices().clone();
+    devices.watching_list(true);
+    struct Leave(Arc<loft_core::devices::Devices>);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            self.0.watching_list(false);
+        }
+    }
+    let _leave = Leave(devices.clone());
+    let Ok(snapshot) = core.device_snapshot(&Topic::Devices).await else {
+        return;
+    };
+    if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
+        return;
+    }
+    loop {
+        match bus.recv().await {
+            Ok(BusMsg::DevicesChanged) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                let (list, support) = devices.list().await;
+                if out
+                    .send(ServerMsg::DeviceList {
+                        sub_id,
+                        devices: list,
+                        support,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// One viewer of a simulator or emulator: its state as it changes, and its
+/// pictures, as many on the way at once as the link carries
+/// ([`PictureWindow`]), always the newest. Watching is what makes a running
+/// device stream.
+async fn forward_device(
+    core: Arc<Core>,
+    sub_id: u64,
+    device: loft_protocol::DeviceId,
+    out: mpsc::UnboundedSender<ServerMsg>,
+    mut acks: watch::Receiver<u64>,
+) {
+    let mut bus = core.subscribe();
+    let devices = core.devices().clone();
+    let snapshot = match core.device_snapshot(&Topic::Device(device.clone())).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = out.send(ServerMsg::Fatal(err));
+            return;
+        }
+    };
+    let mut sent = match &snapshot {
+        Snapshot::Device {
+            seq,
+            frame: Some(_),
+            ..
+        } => *seq,
+        _ => 0,
+    };
+    let mut window = PictureWindow::new();
+    if sent > 0 {
+        window.sent(sent, tokio::time::Instant::now());
+    }
+    if out.send(ServerMsg::Snapshot { sub_id, snapshot }).is_err() {
+        return;
+    }
+    devices.watching(&device, true).await;
+    struct Leave(Arc<loft_core::devices::Devices>, loft_protocol::DeviceId);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            let (devices, id) = (self.0.clone(), self.1.clone());
+            tokio::spawn(async move { devices.watching(&id, false).await });
+        }
+    }
+    let _leave = Leave(devices.clone(), device.clone());
+    // A picture may have come between the snapshot and watching.
+    let mut newer = true;
+    loop {
+        let now = tokio::time::Instant::now();
+        window.acked(*acks.borrow(), now);
+        window.expire(now);
+        if newer && window.ready() {
+            newer = false;
+            if let Some(frame) = devices.frame_after(&device, sent) {
+                sent = frame.seq;
+                window.sent(sent, now);
+                let frame = ServerMsg::DeviceFrame {
+                    sub_id,
+                    id: device.clone(),
+                    frame,
+                };
+                if out.send(frame).is_err() {
+                    return;
+                }
+            }
+        }
+        let waiting = newer.then(|| window.deadline()).flatten();
+        tokio::select! {
+            msg = bus.recv() => match msg {
+                // A screen attached again numbers from 1: any picture
+                // other than the one sent is new.
+                Ok(BusMsg::DeviceFrame { id, seq }) if id == device && seq != sent => {
+                    if seq < sent {
+                        sent = 0;
+                    }
+                    newer = true;
+                }
+                Ok(BusMsg::DeviceState { id }) if id == device => {
+                    if let Some(info) = devices.info(&device)
+                        && out.send(ServerMsg::DeviceState { sub_id, device: info }).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    newer = true;
+                    if let Some(info) = devices.info(&device)
+                        && out.send(ServerMsg::DeviceState { sub_id, device: info }).is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            changed = acks.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = async { tokio::time::sleep_until(waiting.unwrap_or_else(tokio::time::Instant::now)).await }, if waiting.is_some() => {}
+        }
     }
 }
 

@@ -5,12 +5,14 @@
 //! and [`ServerMsg`].
 
 pub mod automation;
+pub mod devices;
 pub mod ids;
 pub mod model;
 pub mod pages;
 pub mod workbench;
 
 pub use automation::*;
+pub use devices::*;
 pub use ids::*;
 pub use model::*;
 pub use pages::*;
@@ -75,8 +77,8 @@ pub enum ClientMsg {
     Unsubscribe {
         sub_id: u64,
     },
-    /// This viewer has shown [`ServerMsg::PageFrame`] `seq` and is ready for
-    /// the next. One frame is in flight per subscription, so a slow link
+    /// This viewer has shown [`ServerMsg::PageFrame`] (or
+    /// [`ServerMsg::DeviceFrame`]) `seq` and is ready for the next. One frame is in flight per subscription, so a slow link
     /// gets fewer frames instead of a growing queue.
     PageFrameAck {
         sub_id: u64,
@@ -646,6 +648,42 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab: Option<String>,
     },
+    /// The simulators and emulators on the daemon's computer, and what it
+    /// can run (ADR-0020). Answers `Response::Devices`.
+    DeviceList,
+    /// Boot a stopped device, headless (its screen is only streamed).
+    /// Answers `Ok` at once; its state comes on [`Topic::Devices`] and
+    /// [`Topic::Device`]. `thread_id`: the thread whose agent asked, if one.
+    DeviceBoot {
+        id: DeviceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<ThreadId>,
+    },
+    DeviceShutdown {
+        id: DeviceId,
+    },
+    /// Touches, keys, buttons. Answers `Ok` once the device took them.
+    DeviceInput {
+        id: DeviceId,
+        input: DeviceInput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<ThreadId>,
+    },
+    /// A PNG of the screen at its full size (`Response::Picture`).
+    DeviceCapture {
+        id: DeviceId,
+    },
+    /// Install, start or stop an app, or open an address (`Ok`).
+    DeviceApp {
+        id: DeviceId,
+        app: DeviceApp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<ThreadId>,
+    },
+    DeviceSet {
+        id: DeviceId,
+        setting: DeviceSetting,
+    },
     /// An agent starts another thread (orchestration): a child of `from`,
     /// with `from`'s agent, model, effort and permissions unless given, in
     /// `from`'s workspace (or a new worktree from it), sent `prompt` at
@@ -823,6 +861,12 @@ pub enum Topic {
     Terminal(TerminalId),
     /// Pictures and state of one tab of the daemon's browser.
     Page(PageId),
+    /// The list of simulators and emulators, as they come, go, boot and
+    /// stop (ADR-0020).
+    Devices,
+    /// Pictures and state of one simulator or emulator. Watching it is
+    /// what makes it stream; it doesn't boot it.
+    Device(DeviceId),
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +902,31 @@ pub enum ServerMsg {
         sub_id: u64,
         id: TerminalId,
         code: Option<i32>,
+    },
+    /// A new picture of a device's screen. Acknowledge it with
+    /// [`ClientMsg::PageFrameAck`] to get the next.
+    DeviceFrame {
+        sub_id: u64,
+        id: DeviceId,
+        frame: DeviceFrame,
+    },
+    /// A device's state, size or error changed ([`Topic::Device`]).
+    DeviceState {
+        sub_id: u64,
+        device: DeviceInfo,
+    },
+    /// The devices now ([`Topic::Devices`]).
+    DeviceList {
+        sub_id: u64,
+        devices: Vec<DeviceInfo>,
+        support: DeviceSupport,
+    },
+    /// An agent is using a device for `thread_id`: sent to subscribers of
+    /// that thread (`Topic::Thread`), at most about once a second per
+    /// device, so a window can show it while the agent works.
+    DeviceDriven {
+        thread_id: ThreadId,
+        device: DeviceInfo,
     },
     /// A new picture of a page. Acknowledge it with
     /// [`ClientMsg::PageFrameAck`] to get the next.
@@ -1011,7 +1080,12 @@ pub enum Response {
     Browser {
         reply: Box<BrowserReply>,
     },
-    /// A picture (`Request::PageCapture`).
+    /// `Request::DeviceList`.
+    Devices {
+        devices: Vec<DeviceInfo>,
+        support: DeviceSupport,
+    },
+    /// A picture (`Request::PageCapture`, `Request::DeviceCapture`).
     Picture {
         png: Bytes,
     },
@@ -1126,6 +1200,17 @@ pub enum Snapshot {
         seq: u64,
         terminal: TerminalInfo,
         replay: Bytes,
+    },
+    Devices {
+        devices: Vec<DeviceInfo>,
+        support: DeviceSupport,
+    },
+    /// A device as it is now, with its latest picture if it has one.
+    Device {
+        seq: u64,
+        device: DeviceInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<DeviceFrame>,
     },
     /// A page as it is now, with its latest picture if it has one (`seq`
     /// is that picture's).

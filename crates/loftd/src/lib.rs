@@ -85,6 +85,7 @@ impl Daemon {
             tracing::warn!(%err, "invalid config.toml; using defaults");
             loft_config::Config::default()
         });
+        let device_backends = device_backends(&env);
         let core = Core::new(
             store,
             opts.harnesses,
@@ -97,6 +98,7 @@ impl Daemon {
                 projects_dir: paths.projects_dir(),
                 config_file: Some(paths.config_file()),
                 attachments_dir: paths.attachments_dir(),
+                device_backends,
                 fetch: opts.check_agent_updates.then(|| {
                     std::sync::Arc::new(|url: &str| http::get_text(url, 1 << 20))
                         as loft_core::Fetcher
@@ -234,4 +236,27 @@ fn acquire_lock(paths: &Paths) -> Result<File> {
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("lock file"),
     }
+}
+
+/// Simulators and emulators (ADR-0020): this computer's, or with
+/// `AGENTLOFT_FAKE_DEVICES=1` a fake iPhone and a fake Android phone that
+/// need neither Xcode nor the Android SDK (for trying the panel).
+fn device_backends(
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<Arc<dyn loft_core::devices::Backend>> {
+    use loft_core::devices::fake::FakeBackend;
+    use loft_protocol::DevicePlatform;
+    if std::env::var_os("AGENTLOFT_FAKE_DEVICES").is_some_and(|v| v == "1") {
+        return vec![
+            Arc::new(FakeBackend::new(
+                DevicePlatform::Ios,
+                Duration::from_secs(2),
+            )),
+            Arc::new(FakeBackend::new(
+                DevicePlatform::Android,
+                Duration::from_secs(3),
+            )),
+        ];
+    }
+    loft_core::devices::system_backends(env)
 }

@@ -404,7 +404,21 @@ impl Core {
                 Err(forbidden("Keeping a view's state"))
             }
 
-            Request::PageOpen { .. }
+            // Installing takes a path on the daemon's computer.
+            Request::DeviceApp {
+                app: loft_protocol::DeviceApp::Install { .. },
+                ..
+            } => Err(forbidden("Installing apps on a device")),
+            // A simulator or emulator shows and runs things on the daemon's
+            // computer, as its browser does: the same permission.
+            Request::DeviceList
+            | Request::DeviceBoot { .. }
+            | Request::DeviceShutdown { .. }
+            | Request::DeviceInput { .. }
+            | Request::DeviceCapture { .. }
+            | Request::DeviceApp { .. }
+            | Request::DeviceSet { .. }
+            | Request::PageOpen { .. }
             | Request::PageList { .. }
             | Request::PageNavigate { .. }
             | Request::PageInput { .. }
@@ -511,6 +525,8 @@ impl Core {
             Topic::Terminal(_) => Err(terminals_off()),
             Topic::Page(id) if policy.allow_browser || self.pages.is_view(id) => Ok(()),
             Topic::Page(_) => Err(browser_off()),
+            Topic::Devices | Topic::Device(_) if policy.allow_browser => Ok(()),
+            Topic::Devices | Topic::Device(_) => Err(browser_off()),
         }
     }
 }
