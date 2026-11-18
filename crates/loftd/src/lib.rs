@@ -246,8 +246,9 @@ fn acquire_lock(paths: &Paths) -> Result<File> {
 }
 
 /// Simulators and emulators (ADR-0020): this computer's, or with
-/// `AGENTLOFT_FAKE_DEVICES=1` a fake iPhone and a fake Android phone that
-/// need neither Xcode nor the Android SDK (for trying the panel).
+/// `AGENTLOFT_FAKE_DEVICES=1` a fake iPhone, Android phone and foldable,
+/// and two fake plugged-in phones (one unauthorized), that need neither
+/// Xcode nor the Android SDK (for trying the panel).
 fn device_backends(
     env: &std::collections::HashMap<String, String>,
 ) -> Vec<Arc<dyn loft_core::devices::Backend>> {
@@ -264,6 +265,8 @@ fn device_backends(
                 Duration::from_secs(3),
             )),
             Arc::new(FakeBackend::foldable(Duration::from_secs(3))),
+            Arc::new(FakeBackend::phone("FAKE-USB", false)),
+            Arc::new(FakeBackend::phone("FAKE-LOCKED", true)),
         ];
     }
     loft_core::devices::system_backends(env)

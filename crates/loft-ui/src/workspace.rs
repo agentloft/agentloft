@@ -57,6 +57,7 @@ actions!(
 
 // The composer's recall, thread context and quoting (`workspace/compose.rs`).
 mod compose;
+mod device_card;
 mod handoff;
 pub use compose::QuoteSelection;
 
@@ -196,6 +197,8 @@ pub struct WorkspaceView {
     device_preview: bool,
     /// Where the floating device was dragged to (as `browser_preview_at`).
     device_preview_at: Option<gpui_kit::Point<gpui_kit::Pixels>>,
+    /// How wide its screen area was made (`None`: as wide as at first).
+    device_preview_w: Option<f32>,
     /// The conversation's size as last laid out (the mini browser stays in it).
     preview_room: std::rc::Rc<std::cell::Cell<gpui_kit::Size<gpui_kit::Pixels>>>,
     /// Whether we listen to the browser's events yet (annotations).
@@ -388,6 +391,7 @@ impl WorkspaceView {
             browser_preview_at: None,
             device_preview: false,
             device_preview_at: None,
+            device_preview_w: None,
             preview_room: Default::default(),
             model_pickers: HashMap::new(),
             picker_open: false,
@@ -652,6 +656,45 @@ impl WorkspaceView {
                 let t = thread_id.clone();
                 self.panel
                     .update(cx, |p, cx| p.show_device(&t, Some(id), true, window, cx));
+            }
+            // `later:<ms>:<hook>`: a hook, that long after launch.
+            Some(("later", rest)) => {
+                if let Some((ms, hook)) = rest.split_once(':')
+                    && let Ok(ms) = ms.parse::<u64>()
+                {
+                    let (hook, thread) = (hook.to_owned(), thread.clone());
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(ms))
+                            .await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.apply_dev_tab(&hook, &thread, window, cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+            }
+            // `devicepick:<id>`: pick that device in the Device tab shown,
+            // as its list or picker does (another tab showing it comes
+            // forward).
+            Some(("devicepick", id)) => {
+                let id = loft_protocol::DeviceId(id.to_owned());
+                if let Some(view) = self.panel.read(cx).existing_device(&thread_id) {
+                    view.update(cx, |v, cx| v.pick(id, false, cx));
+                }
+            }
+            // `devicetab:<id>`: another Device tab (as + ▸ Device does), on
+            // that device, started if it is stopped.
+            Some(("devicetab", id)) => {
+                let id = loft_protocol::DeviceId(id.to_owned());
+                let t = thread_id.clone();
+                self.panel.update(cx, |p, cx| {
+                    p.add_tab(Tab::Device, window, cx);
+                    if let Some(view) = p.existing_device(&t) {
+                        view.update(cx, |v, cx| v.choose(Some(id), true, cx));
+                    }
+                });
             }
             Some(("type", text)) => {
                 let composer = self.composer_for(thread, window, cx);
@@ -1450,6 +1493,28 @@ impl WorkspaceView {
                 "device" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Device, window, cx)),
+                // The Device tab's tools drawer, open (once the tab has
+                // drawn its device: opened in the very frame that launches
+                // it, the window stopped drawing).
+                "devicetools" => {
+                    let t = thread_id.clone();
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(2500))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(view) = this.panel.read(cx).existing_device(&t) {
+                                view.update(cx, |v, cx| v.toggle_tools(cx));
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                // The Device tab's device floating over the chat.
+                "devicefloat" => {
+                    let t = thread_id.clone();
+                    self.float_device(&t, None, window, cx);
+                }
                 // Another browser tab, as the panel's + menu opens one.
                 "browsertab" => {
                     self.panel_open = true;
@@ -1863,13 +1928,22 @@ impl WorkspaceView {
         }
         let showing = self.panel_open && self.panel.read(cx).active_tab(cx) == Some(Tab::Device);
         let view = self.panel.read(cx).existing_device(thread_id);
-        if showing {
-            // Showing the list: show the device the agent uses.
-            if let Some(view) = view
-                && view.read(cx).chosen().is_none()
-            {
-                let id = device.id.clone();
-                view.update(cx, |v, cx| v.choose(Some(id), false, cx));
+        if showing && let Some(view) = view {
+            match view.read(cx).chosen() {
+                // Showing the list: show the device the agent uses.
+                None => {
+                    let id = device.id.clone();
+                    view.update(cx, |v, cx| v.choose(Some(id), false, cx));
+                }
+                // Showing it already.
+                Some(id) if *id == device.id => {}
+                // Showing another: float the one the agent uses (first use
+                // in a while only, below).
+                Some(_) => {
+                    if !before.is_some_and(|at| now.duration_since(at) < AGAIN_AFTER) {
+                        self.float_device(thread_id, Some(device.id.clone()), window, cx);
+                    }
+                }
             }
             return;
         }
@@ -1904,9 +1978,16 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// Whether the side panel shows the thread's device.
+    /// Whether the side panel shows the thread's floating device.
     fn device_in_panel(&self, cx: &gpui_kit::App) -> bool {
-        self.panel_open && self.panel.read(cx).active_tab(cx) == Some(Tab::Device)
+        let Some(thread) = self.store.read(cx).selected.clone() else {
+            return false;
+        };
+        let panel = self.panel.read(cx);
+        self.panel_open
+            && panel
+                .floating_device(&thread)
+                .is_some_and(|v| panel.shows_device(&thread, v.entity_id()))
     }
 
     /// Whether the conversation area is wide enough to dock the details card.
@@ -5237,6 +5318,8 @@ impl WorkspaceView {
                     cx.notify();
                 },
             ))
+            // Its edges and corners resize the floating device.
+            .on_drag_move(cx.listener(Self::resize_device_card))
             .child(
                 div()
                     .flex_1()
@@ -5862,131 +5945,6 @@ impl WorkspaceView {
                         ),
                 )
                 .child(div().w(px(W)).h(px(H)).flex().flex_col().child(surface))
-                .into_any_element(),
-        )
-    }
-
-    /// The thread's device floating over the conversation: its live screen
-    /// (touch and type in it as in the panel), dragged by its bar. Beside
-    /// the mini browser when that shows too.
-    fn device_preview_card(
-        &mut self,
-        p: &Palette,
-        beside_browser: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if !self.device_preview || self.device_in_panel(cx) {
-            return None;
-        }
-        let thread_id = self.store.read(cx).selected.clone()?;
-        let view = self.panel.read(cx).existing_device(&thread_id)?;
-        view.read(cx).chosen()?;
-        let (title, busy, height) = {
-            let v = view.read(cx);
-            let height = v
-                .floating_height(DEVICE_PREVIEW_W)
-                .clamp(120., DEVICE_PREVIEW_MAX_H);
-            (v.title(), v.is_busy(), height)
-        };
-        view.update(cx, |v, _| v.set_floating(true));
-        let card = gpui_kit::size(px(DEVICE_PREVIEW_W + 2.), px(height + 30. + 1. + 2.));
-        let at = match self.device_preview_at {
-            Some(at) => keep_preview_in(at, self.preview_room.get(), card),
-            None if beside_browser => gpui_kit::point(px(20. + PREVIEW_CARD_W + 12.), px(150.)),
-            None => gpui_kit::point(px(20.), px(150.)),
-        };
-        let at = keep_preview_in(at, self.preview_room.get(), card);
-        let bar_button = |id: &'static str, icon: IconName| {
-            div()
-                .id(id)
-                .p(px(3.))
-                .rounded(px(5.))
-                .cursor_pointer()
-                .text_color(p.muted_foreground)
-                .hover(|d| d.bg(p.hover).text_color(p.foreground))
-                .child(Icon::new(icon).xsmall())
-        };
-        Some(
-            v_flex()
-                .absolute()
-                .right(at.x)
-                .bottom(at.y)
-                .w(card.width)
-                .rounded(px(12.))
-                .overflow_hidden()
-                .border_1()
-                .border_color(p.border)
-                .bg(p.elevated)
-                .shadow_lg()
-                .child(
-                    h_flex()
-                        .id("device-preview-bar")
-                        .h(px(30.))
-                        .px_2()
-                        .gap_1p5()
-                        .items_center()
-                        .text_xs()
-                        .border_b_1()
-                        .border_color(p.border)
-                        .cursor(gpui_kit::CursorStyle::OpenHand)
-                        .on_drag(DraggedPreview::new(card, true), |d, grab, _, cx| {
-                            d.grab.set(grab);
-                            cx.new(|_| d.clone())
-                        })
-                        .child(if busy {
-                            Spinner::new()
-                                .xsmall()
-                                .color(p.muted_foreground)
-                                .into_any_element()
-                        } else {
-                            Icon::new(IconName::Smartphone)
-                                .xsmall()
-                                .text_color(p.muted_foreground)
-                                .into_any_element()
-                        })
-                        .child(div().flex_1().min_w_0().truncate().child(title))
-                        .child(
-                            bar_button("device-preview-expand", IconName::Maximize2)
-                                .tooltip(|window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new(
-                                        "Open in the side panel",
-                                    )
-                                    .build(window, cx)
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.device_preview = false;
-                                    this.panel_open = true;
-                                    if let Some(t) = this.store.read(cx).selected.clone() {
-                                        this.panel.update(cx, |p, cx| {
-                                            p.show_device(&t, None, false, window, cx)
-                                        });
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            bar_button("device-preview-close", IconName::X)
-                                .tooltip(|window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new(
-                                        "Close (the device keeps running)",
-                                    )
-                                    .build(window, cx)
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.device_preview = false;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .w(px(DEVICE_PREVIEW_W))
-                        .h(px(height))
-                        .flex()
-                        .flex_col()
-                        .child(view),
-                )
                 .into_any_element(),
         )
     }
@@ -8121,11 +8079,6 @@ impl DraggedPreview {
 fn preview_card() -> gpui_kit::Size<gpui_kit::Pixels> {
     gpui_kit::size(px(PREVIEW_CARD_W), px(PREVIEW_CARD_H))
 }
-
-/// How wide the floating device's screen area is.
-const DEVICE_PREVIEW_W: f32 = 260.;
-/// The floating device is never taller than this (a tablet).
-const DEVICE_PREVIEW_MAX_H: f32 = 560.;
 
 impl Render for DraggedPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {

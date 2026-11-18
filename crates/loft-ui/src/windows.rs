@@ -3,6 +3,7 @@
 //! group can hold threads from any project side by side — groups aren't
 //! tied to projects.
 
+use crate::panel::device_tabs::DeviceTab;
 use crate::store::AppStore;
 use crate::workspace::WorkspaceView;
 use gpui_kit::{
@@ -80,9 +81,13 @@ struct SavedWindow {
     /// computer's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<String>,
-    /// The device each thread's Device panel showed (ADR-0020).
+    /// Before Device tabs: the one device each thread's Device panel
+    /// showed (ADR-0020). Read, and saved as `device_tabs` from then on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     devices: Vec<(ThreadId, loft_protocol::DeviceId)>,
+    /// Each thread's Device tabs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    device_tabs: Vec<(ThreadId, Vec<DeviceTab>)>,
 }
 
 /// Remember each window's threads and panes for next time.
@@ -104,8 +109,9 @@ pub fn save_session(cx: &mut App) {
             panes: Vec::new(),
             layout: store.layout.clone(),
             remote: store.remote().map(str::to_owned),
-            devices: store
-                .device_choice
+            devices: Vec::new(),
+            device_tabs: store
+                .device_tabs
                 .iter()
                 .map(|(t, d)| (t.clone(), d.clone()))
                 .collect(),
@@ -143,9 +149,10 @@ pub fn restore(cx: &mut App) {
         Option<ThreadId>,
         Vec<Vec<ThreadId>>,
         Option<String>,
-        Vec<(ThreadId, loft_protocol::DeviceId)>,
+        std::collections::HashMap<ThreadId, Vec<DeviceTab>>,
     )> = Vec::new();
     for w in saved {
+        let devices = crate::panel::device_tabs::from_session(w.devices, w.device_tabs);
         let mut layout = w.layout;
         if layout.is_empty() {
             layout = w.panes.into_iter().map(|t| vec![t]).collect();
@@ -154,8 +161,10 @@ pub fn restore(cx: &mut App) {
             layout.extend(w.thread.clone().map(|t| vec![t]));
         }
         match windows.iter_mut().find(|(g, ..)| *g == w.group) {
-            Some((_, _, existing, _, devices)) => {
-                devices.extend(w.devices);
+            Some((_, _, existing, _, existing_devices)) => {
+                for (thread, tabs) in devices {
+                    existing_devices.entry(thread).or_insert(tabs);
+                }
                 for col in layout {
                     let col: Vec<ThreadId> = col
                         .into_iter()
@@ -166,7 +175,7 @@ pub fn restore(cx: &mut App) {
                     }
                 }
             }
-            None => windows.push((w.group, w.thread, layout, w.remote, w.devices)),
+            None => windows.push((w.group, w.thread, layout, w.remote, devices)),
         }
     }
     for (_, thread, layout, remote, devices) in windows {
@@ -183,7 +192,7 @@ pub fn restore(cx: &mut App) {
                     s.ensure_thread(id, cx);
                 }
                 s.layout = layout;
-                s.device_choice.extend(devices);
+                s.device_tabs.extend(devices);
                 if let Some(t) = &thread
                     && s.pane_at(t).is_none()
                 {

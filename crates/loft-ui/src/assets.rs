@@ -92,6 +92,12 @@ gpui_kit::assets::icon_assets!(
         RotateCwSquare,
         Expand,
         Smartphone,
+        // The Device panel's tools drawer and tabs.
+        SlidersHorizontal,
+        MapPin,
+        Wifi,
+        Usb,
+        Pencil,
         PictureInPicture2,
         Power,
         Play,
