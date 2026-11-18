@@ -51,6 +51,8 @@ const SCROLL_EVERY: Duration = Duration::from_millis(40);
 /// A panel out of sight for this long stops watching (the device stops
 /// streaming to it); drawing it again watches again.
 const UNSEEN_AFTER: Duration = Duration::from_millis(1500);
+/// A panel narrower than this shows the tools drawer over the screen.
+const NARROW_FOR_TOOLS: f32 = 620.;
 /// Room around the phone in the panel.
 const MARGIN: f32 = 18.;
 /// Room around the phone when it floats over the chat.
@@ -145,6 +147,9 @@ pub struct DeviceView {
     /// Where the device picker is (its menu opens under it).
     picker: Rc<Cell<Option<Bounds<Pixels>>>>,
     marked: Option<String>,
+    /// The panel's width as last drawn: a narrow panel shows the tools
+    /// drawer over the screen rather than beside it.
+    room: Rc<Cell<f32>>,
     /// Drawn in the card floating over the chat: the screen alone, with
     /// less room around it (the card has its own bar).
     floating: bool,
@@ -207,6 +212,7 @@ impl DeviceView {
             picker: Rc::default(),
             marked: None,
             floating: false,
+            room: Rc::default(),
             model: model::Model3d::default(),
             _subs: subs,
         }
@@ -1204,11 +1210,15 @@ impl DeviceView {
                             .small()
                             .text_color(p.muted_foreground),
                     )
-                    .child(div().min_w_0().truncate().child(label))
+                    // With little room the system's version gives way
+                    // first, then the name, which keeps a few letters.
+                    .child(div().min_w(px(56.)).flex_shrink(1.).truncate().child(label))
                     .when_some(device.as_ref(), |d, device| {
                         d.child(
                             div()
-                                .flex_none()
+                                .min_w_0()
+                                .flex_shrink(50.)
+                                .truncate()
                                 .text_xs()
                                 .text_color(p.muted_foreground)
                                 .child(device.os.clone()),
@@ -1945,6 +1955,26 @@ impl Render for DeviceView {
                 .clone()
                 .filter(|_| self.tools_open && !self.floating)
             {
+                // Too narrow for both side by side: the drawer covers the
+                // right of the screen (the phone keeps its size).
+                Some(tools) if self.room.get() < NARROW_FOR_TOOLS => div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(screen)
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .shadow_lg()
+                            .child(tools),
+                    )
+                    .into_any_element(),
                 Some(tools) => h_flex()
                     .flex_1()
                     .min_h_0()
@@ -1980,9 +2010,19 @@ impl Render for DeviceView {
                 )
                 .into_any_element()
         };
+        let room = self.room.clone();
         v_flex()
+            .relative()
             .size_full()
             .bg(p.background)
+            .child(
+                canvas(
+                    move |bounds, _, _| room.set(f32::from(bounds.size.width)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .when(!self.floating, |d| d.child(self.toolbar(&p, cx)))
             .children(fold_bar)
             .child(body)
