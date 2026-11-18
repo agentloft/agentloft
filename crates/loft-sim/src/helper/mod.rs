@@ -1,14 +1,16 @@
 //! `agentloftd simulator`: one running simulator's screen and input, over
 //! stdin and stdout ([`crate::wire`]).
 //!
-//! Four threads: the main one runs the run loop CoreSimulator's callbacks
+//! Five threads: the main one runs the run loop CoreSimulator's callbacks
 //! may need and checks how the screen is turned and whether the device is
 //! still running; one reads requests; one carries out input, in order; one
 //! takes pictures (at most 30 a second, only while someone
-//! watches, and only when the screen changed).
+//! watches, and only when the screen changed); one reads what accessibility
+//! sees, while its frames are outlined ([`ax`]).
 
 #![allow(unsafe_code)] // Objective-C and C calls into Apple's frameworks; each has a SAFETY note.
 
+mod ax;
 mod picture;
 mod sim;
 
@@ -16,12 +18,12 @@ use crate::geometry::{Held, Turn, picture_size};
 use crate::keys;
 use crate::wire::{self, Command, Event, Request, ScreenSize};
 use anyhow::{Context, Result, bail};
-use loft_protocol::{DeviceButton, DeviceInput, TouchPhase};
+use loft_protocol::{DeviceButton, DeviceInput, TouchPhase, TouchPoint};
 use sim::{DOWN, Device, Shared, UP};
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +51,11 @@ struct State {
     wake: Condvar,
     quit: AtomicBool,
     turn: Mutex<Turn>,
+    /// Counts the screen's changes (for the accessibility thread).
+    changes: AtomicU64,
+    /// The accessibility frames outlined, in points of the screen as the
+    /// interface shows it (empty while off).
+    outlines: Mutex<Vec<ax::Frame>>,
 }
 
 #[derive(Default)]
@@ -108,6 +115,8 @@ pub fn run(options: Options) -> Result<()> {
         wake: Condvar::new(),
         quit: AtomicBool::new(false),
         turn: Mutex::default(),
+        changes: AtomicU64::new(0),
+        outlines: Mutex::default(),
     });
     let opened = Device::open(
         &options.udid,
@@ -137,13 +146,17 @@ pub fn run(options: Options) -> Result<()> {
             width,
             height,
             scale,
+            orientation: Some(turn.orientation()),
         }
     };
     *state.turn.lock().unwrap_or_else(|e| e.into_inner()) = turn;
 
     let on_change = {
         let state = state.clone();
-        move || state.change(|f| f.dirty = true)
+        move || {
+            state.changes.fetch_add(1, Ordering::Relaxed);
+            state.change(|f| f.dirty = true)
+        }
     };
     let on_surfaces = {
         let state = state.clone();
@@ -168,6 +181,7 @@ pub fn run(options: Options) -> Result<()> {
     });
 
     let (inputs, input_rx) = mpsc::channel::<Request>();
+    let (outlining, outlining_rx) = mpsc::channel::<Request>();
     let pictures = spawn("pictures", {
         let (state, device) = (state.clone(), device.clone());
         move || pictures(&state, &device, surface, scale)
@@ -184,7 +198,13 @@ pub fn run(options: Options) -> Result<()> {
         }),
         spawn("requests", {
             let state = state.clone();
-            move || requests(&state, inputs)
+            move || requests(&state, inputs, outlining)
+        }),
+        spawn("accessibility", {
+            let (state, device) = (state.clone(), device.clone());
+            // The screen's area in points, to leave out the app's window.
+            let area = native.0 as f64 * native.1 as f64 / (scale as f64 * scale as f64);
+            move || accessibility(&state, &device, outlining_rx, area)
         }),
     ];
 
@@ -280,7 +300,7 @@ fn run_loop_for(time: Duration) {
 }
 
 /// Read requests from stdin until it ends.
-fn requests(state: &State, inputs: mpsc::Sender<Request>) {
+fn requests(state: &State, inputs: mpsc::Sender<Request>, outlining: mpsc::Sender<Request>) {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -304,8 +324,13 @@ fn requests(state: &State, inputs: mpsc::Sender<Request>) {
                 state.done(request.id, Ok(()));
             }
             Command::Capture => state.change(|f| f.captures.push(request.id)),
-            Command::Input { .. } => {
+            Command::Input { .. } | Command::Orientation { .. } => {
                 if inputs.send(request).is_err() {
+                    break;
+                }
+            }
+            Command::AccessibilityFrames { .. } => {
+                if outlining.send(request).is_err() {
                     break;
                 }
             }
@@ -373,9 +398,24 @@ fn pictures(
         let turn = state.turn();
         let ptr = surface_ptr(&surface);
         let (width, height) = picture::surface_size(ptr);
+        let outlines = state
+            .outlines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let outline = |p: &mut picture::Pixels| {
+            if !outlines.is_empty() {
+                // Points of the interface to pixels of the picture.
+                let (shown, _) = turn.shown_size(width as u32, height as u32);
+                let factor = p.width as f64 * scale as f64 / shown as f64;
+                picture::outline(p, &outlines, factor);
+            }
+        };
         for id in captures {
-            let png = picture::read(ptr, width, height, turn)
-                .and_then(|mut p| picture::encode(&mut p, None));
+            let png = picture::read(ptr, width, height, turn).and_then(|mut p| {
+                outline(&mut p);
+                picture::encode(&mut p, None)
+            });
             match png {
                 Ok(png) => state.send(wire::KIND_CAPTURE, &[&id.to_be_bytes(), &png]),
                 Err(e) => state.done(id, Err(e)),
@@ -385,6 +425,7 @@ fn pictures(
             last = Some(Instant::now());
             let (w, h) = picture_size(width as u32, height as u32, scale, LONGEST);
             let jpeg = picture::read(ptr, w as usize, h as usize, turn).and_then(|mut p| {
+                outline(&mut p);
                 let jpeg = picture::encode(&mut p, Some(JPEG_QUALITY))?;
                 Ok((p.width as u32, p.height as u32, jpeg))
             });
@@ -397,6 +438,114 @@ fn pictures(
             }
         }
     }
+}
+
+/// How often the outlines are read again while the screen keeps changing,
+/// and while it doesn't (an app may change what accessibility sees without
+/// redrawing).
+const OUTLINES_EVERY: Duration = Duration::from_millis(400);
+const OUTLINES_AT_LEAST: Duration = Duration::from_secs(3);
+
+/// While accessibility frames are outlined, read them again after the
+/// screen changes, and have them pictured.
+fn accessibility(
+    state: &State,
+    device: &Shared<Device>,
+    requests: mpsc::Receiver<Request>,
+    area: f64,
+) {
+    let mut reader: Option<ax::Accessibility> = None;
+    let mut on = false;
+    let mut seen = u64::MAX;
+    let mut read_at: Option<Instant> = None;
+    loop {
+        let request = if on {
+            match requests.recv_timeout(OUTLINES_EVERY) {
+                Ok(r) => Some(r),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            match requests.recv() {
+                Ok(r) => Some(r),
+                Err(_) => return,
+            }
+        };
+        if state.stopped() {
+            return;
+        }
+        if let Some(request) = request {
+            let Command::AccessibilityFrames { on: wanted } = request.command else {
+                continue;
+            };
+            on = wanted;
+            if !on {
+                state
+                    .outlines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                state.change(|f| f.dirty = true);
+                state.done(request.id, Ok(()));
+                continue;
+            }
+            if reader.is_none() {
+                match ax::Accessibility::new(&device.0) {
+                    Ok(r) => reader = Some(r),
+                    Err(e) => {
+                        on = false;
+                        state.done(request.id, Err(e));
+                        continue;
+                    }
+                }
+            }
+            // A device that just started has no app in front for a while.
+            let mut result = read_outlines(state, reader.as_ref(), area);
+            for _ in 0..10 {
+                let empty = state
+                    .outlines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+                if result.is_err() || !empty {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                result = read_outlines(state, reader.as_ref(), area);
+            }
+            seen = state.changes.load(Ordering::Relaxed);
+            read_at = Some(Instant::now());
+            state.done(request.id, result);
+            continue;
+        }
+        let changes = state.changes.load(Ordering::Relaxed);
+        let stale = read_at.is_none_or(|at| at.elapsed() >= OUTLINES_AT_LEAST);
+        if changes != seen || stale {
+            seen = changes;
+            read_at = Some(Instant::now());
+            if let Err(e) = read_outlines(state, reader.as_ref(), area) {
+                eprintln!("simulator helper: {e:#}");
+            }
+        }
+    }
+}
+
+/// Read the frames and, if they changed, have the screen pictured again.
+fn read_outlines(state: &State, reader: Option<&ax::Accessibility>, area: f64) -> Result<()> {
+    let Some(reader) = reader else { return Ok(()) };
+    let Some(mut frames) = reader.frames()? else {
+        // Nothing in front to read yet: read again soon.
+        return Ok(());
+    };
+    // Leave out what covers (nearly) the whole screen: the app's window.
+    frames.retain(|f| f.width * f.height < 0.9 * area);
+    let mut outlines = state.outlines.lock().unwrap_or_else(|e| e.into_inner());
+    if *outlines != frames {
+        *outlines = frames;
+        drop(outlines);
+        state.change(|f| f.dirty = true);
+    }
+    Ok(())
 }
 
 /// Text a US keyboard can't type goes through the device's pasteboard.
@@ -429,6 +578,26 @@ impl Pasteboard {
     }
 }
 
+/// Where the fingers are on the screen as built.
+type Fingers = Vec<(f64, f64)>;
+
+/// Fingers of the upright picture, on the screen as built.
+fn fingers_of(turn: Turn, touches: &[TouchPoint]) -> Result<Fingers> {
+    if touches.is_empty() {
+        bail!("a touch needs at least one finger");
+    }
+    if touches.len() > sim::MOST_FINGERS {
+        bail!(
+            "iOS simulators take at most {} fingers at once",
+            sim::MOST_FINGERS
+        );
+    }
+    Ok(touches
+        .iter()
+        .map(|p| turn.to_device(p.x as f64, p.y as f64))
+        .collect())
+}
+
 /// Carry out input, in order.
 fn input(
     state: &State,
@@ -439,17 +608,17 @@ fn input(
 ) {
     let device = &device.0;
     let mut backlog: VecDeque<Request> = VecDeque::new();
-    // A finger is down; a drag SimulatorKit dropped for coming too soon.
+    // Fingers are down; a drag SimulatorKit dropped for coming too soon.
     let mut touching = false;
-    let mut pending: Option<(f64, f64)> = None;
+    let mut pending: Option<Fingers> = None;
     loop {
         let request = match backlog.pop_front() {
             Some(r) => r,
             None if pending.is_some() => match requests.recv_timeout(DRAG_GAP) {
                 Ok(r) => r,
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Some((x, y)) = pending
-                        && device.touch(6, x, y).unwrap_or(true)
+                    if let Some(at) = &pending
+                        && device.fingers(6, at).unwrap_or(true)
                     {
                         pending = None;
                     }
@@ -465,39 +634,48 @@ fn input(
         if state.stopped() {
             return;
         }
-        let Command::Input { input } = request.command else {
-            continue;
+        let input = match request.command {
+            Command::Input { input } => input,
+            Command::Orientation { orientation } => {
+                held = Held::of(orientation);
+                state.done(request.id, device.hold(held.0));
+                continue;
+            }
+            _ => continue,
         };
         let turn = state.turn();
+        let mut fingers = |phase: TouchPhase, at: Fingers| match phase {
+            TouchPhase::Down => {
+                pending = None;
+                touching = true;
+                device.fingers(1, &at).map(drop)
+            }
+            TouchPhase::Move if touching => match device.fingers(6, &at) {
+                Ok(true) => {
+                    pending = None;
+                    Ok(())
+                }
+                Ok(false) => {
+                    pending = Some(at);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+            TouchPhase::Move => Ok(()),
+            TouchPhase::Up | TouchPhase::Cancel => {
+                touching = false;
+                if let Some(before) = pending.take() {
+                    let _ = device.fingers(6, &before);
+                }
+                device.fingers(2, &at).map(drop)
+            }
+        };
         let result = match input {
             DeviceInput::Touch { phase, x, y } => {
-                let (x, y) = turn.to_device(x as f64, y as f64);
-                match phase {
-                    TouchPhase::Down => {
-                        pending = None;
-                        touching = true;
-                        device.touch(1, x, y).map(drop)
-                    }
-                    TouchPhase::Move if touching => match device.touch(6, x, y) {
-                        Ok(true) => {
-                            pending = None;
-                            Ok(())
-                        }
-                        Ok(false) => {
-                            pending = Some((x, y));
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    },
-                    TouchPhase::Move => Ok(()),
-                    TouchPhase::Up | TouchPhase::Cancel => {
-                        touching = false;
-                        if let Some((px, py)) = pending.take() {
-                            let _ = device.touch(6, px, py);
-                        }
-                        device.touch(2, x, y).map(drop)
-                    }
-                }
+                fingers(phase, vec![turn.to_device(x as f64, y as f64)])
+            }
+            DeviceInput::Touches { phase, touches } => {
+                fingers_of(turn, &touches).and_then(|f| fingers(phase, f))
             }
             DeviceInput::Scroll { x, y, dx, dy } => {
                 // Wheel events come in bursts: one drag for all that are
@@ -556,9 +734,6 @@ fn input(
                 }
                 DeviceButton::Back => Err(anyhow::anyhow!("iOS has no Back button.")),
             },
-            DeviceInput::Touches { .. } => Err(anyhow::anyhow!(
-                "several fingers at once aren't supported on iOS simulators yet"
-            )),
         };
         state.done(request.id, result);
     }

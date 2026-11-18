@@ -55,6 +55,8 @@ tempfile.workspace = true
 # One build of each dependency whatever the cargo command (.config/hakari.toml).
 [target.'cfg(target_os = "macos")'.dependencies]
 workspace-hack.workspace = true
+# Which simulator app is in front: its process's Darwin role (devices/ios.rs).
+libc.workspace = true
 
 [lints]
 workspace = true

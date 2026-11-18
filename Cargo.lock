@@ -4529,6 +4529,7 @@ dependencies = [
  "http",
  "ignore",
  "image",
+ "libc",
  "loft-config",
  "loft-git",
  "loft-harness",

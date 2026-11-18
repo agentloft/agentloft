@@ -7,6 +7,8 @@
 //! they go to the device's digitizer, which also only knows the screen as
 //! built.
 
+use loft_protocol::DeviceOrientation;
+
 /// Which way the frontmost interface is turned, as CoreSimulator reports it
 /// (`UIInterfaceOrientation`: 1 portrait, 2 upside down, 3 landscape left,
 /// 4 landscape right).
@@ -67,6 +69,14 @@ impl Turn {
         }
     }
 
+    /// The interface turned this way, named as the device would be held to
+    /// show it so ([`DeviceOrientation`] follows `UIDeviceOrientation`:
+    /// landscape left is the device turned a quarter anticlockwise, what
+    /// Rotate Left gives, and its interface is then landscape *right*).
+    pub fn orientation(self) -> DeviceOrientation {
+        Held::from_turn(self).orientation()
+    }
+
     /// The other way: a point of the screen as built, in the upright picture.
     pub fn to_shown(self, x: f64, y: f64) -> (f64, f64) {
         match self.clockwise_quarters() {
@@ -94,6 +104,24 @@ impl Held {
             Turn::LandscapeRight => 3,
             Turn::LandscapeLeft => 4,
         })
+    }
+
+    pub fn of(orientation: DeviceOrientation) -> Self {
+        Self(match orientation {
+            DeviceOrientation::Portrait => 1,
+            DeviceOrientation::PortraitUpsideDown => 2,
+            DeviceOrientation::LandscapeLeft => 3,
+            DeviceOrientation::LandscapeRight => 4,
+        })
+    }
+
+    pub fn orientation(self) -> DeviceOrientation {
+        match self.0 {
+            2 => DeviceOrientation::PortraitUpsideDown,
+            3 => DeviceOrientation::LandscapeLeft,
+            4 => DeviceOrientation::LandscapeRight,
+            _ => DeviceOrientation::Portrait,
+        }
     }
 
     /// After turning the device a quarter anticlockwise (Rotate Left).
@@ -196,6 +224,32 @@ mod tests {
         // The interface turns against the device.
         assert_eq!(Held::from_turn(Turn::LandscapeRight), Held(3));
         assert_eq!(Held::from_turn(Turn::LandscapeLeft), Held(4));
+    }
+
+    #[test]
+    fn orientations_are_named_as_the_device_is_held() {
+        // Rotate Left: the device's landscape left, the interface's right.
+        assert_eq!(
+            Held(1).left().orientation(),
+            DeviceOrientation::LandscapeLeft
+        );
+        assert_eq!(
+            Turn::LandscapeRight.orientation(),
+            DeviceOrientation::LandscapeLeft
+        );
+        assert_eq!(
+            Turn::LandscapeLeft.orientation(),
+            DeviceOrientation::LandscapeRight
+        );
+        assert_eq!(Turn::Portrait.orientation(), DeviceOrientation::Portrait);
+        for o in [
+            DeviceOrientation::Portrait,
+            DeviceOrientation::PortraitUpsideDown,
+            DeviceOrientation::LandscapeLeft,
+            DeviceOrientation::LandscapeRight,
+        ] {
+            assert_eq!(Held::of(o).orientation(), o);
+        }
     }
 
     #[test]

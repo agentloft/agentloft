@@ -1,6 +1,9 @@
 //! A real iOS simulator through the daemon's backend and its helper
 //! (`agentloftd simulator`): boot, pictures, a swipe, Home, turning, a
-//! capture, shutdown. Needs Xcode with an iOS runtime; takes about a minute.
+//! capture, shutdown; and settings read back, permissions, a push, the app
+//! in front, an orientation, accessibility frames, a pinch in Maps and three
+//! fingers on a web page. Needs Xcode with an iOS
+//! runtime; takes a minute or two.
 //!
 //! `cargo test -p loftd --test ios_live -- --ignored --nocapture`
 //!
@@ -11,7 +14,10 @@
 
 use loft_core::devices::ios::{Helper, IosBackend};
 use loft_core::devices::{Backend, Picture, Screen};
-use loft_protocol::{DeviceApp, DeviceButton, DeviceInput, DeviceState, TouchPhase};
+use loft_protocol::{
+    DeviceApp, DeviceButton, DeviceInput, DeviceOrientation, DeviceSetting, DeviceState,
+    DeviceTextSize, TouchPhase, TouchPoint,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -25,8 +31,11 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    fn new() -> Self {
-        let set = PathBuf::from(format!("/private/tmp/loft-ios-live-{}", std::process::id()));
+    fn new(name: &str) -> Self {
+        let set = PathBuf::from(format!(
+            "/private/tmp/loft-ios-live-{name}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&set).unwrap();
         let (device_type, runtime) = newest_iphone();
         let out = Command::new("xcrun")
@@ -185,7 +194,7 @@ async fn touch(screen: &Arc<dyn Screen>, phase: TouchPhase, x: f32, y: f32) {
 #[ignore = "boots a real iOS simulator (needs Xcode)"]
 async fn live_an_iphone_simulator() {
     let simulator_before = simulator_app_running();
-    let sandbox = Sandbox::new();
+    let sandbox = Sandbox::new("basics");
     let helper = Helper::agentloftd(PathBuf::from(env!("CARGO_BIN_EXE_agentloftd")));
     let backend =
         IosBackend::new(helper, loft_config::process_env()).with_device_set(sandbox.set.clone());
@@ -366,4 +375,442 @@ async fn live_an_iphone_simulator() {
         !simulator_app_running() || simulator_before,
         "Simulator.app was opened"
     );
+}
+
+/// What `privacy` left in the device's TCC database for `service` and
+/// `app`: 2 allowed, 0 denied, `None` no answer yet.
+fn tcc(sandbox: &Sandbox, service: &str, app: &str) -> Option<i64> {
+    let db = sandbox
+        .set
+        .join(&sandbox.udid)
+        .join("data/Library/TCC/TCC.db");
+    let out = Command::new("/usr/bin/sqlite3")
+        .arg(&db)
+        .arg(format!(
+            "select auth_value from access where service = '{service}' and client = '{app}'"
+        ))
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// A page that turns green when three fingers touch it at once.
+const THREE_FINGERS: &str = r#"<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,user-scalable=no">
+<body style="height:100vh;margin:0;touch-action:none;background:#fff">
+<script>
+for (const kind of ["touchstart", "touchmove"]) {
+  document.addEventListener(kind, (e) => {
+    e.preventDefault();
+    if (e.touches.length === 3) document.body.style.background = "rgb(0,200,0)";
+  }, { passive: false });
+}
+</script>"#;
+
+/// Serve `html` on this computer (the simulator shares its network) and
+/// return its address. Each connection is answered on a thread of its own.
+fn serve(html: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                    html.len()
+                );
+            });
+        }
+    });
+    address
+}
+
+/// The share of a picture's pixels in the outlines' pink.
+fn pinkness(picture: &image::RgbImage) -> f64 {
+    let pink = picture
+        .pixels()
+        .filter(|p| {
+            let [r, g, b] = p.0;
+            r > 220 && g < 110 && (90..200).contains(&b)
+        })
+        .count();
+    pink as f64 / (picture.width() * picture.height()) as f64
+}
+
+/// The share of a picture's pixels that are near white.
+fn whiteness(picture: &image::RgbImage) -> f64 {
+    let white = picture
+        .pixels()
+        .filter(|p| p.0.iter().all(|&c| c > 235))
+        .count();
+    white as f64 / (picture.width() * picture.height()) as f64
+}
+
+async fn tap(screen: &Arc<dyn Screen>, x: f32, y: f32) {
+    touch(screen, TouchPhase::Down, x, y).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    touch(screen, TouchPhase::Up, x, y).await;
+}
+
+async fn fingers(screen: &Arc<dyn Screen>, phase: TouchPhase, points: [(f32, f32); 2]) {
+    screen
+        .input(DeviceInput::Touches {
+            phase,
+            touches: points.iter().map(|&(x, y)| TouchPoint { x, y }).collect(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots a real iOS simulator (needs Xcode)"]
+async fn live_settings_and_fingers() {
+    let sandbox = Sandbox::new("settings");
+    let helper = Helper::agentloftd(PathBuf::from(env!("CARGO_BIN_EXE_agentloftd")));
+    let backend =
+        IosBackend::new(helper, loft_config::process_env()).with_device_set(sandbox.set.clone());
+    let udid = sandbox.udid.as_str();
+    backend.boot(udid).await.unwrap();
+    let screen = backend.attach(udid).await.unwrap();
+    screen.watching(true);
+    let mut pictures = screen.pictures();
+    tokio::time::timeout(Duration::from_secs(10), pictures.wait_for(|p| p.is_some()))
+        .await
+        .expect("a first picture")
+        .unwrap();
+
+    let read = backend.settings(udid).await.unwrap();
+    eprintln!("settings at first: {read:?}");
+    for name in [
+        "appearance",
+        "text_size",
+        "contrast",
+        "reduce_motion",
+        "orientation",
+    ] {
+        assert!(
+            read.supported.iter().any(|s| s == name),
+            "{name} unsupported"
+        );
+    }
+    for name in ["screen_reader", "network", "posture"] {
+        assert!(
+            !read.supported.iter().any(|s| s == name),
+            "{name} supported"
+        );
+    }
+    assert_eq!(read.dark, Some(false));
+    assert_eq!(read.text_size, Some(DeviceTextSize::Default));
+    assert_eq!(read.contrast, Some(false));
+    assert_eq!(read.reduce_motion, Some(false));
+    assert_eq!(read.orientation, Some(DeviceOrientation::Portrait));
+    assert!(
+        read.apps.is_empty(),
+        "a new iPhone has no apps of the user's"
+    );
+
+    // Each setting, set and read back from the device.
+    let set = |setting| backend.set(udid, setting);
+    set(DeviceSetting::Appearance { dark: true }).await.unwrap();
+    set(DeviceSetting::TextSize {
+        size: DeviceTextSize::Largest,
+    })
+    .await
+    .unwrap();
+    set(DeviceSetting::Contrast { high: true }).await.unwrap();
+    set(DeviceSetting::ReduceMotion { on: true }).await.unwrap();
+    let read = backend.settings(udid).await.unwrap();
+    assert_eq!(read.dark, Some(true));
+    assert_eq!(read.text_size, Some(DeviceTextSize::Largest));
+    assert_eq!(read.contrast, Some(true));
+    assert_eq!(read.reduce_motion, Some(true));
+    set(DeviceSetting::Appearance { dark: false })
+        .await
+        .unwrap();
+    set(DeviceSetting::TextSize {
+        size: DeviceTextSize::Small,
+    })
+    .await
+    .unwrap();
+    set(DeviceSetting::Contrast { high: false }).await.unwrap();
+    set(DeviceSetting::ReduceMotion { on: false })
+        .await
+        .unwrap();
+    let read = backend.settings(udid).await.unwrap();
+    assert_eq!(read.dark, Some(false));
+    assert_eq!(read.text_size, Some(DeviceTextSize::Small));
+    assert_eq!(read.contrast, Some(false));
+    assert_eq!(read.reduce_motion, Some(false));
+    let unsupported = set(DeviceSetting::Network { on: false }).await.unwrap_err();
+    eprintln!("network: {unsupported:#}");
+
+    // A permission of a built-in app, granted and taken back.
+    let permission = |grant| DeviceSetting::Permission {
+        app: "com.apple.mobilesafari".into(),
+        permission: "photos".into(),
+        grant,
+    };
+    set(permission(true)).await.unwrap();
+    assert_eq!(
+        tcc(&sandbox, "kTCCServicePhotos", "com.apple.mobilesafari"),
+        Some(2)
+    );
+    set(permission(false)).await.unwrap();
+    assert_eq!(
+        tcc(&sandbox, "kTCCServicePhotos", "com.apple.mobilesafari"),
+        Some(0)
+    );
+
+    // A push to a built-in app.
+    set(DeviceSetting::Push {
+        app: "com.apple.Preferences".into(),
+        payload: serde_json::json!({"aps": {"alert": {"title": "Agentloft", "body": "A test push"}}}),
+    })
+    .await
+    .unwrap();
+
+    // The app in front: the home screen, then Safari.
+    let read = backend.settings(udid).await.unwrap();
+    assert_eq!(
+        read.foreground_app.as_deref(),
+        Some("com.apple.springboard")
+    );
+    backend
+        .app(
+            udid,
+            DeviceApp::Launch {
+                app: "com.apple.mobilesafari".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let launched = Instant::now();
+    let front = loop {
+        let front = backend.settings(udid).await.unwrap().foreground_app;
+        if front.as_deref() == Some("com.apple.mobilesafari")
+            || launched.elapsed() > Duration::from_secs(10)
+        {
+            break front;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert_eq!(front.as_deref(), Some("com.apple.mobilesafari"));
+
+    // Landscape, set directly: Safari turns, and it reads back.
+    let (width, height, _) = screen.size().unwrap();
+    set(DeviceSetting::Orientation {
+        orientation: DeviceOrientation::LandscapeLeft,
+    })
+    .await
+    .unwrap();
+    let turned = Instant::now();
+    while screen.size().is_some_and(|(w, h, _)| w < h) && turned.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(screen.size().map(|(w, h, _)| (w, h)), Some((height, width)));
+    assert_eq!(
+        backend.settings(udid).await.unwrap().orientation,
+        Some(DeviceOrientation::LandscapeLeft)
+    );
+    set(DeviceSetting::Orientation {
+        orientation: DeviceOrientation::Portrait,
+    })
+    .await
+    .unwrap();
+    let turned = Instant::now();
+    while screen.size().is_some_and(|(w, h, _)| w > h) && turned.elapsed() < Duration::from_secs(5)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(screen.size().map(|(w, h, _)| (w, h)), Some((width, height)));
+
+    // Accessibility frames: Safari's elements outlined in the pictures.
+    settle(
+        &screen,
+        Duration::from_millis(1000),
+        Duration::from_secs(10),
+    )
+    .await;
+    let plain = decode(&latest(&screen));
+    assert!(pinkness(&plain) < 0.002, "outlined before asked");
+    set(DeviceSetting::AccessibilityFrames { on: true })
+        .await
+        .unwrap();
+    let mut pictures = screen.pictures();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        pictures.wait_for(|p| p.as_ref().is_some_and(|p| pinkness(&decode(p)) > 0.004)),
+    )
+    .await
+    .expect("outlines in the pictures")
+    .unwrap();
+    assert_eq!(
+        backend.settings(udid).await.unwrap().accessibility_frames,
+        Some(true)
+    );
+    set(DeviceSetting::AccessibilityFrames { on: false })
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        pictures.wait_for(|p| p.as_ref().is_some_and(|p| pinkness(&decode(p)) < 0.002)),
+    )
+    .await
+    .expect("the outlines went")
+    .unwrap();
+    assert_eq!(
+        backend.settings(udid).await.unwrap().accessibility_frames,
+        Some(false)
+    );
+
+    // A pinch in Maps zooms the map. Somewhere with streets, and Maps' two
+    // first-run screens answered where they show (its location prompt's
+    // "Allow While Using App", then the Ads notice's Continue).
+    set(DeviceSetting::Location {
+        latitude: 51.5007,
+        longitude: -0.1246,
+    })
+    .await
+    .unwrap();
+    backend
+        .app(
+            udid,
+            DeviceApp::Launch {
+                app: "com.apple.Maps".into(),
+            },
+        )
+        .await
+        .unwrap();
+    settle(
+        &screen,
+        Duration::from_millis(2000),
+        Duration::from_secs(20),
+    )
+    .await;
+    tap(&screen, 0.5, 0.613).await;
+    settle(
+        &screen,
+        Duration::from_millis(2000),
+        Duration::from_secs(20),
+    )
+    .await;
+    // Then white pages ("Get Notified…", the Ads notice) whose button is at
+    // the same place: tapped until the map shows.
+    for _ in 0..6 {
+        if whiteness(&decode(&latest(&screen))) < 0.5 {
+            break;
+        }
+        tap(&screen, 0.5, 0.925).await;
+        settle(
+            &screen,
+            Duration::from_millis(2000),
+            Duration::from_secs(20),
+        )
+        .await;
+    }
+    assert_eq!(
+        backend
+            .settings(udid)
+            .await
+            .unwrap()
+            .foreground_app
+            .as_deref(),
+        Some("com.apple.Maps")
+    );
+    let before = decode(&latest(&screen));
+    let (a, b) = ((0.4f32, 0.3f32), (0.6f32, 0.4f32));
+    fingers(&screen, TouchPhase::Down, [a, b]).await;
+    let mut at = [a, b];
+    for step in 1..=15 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t = step as f32;
+        at = [
+            (a.0 - 0.015 * t, a.1 - 0.01 * t),
+            (b.0 + 0.015 * t, b.1 + 0.01 * t),
+        ];
+        fingers(&screen, TouchPhase::Move, at).await;
+    }
+    fingers(&screen, TouchPhase::Up, at).await;
+    settle(
+        &screen,
+        Duration::from_millis(1500),
+        Duration::from_secs(10),
+    )
+    .await;
+    let after = decode(&latest(&screen));
+    let changed = difference(&before, &after);
+    eprintln!("the pinch changed the picture by {changed:.1}");
+    if changed <= 8.0 {
+        let dir = std::env::temp_dir();
+        before
+            .save(dir.join("loft-ios-live-pinch-before.png"))
+            .unwrap();
+        after
+            .save(dir.join("loft-ios-live-pinch-after.png"))
+            .unwrap();
+        panic!(
+            "the pinch didn't zoom the map (pictures in {})",
+            dir.display()
+        );
+    }
+
+    // Three fingers at once reach a web page as three touches: it turns
+    // green.
+    let page = serve(THREE_FINGERS);
+    backend
+        .app(udid, DeviceApp::OpenUrl { url: page })
+        .await
+        .unwrap();
+    settle(
+        &screen,
+        Duration::from_millis(1500),
+        Duration::from_secs(20),
+    )
+    .await;
+    let three = [(0.25, 0.3), (0.5, 0.35), (0.75, 0.3)];
+    let touches = |dx: f32| {
+        three
+            .iter()
+            .map(|&(x, y)| TouchPoint { x: x + dx, y })
+            .collect::<Vec<_>>()
+    };
+    for (phase, dx) in [
+        (TouchPhase::Down, 0.0),
+        (TouchPhase::Move, 0.02),
+        (TouchPhase::Up, 0.02),
+    ] {
+        screen
+            .input(DeviceInput::Touches {
+                phase,
+                touches: touches(dx),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut pictures = screen.pictures();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pictures.wait_for(|p| {
+            p.as_ref().is_some_and(|p| {
+                let picture = decode(p);
+                let [r, g, b] = picture
+                    .get_pixel(picture.width() / 2, picture.height() / 4)
+                    .0;
+                g > 150 && r < 80 && b < 80
+            })
+        }),
+    )
+    .await
+    .expect("the page saw three touches at once")
+    .unwrap();
+
+    backend.shutdown(udid).await.unwrap();
+    drop(screen);
 }
