@@ -2,6 +2,7 @@
 //! upright with vImage, encoded with ImageIO (JPEG for the stream, PNG for
 //! captures).
 
+use super::ax::Frame;
 use crate::geometry::Turn;
 use anyhow::{Result, bail};
 use std::ffi::c_void;
@@ -212,6 +213,36 @@ fn turn_upright(pixels: Pixels, turn: Turn) -> Result<Pixels> {
         width,
         height,
     })
+}
+
+/// Outline `frames` (points, `factor` pixels each) in the picture, a point
+/// wide, in a pink that shows on light and dark screens alike.
+pub fn outline(pixels: &mut Pixels, frames: &[Frame], factor: f64) {
+    const BGRA: [u8; 4] = [0x8c, 0x2d, 0xff, 0xff];
+    let width = pixels.width as i64;
+    let height = pixels.height as i64;
+    let thick = (factor * 1.0).round().max(1.0) as i64;
+    let mut fill = |x0: i64, y0: i64, x1: i64, y1: i64| {
+        let (x0, x1) = (x0.clamp(0, width), x1.clamp(0, width));
+        let (y0, y1) = (y0.clamp(0, height), y1.clamp(0, height));
+        for y in y0..y1 {
+            let row = (y * width) as usize * 4;
+            for x in x0..x1 {
+                let at = row + x as usize * 4;
+                pixels.data[at..at + 4].copy_from_slice(&BGRA);
+            }
+        }
+    };
+    for frame in frames {
+        let x0 = (frame.x * factor).round() as i64;
+        let y0 = (frame.y * factor).round() as i64;
+        let x1 = ((frame.x + frame.width) * factor).round() as i64;
+        let y1 = ((frame.y + frame.height) * factor).round() as i64;
+        fill(x0, y0, x1, y0 + thick);
+        fill(x0, y1 - thick, x1, y1);
+        fill(x0, y0, x0 + thick, y1);
+        fill(x1 - thick, y0, x1, y1);
+    }
 }
 
 /// Encode as JPEG (`quality` 0–1) or, with `None`, PNG.

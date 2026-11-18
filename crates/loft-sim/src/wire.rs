@@ -12,7 +12,7 @@
 //!
 //! The helper ends when its stdin does.
 
-use loft_protocol::DeviceInput;
+use loft_protocol::{DeviceInput, DeviceOrientation};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
@@ -42,6 +42,16 @@ pub enum Command {
     },
     /// A PNG of the whole screen as it is turned now.
     Capture,
+    /// Turn the device to face this way, as the rotate buttons do.
+    Orientation {
+        orientation: DeviceOrientation,
+    },
+    /// Outline every element accessibility knows of in the app in front,
+    /// in the pictures and captures (done once the first outlines are
+    /// read).
+    AccessibilityFrames {
+        on: bool,
+    },
 }
 
 /// The screen as it is turned now: pixels, and pixels per point.
@@ -50,6 +60,10 @@ pub struct ScreenSize {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    /// Which way the interface faces (not how the device is held: an
+    /// iPhone's home screen stays upright whichever way it is turned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<DeviceOrientation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -142,6 +156,25 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
         let watch: Request = serde_json::from_str(r#"{"id":1,"cmd":"watch","on":true}"#).unwrap();
         assert_eq!(watch.command, Command::Watch { on: true });
+        let turn = Request {
+            id: 2,
+            command: Command::Orientation {
+                orientation: DeviceOrientation::LandscapeLeft,
+            },
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":2,"cmd":"orientation","orientation":"landscape_left"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), turn);
+        let frames: Request =
+            serde_json::from_str(r#"{"id":3,"cmd":"accessibility_frames","on":true}"#).unwrap();
+        assert_eq!(frames.command, Command::AccessibilityFrames { on: true });
+        // A helper that doesn't say which way the screen faces.
+        let size: ScreenSize =
+            serde_json::from_str(r#"{"width":1,"height":2,"scale":3.0}"#).unwrap();
+        assert_eq!(size.orientation, None);
     }
 
     #[test]

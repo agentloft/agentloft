@@ -16,7 +16,15 @@
 //!   device, made by its exported `IndigoHIDMessageFor…` functions:
 //!   `MouseNSEvent(point, second point, target, NSEvent type, size, edge)`
 //!   with the point as a fraction of `size` and target `0x32` (the main
-//!   screen's digitizer); `Button(source, direction, target)` with target
+//!   screen's digitizer). Given a second point (Simulator.app's
+//!   Option-drag pinch), the message carries a second finger: after a
+//!   `0x20`-byte header (its byte `0x1c` counts the events) come digitizer
+//!   events of `0xa0` bytes, one for the hand and one per finger. A
+//!   finger's event has its index and identity at `+0x10` (1 and 2 for the
+//!   first finger, 2 and 3 for the second), what changed at `+0x18`, its
+//!   point (two doubles, fractions) at `+0x1c`, and whether it touches at
+//!   `+0x44` and `+0x48`. More fingers are more such events, made from the
+//!   second's; `Button(source, direction, target)` with target
 //!   `0x33` and source 0 Home, 1 Lock; `KeyboardArbitrary(usage,
 //!   direction)`; `HIDArbitrary(target, page, usage, direction)`. Direction
 //!   is 1 down, 2 up. The functions return a `calloc`ed message the client
@@ -87,7 +95,7 @@ unsafe impl block2::ManualBlockEncoding for OneObject {
     const ENCODING_CSTR: &'static CStr = c"v16@?0@8";
 }
 
-fn block(f: impl Fn(*mut AnyObject) + 'static) -> RcBlock<dyn Fn(*mut AnyObject)> {
+pub fn block(f: impl Fn(*mut AnyObject) + 'static) -> RcBlock<dyn Fn(*mut AnyObject)> {
     RcBlock::with_encoding::<_, _, _, OneObject>(f)
 }
 
@@ -127,7 +135,7 @@ fn responds(object: &AnyObject, selector: &CStr) -> bool {
     yes.as_bool()
 }
 
-fn open_library(path: &str) -> Result<*mut c_void> {
+pub fn open_library(path: &str) -> Result<*mut c_void> {
     let c = CString::new(path)?;
     // SAFETY: a path, RTLD_NOW; the library stays loaded for the process.
     let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW) };
@@ -296,6 +304,16 @@ impl Device {
         })
     }
 
+    /// The `SimDevice`.
+    pub fn sim_device(&self) -> Retained<AnyObject> {
+        self.device.clone()
+    }
+
+    /// The queue CoreSimulator answers on.
+    pub fn queue(&self) -> *mut AnyObject {
+        self.queue
+    }
+
     pub fn state(&self) -> Result<u64> {
         // SAFETY: `-[SimDevice state]`.
         guarded("Reading the simulator's state", || unsafe {
@@ -406,18 +424,36 @@ impl Device {
     /// `NSEventType`: 1 down, 6 dragged, 2 up. A drag less than 16 ms after
     /// the last message is dropped by SimulatorKit: `Ok(false)`.
     pub fn touch(&self, kind: u64, x: f64, y: f64) -> Result<bool> {
+        self.fingers(kind, &[(x, y)])
+    }
+
+    /// Fingers that go down, move and lift together (a pinch, a two-finger
+    /// turn), as [`Device::touch`].
+    pub fn fingers(&self, kind: u64, points: &[(f64, f64)]) -> Result<bool> {
+        let Some(&(x, y)) = points.first() else {
+            bail!("a touch needs a finger");
+        };
         let point = CGPoint { x, y };
+        let second = points.get(1).map(|&(x, y)| CGPoint { x, y });
         let size = CGSize {
             width: 1.0,
             height: 1.0,
         };
-        // SAFETY: see `MouseFn`; no second finger, edge 0 (an ordinary
-        // touch: other edges are swipes from the screen's edges).
-        let message =
-            unsafe { (self.mouse)(&point, std::ptr::null(), TOUCH_TARGET, kind, size, 0) };
+        let second_ptr = second
+            .as_ref()
+            .map_or(std::ptr::null(), |p| p as *const CGPoint);
+        // SAFETY: see `MouseFn`; the second point, when there is one, lives
+        // until the call returns. Edge 0: an ordinary touch (other edges
+        // are swipes from the screen's edges).
+        let message = unsafe { (self.mouse)(&point, second_ptr, TOUCH_TARGET, kind, size, 0) };
         if message.is_null() {
             return Ok(false);
         }
+        let message = if points.len() > 2 {
+            more_fingers(message, &points[2..])?
+        } else {
+            message
+        };
         self.send(message).map(|()| true)
     }
 
@@ -488,6 +524,54 @@ impl Device {
             bail!("the simulator didn't take the turn (Mach error {result:#x})");
         }
         Ok(())
+    }
+}
+
+/// The layout of a touch message (see the module's documentation).
+const HEADER: usize = 0x20;
+const EVENT: usize = 0xa0;
+const EVENTS_AT: usize = 0x1c;
+const FINGER_ID: usize = 0x10;
+const FINGER_POINT: usize = 0x1c;
+/// The most fingers a touch takes (two hands').
+pub const MOST_FINGERS: usize = 10;
+
+/// A two-finger message from SimulatorKit with `more` fingers after its
+/// two, each made from the second's event, moved to its own point. Frees
+/// `message` and returns a new one, `calloc`ed as SimulatorKit's are.
+fn more_fingers(message: *mut c_void, more: &[(f64, f64)]) -> Result<*mut c_void> {
+    let old = message.cast::<u8>();
+    // SAFETY: SimulatorKit's message, read within its header.
+    let events = unsafe { *old.add(EVENTS_AT) } as usize;
+    if events != 3 {
+        // SAFETY: the message SimulatorKit made, freed once.
+        unsafe { libc::free(message) };
+        bail!("SimulatorKit's touch has {events} events, not a hand and two fingers");
+    }
+    let fingers = 2 + more.len();
+    let size = HEADER + (fingers + 1) * EVENT;
+    // SAFETY: a fresh buffer, filled within its size from the old message's
+    // `HEADER + 3 * EVENT` bytes; the old one is freed once.
+    unsafe {
+        let new = libc::calloc(1, size).cast::<u8>();
+        if new.is_null() {
+            libc::free(message);
+            bail!("no memory for a touch");
+        }
+        std::ptr::copy_nonoverlapping(old, new, HEADER + 3 * EVENT);
+        libc::free(message);
+        *new.add(EVENTS_AT) = (fingers + 1) as u8;
+        let second = new.add(HEADER + 2 * EVENT);
+        for (i, &(x, y)) in more.iter().enumerate() {
+            let finger = 2 + i;
+            let event = new.add(HEADER + (finger + 1) * EVENT);
+            std::ptr::copy_nonoverlapping(second, event, EVENT);
+            let id = [(finger + 1) as u32, (finger + 2) as u32];
+            std::ptr::copy_nonoverlapping(id.as_ptr().cast::<u8>(), event.add(FINGER_ID), 8);
+            let point = [x, y];
+            std::ptr::copy_nonoverlapping(point.as_ptr().cast::<u8>(), event.add(FINGER_POINT), 16);
+        }
+        Ok(new.cast())
     }
 }
 

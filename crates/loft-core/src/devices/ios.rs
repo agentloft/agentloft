@@ -6,11 +6,26 @@
 //! the `loft-sim` crate) so that a crash there can't take the daemon down:
 //! the helper sends JPEG pictures of the screen and carries out touches,
 //! keys and buttons ([`loft_sim::wire`]).
+//!
+//! Settings ([`Backend::set`], read back by [`Backend::settings`]):
+//! appearance, text size and Increase Contrast through `simctl ui`;
+//! Reduce Motion through the device's accessibility preferences
+//! (`com.apple.Accessibility`'s `ReduceMotionEnabled`, then the Darwin
+//! notifications its readers listen for); permissions through `simctl
+//! privacy`; pushes through `simctl push`; the orientation through the
+//! helper, as the rotate buttons; accessibility frames are outlined by the
+//! helper in its pictures, from the device's accessibility tree
+//! (`loft-sim`'s `helper/ax.rs`). The app in front is the one RunningBoard
+//! gave the focal UI role (simulator apps are this Mac's processes, so their
+//! role reads with `getpriority(PRIO_DARWIN_ROLE)`). What a simulator can't
+//! do: VoiceOver (not in the simulator's runtime), turning its network off
+//! (it is this Mac's), folding (Xcode has no foldable device).
 
 use super::{Backend, BoxFut, Picture, Screen};
 use anyhow::{Context, Result, anyhow, bail};
 use loft_protocol::{
-    DeviceApp, DeviceId, DeviceInfo, DeviceInput, DevicePlatform, DeviceSetting, DeviceState,
+    DeviceApp, DeviceId, DeviceInfo, DeviceInput, DeviceOrientation, DevicePlatform, DeviceSetting,
+    DeviceSettings, DeviceState, DeviceTextSize,
 };
 use loft_sim::wire::{self, Command, Event, Request};
 use serde::Deserialize;
@@ -18,7 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -58,6 +73,12 @@ pub struct IosBackend {
     supported: Mutex<Option<(PathBuf, Instant)>>,
     /// Screen sizes by device type (its profile, read once).
     screens: Mutex<HashMap<String, Option<ScreenOf>>>,
+    /// The helpers attached now, by UDID, for settings that go through one
+    /// (the orientation).
+    attached: Mutex<HashMap<String, Weak<IosScreen>>>,
+    /// The devices whose accessibility frames are to be outlined (a
+    /// helper attached later outlines them too).
+    outlined: Mutex<std::collections::HashSet<String>>,
 }
 
 impl IosBackend {
@@ -70,6 +91,8 @@ impl IosBackend {
             set: None,
             supported: Mutex::new(None),
             screens: Mutex::default(),
+            attached: Mutex::default(),
+            outlined: Mutex::default(),
         }
     }
 
@@ -95,16 +118,30 @@ impl IosBackend {
 
     /// Run `simctl` with `args` and return its stdout.
     async fn simctl(&self, args: &[&str]) -> Result<String> {
+        self.simctl_with(args, None).await
+    }
+
+    /// Run `simctl` with `args`, `input` on its stdin, and return its stdout.
+    async fn simctl_with(&self, args: &[&str], input: Option<&[u8]>) -> Result<String> {
         let mut command = self.xcrun();
         command.arg("simctl");
         if let Some(set) = &self.set {
             command.arg("--set").arg(set);
         }
-        let out = command
-            .args(args)
-            .output()
-            .await
-            .context("couldn't run xcrun")?;
+        command.args(args);
+        let out = match input {
+            None => command.output().await.context("couldn't run xcrun")?,
+            Some(input) => {
+                let mut child = command
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .context("couldn't run xcrun")?;
+                let mut stdin = child.stdin.take().context("no stdin")?;
+                stdin.write_all(input).await?;
+                drop(stdin);
+                child.wait_with_output().await?
+            }
+        };
         if !out.status.success() {
             bail!("{}", simctl_error(&String::from_utf8_lossy(&out.stderr)));
         }
@@ -373,6 +410,261 @@ pub(crate) fn devices_of(
     out
 }
 
+/// The settings an iOS simulator takes, as `DeviceSettings::supported`
+/// names them.
+const SETTINGS: &[&str] = &[
+    "appearance",
+    "location",
+    "text_size",
+    "contrast",
+    "reduce_motion",
+    "permission",
+    "push",
+    "orientation",
+    "accessibility_frames",
+];
+
+/// The accessibility preferences' domain, and the Darwin notifications its
+/// readers (UIKit's cache, Settings) take as "Reduce Motion changed".
+const ACCESSIBILITY: &str = "com.apple.Accessibility";
+const REDUCE_MOTION: &str = "ReduceMotionEnabled";
+const REDUCE_MOTION_CHANGED: &[&str] = &[
+    "com.apple.accessibility.reduce.motion.status",
+    "com.apple.accessibility.cache.reduce.motion",
+];
+
+/// SpringBoard's bundle id: the home screen (and lock screen) in front.
+pub(crate) const SPRINGBOARD: &str = "com.apple.springboard";
+
+/// `simctl ui … content_size`'s category for a text size. iOS has seven
+/// standard sizes and five larger accessibility ones; `Default` is its
+/// own default, `large`.
+fn content_size(size: DeviceTextSize) -> &'static str {
+    match size {
+        DeviceTextSize::ExtraSmall => "extra-small",
+        DeviceTextSize::Small => "small",
+        DeviceTextSize::Default => "large",
+        DeviceTextSize::Large => "extra-large",
+        DeviceTextSize::ExtraLarge => "extra-extra-extra-large",
+        DeviceTextSize::Largest => "accessibility-extra-extra-extra-large",
+    }
+}
+
+/// The text size nearest a content size category simctl printed (it
+/// prints some capitalized: "Small" after `content_size small`).
+fn text_size_of(category: &str) -> Option<DeviceTextSize> {
+    Some(match category.trim().to_ascii_lowercase().as_str() {
+        "extra-small" => DeviceTextSize::ExtraSmall,
+        "small" | "medium" => DeviceTextSize::Small,
+        "large" => DeviceTextSize::Default,
+        "extra-large" => DeviceTextSize::Large,
+        "extra-extra-large" | "extra-extra-extra-large" => DeviceTextSize::ExtraLarge,
+        c if c.starts_with("accessibility-") => DeviceTextSize::Largest,
+        _ => return None,
+    })
+}
+
+/// `simctl ui … appearance` / `increase_contrast` as read back: `None` for
+/// "unknown" or "unsupported".
+fn ui_value(printed: &str, on: &str, off: &str) -> Option<bool> {
+    match printed.trim() {
+        v if v == on => Some(true),
+        v if v == off => Some(false),
+        _ => None,
+    }
+}
+
+/// A boolean `defaults read` printed (`1`/`0`); a preference never set is
+/// off.
+fn defaults_bool(read: &Result<String>) -> Option<bool> {
+    match read {
+        Ok(text) => match text.trim() {
+            "1" | "true" | "YES" => Some(true),
+            "0" | "false" | "NO" => Some(false),
+            _ => None,
+        },
+        Err(e) if format!("{e:#}").contains("does not exist") => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// The apps in `simctl listapps` (as JSON): every bundle id, and the user's
+/// own (not the system's), each sorted.
+fn apps_of(json: &[u8]) -> Result<(Vec<String>, Vec<String>)> {
+    #[derive(Deserialize)]
+    struct App {
+        #[serde(rename = "ApplicationType", default)]
+        kind: String,
+    }
+    let apps: BTreeMap<String, App> =
+        serde_json::from_slice(json).context("simctl's app list isn't JSON")?;
+    let user = apps
+        .iter()
+        .filter(|(_, app)| app.kind == "User")
+        .map(|(id, _)| id.clone())
+        .collect();
+    Ok((apps.into_keys().collect(), user))
+}
+
+/// The running apps in the device's `launchctl list` (pid, status, label per
+/// line): their pids and bundle ids, and SpringBoard's pid.
+fn running_apps(list: &str) -> (Vec<(i32, String)>, Option<i32>) {
+    let mut apps = Vec::new();
+    let mut springboard = None;
+    for line in list.lines() {
+        let mut fields = line.split('\t');
+        let (Some(pid), Some(_), Some(label)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<i32>() else {
+            continue;
+        };
+        if label == "com.apple.SpringBoard" {
+            springboard = Some(pid);
+        } else if let Some(rest) = label.strip_prefix("UIKitApplication:") {
+            let bundle = rest.split('[').next().unwrap_or(rest);
+            apps.push((pid, bundle.to_string()));
+        }
+    }
+    (apps, springboard)
+}
+
+/// The app RunningBoard put in front: of the running apps (those in
+/// `known`, leaving out extensions such as widget renderers, which get the
+/// same role), the one whose process has the focal UI role; else
+/// SpringBoard's home or lock screen when it has it.
+fn foreground(
+    running: &[(i32, String)],
+    springboard: Option<i32>,
+    known: &[String],
+    focal: impl Fn(i32) -> bool,
+) -> Option<String> {
+    running
+        .iter()
+        .filter(|(_, bundle)| known.binary_search(bundle).is_ok())
+        .find(|(pid, _)| focal(*pid))
+        .map(|(_, bundle)| bundle.clone())
+        .or_else(|| {
+            springboard
+                .filter(|pid| focal(*pid))
+                .map(|_| SPRINGBOARD.to_string())
+        })
+}
+
+/// Whether a process on this Mac has the focal UI role (the app in front).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn is_focal(pid: i32) -> bool {
+    /// `<sys/resource.h>`: `PRIO_DARWIN_ROLE` and `PRIO_DARWIN_ROLE_UI_FOCAL`.
+    const PRIO_DARWIN_ROLE: libc::c_int = 6;
+    const ROLE_UI_FOCAL: libc::c_int = 1;
+    // SAFETY: getpriority reads a process's role; it takes any pid and
+    // answers -1 for one it can't see.
+    let role = unsafe { libc::getpriority(PRIO_DARWIN_ROLE, pid as libc::id_t) };
+    role == ROLE_UI_FOCAL
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_focal(_pid: i32) -> bool {
+    false
+}
+
+/// Turn an old-style or binary property list (what `simctl listapps`
+/// prints) into JSON.
+async fn plist_json(plist: &[u8]) -> Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("couldn't run plutil")?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    stdin.write_all(plist).await?;
+    drop(stdin);
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        bail!("plutil: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
+impl IosBackend {
+    /// The device's attached screen, or a helper of its own for as long as
+    /// `f` needs it.
+    async fn helper_for(&self, udid: &str) -> Result<Arc<IosScreen>> {
+        if let Some(screen) = self.attached(udid) {
+            return Ok(screen);
+        }
+        let developer_dir = self.check_support().await.map_err(|why| anyhow!(why))?;
+        Ok(Arc::new(
+            IosScreen::start(&self.helper, udid, &developer_dir, self.set.as_deref()).await?,
+        ))
+    }
+
+    async fn set_reduce_motion(&self, udid: &str, on: bool) -> Result<()> {
+        let value = if on { "true" } else { "false" };
+        self.simctl(&[
+            "spawn",
+            udid,
+            "defaults",
+            "write",
+            ACCESSIBILITY,
+            REDUCE_MOTION,
+            "-bool",
+            value,
+        ])
+        .await?;
+        for name in REDUCE_MOTION_CHANGED {
+            self.simctl(&["spawn", udid, "notifyutil", "-p", name])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Every installed app's bundle id, and the user's own apps.
+    async fn apps(&self, udid: &str) -> Result<(Vec<String>, Vec<String>)> {
+        let mut command = self.xcrun();
+        command.arg("simctl");
+        if let Some(set) = &self.set {
+            command.arg("--set").arg(set);
+        }
+        let out = command
+            .args(["listapps", udid])
+            .output()
+            .await
+            .context("couldn't run xcrun")?;
+        if !out.status.success() {
+            bail!("{}", simctl_error(&String::from_utf8_lossy(&out.stderr)));
+        }
+        apps_of(&plist_json(&out.stdout).await?)
+    }
+
+    async fn foreground_app(&self, udid: &str, known: &[String]) -> Result<Option<String>> {
+        let list = self.simctl(&["spawn", udid, "launchctl", "list"]).await?;
+        let (running, springboard) = running_apps(&list);
+        Ok(foreground(&running, springboard, known, is_focal))
+    }
+
+    fn attached(&self, udid: &str) -> Option<Arc<IosScreen>> {
+        self.attached
+            .lock()
+            .unwrap()
+            .get(udid)
+            .and_then(Weak::upgrade)
+            .filter(|s| s.ended.borrow().is_none())
+    }
+
+    /// The orientation of the device's interface, from its helper (one is
+    /// started for it when none is attached).
+    async fn orientation(&self, udid: &str) -> Result<Option<DeviceOrientation>> {
+        let screen = self.helper_for(udid).await?;
+        Ok(*screen.orientation.lock().unwrap())
+    }
+}
+
 impl Backend for IosBackend {
     fn platform(&self) -> DevicePlatform {
         DevicePlatform::Ios
@@ -424,9 +716,26 @@ impl Backend for IosBackend {
     fn attach<'a>(&'a self, native: &'a str) -> BoxFut<'a, Arc<dyn Screen>> {
         Box::pin(async move {
             let developer_dir = self.check_support().await.map_err(|why| anyhow!(why))?;
-            let screen =
-                IosScreen::start(&self.helper, native, &developer_dir, self.set.as_deref()).await?;
-            Ok(Arc::new(screen) as Arc<dyn Screen>)
+            let screen = Arc::new(
+                IosScreen::start(&self.helper, native, &developer_dir, self.set.as_deref()).await?,
+            );
+            {
+                let mut attached = self.attached.lock().unwrap();
+                attached.retain(|_, s| s.strong_count() > 0);
+                attached.insert(native.to_string(), Arc::downgrade(&screen));
+            }
+            if self.outlined.lock().unwrap().contains(native) {
+                let screen = Arc::downgrade(&screen);
+                tokio::spawn(async move {
+                    let Some(screen) = screen.upgrade() else {
+                        return;
+                    };
+                    if let Err(e) = screen.outline(true).await {
+                        tracing::warn!("accessibility frames: {e:#}");
+                    }
+                });
+            }
+            Ok(screen as Arc<dyn Screen>)
         })
     }
 
@@ -457,9 +766,117 @@ impl Backend for IosBackend {
                     let at = format!("{latitude},{longitude}");
                     self.simctl(&["location", native, "set", &at]).await
                 }
-                other => anyhow::bail!("{other:?} isn't supported on iOS simulators yet."),
+                DeviceSetting::TextSize { size } => {
+                    self.simctl(&["ui", native, "content_size", content_size(size)])
+                        .await
+                }
+                DeviceSetting::Contrast { high } => {
+                    let to = if high { "enabled" } else { "disabled" };
+                    self.simctl(&["ui", native, "increase_contrast", to]).await
+                }
+                DeviceSetting::ReduceMotion { on } => self
+                    .set_reduce_motion(native, on)
+                    .await
+                    .map(|()| String::new()),
+                DeviceSetting::Permission {
+                    app,
+                    permission,
+                    grant,
+                } => {
+                    let action = if grant { "grant" } else { "revoke" };
+                    self.simctl(&["privacy", native, action, &permission, &app])
+                        .await
+                }
+                DeviceSetting::Push { app, payload } => {
+                    let payload = serde_json::to_vec(&payload)?;
+                    self.simctl_with(&["push", native, &app, "-"], Some(&payload))
+                        .await
+                }
+                DeviceSetting::Orientation { orientation } => {
+                    let screen = self.helper_for(native).await?;
+                    screen.orient(orientation).await.map(|()| String::new())
+                }
+                DeviceSetting::ScreenReader { .. } => {
+                    bail!("iOS simulators have no VoiceOver: it runs only on real devices.")
+                }
+                DeviceSetting::AccessibilityFrames { on } => {
+                    if on {
+                        self.outlined.lock().unwrap().insert(native.to_string());
+                    } else {
+                        self.outlined.lock().unwrap().remove(native);
+                    }
+                    // Drawn in the pictures of the attached screen; one
+                    // attached later outlines them from the start.
+                    match self.attached(native) {
+                        Some(screen) => screen.outline(on).await.map(|()| String::new()),
+                        None => Ok(String::new()),
+                    }
+                }
+                DeviceSetting::Network { .. } => bail!(
+                    "An iOS simulator uses this Mac's network: it can't be turned off on its own."
+                ),
+                DeviceSetting::Posture { .. } | DeviceSetting::Hinge { .. } => {
+                    bail!("No iOS simulator folds.")
+                }
             }
             .map(drop)
+        })
+    }
+
+    fn settings<'a>(&'a self, native: &'a str) -> BoxFut<'a, DeviceSettings> {
+        Box::pin(async move {
+            let appearance = ["ui", native, "appearance"];
+            let size = ["ui", native, "content_size"];
+            let contrast = ["ui", native, "increase_contrast"];
+            let motion = [
+                "spawn",
+                native,
+                "defaults",
+                "read",
+                ACCESSIBILITY,
+                REDUCE_MOTION,
+            ];
+            let (appearance, size, contrast, motion, apps) = tokio::join!(
+                self.simctl(&appearance),
+                self.simctl(&size),
+                self.simctl(&contrast),
+                self.simctl(&motion),
+                self.apps(native),
+            );
+            let mut settings = DeviceSettings {
+                supported: SETTINGS.iter().map(|s| s.to_string()).collect(),
+                dark: appearance.ok().and_then(|a| ui_value(&a, "dark", "light")),
+                text_size: size.ok().and_then(|s| text_size_of(&s)),
+                contrast: contrast
+                    .ok()
+                    .and_then(|c| ui_value(&c, "enabled", "disabled")),
+                reduce_motion: defaults_bool(&motion),
+                ..Default::default()
+            };
+            // The rest only of a running device.
+            let Ok((known, user)) = apps else {
+                return Ok(settings);
+            };
+            settings.apps = user;
+            let (front, orientation) = tokio::join!(
+                self.foreground_app(native, &known),
+                self.orientation(native)
+            );
+            settings.foreground_app = front.unwrap_or_else(|e| {
+                tracing::debug!("the simulator's app in front: {e:#}");
+                None
+            });
+            settings.orientation = orientation.unwrap_or_else(|e| {
+                tracing::debug!("the simulator's orientation: {e:#}");
+                None
+            });
+            // The outlines are the helper's own drawing: what the attached
+            // one draws, else what one would.
+            settings.accessibility_frames = Some(match self.attached(native) {
+                Some(screen) => *screen.outlining.lock().unwrap(),
+                None => self.outlined.lock().unwrap().contains(native),
+            });
+            Ok(settings)
         })
     }
 }
@@ -476,6 +893,10 @@ struct IosScreen {
     pictures: watch::Sender<Option<Arc<Picture>>>,
     ended: watch::Sender<Option<String>>,
     size: Arc<Mutex<Option<(u32, u32, f32)>>>,
+    /// Which way the interface faces now.
+    orientation: Arc<Mutex<Option<DeviceOrientation>>>,
+    /// Accessibility frames are outlined in its pictures.
+    outlining: Mutex<bool>,
     requests: mpsc::UnboundedSender<String>,
     waiting: Waiting,
     next_id: AtomicU64,
@@ -520,6 +941,7 @@ impl IosScreen {
         let pictures = watch::channel(None).0;
         let ended = watch::channel(None).0;
         let size = Arc::new(Mutex::new(None));
+        let orientation = Arc::new(Mutex::new(None));
         let waiting: Waiting = Arc::default();
         let (requests, mut requests_rx) = mpsc::unbounded_channel::<String>();
         let (stop, mut stopped) = oneshot::channel::<()>();
@@ -568,10 +990,11 @@ impl IosScreen {
 
         // Pictures and answers out.
         {
-            let (pictures, ended, size, waiting) = (
+            let (pictures, ended, size, orientation, waiting) = (
                 pictures.clone(),
                 ended.clone(),
                 size.clone(),
+                orientation.clone(),
                 waiting.clone(),
             );
             tokio::spawn(async move {
@@ -603,6 +1026,7 @@ impl IosScreen {
                             Ok(Event::Ready { screen }) => {
                                 *size.lock().unwrap() =
                                     Some((screen.width, screen.height, screen.scale));
+                                *orientation.lock().unwrap() = screen.orientation;
                                 if let Some(ready) = ready.take() {
                                     let _ = ready.send(Ok(()));
                                 }
@@ -610,6 +1034,7 @@ impl IosScreen {
                             Ok(Event::Size { screen }) => {
                                 *size.lock().unwrap() =
                                     Some((screen.width, screen.height, screen.scale));
+                                *orientation.lock().unwrap() = screen.orientation;
                             }
                             Ok(Event::Done { id, error }) => {
                                 if let Some(tx) = waiting.lock().unwrap().remove(&id) {
@@ -644,6 +1069,8 @@ impl IosScreen {
             pictures,
             ended,
             size,
+            orientation,
+            outlining: Mutex::new(false),
             requests,
             waiting,
             next_id: AtomicU64::new(1),
@@ -692,6 +1119,46 @@ impl IosScreen {
                 "The simulator didn't answer in {}s.",
                 wait.as_secs()
             )),
+        }
+    }
+}
+
+impl IosScreen {
+    /// Turn the device to face `orientation`, as the rotate buttons do.
+    async fn orient(&self, orientation: DeviceOrientation) -> Result<()> {
+        match self
+            .request(
+                Command::Orientation { orientation },
+                Some(Duration::from_secs(10)),
+            )
+            .await?
+        {
+            Reply::Done(None) | Reply::Capture(_) => Ok(()),
+            Reply::Done(Some(error)) => Err(anyhow!(error)),
+        }
+    }
+}
+
+impl IosScreen {
+    /// Outline accessibility frames in the pictures, or stop. Turning them
+    /// on answers once the first outlines are read (seconds, the first
+    /// time).
+    async fn outline(&self, on: bool) -> Result<()> {
+        match self
+            .request(
+                Command::AccessibilityFrames { on },
+                Some(Duration::from_secs(30)),
+            )
+            .await?
+        {
+            Reply::Done(None) | Reply::Capture(_) => {
+                *self.outlining.lock().unwrap() = on;
+                Ok(())
+            }
+            Reply::Done(Some(error)) => {
+                *self.outlining.lock().unwrap() = false;
+                Err(anyhow!(error))
+            }
         }
     }
 }
@@ -840,6 +1307,107 @@ mod tests {
         let profile = br#"{"mainScreenHeight": 2622, "mainScreenScale": 3, "mainScreenWidth": 1206, "mainScreenWidthDPI": 460}"#;
         assert_eq!(screen_of_profile(profile), Some((1206, 2622, 3.0)));
         assert_eq!(screen_of_profile(b"{}"), None);
+    }
+
+    #[test]
+    fn text_sizes_map_to_content_sizes_and_back() {
+        for size in [
+            DeviceTextSize::ExtraSmall,
+            DeviceTextSize::Small,
+            DeviceTextSize::Default,
+            DeviceTextSize::Large,
+            DeviceTextSize::ExtraLarge,
+            DeviceTextSize::Largest,
+        ] {
+            assert_eq!(text_size_of(content_size(size)), Some(size), "{size:?}");
+        }
+        assert_eq!(content_size(DeviceTextSize::Default), "large");
+        // Sizes set elsewhere read as the nearest.
+        assert_eq!(text_size_of("medium\n"), Some(DeviceTextSize::Small));
+        assert_eq!(text_size_of("Small\n"), Some(DeviceTextSize::Small));
+        assert_eq!(
+            text_size_of("extra-extra-large"),
+            Some(DeviceTextSize::ExtraLarge)
+        );
+        assert_eq!(
+            text_size_of("accessibility-medium"),
+            Some(DeviceTextSize::Largest)
+        );
+        assert_eq!(text_size_of("unknown"), None);
+        assert_eq!(text_size_of("unsupported"), None);
+    }
+
+    #[test]
+    fn ui_values_read_back() {
+        assert_eq!(ui_value("dark\n", "dark", "light"), Some(true));
+        assert_eq!(ui_value("light", "dark", "light"), Some(false));
+        assert_eq!(ui_value("unsupported", "dark", "light"), None);
+        assert_eq!(ui_value("enabled\n", "enabled", "disabled"), Some(true));
+        assert_eq!(ui_value("unknown", "enabled", "disabled"), None);
+        assert_eq!(defaults_bool(&Ok("1\n".into())), Some(true));
+        assert_eq!(defaults_bool(&Ok("0\n".into())), Some(false));
+        let never_set = anyhow!(
+            "The domain/default pair of (com.apple.Accessibility, ReduceMotionEnabled) does not exist"
+        );
+        assert_eq!(defaults_bool(&Err(never_set)), Some(false));
+        assert_eq!(
+            defaults_bool(&Err(anyhow!("Unable to lookup in current state: Shutdown"))),
+            None
+        );
+    }
+
+    #[test]
+    fn user_apps_from_listapps() {
+        let json = br#"{
+            "com.apple.mobilesafari": {"ApplicationType": "System", "CFBundleIdentifier": "com.apple.mobilesafari"},
+            "com.example.Mine": {"ApplicationType": "User", "CFBundleIdentifier": "com.example.Mine"},
+            "com.apple.Maps": {"ApplicationType": "System"},
+            "com.example.Another": {"ApplicationType": "User"}
+        }"#;
+        let (all, user) = apps_of(json).unwrap();
+        assert_eq!(
+            all,
+            [
+                "com.apple.Maps",
+                "com.apple.mobilesafari",
+                "com.example.Another",
+                "com.example.Mine"
+            ]
+        );
+        assert_eq!(user, ["com.example.Another", "com.example.Mine"]);
+        assert!(apps_of(b"not json").is_err());
+    }
+
+    #[test]
+    fn the_app_in_front_is_the_focal_one() {
+        let list = "PID\tStatus\tLabel\n\
+            80198\t0\tcom.apple.SpringBoard\n\
+            80912\t0\tUIKitApplication:com.apple.Preferences[f6ab][rb-legacy]\n\
+            80437\t0\tUIKitApplication:com.apple.chrono.WidgetRenderer-Default[1601][rb-legacy]\n\
+            -\t0\tUIKitApplication:com.apple.mobilecal[0900][rb-legacy]\n\
+            123\t0\tcom.apple.backboardd\n";
+        let (running, springboard) = running_apps(list);
+        assert_eq!(
+            running,
+            [
+                (80912, "com.apple.Preferences".to_string()),
+                (80437, "com.apple.chrono.WidgetRenderer-Default".to_string())
+            ]
+        );
+        assert_eq!(springboard, Some(80198));
+        let known = vec!["com.apple.Preferences".to_string()];
+        // Settings in front (SpringBoard keeps its role too).
+        let focal = |pids: &'static [i32]| move |pid: i32| pids.contains(&pid);
+        assert_eq!(
+            foreground(&running, springboard, &known, focal(&[80198, 80912])),
+            Some("com.apple.Preferences".into())
+        );
+        // The home screen: a widget renderer is focal too, but isn't an app.
+        assert_eq!(
+            foreground(&running, springboard, &known, focal(&[80198, 80437])),
+            Some(SPRINGBOARD.into())
+        );
+        assert_eq!(foreground(&running, springboard, &known, focal(&[])), None);
     }
 
     #[test]
