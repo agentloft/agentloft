@@ -114,6 +114,8 @@ Run the full suite once, in the background if your tool allows it, saving the ou
 - Folders in the temporary directory go through `loft_config::private_temp_dir` (on Linux `/tmp` is shared, and another account could plant the folder or a symlink). Agent CLIs never run with a shared folder as their working directory: they read project settings (MCP servers, plugins) from it.
 - Document parsers run in the app (and in a browser tab): an allocation that fails aborts the whole app, which `catch_unwind` can't stop. Check sizes a file declares before handing it to a library that allocates by them (`sheets::check_xls`, `pdf::images_fit`).
 - On Linux, a URL passed to `cx.open_url` is on `xdg-open`'s command line, which every account can read: links with a secret go through `settings::web::open_secret_link`.
+- For the same reason, the user's or an agent's text never goes on a local process's arguments: one-off prompts reach the agent CLI on stdin (`Core::ask_once`: `claude -p`, `codex exec -`, `opencode run`, headless `gemini` all read it there), and text typed on Android devices goes to `adb shell -T` as a script on stdin (`devices::adb_shell_script`).
+- Everything an agent's capture tools return is redacted, console text included (`Redactor::text` in `pages/capture/redaction.rs`, the same rules as network captures). Redact before keeping, so a read's `filter` can't find a secret either.
 
 ## How the maintainer likes work done
 
