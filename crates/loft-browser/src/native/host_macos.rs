@@ -26,8 +26,8 @@ use anyhow::Context as _;
 use block2::RcBlock;
 use futures::channel::{mpsc::UnboundedSender, oneshot};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSBitmapFormat, NSBitmapImageRep, NSEvent, NSEventMask, NSEventModifierFlags,
     NSEventPhase, NSEventType, NSImage, NSView,
@@ -234,6 +234,12 @@ impl NativeHost {
             .build_as_child(window)
             .context("failed to create the view's WKWebView")?;
         let wk: Retained<WKWebView> = Retained::into_super(webview.webview());
+        // Before anything is loaded. Without it, no native page: the view
+        // is streamed from the daemon's browser instead, where it has none.
+        anyhow::ensure!(
+            no_peer_connections(&wk),
+            "this WebKit can't turn WebRTC off for a view"
+        );
 
         // `clip` takes the web view's place under GPUI's content view, with
         // nothing of the page in it yet.
@@ -1004,6 +1010,48 @@ fn key_code(key: char) -> Option<u16> {
         c @ '0'..='9' => Some(DIGITS[c as usize - '0' as usize]),
         _ => None,
     }
+}
+
+/// No WebRTC in a view (ADR-0018): its connections (STUN, TURN, data
+/// channels) are neither loads the content rules see nor anything a page's
+/// policy governs. WebKit turns it off for one web view: its own feature
+/// switch `PeerConnectionEnabled`, off, takes `RTCPeerConnection` and the rest
+/// out of every frame of the page. Private calls (`_features`,
+/// `_setEnabled:forFeature:`), each checked first; `false` if this WebKit has
+/// no such switch. Set before the first load.
+fn no_peer_connections(wk: &WKWebView) -> bool {
+    let Some(class) = AnyClass::get(c"WKPreferences") else {
+        return false;
+    };
+    // SAFETY: main thread (the web view is); every selector is asked about
+    // before it is sent, and the objects are WebKit's own.
+    unsafe {
+        let configuration = wk.configuration();
+        let preferences: Option<Retained<AnyObject>> = msg_send![&*configuration, preferences];
+        let Some(preferences) = preferences else {
+            return false;
+        };
+        let lists: bool = msg_send![class, respondsToSelector: sel!(_features)];
+        let sets: bool =
+            msg_send![&*preferences, respondsToSelector: sel!(_setEnabled:forFeature:)];
+        if !lists || !sets {
+            return false;
+        }
+        let features: Option<Retained<AnyObject>> = msg_send![class, _features];
+        let Some(features) = features else {
+            return false;
+        };
+        let count: usize = msg_send![&*features, count];
+        for at in 0..count {
+            let feature: Retained<AnyObject> = msg_send![&*features, objectAtIndex: at];
+            let key: Option<Retained<NSString>> = msg_send![&*feature, key];
+            if key.is_some_and(|key| key.to_string() == "PeerConnectionEnabled") {
+                let _: () = msg_send![&*preferences, _setEnabled: false, forFeature: &*feature];
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// WebKit content rules: nothing loads but scripts, styles and fonts from
