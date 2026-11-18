@@ -601,7 +601,7 @@ mod tests {
                 "Runtime.exceptionThrown",
                 json!({ "timestamp": 5.0, "exceptionDetails": {
                     "executionContextId": 1, "text": "Uncaught",
-                    "url": format!("https://x.test/app.js?sig=abc123def456"),
+                    "url": "https://x.test/app.js?sig=abc123def456",
                     "lineNumber": 4,
                     "exception": { "description": format!(
                         "Error: 401 for /api/{JWT}/items\n    at load (https://x.test/app.js?sig=abc123def456:5:3)"

@@ -2450,7 +2450,7 @@ impl Core {
     /// process's arguments (`/proc/<pid>/cmdline` on Linux, `ps`). Each of
     /// these reads its prompt from stdin when given none as an argument
     /// and stdin isn't a terminal (checked against Claude Code 2.1, Codex
-    /// 0.167, OpenCode 2.3 and Gemini CLI's `isHeadlessMode`).
+    /// 0.170, OpenCode 2.3 and Gemini CLI's `isHeadlessMode`).
     pub(crate) async fn ask_once(
         &self,
         prompt: String,
