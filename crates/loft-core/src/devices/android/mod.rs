@@ -9,23 +9,25 @@
 //! as an agent: it outlives the daemon (the startup reaper only ends
 //! recorded agent processes) and is stopped from the panel.
 
+mod fold;
 mod grpc;
 mod input;
 mod sdk;
+mod settings;
 
 use super::{Backend, BoxFut, Picture, Screen};
 use anyhow::{Context as _, anyhow, bail};
 use grpc::Grpc;
 use input::{Finger, ScrollDrag, Turn};
 use loft_protocol::{
-    DeviceApp, DeviceButton, DeviceInfo, DeviceInput, DevicePlatform, DeviceSetting, DeviceState,
-    TouchPhase,
+    DeviceApp, DeviceButton, DeviceInfo, DeviceInput, DevicePlatform, DeviceSetting,
+    DeviceSettings, DeviceState, TouchPhase, TouchPoint,
 };
 use sdk::{Avd, Running, Sdk};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -46,6 +48,9 @@ pub struct AndroidBackend {
     conns: Mutex<HashMap<u32, Grpc>>,
     /// Emulators (by pid) known to have finished booting.
     booted: Mutex<HashSet<u32>>,
+    /// Attached screens by AVD, so a fold or a turn set here shows in
+    /// their size at once.
+    screens: Mutex<HashMap<String, Vec<Weak<Shared>>>>,
 }
 
 /// The SDK's adb, run with the login shell's environment.
@@ -139,6 +144,18 @@ impl AndroidBackend {
             sdk,
             conns: Mutex::default(),
             booted: Mutex::default(),
+            screens: Mutex::default(),
+        }
+    }
+
+    /// Do `f` to each screen attached to `avd`.
+    fn screens_of(&self, avd: &str, f: impl Fn(&Shared)) {
+        let mut screens = lock(&self.screens);
+        if let Some(list) = screens.get_mut(avd) {
+            list.retain(|s| s.strong_count() > 0);
+            for shared in list.iter().filter_map(Weak::upgrade) {
+                f(&shared);
+            }
         }
     }
 
@@ -217,7 +234,7 @@ impl AndroidBackend {
         if lock(&self.booted).contains(&running.pid) {
             return true;
         }
-        let booted = if running.token.is_some() {
+        let emulator_booted = if running.token.is_some() {
             match self.grpc(running).await {
                 Ok(conn) => conn
                     .unary::<_, grpc::EmulatorStatus>("getStatus", &grpc::Empty {})
@@ -226,10 +243,15 @@ impl AndroidBackend {
                 Err(_) => false,
             }
         } else {
-            self.shell(running, &["getprop", "sys.boot_completed"])
-                .await
-                .is_ok_and(|out| out.trim() == "1")
+            true
         };
+        // The emulator may say it booted (a cold boot's first frames) while
+        // adb still has the device offline: settings and apps need adb.
+        let booted = emulator_booted
+            && self
+                .shell(running, &["getprop", "sys.boot_completed"])
+                .await
+                .is_ok_and(|out| out.trim() == "1");
         if booted {
             lock(&self.booted).insert(running.pid);
         }
@@ -255,7 +277,7 @@ impl AndroidBackend {
             error: None,
             agent: None,
             physical: false,
-            fold: None,
+            fold: avd.fold.as_ref().map(fold::FoldConfig::at_rest),
         }
     }
 
@@ -443,12 +465,25 @@ impl Backend for AndroidBackend {
             let avds = self.sdk.avds();
             let mut devices = Vec::with_capacity(avds.len());
             for avd in &avds {
-                let state = match self.running(&avd.name).await {
-                    Some(running) if self.has_booted(&running).await => DeviceState::Running,
+                let running = self.running(&avd.name).await;
+                let state = match &running {
+                    Some(running) if self.has_booted(running).await => DeviceState::Running,
                     Some(_) => DeviceState::Booting,
                     None => DeviceState::Stopped,
                 };
-                devices.push(Self::info(avd, state));
+                let mut info = Self::info(avd, state);
+                // A running foldable says how it is folded now, and shows
+                // its cover screen's size while folded to it.
+                if let (Some(config), Some(running), DeviceState::Running) =
+                    (&avd.fold, &running, state)
+                    && running.token.is_some()
+                    && let Ok(conn) = self.grpc(running).await
+                    && let Ok(now) = fold::now(&conn, config).await
+                {
+                    (info.width, info.height) = config.screen(now.posture, (avd.width, avd.height));
+                    info.fold = Some(now);
+                }
+                devices.push(info);
             }
             Ok(devices)
         })
@@ -550,8 +585,22 @@ impl Backend for AndroidBackend {
                 _ => Keys::Emulator,
             };
             let turn = sensor_turn(&conn).await.unwrap_or_default();
-            let screen = AndroidScreen::start(conn, keys, width, height, density);
+            let fold = avd.and_then(|a| a.fold);
+            // Folded to its cover screen, the pictures show that.
+            let shown = match &fold {
+                Some(config) => match fold::now(&conn, config).await {
+                    Ok(now) => config.screen(now.posture, (width, height)),
+                    Err(_) => (width, height),
+                },
+                None => (width, height),
+            };
+            let screen = AndroidScreen::start(conn, keys, (width, height), shown, density, fold);
             *lock(&screen.shared.turn) = turn;
+            let mut screens = lock(&self.screens);
+            let list = screens.entry(native.to_owned()).or_default();
+            list.retain(|s| s.strong_count() > 0);
+            list.push(Arc::downgrade(&screen.shared));
+            drop(screens);
             Ok(screen as Arc<dyn Screen>)
         })
     }
@@ -633,13 +682,6 @@ impl Backend for AndroidBackend {
         Box::pin(async move {
             let running = self.running_or_err(native).await?;
             match setting {
-                DeviceSetting::Appearance { dark } => {
-                    self.shell(
-                        &running,
-                        &["cmd", "uimode", "night", if dark { "yes" } else { "no" }],
-                    )
-                    .await?;
-                }
                 DeviceSetting::Location {
                     latitude,
                     longitude,
@@ -672,10 +714,20 @@ impl Backend for AndroidBackend {
                         }
                     }
                 }
-                other => anyhow::bail!("{other:?} isn't supported on Android emulators yet."),
+                DeviceSetting::Posture { posture } => {
+                    self.fold_to(native, &running, Some(posture), None).await?;
+                }
+                DeviceSetting::Hinge { degrees } => {
+                    self.fold_to(native, &running, None, Some(degrees)).await?;
+                }
+                other => self.set_setting(native, &running, other).await?,
             }
             Ok(())
         })
+    }
+
+    fn settings<'a>(&'a self, native: &'a str) -> BoxFut<'a, DeviceSettings> {
+        Box::pin(self.read_settings(native))
     }
 }
 
@@ -712,11 +764,17 @@ struct Raw {
 }
 
 struct Shared {
-    /// The display as built, in pixels, and its dots per inch.
+    /// The display as built, in pixels, and its dots per inch. Touches are
+    /// in its pixels, even on a foldable's cover screen (the emulator
+    /// scales them onto it).
     width: u32,
     height: u32,
     density: u32,
     turn: Mutex<Turn>,
+    /// The screen the pictures show, upright: the display as built, or a
+    /// folded foldable's cover screen.
+    screen: Mutex<(u32, u32)>,
+    fold: Option<fold::FoldConfig>,
 }
 
 /// How keys reach the device.
@@ -747,12 +805,16 @@ struct InputState {
     sender: Option<grpc::Sender>,
     /// Where the finger is down, to lift it again on cancel.
     touching: Option<(f32, f32)>,
+    /// Where several fingers are down (`DeviceInput::Touches`).
+    fingers: Vec<(f32, f32)>,
     scroll: ScrollDrag,
 }
 
-/// The finger that touches, and the one that scrolls.
+/// The finger that touches, the one that scrolls, and the first of
+/// several touching together.
 const TOUCH_FINGER: i32 = 0;
 const SCROLL_FINGER: i32 = 1;
+const FIRST_OF_FINGERS: i32 = 2;
 /// A scrolling finger lifts once scrolls stopped coming for this long.
 const SCROLL_QUIET: Duration = Duration::from_millis(150);
 
@@ -780,17 +842,42 @@ async fn send_events(
 
 /// A finger at a point of the picture, down or lifted.
 fn finger(shared: &Shared, id: i32, x: f32, y: f32, down: bool) -> grpc::Input {
+    grpc::Input::Touch(grpc::TouchEvent {
+        touches: vec![touch(shared, id, x, y, down)],
+        display: 0,
+    })
+}
+
+fn touch(shared: &Shared, id: i32, x: f32, y: f32, down: bool) -> grpc::Touch {
     let turn = *lock(&shared.turn);
     let (x, y) = turn.to_display(x, y, shared.width, shared.height);
+    grpc::Touch {
+        x,
+        y,
+        identifier: id,
+        pressure: if down { 1024 } else { 0 },
+        touch_major: if down { 8 } else { 0 },
+        touch_minor: 0,
+    }
+}
+
+/// Several fingers in one event, so they move together: each one's
+/// identifier is its place in `points`. Fingers that were down before and
+/// aren't in `points` any more lift where they were.
+fn fingers(shared: &Shared, was: &[(f32, f32)], points: &[(f32, f32)], down: bool) -> grpc::Input {
+    let mut touches: Vec<grpc::Touch> = points
+        .iter()
+        .enumerate()
+        .map(|(i, &(x, y))| touch(shared, FIRST_OF_FINGERS + i as i32, x, y, down))
+        .collect();
+    touches.extend(
+        was.iter()
+            .enumerate()
+            .skip(points.len())
+            .map(|(i, &(x, y))| touch(shared, FIRST_OF_FINGERS + i as i32, x, y, false)),
+    );
     grpc::Input::Touch(grpc::TouchEvent {
-        touches: vec![grpc::Touch {
-            x,
-            y,
-            identifier: id,
-            pressure: if down { 1024 } else { 0 },
-            touch_major: if down { 8 } else { 0 },
-            touch_minor: 0,
-        }],
+        touches,
         display: 0,
     })
 }
@@ -804,12 +891,22 @@ impl Drop for AndroidScreen {
 }
 
 impl AndroidScreen {
-    fn start(conn: Grpc, keys: Keys, width: u32, height: u32, density: u32) -> Arc<Self> {
+    fn start(
+        conn: Grpc,
+        keys: Keys,
+        (width, height): (u32, u32),
+        shown: (u32, u32),
+        density: u32,
+        fold: Option<fold::FoldConfig>,
+    ) -> Arc<Self> {
+        let foldable = fold.is_some();
         let shared = Arc::new(Shared {
             width,
             height,
             density,
             turn: Mutex::new(Turn::Portrait),
+            screen: Mutex::new(shown),
+            fold,
         });
         let (pictures, _) = watch::channel(None);
         let (ended, _) = watch::channel(None);
@@ -826,6 +923,9 @@ impl AndroidScreen {
             .abort_handle(),
         );
         tasks.push(tokio::spawn(encode_pictures(raw_rx, pictures.clone())).abort_handle());
+        if foldable {
+            tasks.push(tokio::spawn(follow_posture(conn.clone(), shared.clone())).abort_handle());
+        }
         let gone = ended.clone();
         let watched = conn.clone();
         tasks.push(
@@ -956,19 +1056,7 @@ impl AndroidScreen {
             .await
             .unwrap_or_else(|_| self.turn());
         let turn = now.turned(counter_clockwise);
-        self.conn
-            .unary::<_, grpc::Empty>(
-                "setPhysicalModel",
-                &grpc::PhysicalModelValue {
-                    target: grpc::physical::ROTATION,
-                    status: 0,
-                    value: Some(grpc::ParameterValue {
-                        data: vec![0.0, 0.0, turn.degrees()],
-                    }),
-                    interpolation: 1,
-                },
-            )
-            .await?;
+        settings::set_turn(&self.conn, turn).await?;
         *lock(&self.shared.turn) = turn;
         Ok(())
     }
@@ -1044,8 +1132,24 @@ impl Screen for AndroidScreen {
                         self.press(key, 0).await
                     }
                 },
-                DeviceInput::Touches { .. } => {
-                    Err(anyhow!("several fingers at once aren't supported here yet"))
+                DeviceInput::Touches { phase, touches } => {
+                    let points: Vec<(f32, f32)> =
+                        touches.iter().map(|&TouchPoint { x, y }| (x, y)).collect();
+                    let mut state = self.input.lock().await;
+                    let was = std::mem::take(&mut state.fingers);
+                    let event = match phase {
+                        TouchPhase::Down | TouchPhase::Move => {
+                            state.fingers = points.clone();
+                            fingers(&self.shared, &was, &points, true)
+                        }
+                        TouchPhase::Up => fingers(&self.shared, &was, &points, false),
+                        // Lift them where they were.
+                        TouchPhase::Cancel => {
+                            let at = if was.is_empty() { &points } else { &was };
+                            fingers(&self.shared, &was, at, false)
+                        }
+                    };
+                    send_events(&self.conn, &mut state, vec![event]).await
                 }
             }
         })
@@ -1071,7 +1175,8 @@ impl Screen for AndroidScreen {
     }
 
     fn size(&self) -> Option<(u32, u32, f32)> {
-        let (w, h) = self.turn().size(self.shared.width, self.shared.height);
+        let (w, h) = *lock(&self.shared.screen);
+        let (w, h) = self.turn().size(w, h);
         Some((w, h, density_scale(self.shared.density)))
     }
 
@@ -1124,6 +1229,19 @@ async fn stream_pictures(
             };
             let (width, height, turn) = image.dims();
             *lock(&shared.turn) = Turn::from_skin(turn);
+            if shared.fold.is_some() && width > 0 && height > 0 {
+                // Folded to its cover screen, the emulator says so with each
+                // picture.
+                let folded = image
+                    .format
+                    .as_ref()
+                    .and_then(|f| f.folded_display.as_ref())
+                    .filter(|f| f.width > 0 && f.height > 0);
+                *lock(&shared.screen) = match folded {
+                    Some(f) => (f.width, f.height),
+                    None => (shared.width, shared.height),
+                };
+            }
             let picture = if width == 0 || height == 0 {
                 // The display is off (the power button): a dark screen of
                 // the last size.
@@ -1147,6 +1265,36 @@ async fn stream_pictures(
             };
             raw.send_replace(Some(Arc::new(picture)));
         }
+    }
+}
+
+/// Keep a foldable's screen size as its posture changes (folded by an
+/// agent's adb, say), even while nobody watches its pictures.
+async fn follow_posture(conn: Grpc, shared: Arc<Shared>) {
+    let Some(config) = shared.fold.clone() else {
+        return;
+    };
+    while !conn.is_closed() {
+        let mut notes = match conn
+            .server_stream("streamNotification", &grpc::Empty {})
+            .await
+        {
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::debug!("emulator notifications: {e:#}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        while let Ok(Some(note)) = notes.next::<grpc::Notification>().await {
+            if let Some(posture) = note
+                .posture
+                .and_then(|p| fold::posture_from_android(p.value))
+            {
+                *lock(&shared.screen) = config.screen(posture, (shared.width, shared.height));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

@@ -30,6 +30,8 @@
 
 - One `Backend` per platform in `loft-core/src/devices/` and a `Screen` per watched device; the manager in `devices/mod.rs` numbers pictures and fans them out. `fake.rs` is a phone that needs neither SDK (`AGENTLOFT_FAKE_DEVICES=1`), for tests and for trying the panel.
 - **Android**: the emulator's own gRPC control service (streamed screenshots, touch, keys, rotation), started headless (`-no-window`). `adb` for apps and settings.
+  - Foldable AVDs (`hw.sensor.hinge*`, `hw.sensor.posture_list`, the cover screen as `hw.displayRegion.0.1.*`) report their fold read live from the physical model (`HINGE_ANGLE0`, `POSTURE`); posture and hinge are set over gRPC. Folded to the cover screen, the emulator streams that screen's size (each picture says so in `foldedDisplay`; `streamNotification` says the posture even while nobody watches), while touches stay in the main display's pixels.
+  - Several fingers are one `TouchEvent` with an identifier per finger. Settings are read back from the device in one adb call (`settings`, `cmd uimode`, `getprop debug.layout`, `dumpsys activity`, `pm list packages -3`), so the panel shows what is set rather than what it asked for.
 - **iOS**: `simctl` for the list, boot, apps and settings. The screen and touches go through the same private frameworks Simulator.app uses (CoreSimulator's display surface, SimulatorKit's HID events), in a helper process so a crash there can't take the daemon down. To review: private frameworks can change with any Xcode.
 
 ### 4. Agents

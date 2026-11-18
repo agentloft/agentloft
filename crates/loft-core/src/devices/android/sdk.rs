@@ -212,6 +212,8 @@ pub struct Avd {
     /// has no device for the emulator's key events, and keys go through
     /// adb instead.
     pub keyboard: bool,
+    /// How it folds, when it is a foldable.
+    pub fold: Option<super::fold::FoldConfig>,
 }
 
 impl Avd {
@@ -259,6 +261,7 @@ impl Avd {
             keyboard: config
                 .get("hw.keyboard")
                 .is_some_and(|v| v == "yes" || v == "true"),
+            fold: super::fold::FoldConfig::parse(config),
         }
     }
 }
@@ -419,6 +422,7 @@ mod tests {
                     height: 2400,
                     density: 420,
                     keyboard: true,
+                    fold: None,
                 },
                 Avd {
                     name: "tablet".into(),
@@ -428,6 +432,7 @@ mod tests {
                     height: 0,
                     density: 0,
                     keyboard: false,
+                    fold: None,
                 },
             ]
         );

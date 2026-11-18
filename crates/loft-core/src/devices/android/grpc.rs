@@ -300,6 +300,23 @@ pub struct ImageFormat {
     pub height: u32,
     #[prost(uint32, tag = "5")]
     pub display: u32,
+    /// Output only: the folded screen's size before scaling, while a
+    /// foldable is folded.
+    #[prost(message, optional, tag = "7")]
+    pub folded_display: Option<FoldedDisplay>,
+}
+
+/// Where a folded screen lies in the unfolded one.
+#[derive(Clone, PartialEq, Message)]
+pub struct FoldedDisplay {
+    #[prost(uint32, tag = "1")]
+    pub width: u32,
+    #[prost(uint32, tag = "2")]
+    pub height: u32,
+    #[prost(uint32, tag = "3")]
+    pub x_offset: u32,
+    #[prost(uint32, tag = "4")]
+    pub y_offset: u32,
 }
 
 /// `Rotation.SkinRotation`: 0 portrait, 1 landscape (turned a quarter
@@ -426,6 +443,32 @@ pub struct VmRunState {
 pub mod physical {
     /// Degrees about x, y, z.
     pub const ROTATION: i32 = 1;
+    /// A foldable's (first) hinge, in degrees.
+    pub const HINGE_ANGLE0: i32 = 10;
+    /// A foldable's posture, as [`super::posture`] numbers them.
+    pub const POSTURE: i32 = 16;
+}
+
+/// `Posture.PostureValue` (also the AVD's `hw.sensor.posture_list`).
+pub mod posture {
+    pub const CLOSED: i32 = 1;
+    pub const HALF_OPENED: i32 = 2;
+    pub const OPENED: i32 = 3;
+    pub const FLIPPED: i32 = 4;
+    pub const TENT: i32 = 5;
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Posture {
+    #[prost(int32, tag = "3")]
+    pub value: i32,
+}
+
+/// What `streamNotification` says; only a posture change is read.
+#[derive(Clone, PartialEq, Message)]
+pub struct Notification {
+    #[prost(message, optional, tag = "4")]
+    pub posture: Option<Posture>,
 }
 
 #[derive(Clone, PartialEq, Message)]
