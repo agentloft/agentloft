@@ -38,7 +38,8 @@ type Result<T> = std::result::Result<T, ErrorBody>;
 
 /// The backends a real daemon uses on this computer.
 pub fn system_backends(env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
-    let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut backends: Vec<Arc<dyn Backend>> = vec![Arc::new(android::AndroidBackend::new(env))];
     // iOS simulators: their screens come through a helper process, the
     // daemon's own executable (`agentloftd simulator`).
     // `AGENTLOFT_SIMULATOR_SET`: another device set than the user's
@@ -51,7 +52,6 @@ pub fn system_backends(env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
         }
         backends.push(Arc::new(ios));
     }
-    backends.push(Arc::new(android::AndroidBackend::new(env)));
     backends
 }
 
