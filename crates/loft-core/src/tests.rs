@@ -3779,3 +3779,79 @@ async fn only_full_access_opens_any_local_file() {
         .unwrap();
     assert!(f.core.drive_options(Some(&thread)).any_local_file);
 }
+
+// One-off answers (titles, suggestions) carry the user's conversation, and
+// every account can read a process's arguments (`/proc/<pid>/cmdline`,
+// `ps`): each agent CLI gets the prompt on stdin. Its stand-ins are shell
+// scripts.
+#[cfg(unix)]
+#[tokio::test]
+async fn one_off_prompts_go_on_stdin_never_the_command_line() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log");
+    std::fs::create_dir_all(&log).unwrap();
+    let names = ["claude", "codex", "opencode", "gemini"];
+    let mut config = String::new();
+    for name in names {
+        let script = dir.path().join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > '{log}/{name}.argv'\n\
+                 /bin/cat > '{log}/{name}.stdin'\n\
+                 printf 'answer from {name}'\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        config += &format!("[harness.{name}]\npath = \"{}\"\n", script.display());
+    }
+    let config_file = dir.path().join("config.toml");
+    std::fs::write(&config_file, config).unwrap();
+    // An empty PATH: never this computer's real agent CLIs.
+    let empty = dir.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(config_file),
+            env: Arc::new([("PATH".to_owned(), empty.display().to_string())].into()),
+            ..Default::default()
+        },
+    );
+    core.handle(Request::ReloadConfig).await.unwrap();
+    assert!(
+        core.config()
+            .harness
+            .gemini
+            .path
+            .starts_with(&*dir.path().to_string_lossy())
+    );
+    let prompt = "Title this: my secret plan, 'quoted' and -dashed\nsecond line";
+    for name in names {
+        let Response::Text { text } = core
+            .handle(Request::AskOnce {
+                prompt: prompt.to_owned(),
+                harness: Some(HarnessId(name.into())),
+                model: Some("m1".into()),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(text, format!("answer from {name}"));
+        let argv = std::fs::read_to_string(log.join(format!("{name}.argv"))).unwrap();
+        assert!(
+            !argv.contains("secret"),
+            "{name} got the prompt as an argument: {argv}"
+        );
+        assert!(argv.contains("m1"), "{name}: {argv}");
+        let stdin = std::fs::read_to_string(log.join(format!("{name}.stdin"))).unwrap();
+        assert_eq!(stdin, prompt, "{name}'s stdin");
+    }
+}

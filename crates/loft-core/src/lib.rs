@@ -2443,7 +2443,14 @@ impl Core {
 /// `[harness.<id>]` settings for a harness (defaults when unknown).
 impl Core {
     /// A one-off answer from an agent's CLI: no tools, no session, low
-    /// effort (Claude `-p`, `codex exec`, `opencode run`, `gemini -p`).
+    /// effort (Claude `-p`, `codex exec`, `opencode run`, headless `gemini`).
+    ///
+    /// The prompt (the user's conversation) goes on the CLI's stdin, never
+    /// its command line: every account on the computer can read a
+    /// process's arguments (`/proc/<pid>/cmdline` on Linux, `ps`). Each of
+    /// these reads its prompt from stdin when given none as an argument
+    /// and stdin isn't a terminal (checked against Claude Code 2.1, Codex
+    /// 0.167, OpenCode 2.3 and Gemini CLI's `isHeadlessMode`).
     pub(crate) async fn ask_once(
         &self,
         prompt: String,
@@ -2484,7 +2491,7 @@ impl Core {
             let mut cmd = std::process::Command::new(&binary);
             match kind.as_str() {
                 HarnessId::CLAUDE => {
-                    cmd.args(["-p", &prompt, "--output-format", "text"]);
+                    cmd.args(["-p", "--output-format", "text"]);
                     if let Some(m) = &model {
                         cmd.args(["--model", m]);
                     }
@@ -2509,30 +2516,47 @@ impl Core {
                     if let Some(m) = &model {
                         cmd.args(["-m", m]);
                     }
-                    cmd.arg(&prompt);
+                    // `-`: the prompt is on stdin.
+                    cmd.arg("-");
                 }
                 HarnessId::OPENCODE => {
+                    // No message: `opencode run` reads it from stdin.
                     cmd.arg("run");
                     if let Some(m) = &model {
                         cmd.args(["-m", m]);
                     }
-                    cmd.arg(&prompt);
                 }
                 _ => {
-                    cmd.args(["-p", &prompt]);
+                    // No `-p`: Gemini runs headless when stdin isn't a
+                    // terminal, and its prompt is what stdin says.
                     if let Some(m) = &model {
                         cmd.args(["-m", m]);
                     }
                 }
             }
-            let out = cmd
+            use std::io::Write as _;
+            use std::process::Stdio;
+            let mut child = cmd
                 .current_dir(&dir)
                 .env_clear()
                 .envs(env.iter())
                 .env("NO_COLOR", "1")
-                .stdin(std::process::Stdio::null())
-                .output()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .with_context(|| format!("run {}", binary.display()))?;
+            let mut stdin = child.stdin.take().context("the agent's stdin")?;
+            // Written beside reading its output: a long prompt fills the
+            // pipe before the CLI has read it all. A CLI that stops reading
+            // early (it failed) says why on stderr.
+            let writer = std::thread::spawn(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+            });
+            let out = child
+                .wait_with_output()
+                .with_context(|| format!("run {}", binary.display()))?;
+            let _ = writer.join();
             anyhow::ensure!(
                 out.status.success(),
                 "{} failed: {}",
