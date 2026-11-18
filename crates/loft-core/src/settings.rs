@@ -567,25 +567,28 @@ fn stamp_of(path: &Path) -> String {
 /// values (often API keys) replaced, web access left out. Text that doesn't
 /// parse is withheld altogether.
 pub(crate) fn redact_config(text: &str) -> String {
-    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+    // Values only: comments go too (an old key is often left commented
+    // out), and so does the file's own layout.
+    let Ok(mut doc) = toml::from_str::<toml::Table>(text) else {
         return String::new();
     };
     doc.remove("web");
-    if let Some(agents) = doc.get_mut("harness").and_then(|h| h.as_table_like_mut()) {
-        for (_, agent) in agents.iter_mut() {
-            let Some(env) = agent
-                .as_table_like_mut()
-                .and_then(|a| a.get_mut("env"))
-                .and_then(|e| e.as_table_like_mut())
-            else {
-                continue;
-            };
-            for (_, value) in env.iter_mut() {
-                *value = toml_edit::value("•••");
+    if let Some(agents) = doc.get_mut("harness").and_then(|h| h.as_table_mut()) {
+        for agent in agents.iter_mut().filter_map(|(_, a)| a.as_table_mut()) {
+            if let Some(env) = agent.get_mut("env").and_then(|e| e.as_table_mut()) {
+                for (_, value) in env.iter_mut() {
+                    *value = toml::Value::String("•••".into());
+                }
+            }
+            // `--api-key …` is an argument too.
+            if let Some(args) = agent.get_mut("extra_args").and_then(|a| a.as_array_mut()) {
+                for arg in args.iter_mut() {
+                    *arg = toml::Value::String("•••".into());
+                }
             }
         }
     }
-    doc.to_string()
+    toml::to_string_pretty(&doc).unwrap_or_default()
 }
 
 impl Core {
@@ -687,16 +690,15 @@ mod tests {
 
     #[test]
     fn config_is_redacted_for_remote_sessions() {
-        let text = "# mine\n[ui]\ntheme = \"dark\"\n\n[harness.claude]\npath = \"/opt/claude\"\nenv = { ANTHROPIC_API_KEY = \"sk-secret\", DEBUG = \"1\" }\n\n[harness.codex.env]\nOPENAI_API_KEY = \"sk-other\"\n\n[web]\nenabled = true\ntls_key = \"/etc/key.pem\"\n";
+        let text = "# mine\n[ui]\ntheme = \"dark\"\n\n[harness.claude]\npath = \"/opt/claude\"\nextra_args = [\"--api-key\", \"sk-arg\"]\nenv = { ANTHROPIC_API_KEY = \"sk-secret\", DEBUG = \"1\" }\n\n[harness.codex.env]\n# OPENAI_API_KEY = \"sk-old\"\nOPENAI_API_KEY = \"sk-other\"\n\n[web]\nenabled = true\ntls_key = \"/etc/key.pem\"\n";
         let out = redact_config(text);
-        assert!(
-            !out.contains("sk-secret") && !out.contains("sk-other"),
-            "{out}"
-        );
+        for secret in ["sk-secret", "sk-other", "sk-old", "sk-arg"] {
+            assert!(!out.contains(secret), "{secret}: {out}");
+        }
         assert!(out.contains("ANTHROPIC_API_KEY") && out.contains("OPENAI_API_KEY"));
         assert!(!out.contains("[web]") && !out.contains("key.pem"));
-        // The rest is as the user wrote it, and still parses.
-        assert!(out.contains("# mine") && out.contains("theme = \"dark\""));
+        // The rest is there, and still parses.
+        assert!(out.contains("theme = \"dark\"") && out.contains("/opt/claude"));
         let config: loft_config::Config = toml::from_str(&out).unwrap();
         assert_eq!(config.harness.claude.env["DEBUG"], "•••");
         assert!(!config.web.enabled);

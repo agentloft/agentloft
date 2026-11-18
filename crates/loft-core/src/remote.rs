@@ -557,6 +557,11 @@ pub fn redact_settings(mut value: serde_json::Value) -> serde_json::Value {
                         *v = serde_json::Value::String("•••".into());
                     }
                 }
+                if let Some(args) = agent.get_mut("extra_args").and_then(|e| e.as_array_mut()) {
+                    for v in args.iter_mut() {
+                        *v = serde_json::Value::String("•••".into());
+                    }
+                }
             }
         }
     }
@@ -588,7 +593,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             home.join("config.toml"),
-            "[harness.claude]\nenv = { ANTHROPIC_API_KEY = \"sk-secret\" }\n\n[web]\nenabled = true\n",
+            "[harness.claude]\nextra_args = [\"--key\", \"sk-secret\"]\nenv = { ANTHROPIC_API_KEY = \"sk-secret\" }\n\n[web]\nenabled = true\n",
         )
         .unwrap();
         let core = Core::new(
