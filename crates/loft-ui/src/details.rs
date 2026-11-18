@@ -513,6 +513,7 @@ impl DetailsCard {
         let body = Request::GetDiff {
             thread_id: self.thread_id.clone(),
             scope: DiffScope::Origin,
+            from: None,
         };
         cx.spawn(async move |this, cx| {
             if let Ok(Response::Diff { diff }) = client.request(body).await {

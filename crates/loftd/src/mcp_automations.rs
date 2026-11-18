@@ -268,7 +268,7 @@ pub(crate) async fn call(
                     );
                 };
                 // This thread's settings, unless given.
-                let here = match outcome(client, me).await {
+                let here = match outcome(client, me, me).await {
                     Ok(v) => v,
                     Err(e) => return err(e),
                 };
@@ -353,7 +353,9 @@ pub(crate) async fn call(
                 .request(Request::SaveAutomation {
                     id,
                     spec,
-                    from: create.then(|| me.clone()),
+                    // Created or changed, it runs with no more than this
+                    // thread's mode, and the person is asked first.
+                    from: Some(me.clone()),
                 })
                 .await
             {
@@ -373,6 +375,24 @@ pub(crate) async fn call(
                 Err(e) => return err(e),
             };
             let id: AutomationId = a.id.clone();
+            let what = if name == "delete_automation" {
+                "delete"
+            } else {
+                "run now"
+            };
+            if let Err(declined) = crate::mcp::confirm(
+                client,
+                me,
+                format!("{what} the automation “{}”", a.spec.name),
+                format!(
+                    "Its prompt: {}",
+                    a.spec.prompt.chars().take(400).collect::<String>()
+                ),
+            )
+            .await
+            {
+                return Some(declined);
+            }
             if name == "delete_automation" {
                 match client.request(Request::DeleteAutomation { id }).await {
                     Ok(_) => text_result(

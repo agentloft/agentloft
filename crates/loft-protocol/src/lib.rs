@@ -9,6 +9,7 @@ pub mod devices;
 pub mod ids;
 pub mod model;
 pub mod pages;
+pub mod thread_ref;
 pub mod workbench;
 
 pub use automation::*;
@@ -476,6 +477,10 @@ pub enum Request {
     GetDiff {
         thread_id: ThreadId,
         scope: DiffScope,
+        /// The thread whose agent asks (Agentloft's MCP server): below full
+        /// access it sees only threads it may read (`agent_limits`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<ThreadId>,
     },
     /// More of a thread than its snapshot carries (`Snapshot::Thread::older`).
     ThreadItems {
@@ -735,6 +740,10 @@ pub enum Request {
     /// its latest reply and who spawned it (`Response::Json`).
     ThreadOutcome {
         thread_id: ThreadId,
+        /// The thread whose agent asks (Agentloft's MCP server): below full
+        /// access it sees only threads it may read (`agent_limits`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<ThreadId>,
     },
     /// Threads whose messages contain `query` (case-insensitive), most
     /// recent first, one hit per thread (answers `Response::SearchHits`).
@@ -824,11 +833,31 @@ pub enum Request {
         query: Option<String>,
         #[serde(default)]
         project_id: Option<ProjectId>,
+        /// The thread whose agent asks (Agentloft's MCP server): below full
+        /// access it sees only threads it may read (`agent_limits`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<ThreadId>,
     },
     ReadThread {
         thread_id: ThreadId,
         #[serde(default)]
         detail: ReadDetail,
+        /// The thread whose agent asks (Agentloft's MCP server): below full
+        /// access it sees only threads it may read (`agent_limits`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<ThreadId>,
+    },
+    /// An agent (Agentloft's MCP server, for thread `thread_id`) asks to do
+    /// something that deletes or lasts beyond its turn: the person is asked
+    /// in the thread, unless it has full access. Answers `Response::Ok` when
+    /// allowed, `Forbidden` when declined.
+    AgentApproval {
+        thread_id: ThreadId,
+        /// What it would do, e.g. "Remove the project “site”".
+        title: String,
+        /// Why it is asked, shown under it.
+        #[serde(default)]
+        reason: String,
     },
     // -- automations -------------------------------------------------------
     /// Every automation (`Response::Json`: a list of [`Automation`]s).

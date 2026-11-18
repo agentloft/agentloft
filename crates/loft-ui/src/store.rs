@@ -3337,6 +3337,7 @@ impl ThreadState {
                     let body = Request::GetDiff {
                         thread_id: this.id.clone(),
                         scope: loft_protocol::DiffScope::Turn(turn_id),
+                        from: None,
                     };
                     request_in(&store, body, cx, |_, _, _| {});
                 }

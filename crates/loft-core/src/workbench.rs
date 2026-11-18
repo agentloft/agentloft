@@ -375,11 +375,13 @@ impl Core {
         &self,
         query: Option<&str>,
         project: Option<&ProjectId>,
+        readable: Option<&crate::agent_limits::Readable>,
     ) -> CoreResult<serde_json::Value> {
         let (threads, projects) = self.with_store(|s| Ok((s.threads()?, s.projects()?)))?;
         let q = query.map(str::to_lowercase);
         let rows: Vec<serde_json::Value> = threads
             .iter()
+            .filter(|t| readable.is_none_or(|r| r.allows(t)))
             .filter(|t| project.is_none_or(|p| &t.project_id == p))
             .filter(|t| {
                 q.as_ref()

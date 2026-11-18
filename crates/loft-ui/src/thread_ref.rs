@@ -19,9 +19,7 @@ use std::borrow::Cow;
 /// How many threads `@` offers at most.
 pub(crate) const MAX_THREADS: usize = 5;
 
-const OPEN: &str = "[Agentloft thread \"";
-const ID: &str = "\" (thread_id ";
-const CLOSE: &str = "): read it with the agentloft read_thread tool if it is relevant]";
+use loft_protocol::thread_ref::{CLOSE, ID, OPEN};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadRef {
@@ -49,12 +47,9 @@ impl ThreadRef {
 
 /// `line` as a thread reference, if it is exactly one.
 pub(crate) fn parse(line: &str) -> Option<ThreadRef> {
-    let inner = line.trim().strip_prefix(OPEN)?.strip_suffix(CLOSE)?;
-    // The id is last and has no quote in it; the title may.
-    let (title, id) = inner.rsplit_once(ID)?;
-    let plain = !id.is_empty() && !id.contains(|c: char| c.is_whitespace() || c == '"');
-    plain.then(|| ThreadRef {
-        id: ThreadId(id.to_owned()),
+    let (title, id) = loft_protocol::thread_ref::parse(line)?;
+    Some(ThreadRef {
+        id,
         title: title.to_owned(),
     })
 }

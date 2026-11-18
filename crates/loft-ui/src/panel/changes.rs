@@ -50,6 +50,7 @@ impl ChangesView {
         let body = Request::GetDiff {
             thread_id: self.thread_id.clone(),
             scope: self.scope.clone(),
+            from: None,
         };
         request_in(&self.store, body, cx, |this, result, cx| {
             this.loading = false;

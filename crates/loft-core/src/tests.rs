@@ -1851,6 +1851,7 @@ async fn spawned_threads_inherit_settings_and_report_back() {
         .core
         .handle(Request::ThreadOutcome {
             thread_id: child.id.clone(),
+            from: None,
         })
         .await
         .unwrap()
@@ -1878,6 +1879,7 @@ async fn spawned_threads_inherit_settings_and_report_back() {
         .handle(Request::ReadThread {
             thread_id: child.id.clone(),
             detail: loft_protocol::ReadDetail::Full,
+            from: None,
         })
         .await
         .unwrap()
@@ -3419,7 +3421,12 @@ async fn agents_never_grant_more_than_their_own_mode() {
     ));
     // Unset: the agent's default, which asks.
     assert!(forbidden(automation(None).await));
-    automation(Some(PermissionMode::ReadOnly)).await.unwrap();
+    // Within its mode, the person is asked first.
+    let (made, _) = tokio::join!(
+        automation(Some(PermissionMode::ReadOnly)),
+        answer_agent(&core, &thread.id, DecisionKind::AllowOnce)
+    );
+    made.unwrap();
 
     // Nor changes what runs, or the default mode of new threads upward.
     for (key, value) in [
@@ -3440,32 +3447,261 @@ async fn agents_never_grant_more_than_their_own_mode() {
     ] {
         assert!(forbidden(setting(key, value, me.clone()).await), "{key}");
     }
-    setting("ui.theme", serde_json::json!("dark"), me.clone())
-        .await
-        .unwrap();
-    setting(
-        "harness.codex.default_permission_mode",
-        serde_json::json!("read-only"),
-        me.clone(),
-    )
-    .await
-    .unwrap();
+    let (set, _) = tokio::join!(
+        setting("ui.theme", serde_json::json!("dark"), me.clone()),
+        answer_agent(&core, &thread.id, DecisionKind::AllowOnce)
+    );
+    set.unwrap();
+    let (set, _) = tokio::join!(
+        setting(
+            "harness.codex.default_permission_mode",
+            serde_json::json!("read-only"),
+            me.clone(),
+        ),
+        answer_agent(&core, &thread.id, DecisionKind::AllowOnce)
+    );
+    set.unwrap();
+    // Declined, it isn't changed.
+    let (set, _) = tokio::join!(
+        setting("ui.theme", serde_json::json!("light"), me.clone()),
+        answer_agent(&core, &thread.id, DecisionKind::Deny)
+    );
+    assert!(forbidden(set));
+    assert_eq!(core.config().ui.theme, "dark");
 
-    // A full-access agent could run anything anyway: no limits.
+    // A full-access agent could run anything anyway: no limits, and
+    // nothing asked.
     set_mode(PermissionMode::FullAccess).await.unwrap();
-    setting(
+    let quick = |f| tokio::time::timeout(Duration::from_secs(5), f);
+    quick(setting(
         "harness.claude.path",
         serde_json::json!("/tmp/x"),
         me.clone(),
-    )
+    ))
     .await
+    .expect("asked a full-access agent")
     .unwrap();
-    automation(Some(PermissionMode::FullAccess)).await.unwrap();
+    quick(automation(Some(PermissionMode::FullAccess)))
+        .await
+        .expect("asked a full-access agent")
+        .unwrap();
     // The person in the app is not an agent.
     set_mode(PermissionMode::ReadOnly).await.unwrap();
     setting("browser.executable", serde_json::json!("/tmp/y"), None)
         .await
         .unwrap();
+}
+
+/// Answer the next thing an agent's own tools asked about in `thread`.
+async fn answer_agent(core: &Arc<Core>, thread: &ThreadId, decision: DecisionKind) {
+    wait_for(core, thread, |t, _| {
+        t.status == ThreadStatus::WaitingApproval
+    })
+    .await;
+    let (_, _, _, requests) = thread_snapshot(core, thread);
+    let request = requests
+        .iter()
+        .find(|r| r.status == RequestStatus::Open)
+        .unwrap();
+    assert!(request.title.starts_with("Agentloft: "), "{request:?}");
+    core.handle(Request::RespondRequest {
+        thread_id: thread.clone(),
+        request_id: request.id.clone(),
+        decision,
+        reply: None,
+    })
+    .await
+    .unwrap();
+}
+
+/// Below full access an agent reads its own project's threads, the ones it
+/// started or was started from, and the ones the person named to it with
+/// `@`; never others because an agent's own text names them.
+#[tokio::test]
+async fn agents_read_only_threads_in_their_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let (here, there) = (dir.path().join("here"), dir.path().join("there"));
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&there).unwrap();
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(dir.path().join("config.toml")),
+            flush_interval: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let me = new_thread(&core, &here).await;
+    core.handle(Request::SetPermissionMode {
+        thread_id: me.id.clone(),
+        mode: Some(PermissionMode::Auto),
+    })
+    .await
+    .unwrap();
+    let sibling = new_thread(&core, &here).await;
+    let named = new_thread(&core, &there).await;
+    let unnamed = new_thread(&core, &there).await;
+    let mentioned_by_agent = new_thread(&core, &there).await;
+    let reference = |t: &Thread| {
+        format!(
+            "{}T{}{}{}",
+            loft_protocol::thread_ref::OPEN,
+            loft_protocol::thread_ref::ID,
+            t.id.as_str(),
+            loft_protocol::thread_ref::CLOSE
+        )
+    };
+    // The person names one thread over there…
+    core.handle(Request::SendMessage {
+        thread_id: me.id.clone(),
+        text: format!("Compare with this:\n\n{}", reference(&named)),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &me.id, turn_done).await;
+    // …and the agent's own answer names another, which grants nothing.
+    let (_, _, items, _) = thread_snapshot(&core, &me.id);
+    let mut forged = items.last().unwrap().clone();
+    forged.id = ItemId::new();
+    forged.body = ItemBody::AssistantMessage {
+        text: reference(&mentioned_by_agent),
+    };
+    core.commit(vec![Event::ItemUpserted { item: forged }])
+        .unwrap();
+    // It starts one there itself.
+    let Response::Thread { thread: child } = core
+        .handle(Request::SpawnThread {
+            from: me.id.clone(),
+            prompt: "look".into(),
+            title: None,
+            harness: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            worktree: false,
+            top_level: false,
+            project: Some(there.to_string_lossy().into_owned()),
+            chat: false,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_ne!(child.project_id, me.project_id);
+
+    let from = Some(me.id.clone());
+    let read = |id: &ThreadId, from: Option<ThreadId>| {
+        core.handle(Request::ReadThread {
+            thread_id: id.clone(),
+            detail: loft_protocol::ReadDetail::Summary,
+            from,
+        })
+    };
+    let listed = |from: Option<ThreadId>| async {
+        let Response::Json { value } = core
+            .handle(Request::ListThreads {
+                query: None,
+                project_id: None,
+                from,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        value.to_string()
+    };
+    for t in [&me, &sibling, &named, &child] {
+        read(&t.id, from.clone()).await.unwrap();
+        assert!(listed(from.clone()).await.contains(t.id.as_str()));
+    }
+    for t in [&unnamed, &mentioned_by_agent] {
+        let err = read(&t.id, from.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(!listed(from.clone()).await.contains(t.id.as_str()));
+        for request in [
+            Request::GetDiff {
+                thread_id: t.id.clone(),
+                scope: loft_protocol::DiffScope::Thread,
+                from: from.clone(),
+            },
+            Request::ThreadOutcome {
+                thread_id: t.id.clone(),
+                from: from.clone(),
+            },
+        ] {
+            assert!(core.handle(request).await.is_err());
+        }
+        // The person's app reads anything.
+        read(&t.id, None).await.unwrap();
+    }
+    // The child sees its parent too.
+    read(&me.id, Some(child.id.clone())).await.unwrap();
+
+    // Full access: everything.
+    core.handle(Request::SetPermissionMode {
+        thread_id: me.id.clone(),
+        mode: Some(PermissionMode::FullAccess),
+    })
+    .await
+    .unwrap();
+    read(&unnamed.id, from.clone()).await.unwrap();
+    assert!(listed(from.clone()).await.contains(unnamed.id.as_str()));
+}
+
+/// What an agent asks to do through Agentloft's tools waits for the
+/// person's answer; a turn that ends first counts as no.
+#[tokio::test]
+async fn an_agents_ask_waits_for_the_person() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let ask = || {
+        f.core.handle(Request::AgentApproval {
+            thread_id: thread.id.clone(),
+            title: "remove the project “x”".into(),
+            reason: "because".into(),
+        })
+    };
+    let (allowed, _) = tokio::join!(
+        ask(),
+        answer_agent(&f.core, &thread.id, DecisionKind::AllowOnce)
+    );
+    allowed.unwrap();
+    let (denied, _) = tokio::join!(ask(), answer_agent(&f.core, &thread.id, DecisionKind::Deny));
+    assert_eq!(denied.unwrap_err().code, ErrorCode::Forbidden);
+    let (_, _, _, requests) = thread_snapshot(&f.core, &thread.id);
+    assert!(requests.iter().all(|r| r.status == RequestStatus::Resolved));
+    assert_eq!(
+        thread_snapshot(&f.core, &thread.id).0.status,
+        ThreadStatus::Idle
+    );
+
+    // Asked during a turn that is then stopped: no.
+    f.core
+        .handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "slow a b c d e f g h".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    let stop = async {
+        wait_for(&f.core, &thread.id, |t, _| {
+            t.status == ThreadStatus::WaitingApproval
+        })
+        .await;
+        f.core
+            .handle(Request::Interrupt {
+                thread_id: thread.id.clone(),
+            })
+            .await
+            .unwrap();
+    };
+    let (stopped, _) = tokio::join!(ask(), stop);
+    assert_eq!(stopped.unwrap_err().code, ErrorCode::Forbidden);
 }
 
 /// An icon is copied into Agentloft's home, where browser sessions can read

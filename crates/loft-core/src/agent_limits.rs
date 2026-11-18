@@ -13,9 +13,20 @@
 //!   environment; the browser's program; where prices are fetched from)
 //!   need a full-access caller, which can run anything anyway.
 //! - The default mode for new threads can't be raised above the caller's.
+//! - Other threads are read only within the caller's project, plus threads
+//!   it spawned or was started from, plus threads the person named in a
+//!   message of theirs in it (the composer's `@`, `loft_protocol::thread_ref`).
+//! - Whatever deletes, or lasts beyond the turn (settings, projects,
+//!   automations, stopping a thread it didn't start), is asked about in the
+//!   thread first ([`Core::ask_agent`]).
+//!
+//! A full-access agent can run anything as the user, so none of this
+//! applies to it.
 
 use crate::{Core, CoreResult};
-use loft_protocol::{ErrorBody, ErrorCode, HarnessId, PermissionMode, Thread, ThreadId};
+use loft_protocol::{ErrorBody, ErrorCode, HarnessId, ItemBody, PermissionMode, Thread, ThreadId};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// How much a mode lets an agent do without asking, in order.
 pub(crate) fn rank(mode: PermissionMode) -> u8 {
@@ -100,6 +111,76 @@ impl Core {
         Ok(())
     }
 
+    /// Which other threads thread `from`'s agent may read: `None` for any
+    /// (full access).
+    pub(crate) fn agent_reads(&self, from: &ThreadId) -> CoreResult<Option<Readable>> {
+        let (caller, have) = self.caller_mode(from)?;
+        if have == PermissionMode::FullAccess {
+            return Ok(None);
+        }
+        // Only the person's own messages grant: an agent's text naming a
+        // thread grants nothing.
+        let items = self.with_store(|s| s.items(from))?;
+        let named = items
+            .iter()
+            .filter_map(|i| match &i.body {
+                ItemBody::UserMessage { text, .. } => Some(text),
+                _ => None,
+            })
+            .flat_map(|t| loft_protocol::thread_ref::ids(t))
+            .collect();
+        Ok(Some(Readable { caller, named }))
+    }
+
+    /// Refuse thread `target` to thread `from`'s agent if it may not read it.
+    pub(crate) fn check_agent_reads(&self, from: &ThreadId, target: &ThreadId) -> CoreResult<()> {
+        let Some(readable) = self.agent_reads(from)? else {
+            return Ok(());
+        };
+        let thread = self.with_store(|s| s.thread(target))?;
+        match thread {
+            Some(t) if readable.allows(&t) => Ok(()),
+            // Not said apart from a thread that doesn't exist.
+            _ => Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                "thread not found among those this thread may read: threads in its own \
+                 project, ones it started or was started from, and ones the user mentioned \
+                 to it with @",
+            )),
+        }
+    }
+
+    /// Ask the person in thread `from` whether its agent may do `title`
+    /// (something that deletes or lasts beyond the turn). Full access isn't
+    /// asked. Resolves once they answer; an error if they declined, or the
+    /// turn ended first.
+    pub(crate) async fn ask_agent(
+        self: &Arc<Self>,
+        from: &ThreadId,
+        title: String,
+        reason: String,
+    ) -> CoreResult<()> {
+        let (_, have) = self.caller_mode(from)?;
+        if have == PermissionMode::FullAccess {
+            return Ok(());
+        }
+        let handle = self.thread_handle(from)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle
+            .send(crate::thread::ThreadCmd::AskAgent {
+                title: title.clone(),
+                reason,
+                decided: tx,
+            })
+            .map_err(|_| crate::internal("thread actor stopped"))?;
+        match rx.await {
+            Ok(true) => Ok(()),
+            _ => Err(refused(format!(
+                "The user declined: {title}. Don't try another way to do it; ask them what they want instead."
+            ))),
+        }
+    }
+
     /// Refuse a setting thread `from`'s agent may not change to `value`.
     pub(crate) fn check_agent_setting(
         &self,
@@ -130,6 +211,37 @@ impl Core {
              change it (this thread is {}). Ask the user to change it in Settings.",
             label(have)
         )))
+    }
+}
+
+/// `text` cut to at most `max` characters, marked if it was.
+pub(crate) fn shorten(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_owned(),
+    }
+}
+
+/// What a thread's agent below full access may read besides its own thread.
+pub(crate) struct Readable {
+    caller: Thread,
+    /// Threads the person named in its messages.
+    named: HashSet<ThreadId>,
+}
+
+impl Readable {
+    pub(crate) fn allows(&self, t: &Thread) -> bool {
+        let parent_of = |child: &Thread, parent: &Thread| {
+            child
+                .parent
+                .as_ref()
+                .is_some_and(|p| p.thread_id == parent.id)
+        };
+        t.id == self.caller.id
+            || t.project_id == self.caller.project_id
+            || parent_of(t, &self.caller)
+            || parent_of(&self.caller, t)
+            || self.named.contains(&t.id)
     }
 }
 

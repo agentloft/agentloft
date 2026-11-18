@@ -459,7 +459,8 @@ impl Core {
             | Request::ListProjects
             | Request::ThreadOutcome { .. }
             | Request::ListThreads { .. }
-            | Request::ReadThread { .. } => Err(forbidden("That request")),
+            | Request::ReadThread { .. }
+            | Request::AgentApproval { .. } => Err(forbidden("That request")),
         }
     }
 
@@ -1167,6 +1168,12 @@ mod tests {
             Request::ListThreads {
                 query: None,
                 project_id: None,
+                from: None,
+            },
+            Request::AgentApproval {
+                thread_id: ThreadId("t".into()),
+                title: "remove a project".into(),
+                reason: String::new(),
             },
         ] {
             let r = remote(&f, req.clone()).await;

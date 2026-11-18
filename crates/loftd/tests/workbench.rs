@@ -234,6 +234,7 @@ async fn turns_are_checkpointed_and_diffable() {
         .request(Request::GetDiff {
             thread_id: thread.id.clone(),
             scope: DiffScope::LastTurn,
+            from: None,
         })
         .await
         .unwrap()
@@ -251,6 +252,7 @@ async fn turns_are_checkpointed_and_diffable() {
         .request(Request::GetDiff {
             thread_id: thread.id.clone(),
             scope: DiffScope::Turn(turn_id),
+            from: None,
         })
         .await
         .unwrap()
@@ -274,6 +276,7 @@ async fn turns_are_checkpointed_and_diffable() {
         .request(Request::GetDiff {
             thread_id: thread.id.clone(),
             scope: DiffScope::WorkingTree,
+            from: None,
         })
         .await
         .unwrap()
@@ -2078,6 +2081,144 @@ async fn live_agents_name_their_tabs_and_hand_them_over() {
             .contains("docs"),
         "{closed}"
     );
+
+    bridge.stop().await;
+    env.daemon.shutdown().await;
+}
+
+/// The next approval the agent's own tools asked about in a thread that
+/// `rx` is subscribed to, answered with `decision`.
+async fn answer_agent_ask(
+    client: &Client,
+    rx: &mut UnboundedReceiver<ClientEvent>,
+    decision: DecisionKind,
+) -> RuntimeRequest {
+    loop {
+        if let ClientEvent::Event { event, .. } = next(rx).await
+            && let Event::RequestOpened { request } = event.event
+        {
+            assert!(request.title.starts_with("Agentloft: "), "{request:?}");
+            client
+                .request(Request::RespondRequest {
+                    thread_id: request.thread_id.clone(),
+                    request_id: request.id.clone(),
+                    decision,
+                    reply: None,
+                })
+                .await
+                .unwrap();
+            return request;
+        }
+    }
+}
+
+/// Below full access an agent's Agentloft tools read only its own project
+/// (plus threads it started or the person named), and whatever deletes or
+/// lasts is asked about in its thread first; a full-access agent is neither
+/// limited nor asked.
+#[tokio::test]
+async fn agents_tools_read_their_scope_and_ask_before_lasting_changes() {
+    use serde_json::json;
+    let mut env = setup().await;
+    let thread = fake_thread(&env).await;
+    let set_mode = |mode: PermissionMode| {
+        env.client.request(Request::SetPermissionMode {
+            thread_id: thread.id.clone(),
+            mode: Some(mode),
+        })
+    };
+    set_mode(PermissionMode::AcceptEdits).await.unwrap();
+    // Another project, with a thread of its own.
+    let elsewhere = env._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let Response::Project { project: other } = env
+        .client
+        .request(Request::AddProject {
+            path: elsewhere.to_string_lossy().into_owned(),
+            name: Some("Elsewhere".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Response::Thread { thread: hidden } = env
+        .client
+        .request(Request::CreateThread {
+            project_id: other.id.clone(),
+            harness: HarnessId(HarnessId::FAKE.into()),
+            title: Some("Private plans".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    env.client.subscribe(Topic::Thread(thread.id.clone()));
+    let ClientEvent::Snapshot { .. } = next(&mut env.rx).await else {
+        panic!()
+    };
+
+    let mut bridge = Bridge::start(&env.paths, &thread.id).await;
+    let text = |r: &serde_json::Value| r["content"][0]["text"].as_str().unwrap_or("").to_owned();
+
+    // Reads stay in the project.
+    let listed = bridge.tool("list_threads", json!({})).await;
+    assert_eq!(listed["isError"], false, "{listed}");
+    assert!(text(&listed).contains(thread.id.as_str()), "{listed}");
+    assert!(!text(&listed).contains(hidden.id.as_str()), "{listed}");
+    for (tool, args) in [
+        ("read_thread", json!({ "thread_id": hidden.id })),
+        ("get_thread_diff", json!({ "thread_id": hidden.id })),
+        ("thread_status", json!({ "thread_id": hidden.id })),
+    ] {
+        let r = bridge.tool(tool, args).await;
+        assert_eq!(r["isError"], true, "{tool}: {r}");
+    }
+
+    // Removing a project is asked about; declined, nothing happens.
+    let (removed, asked) = tokio::join!(
+        bridge.tool("remove_project", json!({ "project": "Elsewhere" })),
+        answer_agent_ask(&env.client, &mut env.rx, DecisionKind::Deny),
+    );
+    assert!(asked.title.contains("Elsewhere"), "{asked:?}");
+    assert_eq!(removed["isError"], true, "{removed}");
+    assert!(text(&removed).contains("declined"), "{removed}");
+    let Response::Json { value: projects } =
+        env.client.request(Request::ListProjects).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(projects.to_string().contains("Elsewhere"));
+
+    // An automation it can't raise above its own mode, created or changed;
+    // within it, it is asked about.
+    let (made, _) = tokio::join!(
+        bridge.tool(
+            "create_automation",
+            json!({ "name": "Nightly", "prompt": "check", "every_minutes": 60, "enabled": false })
+        ),
+        answer_agent_ask(&env.client, &mut env.rx, DecisionKind::AllowOnce),
+    );
+    assert_eq!(made["isError"], false, "{made}");
+    let raised = bridge
+        .tool(
+            "update_automation",
+            json!({ "automation": "Nightly", "permission_mode": "full-access" }),
+        )
+        .await;
+    assert_eq!(raised["isError"], true, "{raised}");
+
+    // Full access: no limits, nothing asked.
+    set_mode(PermissionMode::FullAccess).await.unwrap();
+    let r = bridge
+        .tool("read_thread", json!({ "thread_id": hidden.id }))
+        .await;
+    assert_eq!(r["isError"], false, "{r}");
+    let removed = bridge
+        .tool("remove_project", json!({ "project": "Elsewhere" }))
+        .await;
+    assert_eq!(removed["isError"], false, "{removed}");
 
     bridge.stop().await;
     env.daemon.shutdown().await;

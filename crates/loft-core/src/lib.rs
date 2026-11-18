@@ -1321,6 +1321,18 @@ impl Core {
             Request::ChangeSetting { key, value, from } => {
                 if let Some(from) = &from {
                     self.check_agent_setting(from, &key, &value)?;
+                    let shown = match &value {
+                        serde_json::Value::Null => "its default".to_owned(),
+                        v => agent_limits::shorten(&v.to_string(), 200),
+                    };
+                    self.ask_agent(
+                        from,
+                        format!("change the setting `{key}` to {shown}"),
+                        "The agent asked to change one of Agentloft's settings. It stays \
+                         changed after this turn."
+                            .into(),
+                    )
+                    .await?;
                 }
                 self.change_setting(&key, &value)
             }
@@ -1605,9 +1617,18 @@ impl Core {
                         .map_err(internal)??;
                 Ok(Response::File { file })
             }
-            Request::GetDiff { thread_id, scope } => Ok(Response::Diff {
-                diff: self.diff(&thread_id, scope).await?,
-            }),
+            Request::GetDiff {
+                thread_id,
+                scope,
+                from,
+            } => {
+                if let Some(from) = &from {
+                    self.check_agent_reads(from, &thread_id)?;
+                }
+                Ok(Response::Diff {
+                    diff: self.diff(&thread_id, scope).await?,
+                })
+            }
             Request::ThreadItems { thread_id, page } => self.thread_items(&thread_id, page),
             Request::TerminalOpen {
                 root,
@@ -1957,22 +1978,73 @@ impl Core {
                 })
                 .await
             }
-            Request::ThreadOutcome { thread_id } => Ok(Response::Json {
-                value: self.thread_outcome(&thread_id)?,
-            }),
+            Request::ThreadOutcome { thread_id, from } => {
+                if let Some(from) = &from {
+                    self.check_agent_reads(from, &thread_id)?;
+                }
+                Ok(Response::Json {
+                    value: self.thread_outcome(&thread_id)?,
+                })
+            }
             Request::SearchThreads { query, limit } => Ok(Response::SearchHits {
                 hits: self.search_threads(&query, limit.min(500) as usize)?,
             }),
-            Request::ListThreads { query, project_id } => Ok(Response::Json {
-                value: self.list_threads_json(query.as_deref(), project_id.as_ref())?,
-            }),
-            Request::ReadThread { thread_id, detail } => Ok(Response::Text {
-                text: self.read_thread_text(&thread_id, detail)?,
-            }),
+            Request::ListThreads {
+                query,
+                project_id,
+                from,
+            } => {
+                let readable = match &from {
+                    Some(from) => self.agent_reads(from)?,
+                    None => None,
+                };
+                Ok(Response::Json {
+                    value: self.list_threads_json(
+                        query.as_deref(),
+                        project_id.as_ref(),
+                        readable.as_ref(),
+                    )?,
+                })
+            }
+            Request::ReadThread {
+                thread_id,
+                detail,
+                from,
+            } => {
+                if let Some(from) = &from {
+                    self.check_agent_reads(from, &thread_id)?;
+                }
+                Ok(Response::Text {
+                    text: self.read_thread_text(&thread_id, detail)?,
+                })
+            }
+            Request::AgentApproval {
+                thread_id,
+                title,
+                reason,
+            } => {
+                self.ask_agent(&thread_id, title, reason).await?;
+                Ok(Response::Ok)
+            }
             Request::ListAutomations => Ok(Response::Json {
                 value: self.automations_json()?,
             }),
-            Request::SaveAutomation { id, spec, from } => self.save_automation(id, spec, from),
+            Request::SaveAutomation { id, spec, from } => {
+                if let Some(from) = &from {
+                    self.check_agent_automation(from, &spec)?;
+                    let what = if id.is_some() { "change" } else { "create" };
+                    self.ask_agent(
+                        from,
+                        format!("{what} the automation “{}”", spec.name),
+                        format!(
+                            "It starts a new thread on its schedule, with this prompt: {}",
+                            agent_limits::shorten(&spec.prompt, 400)
+                        ),
+                    )
+                    .await?;
+                }
+                self.save_automation(id, spec, from)
+            }
             Request::SetAutomationEnabled { id, enabled } => {
                 self.set_automation_enabled(&id, enabled)
             }

@@ -346,7 +346,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "stop_thread",
-            "Stop the current turn of a thread this thread spawned.",
+            "Stop the current turn of a thread. One this thread spawned stops at once; any other only once the user agrees (they're asked, unless this thread has full access).",
             json!({ "thread_id": { "type": "string" } }),
             &["thread_id"],
         ),
@@ -438,7 +438,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "list_threads",
-            "List Agentloft threads (other agent conversations), optionally filtered by a title query and/or a project (its name, path or id).",
+            "List Agentloft threads (other agent conversations), optionally filtered by a title query and/or a project (its name, path or id). Unless this thread has full access, only threads in this project, ones this thread started or was started from, and ones the user mentioned to it with @.",
             json!({ "query": { "type": "string" }, "project": { "type": "string" } }),
             &[],
         ),
@@ -987,6 +987,7 @@ async fn call_tool(
             Request::ListThreads {
                 query: args.get("query").and_then(Value::as_str).map(str::to_owned),
                 project_id,
+                from: Some(thread.clone()),
             }
         }
         "read_thread" => match args.get("thread_id").and_then(Value::as_str) {
@@ -996,6 +997,7 @@ async fn call_tool(
                     Some("full") => ReadDetail::Full,
                     _ => ReadDetail::Summary,
                 },
+                from: Some(thread.clone()),
             },
             None => return text_result("thread_id is required", true),
         },
@@ -1011,6 +1013,7 @@ async fn call_tool(
                 Some("origin") => DiffScope::Origin,
                 _ => DiffScope::LastTurn,
             },
+            from: Some(thread.clone()),
         },
         other => return text_result(format!("unknown tool: {other}"), true),
     };
@@ -1101,10 +1104,16 @@ const AGENTS: [&str; 4] = [
     HarnessId::GEMINI,
 ];
 
-pub(crate) async fn outcome(client: &Client, id: &ThreadId) -> Result<Value, String> {
+/// Where thread `id` stands, as thread `me`'s agent may see it.
+pub(crate) async fn outcome(
+    client: &Client,
+    me: &ThreadId,
+    id: &ThreadId,
+) -> Result<Value, String> {
     match client
         .request(Request::ThreadOutcome {
             thread_id: id.clone(),
+            from: Some(me.clone()),
         })
         .await
     {
@@ -1118,6 +1127,28 @@ pub(crate) fn json_result(v: &Value) -> Value {
     text_result(serde_json::to_string_pretty(v).unwrap_or_default(), false)
 }
 
+/// Ask the person in thread `me` whether its agent may do `title`
+/// (something that deletes or lasts beyond the turn; `agent_limits` in
+/// `loft-core`). Full access isn't asked. `Err` is the tool's answer.
+pub(crate) async fn confirm(
+    client: &Client,
+    me: &ThreadId,
+    title: String,
+    reason: impl Into<String>,
+) -> Result<(), Value> {
+    match client
+        .request(Request::AgentApproval {
+            thread_id: me.clone(),
+            title,
+            reason: reason.into(),
+        })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => Err(text_result(err.message, true)),
+    }
+}
+
 /// A thread this one spawned (only those may be messaged or stopped).
 async fn own_child(
     client: &Client,
@@ -1128,7 +1159,7 @@ async fn own_child(
         return Err(text_result("thread_id is required", true));
     };
     let id = ThreadId(id.to_owned());
-    let state = outcome(client, &id)
+    let state = outcome(client, me, &id)
         .await
         .map_err(|e| text_result(e, true))?;
     if state["spawned_by"].as_str() != Some(me.as_str()) {
@@ -1184,7 +1215,7 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 Ok(l) => l,
                 Err(e) => return Some(text_result(e, true)),
             };
-            let current = outcome(client, me)
+            let current = outcome(client, me, me)
                 .await
                 .ok()
                 .and_then(|o| o["project_id"].as_str().map(str::to_owned));
@@ -1221,6 +1252,20 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 return Some(text_result("toml is required", true));
             };
             let select = args.get("select").and_then(Value::as_bool).unwrap_or(true);
+            if let Err(declined) = confirm(
+                client,
+                me,
+                if select {
+                    "save a colour theme and switch to it".into()
+                } else {
+                    "save a colour theme".into()
+                },
+                "The agent asked to add a theme to Agentloft's settings.",
+            )
+            .await
+            {
+                return Some(declined);
+            }
             match client
                 .request(Request::SaveTheme {
                     toml,
@@ -1263,6 +1308,30 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                     github,
                 }
             };
+            let title = match &request {
+                Request::CreateProject { name, github, .. } => format!(
+                    "create the project “{name}”{}",
+                    if *github {
+                        " and its GitHub repository"
+                    } else {
+                        ""
+                    }
+                ),
+                Request::CloneProject { source, parent, .. } => {
+                    format!("clone {source} into {parent} as a project")
+                }
+                _ => String::new(),
+            };
+            if let Err(declined) = confirm(
+                client,
+                me,
+                title,
+                "The agent asked to add a project to Agentloft.",
+            )
+            .await
+            {
+                return Some(declined);
+            }
             match client.request(request).await {
                 Ok(Response::Project { project }) => json_result(&json!({
                     "project_id": project.id, "name": project.name, "path": project.root_path,
@@ -1282,6 +1351,35 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             let Some(id) = found["id"].as_str().map(|s| ProjectId(s.to_owned())) else {
                 return Some(text_result("project not found", true));
             };
+            let project_name = found["name"].as_str().unwrap_or("?").to_owned();
+            let asked = if name == "remove_project" {
+                confirm(
+                    client,
+                    me,
+                    format!("remove the project “{project_name}”"),
+                    "Its threads leave Agentloft's sidebar; its files on disk stay.",
+                )
+                .await
+            } else {
+                let changes: Vec<String> =
+                    ["name", "icon", "agent", "model", "effort", "workspace"]
+                        .iter()
+                        .filter_map(|k| args.get(*k).map(|v| format!("{k} → {v}")))
+                        .collect();
+                confirm(
+                    client,
+                    me,
+                    format!(
+                        "change the project “{project_name}”: {}",
+                        changes.join(", ")
+                    ),
+                    "The agent asked to change a project's name, icon or new-thread defaults.",
+                )
+                .await
+            };
+            if let Err(declined) = asked {
+                return Some(declined);
+            }
             if name == "remove_project" {
                 return Some(
                     match client
@@ -1371,6 +1469,16 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             let Some(path) = str_arg("path") else {
                 return Some(text_result("path is required", true));
             };
+            if let Err(declined) = confirm(
+                client,
+                me,
+                format!("add the folder {path} as a project"),
+                "The agent asked to add a project to Agentloft.",
+            )
+            .await
+            {
+                return Some(declined);
+            }
             match client
                 .request(Request::AddProject {
                     path,
@@ -1419,7 +1527,7 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                     "version": status.version, "models": models,
                 }));
             }
-            let current = outcome(client, me).await.unwrap_or(Value::Null);
+            let current = outcome(client, me, me).await.unwrap_or(Value::Null);
             let projects = match client.request(Request::ListProjects).await {
                 Ok(Response::Json { value }) => value,
                 _ => Value::Null,
@@ -1479,7 +1587,7 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
         }
         "thread_status" => match str_arg("thread_id") {
             None => text_result("thread_id is required", true),
-            Some(id) => match outcome(client, &ThreadId(id)).await {
+            Some(id) => match outcome(client, me, &ThreadId(id)).await {
                 Ok(v) => json_result(&v),
                 Err(e) => text_result(e, true),
             },
@@ -1507,7 +1615,7 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             loop {
                 let mut states = Vec::new();
                 for id in &ids {
-                    states.push(match outcome(client, id).await {
+                    states.push(match outcome(client, me, id).await {
                         Ok(v) => v,
                         Err(e) => json!({ "thread_id": id, "status": "unknown", "error": e }),
                     });
@@ -1549,9 +1657,30 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             }
         }
         "stop_thread" => {
-            let (id, _) = match own_child(client, me, args).await {
-                Ok(c) => c,
-                Err(e) => return Some(e),
+            // Its own spawned threads it stops at once; any other only if
+            // the person agrees.
+            let id = match own_child(client, me, args).await {
+                Ok((id, _)) => id,
+                Err(refused) => {
+                    let Some(id) = str_arg("thread_id").map(ThreadId) else {
+                        return Some(refused);
+                    };
+                    let state = match outcome(client, me, &id).await {
+                        Ok(state) => state,
+                        Err(e) => return Some(text_result(e, true)),
+                    };
+                    if let Err(declined) = confirm(
+                        client,
+                        me,
+                        format!("stop the thread “{}”", state["title"].as_str().unwrap_or("?")),
+                        "The agent asked to stop another thread's running turn, one it didn't start.",
+                    )
+                    .await
+                    {
+                        return Some(declined);
+                    }
+                    id
+                }
             };
             match client.request(Request::Interrupt { thread_id: id }).await {
                 Ok(_) => text_result("Stopped.", false),

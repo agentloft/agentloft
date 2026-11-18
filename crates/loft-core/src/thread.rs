@@ -17,6 +17,14 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) type Reply = oneshot::Sender<CoreResult<Response>>;
 
 pub(crate) enum ThreadCmd {
+    /// The agent asks to do something that deletes or lasts beyond its
+    /// turn (`Core::ask_agent`): ask the person; `decided` gets their
+    /// answer (dropped unanswered if the turn ends first).
+    AskAgent {
+        title: String,
+        reason: String,
+        decided: oneshot::Sender<bool>,
+    },
     SendMessage {
         text: String,
         attachments: Vec<AttachmentRef>,
@@ -190,6 +198,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
         subagents: HashMap::new(),
         requests: HashMap::new(),
         setup_asked: None,
+        agent_asked: HashMap::new(),
         handovers: 0,
         dirty: HashSet::new(),
     };
@@ -241,6 +250,10 @@ struct ThreadActor {
     /// The project's worktree setup command, asked about before it runs:
     /// the request asking, and the command.
     setup_asked: Option<(RequestId, String)>,
+    /// What the agent asked to do through Agentloft's own tools, by the
+    /// key its request is filed under in `requests`: who waits for the
+    /// answer.
+    agent_asked: HashMap<String, oneshot::Sender<bool>>,
     /// Browser tabs the agent handed the person that they haven't finished
     /// with (`ThreadCmd::Handover`).
     handovers: usize,
@@ -289,6 +302,15 @@ impl ThreadActor {
 
     fn on_command(&mut self, cmd: ThreadCmd) {
         match cmd {
+            ThreadCmd::AskAgent {
+                title,
+                reason,
+                decided,
+            } => {
+                if let Err(err) = self.ask_agent(title, reason, decided) {
+                    tracing::warn!(?err, "ask about an agent's action");
+                }
+            }
             ThreadCmd::SendMessage {
                 text,
                 attachments,
@@ -884,6 +906,42 @@ impl ThreadActor {
 
     const SETUP_REQUEST: &'static str = "agentloft-worktree-setup";
 
+    /// Open an approval card for what the agent asked to do through
+    /// Agentloft's own tools (`ThreadCmd::AskAgent`).
+    fn ask_agent(
+        &mut self,
+        title: String,
+        reason: String,
+        decided: oneshot::Sender<bool>,
+    ) -> CoreResult<()> {
+        let key = format!("agentloft-ask-{}", uuid::Uuid::new_v4());
+        let request = RuntimeRequest {
+            id: RequestId::new(),
+            thread_id: self.thread.id.clone(),
+            turn_id: self.turn_id(),
+            item_id: None,
+            kind: RequestKind::ToolApproval,
+            title: format!("Agentloft: {title}"),
+            detail: serde_json::json!({ "decision_reason": reason }),
+            options: vec![DecisionKind::AllowOnce, DecisionKind::Deny],
+            status: RequestStatus::Open,
+            decision: None,
+            opened_at_ms: now_ms(),
+            reply: None,
+        };
+        self.requests.insert(request.id.clone(), key.clone());
+        self.agent_asked.insert(key, decided);
+        self.thread.status = ThreadStatus::WaitingApproval;
+        self.thread.updated_at_ms = now_ms();
+        self.core.commit(vec![
+            Event::RequestOpened { request },
+            Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            },
+        ])?;
+        Ok(())
+    }
+
     fn ask_setup(&mut self, turn: &Turn, cmd: String) -> CoreResult<()> {
         let request = RuntimeRequest {
             id: RequestId::new(),
@@ -1300,6 +1358,15 @@ impl ThreadActor {
             .get(&request_id)
             .cloned()
             .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "request is not open"))?;
+        if let Some(decided) = self.agent_asked.remove(&native) {
+            self.resolve_request(&native, Some(decision))?;
+            let allowed = matches!(
+                decision,
+                DecisionKind::AllowOnce | DecisionKind::AllowSession
+            );
+            let _ = decided.send(allowed);
+            return Ok(Response::Ok);
+        }
         let session = self
             .session
             .as_ref()
@@ -1914,6 +1981,8 @@ impl ThreadActor {
         self.items = keep;
         // Expire approvals that were never answered.
         let open: Vec<String> = self.requests.drain().map(|(_, n)| n).collect();
+        // Whoever waits on the agent's own asks hears no.
+        self.agent_asked.clear();
         for native in open {
             if let Some(mut request) = self.find_open_request(&native)? {
                 request.status = RequestStatus::Expired;
