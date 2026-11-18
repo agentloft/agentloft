@@ -971,6 +971,38 @@ async fn live_an_iphone_duo() {
     assert_eq!(fold.posture, DevicePosture::HalfOpened, "{fold:?}");
     assert!(!fold.on_cover);
 
+    // A drag on the hinge: positions come faster than the device folds
+    // (over a second each). Only the newest waiting one is folded to, so
+    // the burst ends in about two folds' time, at its last position.
+    let started = Instant::now();
+    let steps = [
+        100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 140.0, 130.0, 120.0,
+    ];
+    let burst = steps.iter().enumerate().map(|(i, degrees)| {
+        let (backend, udid) = (&backend, &udid);
+        async move {
+            tokio::time::sleep(Duration::from_millis(30 * i as u64)).await;
+            backend
+                .set(udid, DeviceSetting::Hinge { degrees: *degrees })
+                .await
+        }
+    });
+    for done in futures::future::join_all(burst).await {
+        done.unwrap();
+    }
+    let took = started.elapsed();
+    eprintln!(
+        "{} hinge positions folded in {:.1}s",
+        steps.len(),
+        took.as_secs_f64()
+    );
+    assert!(
+        took < Duration::from_secs(6),
+        "the positions were folded one by one ({took:?})"
+    );
+    let fold = find(&backend.list().await.unwrap()).fold.unwrap();
+    assert_eq!(fold.hinge, 120.0, "{fold:?}");
+
     // Closed: back to the cover.
     backend
         .set(

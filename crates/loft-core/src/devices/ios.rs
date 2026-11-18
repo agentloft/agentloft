@@ -96,6 +96,12 @@ pub struct IosBackend {
     /// Held while a device folds: SpringBoard drops a fold asked for while
     /// another is going on.
     folding: tokio::sync::Mutex<()>,
+    /// The newest fold asked for, per device (a ticket from `fold_tickets`):
+    /// a fold still waiting when a newer one arrives is dropped, so a drag
+    /// on the hinge folds to where it ends, not through every step of it
+    /// (each fold takes over a second).
+    fold_newest: Mutex<HashMap<String, u64>>,
+    fold_tickets: std::sync::atomic::AtomicU64,
 }
 
 impl IosBackend {
@@ -114,6 +120,8 @@ impl IosBackend {
             hinges: Mutex::default(),
             fold_tool: tokio::sync::Mutex::new(None),
             folding: tokio::sync::Mutex::new(()),
+            fold_newest: Mutex::default(),
+            fold_tickets: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -899,9 +907,21 @@ impl IosBackend {
         if !self.foldables.lock().unwrap().contains_key(udid) {
             bail!("This simulator doesn't fold: only foldables (an iPhone Duo) do.");
         }
+        let ticket = self
+            .fold_tickets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.fold_newest
+            .lock()
+            .unwrap()
+            .insert(udid.to_string(), ticket);
         let tool = self.fold_tool().await?;
         let tool = tool.to_string_lossy();
         let _one_at_a_time = self.folding.lock().await;
+        // A newer fold of this device came while this one waited: that one
+        // goes where the hinge should end up.
+        if self.fold_newest.lock().unwrap().get(udid) != Some(&ticket) {
+            return Ok(());
+        }
         self.simctl(&["spawn", udid, &tool, &fold_position(degrees)])
             .await
             .context("SpringBoard didn't fold the device")?;
