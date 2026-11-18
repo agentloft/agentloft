@@ -535,6 +535,7 @@ async fn videotoolbox(
                 match jpeg {
                     Ok(Ok((jpeg, width, height))) => {
                         let picture = Picture {
+                            on_cover: None,
                             jpeg,
                             width,
                             height,
@@ -695,6 +696,7 @@ fn send_jpeg(jpeg: Vec<u8>, nth: u64, tx: &Tx) -> anyhow::Result<()> {
     tx.send((
         nth,
         Msg::Picture(Arc::new(Picture {
+            on_cover: None,
             jpeg,
             width,
             height,
@@ -792,6 +794,7 @@ pub fn raw_picture(raw: &[u8]) -> anyhow::Result<Picture> {
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY);
     image.write_with_encoder(encoder)?;
     Ok(Picture {
+        on_cover: None,
         jpeg,
         width: tw,
         height: th,

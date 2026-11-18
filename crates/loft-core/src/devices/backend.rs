@@ -19,6 +19,9 @@ pub struct Picture {
     /// The picture's size in pixels (it may be smaller than the screen).
     pub width: u32,
     pub height: u32,
+    /// A foldable's picture: of its cover screen, or its main one. `None`
+    /// for a device with one screen, or when not known.
+    pub on_cover: Option<bool>,
 }
 
 /// One platform's devices. `native` is what follows the platform in a
@@ -82,4 +85,14 @@ pub trait Screen: Send + Sync + 'static {
     /// Set when the device went away or the stream broke: the manager drops
     /// this screen and says why.
     fn ended(&self) -> watch::Receiver<Option<String>>;
+
+    /// A foldable whose screen is followed here: whether its pictures are of
+    /// the cover screen now (`None`: not known here). It is what [`size`]
+    /// is of, so the two never disagree, whereas the backend's list is
+    /// read only now and then.
+    ///
+    /// [`size`]: Screen::size
+    fn on_cover(&self) -> Option<bool> {
+        None
+    }
 }

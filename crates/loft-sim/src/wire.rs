@@ -5,8 +5,9 @@
 //! `u32` length and that many bytes:
 //!
 //! - [`KIND_EVENT`]: an [`Event`] as JSON;
-//! - [`KIND_FRAME`]: a picture of the screen: its width and height (big-endian
-//!   `u32`s), then a JPEG;
+//! - [`KIND_FRAME`]: a picture of the screen: its width and height, and the
+//!   screen ID it is of (0 for a device with one screen; big-endian `u32`s),
+//!   then a JPEG;
 //! - [`KIND_CAPTURE`]: the answer to [`Command::Capture`]: the request's id
 //!   (big-endian `u64`), then a PNG.
 //!
@@ -123,11 +124,12 @@ pub fn read_message(input: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> 
     Ok(Some((head[0], body)))
 }
 
-/// A [`KIND_FRAME`] body: width, height and the JPEG.
-pub fn split_frame(body: &[u8]) -> Option<(u32, u32, &[u8])> {
+/// A [`KIND_FRAME`] body: width, height, screen ID and the JPEG.
+pub fn split_frame(body: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
     let width = u32::from_be_bytes(body.get(0..4)?.try_into().ok()?);
     let height = u32::from_be_bytes(body.get(4..8)?.try_into().ok()?);
-    Some((width, height, &body[8..]))
+    let screen = u32::from_be_bytes(body.get(8..12)?.try_into().ok()?);
+    Some((width, height, screen, &body[12..]))
 }
 
 /// A [`KIND_CAPTURE`] body: the request's id and the PNG.
@@ -189,7 +191,12 @@ mod tests {
         write_message(
             &mut out,
             KIND_FRAME,
-            &[&2u32.to_be_bytes(), &1u32.to_be_bytes(), b"jpeg"],
+            &[
+                &2u32.to_be_bytes(),
+                &1u32.to_be_bytes(),
+                &3u32.to_be_bytes(),
+                b"jpeg",
+            ],
         )
         .unwrap();
         let mut input = &out[..];
@@ -201,7 +208,7 @@ mod tests {
         );
         let (kind, body) = read_message(&mut input).unwrap().unwrap();
         assert_eq!(kind, KIND_FRAME);
-        assert_eq!(split_frame(&body), Some((2, 1, &b"jpeg"[..])));
+        assert_eq!(split_frame(&body), Some((2, 1, 3, &b"jpeg"[..])));
         assert!(read_message(&mut input).unwrap().is_none());
     }
 }

@@ -156,6 +156,8 @@ impl FakeBackend {
                 hinge_min: 0.,
                 hinge_max: 180.,
                 on_cover: false,
+                main_size: Some(FOLD_OPEN),
+                cover_size: Some(FOLD_COVER),
             });
             state.settings.supported.push("posture".into());
             state.settings.supported.push("hinge".into());
@@ -390,7 +392,9 @@ impl FakeScreen {
         let mut jpeg = Vec::new();
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80);
         if img.write_with_encoder(encoder).is_ok() {
+            let on_cover = self.state.lock().unwrap().fold.as_ref().map(|f| f.on_cover);
             self.pictures.send_replace(Some(Arc::new(Picture {
+                on_cover,
                 jpeg,
                 width: w,
                 height: h,

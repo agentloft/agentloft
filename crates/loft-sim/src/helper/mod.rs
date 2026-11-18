@@ -73,6 +73,10 @@ struct Flags {
     watching: bool,
     dirty: bool,
     surfaces_changed: bool,
+    /// A foldable switched screens: the new screen's turn, which goes with
+    /// its surface. The pictures thread takes both at once, so no picture
+    /// is of one screen turned as the other is.
+    switched_turn: Option<Turn>,
     captures: Vec<u64>,
 }
 
@@ -251,7 +255,7 @@ pub fn run(options: Options) -> Result<()> {
     let mut other_seen: Option<u32> = None;
     while !state.stopped() {
         run_loop_for(Duration::from_millis(50));
-        if checked_turn.elapsed() >= Duration::from_millis(250) {
+        if checked_turn.elapsed() >= Duration::from_millis(100) {
             checked_turn = Instant::now();
             // A foldable folded or unfolded: show the screen it uses now.
             let drawn = state
@@ -260,7 +264,16 @@ pub fn run(options: Options) -> Result<()> {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let other = screen_in_use(&device.0, &drawn).filter(|id| *id != device.0.screen());
-            let confirmed = other.filter(|id| other_seen == Some(*id));
+            // Seen twice running, or at once when the screen in use went
+            // black (it was switched off for the other).
+            let current_black = other.is_some()
+                && device
+                    .0
+                    .surface()
+                    .ok()
+                    .and_then(|s| picture::is_black(surface_ptr(&s)))
+                    == Some(true);
+            let confirmed = other.filter(|id| other_seen == Some(*id) || current_black);
             other_seen = other;
             let switched = match confirmed {
                 Some(id) => {
@@ -274,14 +287,24 @@ pub fn run(options: Options) -> Result<()> {
                         }
                         Err(e) => eprintln!("simulator helper: {e:#}"),
                     }
-                    state.change(|f| f.surfaces_changed = true);
+                    // The new screen and its own turn, handed over together.
+                    let turn = device
+                        .0
+                        .interface_orientation()
+                        .map_or_else(|_| state.turn(), Turn::from_interface);
+                    state.change(|f| {
+                        f.surfaces_changed = true;
+                        f.switched_turn = Some(turn);
+                    });
                     true
                 }
                 None => false,
             };
             if let Ok(orientation) = device.0.interface_orientation() {
                 let now = Turn::from_interface(orientation);
-                let changed = {
+                // Just switched: the pictures thread sets the turn with the
+                // new screen's surface.
+                let changed = !switched && {
                     let mut turn = state.turn.lock().unwrap_or_else(|e| e.into_inner());
                     std::mem::replace(&mut *turn, now) != now
                 };
@@ -446,8 +469,21 @@ fn pictures(
     scale: f32,
 ) {
     let mut last: Option<Instant> = None;
+    // A foldable's screen goes black for a moment as it folds (SpringBoard
+    // fades it, or the screen just switched on): since when the screen in
+    // use has been black, while its pictures are held back.
+    let foldable = device.0.screens().len() > 1;
+    let mut black_since: Option<Instant> = None;
+    // The screen the surface read is of (sent with each picture of it).
+    let mut surface_screen = if foldable { device.0.screen() } else { 0 };
+    // When a foldable last switched screens, and whether each screen's
+    // pictures were last wider than tall: right after a switch SpringBoard
+    // may say the new screen is still turned as the old one was, and its
+    // pictures come out on their side until it says otherwise.
+    let mut switched_at: Option<Instant> = None;
+    let mut wide_of: std::collections::HashMap<u32, bool> = Default::default();
     loop {
-        let (frame, captures, surfaces_changed) = {
+        let (frame, captures, surfaces_changed, switched_turn) = {
             let mut flags = state.flags.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if state.stopped() {
@@ -485,12 +521,22 @@ fn pictures(
                 frame,
                 std::mem::take(&mut flags.captures),
                 std::mem::take(&mut flags.surfaces_changed),
+                flags.switched_turn.take(),
             )
         };
         if surfaces_changed {
             match device.0.surface() {
-                Ok(s) => surface = s,
+                Ok(s) => {
+                    surface = s;
+                    if foldable {
+                        surface_screen = device.0.screen();
+                    }
+                }
                 Err(e) => eprintln!("simulator helper: {e:#}"),
+            }
+            if let Some(turn) = switched_turn {
+                *state.turn.lock().unwrap_or_else(|e| e.into_inner()) = turn;
+                switched_at = Some(Instant::now());
             }
         }
         let turn = state.turn();
@@ -519,8 +565,38 @@ fn pictures(
                 Err(e) => state.done(id, Err(e)),
             }
         }
-        if frame {
+        // Viewers keep the last picture through a fold's black moment; a
+        // screen black for longer (asleep) is shown black.
+        let held = frame
+            && foldable
+            && if picture::is_black(ptr) == Some(true) {
+                let since = *black_since.get_or_insert_with(Instant::now);
+                since.elapsed() < BLACK_HELD
+            } else {
+                black_since = None;
+                false
+            };
+        // Just switched, and turned otherwise than this screen last was:
+        // held until SpringBoard says how the screen is turned now.
+        let wide = {
+            let (w, h) = turn.shown_size(width as u32, height as u32);
+            w > h
+        };
+        let settling = switched_at.is_some_and(|at| at.elapsed() < TURN_SETTLES);
+        let held = held
+            || (frame
+                && foldable
+                && settling
+                && wide_of.get(&surface_screen).is_some_and(|w| *w != wide));
+        if held {
+            // Looked at again shortly, changed or not.
+            std::thread::sleep(Duration::from_millis(40));
+            state.change(|f| f.dirty = true);
+        } else if frame {
             last = Some(Instant::now());
+            if foldable && !settling {
+                wide_of.insert(surface_screen, wide);
+            }
             let (w, h) = picture_size(width as u32, height as u32, scale, LONGEST);
             let jpeg = picture::read(ptr, w as usize, h as usize, turn).and_then(|mut p| {
                 outline(&mut p);
@@ -530,13 +606,27 @@ fn pictures(
             match jpeg {
                 Ok((w, h, jpeg)) => state.send(
                     wire::KIND_FRAME,
-                    &[&w.to_be_bytes(), &h.to_be_bytes(), &jpeg],
+                    &[
+                        &w.to_be_bytes(),
+                        &h.to_be_bytes(),
+                        &surface_screen.to_be_bytes(),
+                        &jpeg,
+                    ],
                 ),
                 Err(e) => eprintln!("simulator helper: {e:#}"),
             }
         }
     }
 }
+
+/// How long a foldable's black screen is held back (the last picture
+/// shown instead): longer than a fold's fade, shorter than a person waits
+/// for a screen that really is off.
+const BLACK_HELD: Duration = Duration::from_millis(1500);
+
+/// How long after a foldable switches screens its pictures may be turned
+/// as the other screen was (and are held back if they are).
+const TURN_SETTLES: Duration = Duration::from_millis(1500);
 
 /// How often the outlines are read again while the screen keeps changing,
 /// and while it doesn't (an app may change what accessibility sees without

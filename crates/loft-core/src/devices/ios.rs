@@ -101,6 +101,9 @@ pub struct IosBackend {
     /// on the hinge folds to where it ends, not through every step of it
     /// (each fold takes over a second).
     fold_newest: Mutex<HashMap<String, u64>>,
+    /// The fold program kept running in each foldable (`fold --serve`):
+    /// starting one takes over a second, a fold under half of one.
+    fold_servers: tokio::sync::Mutex<HashMap<String, FoldServer>>,
     fold_tickets: std::sync::atomic::AtomicU64,
 }
 
@@ -121,6 +124,7 @@ impl IosBackend {
             fold_tool: tokio::sync::Mutex::new(None),
             folding: tokio::sync::Mutex::new(()),
             fold_newest: Mutex::default(),
+            fold_servers: tokio::sync::Mutex::default(),
             fold_tickets: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -496,7 +500,9 @@ impl FoldNow {
         on_cover: true,
     };
 
-    fn fold(self) -> DeviceFold {
+    /// As the protocol says it, the inner (main) screen being `main` and
+    /// the cover `cover` (pixels, upright).
+    fn fold(self, main: Option<(u32, u32)>, cover: Option<(u32, u32)>) -> DeviceFold {
         let posture = match self.hinge {
             h if h <= 0.0 => DevicePosture::Closed,
             h if h >= 170.0 => DevicePosture::Opened,
@@ -516,6 +522,8 @@ impl FoldNow {
             hinge_min: 0.0,
             hinge_max: 180.0,
             on_cover: self.on_cover,
+            main_size: main,
+            cover_size: cover,
         }
     }
 }
@@ -577,6 +585,7 @@ pub(crate) fn devices_of(
                 screen.map_or((0, 0, 0.0), |s| (s.width, s.height, s.scale));
             let state = device_state(&device.state);
             // A foldable shows the size of the screen it's using.
+            let cover = screen.map(|s| (s.width, s.height));
             let fold = screen.and_then(|s| s.inner).map(|(_, iw, ih)| {
                 let inner = (iw, ih);
                 let now = Some(&state)
@@ -586,7 +595,7 @@ pub(crate) fn devices_of(
                 if !now.on_cover {
                     (width, height) = inner;
                 }
-                now.fold()
+                now.fold(Some(inner), cover)
             });
             out.push(DeviceInfo {
                 id: DeviceId::ios(&device.udid),
@@ -904,6 +913,11 @@ impl IosBackend {
     /// Fold `udid` to `degrees` (0 closed, 180 open), then wait for its
     /// helper to show the screen that goes with it.
     async fn fold(&self, udid: &str, degrees: f32) -> Result<()> {
+        // Which devices fold is learned from the list: read it if it
+        // wasn't yet (a fold asked for first thing after the daemon starts).
+        if !self.foldables.lock().unwrap().contains_key(udid) {
+            Backend::list(self).await?;
+        }
         if !self.foldables.lock().unwrap().contains_key(udid) {
             bail!("This simulator doesn't fold: only foldables (an iPhone Duo) do.");
         }
@@ -922,13 +936,22 @@ impl IosBackend {
         if self.fold_newest.lock().unwrap().get(udid) != Some(&ticket) {
             return Ok(());
         }
-        self.simctl(&["spawn", udid, &tool, &fold_position(degrees)])
-            .await
-            .context("SpringBoard didn't fold the device")?;
-        self.hinges
+        // Where it is going, from now: what is said of the device while it
+        // folds (its screen switching midway) must not take it back to
+        // where it was.
+        let before = self
+            .hinges
             .lock()
             .unwrap()
             .insert(udid.to_string(), degrees);
+        if let Err(e) = self.fold_to(udid, &tool, &fold_position(degrees)).await {
+            let mut hinges = self.hinges.lock().unwrap();
+            match before {
+                Some(before) => hinges.insert(udid.to_string(), before),
+                None => hinges.remove(udid),
+            };
+            return Err(e.context("SpringBoard didn't fold the device"));
+        }
         // The helper notices within a quarter of a second; a hinge between
         // closed and open may not change screens, so wait only for those.
         let cover = match degrees {
@@ -946,6 +969,64 @@ impl IosBackend {
             }
         }
         Ok(())
+    }
+
+    /// Fold `udid` to `position` (0 to 1) through its fold program, started
+    /// if it isn't running (or stopped since); one started just for this
+    /// fold if that fails.
+    async fn fold_to(&self, udid: &str, tool: &str, position: &str) -> Result<()> {
+        let mut servers = self.fold_servers.lock().await;
+        if !servers.contains_key(udid) {
+            match self.start_fold_server(udid, tool).await {
+                Ok(server) => {
+                    servers.insert(udid.to_string(), server);
+                }
+                Err(e) => {
+                    tracing::debug!("no fold program kept running: {e:#}");
+                    drop(servers);
+                    return self
+                        .simctl(&["spawn", udid, tool, position])
+                        .await
+                        .map(drop);
+                }
+            }
+        }
+        let server = servers.get_mut(udid).expect("just added");
+        match server.fold(position).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // It stopped (the device rebooted, SpringBoard restarted):
+                // the next fold starts another.
+                servers.remove(udid);
+                Err(e)
+            }
+        }
+    }
+
+    async fn start_fold_server(&self, udid: &str, tool: &str) -> Result<FoldServer> {
+        let mut command = self.xcrun();
+        command.arg("simctl");
+        if let Some(set) = &self.set {
+            command.arg("--set").arg(set);
+        }
+        command
+            .args(["spawn", udid, tool, "--serve"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().context("couldn't run xcrun")?;
+        let stdin = child.stdin.take().context("no stdin")?;
+        let stdout = child.stdout.take().context("no stdout")?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        match tokio::time::timeout(Duration::from_secs(15), lines.next_line()).await {
+            Ok(Ok(Some(line))) if line.trim() == "ready" => Ok(FoldServer {
+                _child: child,
+                stdin,
+                lines,
+            }),
+            Ok(Ok(Some(line))) => bail!("the fold program said {line:?}"),
+            Ok(_) => bail!("the fold program stopped"),
+            Err(_) => bail!("the fold program didn't start"),
+        }
     }
 
     /// The fold program (`ios_fold.m`), compiled with this Mac's Xcode for
@@ -1084,6 +1165,7 @@ impl Backend for IosBackend {
     fn boot<'a>(&'a self, native: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
             self.hinges.lock().unwrap().remove(native);
+            self.fold_servers.lock().await.remove(native);
             // `simctl boot` starts the device without Simulator.app.
             if let Err(e) = self.simctl(&["boot", native]).await
                 && !already(&e, "Booted")
@@ -1104,6 +1186,7 @@ impl Backend for IosBackend {
 
     fn shutdown<'a>(&'a self, native: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            self.fold_servers.lock().await.remove(native);
             match self.simctl(&["shutdown", native]).await {
                 Err(e) if !already(&e, "Shutdown") => Err(e),
                 _ => Ok(()),
@@ -1439,11 +1522,13 @@ impl IosScreen {
                     };
                     match message {
                         (wire::KIND_FRAME, body) => {
-                            if let Some((width, height, jpeg)) = wire::split_frame(&body) {
+                            if let Some((width, height, screen, jpeg)) = wire::split_frame(&body) {
                                 pictures.send_replace(Some(Arc::new(Picture {
                                     jpeg: jpeg.to_vec(),
                                     width,
                                     height,
+                                    // Screen 1 is a foldable's cover.
+                                    on_cover: (screen != 0).then_some(screen == 1),
                                 })));
                             }
                         }
@@ -1667,6 +1752,38 @@ impl Screen for IosScreen {
     fn ended(&self) -> watch::Receiver<Option<String>> {
         self.ended.subscribe()
     }
+
+    fn on_cover(&self) -> Option<bool> {
+        // Screen 1 is a foldable's cover; a phone with one screen says none.
+        self.screen_id.lock().unwrap().map(|id| id == 1)
+    }
+}
+
+/// A fold program kept running in a foldable (`fold --serve`, see
+/// `ios_fold.m`): a position a line in, "done" or "error <status>" out.
+struct FoldServer {
+    /// Ended with the server (`kill_on_drop`).
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+impl FoldServer {
+    async fn fold(&mut self, position: &str) -> Result<()> {
+        self.stdin
+            .write_all(format!("{position}\n").as_bytes())
+            .await?;
+        self.stdin.flush().await?;
+        let answer = tokio::time::timeout(Duration::from_secs(25), self.lines.next_line())
+            .await
+            .context("the fold program didn't answer")??
+            .context("the fold program stopped")?;
+        match answer.trim() {
+            "done" => Ok(()),
+            "error 4" => bail!("SpringBoard didn't finish folding"),
+            other => bail!("the fold program said {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1776,7 +1893,7 @@ mod tests {
             hinge: BOOK_HINGE,
             on_cover: false,
         };
-        assert_eq!(book.fold().posture, DevicePosture::HalfOpened);
+        assert_eq!(book.fold(None, None).posture, DevicePosture::HalfOpened);
     }
 
     #[test]

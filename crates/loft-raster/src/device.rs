@@ -225,12 +225,15 @@ pub fn guess_cover(kind: Kind, main: (f32, f32)) -> (f32, f32) {
 }
 
 /// The model built, folded and turned `roll` quarter turns, with the
-/// picture on the `live` screen.
+/// picture on the `live` screen (a foldable's picture turned on its screen,
+/// the model itself not turned).
 pub fn scene(model: &Model, live: Live, roll: i8) -> Scene {
     let mut scene = match model.kind {
         Kind::Phone(style) => slab_device(model.main, style, false, live, roll),
         Kind::Tablet(style) => slab_device(model.main, style, true, live, roll),
-        Kind::Book | Kind::Flip => foldable(model, live, roll),
+        // A foldable isn't turned: its interface turns on its screens (an
+        // iPhone Duo turns it as it folds), so only the picture turns.
+        Kind::Book | Kind::Flip => return foldable(model, live, roll),
     };
     if roll.rem_euclid(2) == 1 {
         scene.extent = (scene.extent.1, scene.extent.0);

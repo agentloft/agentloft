@@ -1356,6 +1356,7 @@ fn encode(raw: &Raw) -> anyhow::Result<Picture> {
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY);
     image.write_with_encoder(encoder)?;
     Ok(Picture {
+        on_cover: None,
         jpeg,
         width: raw.width,
         height: raw.height,

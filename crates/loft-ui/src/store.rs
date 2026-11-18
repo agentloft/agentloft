@@ -989,7 +989,7 @@ impl AppStore {
                             let _ = view.update(cx, |v, cx| {
                                 v.on_state(device, cx);
                                 if let Some(frame) = frame {
-                                    v.on_frame(sub_id, frame.seq, frame.jpeg.0, cx);
+                                    v.on_frame(sub_id, frame.seq, frame.jpeg.0, frame.on_cover, cx);
                                 }
                             });
                         }
@@ -1146,10 +1146,14 @@ impl AppStore {
             }
             // Simulators and emulators (ADR-0020), for Device panels.
             ClientEvent::DeviceFrame {
-                sub_id, seq, jpeg, ..
+                sub_id,
+                seq,
+                jpeg,
+                on_cover,
+                ..
             } => match self.device_view(sub_id) {
                 Some(view) => {
-                    let _ = view.update(cx, |v, cx| v.on_frame(sub_id, seq, jpeg, cx));
+                    let _ = view.update(cx, |v, cx| v.on_frame(sub_id, seq, jpeg, on_cover, cx));
                 }
                 // Nobody to show it to: don't hold the stream up.
                 None => {

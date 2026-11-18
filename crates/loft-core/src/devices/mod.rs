@@ -624,6 +624,12 @@ fn decorate(inner: &Inner, id: &DeviceId) -> Option<DeviceInfo> {
     if let Some((thread, _)) = inner.agents.get(id) {
         info.agent = Some(thread.clone());
     }
+    if let (Some(fold), Some(on_cover)) = (
+        info.fold.as_mut(),
+        inner.screens.get(id).and_then(|a| a.screen.on_cover()),
+    ) {
+        fold.on_cover = on_cover;
+    }
     if let Some((width, height, scale)) = inner.screens.get(id).and_then(|a| a.screen.size()) {
         info.width = width;
         info.height = height;
@@ -661,6 +667,7 @@ async fn follow(
                     let Some(a) = inner.screens.get_mut(&id) else { return };
                     a.seq += 1;
                     a.frame = Some(DeviceFrame {
+                        on_cover: picture.on_cover,
                         seq: a.seq,
                         jpeg: picture.jpeg.clone().into(),
                     });

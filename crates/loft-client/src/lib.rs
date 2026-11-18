@@ -103,6 +103,8 @@ pub enum ClientEvent {
         id: loft_protocol::DeviceId,
         seq: u64,
         jpeg: Vec<u8>,
+        /// A foldable's picture: of its cover (else its main screen).
+        on_cover: Option<bool>,
     },
     DeviceState {
         sub_id: u64,
@@ -193,6 +195,7 @@ pub(crate) fn dispatch(
             id,
             seq: frame.seq,
             jpeg: frame.jpeg.0,
+            on_cover: frame.on_cover,
         },
         ServerMsg::DeviceState { sub_id, device } => ClientEvent::DeviceState { sub_id, device },
         ServerMsg::DeviceList {

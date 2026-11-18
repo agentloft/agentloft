@@ -132,6 +132,14 @@ pub struct DeviceFold {
     /// not the main one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub on_cover: bool,
+    /// The main screen's size in pixels, upright, when known: with the
+    /// cover's, a viewer tells which screen a picture is of from its shape
+    /// (pictures and state don't arrive together while a device folds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_size: Option<(u32, u32)>,
+    /// The cover screen's size in pixels, upright, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,6 +193,11 @@ pub struct DeviceFrame {
     /// Counts up per device; a viewer acknowledges it to get the next one.
     pub seq: u64,
     pub jpeg: Bytes,
+    /// A foldable's picture: of its cover screen (else its main one). A
+    /// picture alone can't say: one screen turned on its side may have the
+    /// other's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_cover: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

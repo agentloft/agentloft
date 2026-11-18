@@ -111,9 +111,12 @@ pub struct DeviceView {
     info: Option<DeviceInfo>,
     /// Its screen as last pictured.
     picture: Option<Arc<RenderImage>>,
+    /// A foldable's picture: of its cover (else its main screen), as the
+    /// daemon labelled it.
+    picture_on_cover: Option<bool>,
     /// A picture is being decoded; the newest to arrive meanwhile waits.
     decoding: bool,
-    waiting: Option<(u64, u64, Vec<u8>)>,
+    waiting: Option<(u64, u64, Vec<u8>, Option<bool>)>,
     /// What this panel watches now: the list, and which device.
     watching_list: bool,
     watching: Option<DeviceId>,
@@ -190,6 +193,7 @@ impl DeviceView {
             boot_when_listed: false,
             info: None,
             picture: None,
+            picture_on_cover: None,
             decoding: false,
             waiting: None,
             watching_list: false,
@@ -482,9 +486,18 @@ impl DeviceView {
     /// A new picture. One is decoded at a time; while that happens only the
     /// newest to arrive is kept, and the daemon sends no more until this
     /// one is acknowledged.
-    pub fn on_frame(&mut self, sub_id: u64, seq: u64, jpeg: Vec<u8>, cx: &mut Context<Self>) {
+    pub fn on_frame(
+        &mut self,
+        sub_id: u64,
+        seq: u64,
+        jpeg: Vec<u8>,
+        on_cover: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
         if self.decoding {
-            if let Some((old_sub, old_seq, _)) = self.waiting.replace((sub_id, seq, jpeg)) {
+            if let Some((old_sub, old_seq, _, _)) =
+                self.waiting.replace((sub_id, seq, jpeg, on_cover))
+            {
                 cx.spawn(async move |this, cx| {
                     let _ = this.update(cx, |this, cx| this.ack(old_sub, old_seq, cx));
                 })
@@ -503,11 +516,12 @@ impl DeviceView {
                 {
                     this.drop_picture(cx);
                     this.picture = Some(picture);
+                    this.picture_on_cover = on_cover;
                     cx.notify();
                 }
                 this.ack(sub_id, seq, cx);
-                if let Some((sub_id, seq, jpeg)) = this.waiting.take() {
-                    this.on_frame(sub_id, seq, jpeg, cx);
+                if let Some((sub_id, seq, jpeg, on_cover)) = this.waiting.take() {
+                    this.on_frame(sub_id, seq, jpeg, on_cover, cx);
                 }
             });
         })

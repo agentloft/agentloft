@@ -94,6 +94,19 @@ pub(super) struct Model3d {
     over_screen: bool,
     /// A pinch going on: over the device, it folds; else it zooms.
     pinch_folds: Option<bool>,
+    /// The screen the live picture was on when last drawn: when it moves
+    /// to the other, the model turns to show it.
+    last_live: Option<Live>,
+    /// When the device was last folded (asked here, or its live screen
+    /// changed): turning the model doesn't fold it again for a moment.
+    folded_at: Option<Instant>,
+    /// A foldable's last picture of each screen (main, cover), and how it
+    /// was turned: while the model's hinge already shows the other screen
+    /// and the device hasn't switched yet, that screen shows its last
+    /// picture rather than nothing.
+    last_of: [Option<(Arc<RenderImage>, i8)>; 2],
+    /// The screen the device's own pictures were last of.
+    device_live: Option<Live>,
 }
 
 struct Turn {
@@ -113,6 +126,9 @@ struct Preview {
     degrees: f32,
     /// Let go: it shows until the device says so (or a moment passes).
     released: Option<Instant>,
+    /// A posture asked for: done once the device is in it (its hinge may
+    /// not be the one shown, as a half-open device's isn't).
+    posture: Option<DevicePosture>,
 }
 
 /// Everything a picture of the model depends on.
@@ -161,6 +177,10 @@ impl Default for Model3d {
             touch_screen: Cell::new(None),
             over_screen: false,
             pinch_folds: None,
+            last_live: None,
+            folded_at: None,
+            last_of: [None, None],
+            device_live: None,
         }
     }
 }
@@ -192,7 +212,8 @@ impl Model3d {
     /// Move the view on, as time passes: a tween, a flick's spin, the hinge
     /// easing toward `hinge`. Whether there is more to come, and whether a
     /// spin just came to rest.
-    fn tick(&mut self, now: Instant, hinge: Option<f32>) -> (bool, bool) {
+    fn tick(&mut self, now: Instant, fold: Option<(f32, DevicePosture)>) -> (bool, bool) {
+        let hinge = fold.map(|(h, _)| h);
         let dt = self
             .last_tick
             .map_or(0., |t| now.duration_since(t).as_secs_f32().min(0.1));
@@ -230,7 +251,9 @@ impl Model3d {
         if let Some(p) = self.preview
             && let Some(at) = p.released
             && (hinge.is_some_and(|h| (h - p.degrees).abs() < 1.)
-                || now.duration_since(at) > Duration::from_secs(2))
+                || p.posture
+                    .is_some_and(|want| fold.is_some_and(|(_, now)| now == want))
+                || now.duration_since(at) > PREVIEW_FOR)
         {
             self.preview = None;
         }
@@ -238,7 +261,8 @@ impl Model3d {
         let mut easing = false;
         match (target, self.shown_hinge) {
             (Some(target), Some(shown)) if (target - shown).abs() > 0.3 => {
-                let k = 1. - (-12. * dt).exp();
+                // About as long as the device takes to swing its hinge.
+                let k = 1. - (-HINGE_EASE * dt).exp();
                 self.shown_hinge = Some(shown + (target - shown) * k);
                 easing = true;
             }
@@ -263,6 +287,93 @@ fn facing_view(dir: loft_raster::Vec3, now: View) -> View {
         pitch: pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT),
         zoom: now.zoom,
     }
+}
+
+/// How long after a fold the device's pictures may be dark or turned the
+/// old screen's way (an iPhone Duo's cover takes about three seconds).
+const FOLD_SETTLES: Duration = Duration::from_secs(4);
+
+/// Whether a picture is (nearly) all black: a screen just switched on or
+/// off, which a fold shows instead of the screen's last picture.
+fn is_dark(picture: &RenderImage) -> bool {
+    let size = picture.size(0);
+    let (w, h) = (size.width.0 as usize, size.height.0 as usize);
+    let Some(bytes) = picture.as_bytes(0) else {
+        return false;
+    };
+    if w == 0 || h == 0 || bytes.len() < w * h * 4 {
+        return false;
+    }
+    const GRID: usize = 10;
+    (0..GRID).all(|gy| {
+        (0..GRID).all(|gx| {
+            let (x, y) = ((2 * gx + 1) * w / (2 * GRID), (2 * gy + 1) * h / (2 * GRID));
+            let i = (y * w + x) * 4;
+            bytes[i] < 12 && bytes[i + 1] < 12 && bytes[i + 2] < 12
+        })
+    })
+}
+
+/// A fold-in's hinge from which its main screen, not its cover, is the one
+/// seen (about where an iPhone Duo switches screens as it opens).
+const FACES_OPEN: f32 = 70.;
+
+/// How long a hinge asked for shows before the device has it: a fold of an
+/// iPhone Duo can take over a second to start.
+const PREVIEW_FOR: Duration = Duration::from_secs(4);
+
+/// How fast the drawn hinge eases toward the device's (per second): it
+/// gets there in about half a second, as the device's hinge does.
+const HINGE_EASE: f32 = 7.;
+
+/// The hinge a posture puts a device at, for showing it at once.
+fn posture_hinge(posture: DevicePosture, fold: &loft_protocol::DeviceFold) -> f32 {
+    let flat = 180_f32.clamp(fold.hinge_min, fold.hinge_max);
+    match posture {
+        DevicePosture::Closed => fold.hinge_min,
+        DevicePosture::HalfOpened => ((fold.hinge_min + flat) / 2.).max(fold.hinge_min),
+        DevicePosture::Opened => flat,
+        DevicePosture::Flipped => fold.hinge_max,
+        DevicePosture::Tent => (flat + fold.hinge_max) / 2.,
+    }
+}
+
+/// Which of a foldable's screens a picture of `shape` (width, height) is
+/// of, and whether it is turned on that screen. The screen is the one whose
+/// upright shape is nearest the picture's (a foldable's two screens differ
+/// clearly that way, whereas one screen turned can look much like the
+/// other upright: an iPhone Duo's inner screen on its side is nearly its
+/// cover's shape); `on_cover` (what the device last said) decides a close
+/// call.
+fn which_screen(
+    shape: (f32, f32),
+    main: (f32, f32),
+    cover: (f32, f32),
+    on_cover: bool,
+) -> (Live, bool) {
+    let ratio = |(w, h): (f32, f32)| (w.max(1.) / h.max(1.)).ln();
+    let of = ratio(shape);
+    let off = |r: f32| (of - r).abs();
+    let (main_off, cover_off) = (off(ratio(main)), off(ratio(cover)));
+    let screen = if (main_off - cover_off).abs() < 0.05 {
+        if on_cover { Live::Cover } else { Live::Main }
+    } else if cover_off < main_off {
+        Live::Cover
+    } else {
+        Live::Main
+    };
+    (
+        screen,
+        turned_on(shape, if screen == Live::Cover { cover } else { main }),
+    )
+}
+
+/// Whether a picture of `shape` is turned on its side on a screen of
+/// `screen`'s upright shape.
+fn turned_on(shape: (f32, f32), screen: (f32, f32)) -> bool {
+    let ratio = |(w, h): (f32, f32)| (w.max(1.) / h.max(1.)).ln();
+    let (of, r) = (ratio(shape), ratio(screen));
+    (of + r).abs() + 0.05 < (of - r).abs()
 }
 
 /// An angle in degrees, kept within a turn either way.
@@ -362,6 +473,45 @@ impl DeviceView {
                 FoldAxis::Vertical => Kind::Book,
                 FoldAxis::Horizontal => Kind::Flip,
             };
+            let pair = |(a, b): (u32, u32)| (a as f32, b as f32);
+            // Both screens' shapes, as the device says them: then which
+            // screen a picture is of, and whether it's turned, comes from
+            // the picture's own shape, which can't disagree with what it
+            // shows (the device's state and its pictures arrive apart
+            // while it folds).
+            if let (Some(main), Some(cover)) = (
+                fold.main_size.map(pair),
+                fold.cover_size.map(pair).filter(|_| fold.cover_screen),
+            ) {
+                let shape = picture.map_or((w, h), |p| {
+                    let s = p.size(0);
+                    (s.width.0 as f32, s.height.0 as f32)
+                });
+                // The daemon says which screen a picture is of; only its
+                // shape is left to say whether it's turned on it.
+                let (screen, turned) = match self.picture_on_cover.filter(|_| picture.is_some()) {
+                    Some(on_cover) => {
+                        let screen = if on_cover { Live::Cover } else { Live::Main };
+                        (
+                            screen,
+                            turned_on(shape, if on_cover { cover } else { main }),
+                        )
+                    }
+                    None => which_screen(shape, main, cover, fold.on_cover),
+                };
+                tracing::trace!(
+                    ?shape, ?main, ?cover, on_cover = fold.on_cover, ?screen, turned,
+                    hinge = ?self.model.shown_hinge, "which screen"
+                );
+                let model = Model {
+                    kind,
+                    main,
+                    cover: Some(cover),
+                    inward: fold.inward,
+                    hinge: self.model.shown_hinge.unwrap_or(fold.hinge),
+                };
+                return Some((model, live(screen), i8::from(turned)));
+            }
             let m = &mut self.model;
             let seen = if fold.on_cover {
                 *m.natural_cover.get_or_insert((w, h))
@@ -422,7 +572,9 @@ impl DeviceView {
         };
         let now = Instant::now();
         let fold = self.device().and_then(|d| d.fold.clone());
-        let (more, rested) = self.model.tick(now, fold.as_ref().map(|f| f.hinge));
+        let (more, rested) = self
+            .model
+            .tick(now, fold.as_ref().map(|f| (f.hinge, f.posture)));
         if rested {
             self.after_turn(cx);
         }
@@ -430,9 +582,73 @@ impl DeviceView {
             self.model.want_hinge = None;
             self.send_hinge(degrees, cx);
         }
-        let Some((m, live, roll)) = self.describe() else {
+        let Some((m, mut live, mut roll)) = self.describe() else {
             return;
         };
+        let mut picture = self.picture.clone().filter(|_| live != Live::None);
+        // A fold-in's screen facing out is the cover while the hinge is
+        // nearly shut, the main one once it opens: it shows the device's
+        // live picture once the device has switched, and its own last
+        // picture until then (a fold takes the device longer than the
+        // model).
+        if matches!(m.kind, Kind::Book | Kind::Flip) && m.cover.is_some() && m.inward {
+            let slot = |screen: Live| match screen {
+                Live::Cover => Some(1),
+                Live::Main => Some(0),
+                Live::None => None,
+            };
+            // The device switched screens: a fold is settling.
+            if live != Live::None {
+                if self.model.device_live.is_some_and(|before| before != live) {
+                    self.model.folded_at = Some(now);
+                }
+                self.model.device_live = Some(live);
+            }
+            // While a fold settles (the device switches screens, blanks
+            // them and turns its interface the old screen's way for a few
+            // seconds), a picture that is dark or turned isn't shown: that
+            // screen's last good one is. (Settled, a foldable's screens
+            // show their interface upright.)
+            let settling = self
+                .model
+                .folded_at
+                .is_some_and(|at| now.duration_since(at) < FOLD_SETTLES);
+            let live_good = picture
+                .as_ref()
+                .is_some_and(|p| !(settling && (roll != 0 || is_dark(p))));
+            if live_good && let (Some(p), Some(i)) = (&picture, slot(live)) {
+                self.model.last_of[i] = Some((p.clone(), roll));
+            }
+            let facing = if m.hinge < FACES_OPEN {
+                Live::Cover
+            } else {
+                Live::Main
+            };
+            if live != Live::None
+                && (facing != live || !live_good)
+                && let Some((p, r)) = slot(facing).and_then(|i| self.model.last_of[i].clone())
+            {
+                tracing::trace!(?facing, from = ?live, live_good, "showing the facing screen's last picture");
+                live = facing;
+                roll = r;
+                picture = Some(p);
+            }
+        }
+        // The live picture moved to the other screen (the device folded or
+        // unfolded): turn the model to show it, unless it is being turned.
+        if live != Live::None {
+            if let Some(before) = self.model.last_live
+                && before != live
+            {
+                self.model.folded_at = Some(now);
+                let view = self.model.view;
+                if self.model.turn.is_none() && view.yaw.abs() > 75. {
+                    self.tween_to(View { yaw: 0., ..view }, Duration::from_millis(450));
+                    self.wake_in(FRAME_EVERY, cx);
+                }
+            }
+            self.model.last_live = Some(live);
+        }
         let (aw, ah) = (f32::from(area.size.width), f32::from(area.size.height));
         let mut scale = window.scale_factor();
         if aw * ah * scale * scale > MAX_PIXELS {
@@ -442,7 +658,6 @@ impl DeviceView {
         if w < 4 || h < 4 {
             return;
         }
-        let picture = self.picture.clone().filter(|_| live != Live::None);
         let key = Key {
             size: (w, h),
             view: self.model.view,
@@ -695,6 +910,15 @@ impl DeviceView {
         let Some(fold) = self.device().and_then(|d| d.fold.clone()) else {
             return;
         };
+        // Just folded: the model turned itself to show the live screen, or
+        // the device is still on its way.
+        if self
+            .model
+            .folded_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
         if !self.is_running()
             || fold.on_cover
             || !fold.cover_screen
@@ -816,7 +1040,14 @@ impl DeviceView {
         let Some(id) = self.chosen.clone() else {
             return;
         };
-        self.model.preview = None;
+        // The model swings there at once; the device follows.
+        let fold = self.device().and_then(|d| d.fold.clone());
+        self.model.preview = fold.map(|f| Preview {
+            degrees: posture_hinge(posture, &f),
+            released: Some(Instant::now()),
+            posture: Some(posture),
+        });
+        self.model.folded_at = Some(Instant::now());
         self.ask(
             Request::DeviceSet {
                 id,
@@ -844,10 +1075,13 @@ impl DeviceView {
     /// The hinge dragged to `degrees` (slider or pinch): shown at once, sent
     /// now and then while dragged and when let go.
     fn drag_hinge(&mut self, degrees: f32, released: bool, cx: &mut Context<Self>) {
+        tracing::trace!(degrees, released, "hinge dragged");
         self.model.preview = Some(Preview {
             degrees,
             released: released.then(Instant::now),
+            posture: None,
         });
+        self.model.folded_at = Some(Instant::now());
         if released
             || self
                 .model
@@ -884,8 +1118,14 @@ impl DeviceView {
                     .default_value(fold.hinge.clamp(min, max))
             });
             let sub = cx.subscribe(&state, |this, _, event: &SliderEvent, cx| match event {
-                SliderEvent::Change(v) => this.drag_hinge(v.start(), false, cx),
-                SliderEvent::Release(v) => this.drag_hinge(v.start(), true, cx),
+                SliderEvent::Change(v) => {
+                    tracing::trace!(value = v.start(), "slider changed");
+                    this.drag_hinge(v.start(), false, cx)
+                }
+                SliderEvent::Release(v) => {
+                    tracing::trace!(value = v.start(), "slider let go");
+                    this.drag_hinge(v.start(), true, cx)
+                }
             });
             self.model.slider = Some((state, sub));
         }
@@ -1019,31 +1259,89 @@ mod tests {
         let mut m = Model3d::default();
         let t0 = Instant::now();
         // First seen: at once.
-        assert_eq!(m.tick(t0, Some(180.)), (false, false));
+        assert_eq!(
+            m.tick(t0, Some((180., DevicePosture::Opened))),
+            (false, false)
+        );
         assert_eq!(m.shown_hinge, Some(180.));
         // Shut: on its way, then there.
-        let (more, _) = m.tick(t0 + Duration::from_millis(30), Some(0.));
+        let (more, _) = m.tick(
+            t0 + Duration::from_millis(30),
+            Some((0., DevicePosture::Closed)),
+        );
         assert!(more);
         let h = m.shown_hinge.unwrap();
         assert!(h < 180. && h > 0., "{h}");
         let mut t = t0 + Duration::from_millis(30);
         for _ in 0..40 {
             t += Duration::from_millis(33);
-            m.tick(t, Some(0.));
+            m.tick(t, Some((0., DevicePosture::Closed)));
         }
         assert_eq!(m.shown_hinge, Some(0.));
         // A dragged hinge shows instead, until the device catches up.
         m.preview = Some(Preview {
             degrees: 90.,
             released: Some(t),
+            posture: None,
         });
         for _ in 0..40 {
             t += Duration::from_millis(33);
-            m.tick(t, Some(0.));
+            m.tick(t, Some((0., DevicePosture::Closed)));
         }
         assert!((m.shown_hinge.unwrap() - 90.).abs() < 0.5);
-        m.tick(t + Duration::from_millis(33), Some(90.));
+        m.tick(
+            t + Duration::from_millis(33),
+            Some((90., DevicePosture::HalfOpened)),
+        );
         assert!(m.preview.is_none());
+    }
+
+    #[test]
+    fn a_foldables_picture_is_put_on_the_screen_of_its_shape() {
+        // An iPhone Duo: a wide inner screen, a tall cover.
+        let (main, cover) = ((2853., 2007.), (1398., 2034.));
+        assert_eq!(
+            which_screen((1902., 1338.), main, cover, true),
+            (Live::Main, false)
+        );
+        assert_eq!(
+            which_screen((932., 1356.), main, cover, false),
+            (Live::Cover, false)
+        );
+        // Turned on a known screen: only the picture turns.
+        assert!(turned_on((1356., 932.), cover));
+        assert!(!turned_on((932., 1356.), cover));
+        assert!(!turned_on((1902., 1338.), main));
+    }
+
+    #[test]
+    fn postures_put_the_hinge_where_they_mean() {
+        let fold = loft_protocol::DeviceFold {
+            axis: FoldAxis::Vertical,
+            inward: true,
+            cover_screen: true,
+            postures: vec![],
+            posture: DevicePosture::Closed,
+            hinge: 0.,
+            hinge_min: 0.,
+            hinge_max: 180.,
+            on_cover: true,
+            main_size: None,
+            cover_size: None,
+        };
+        assert_eq!(posture_hinge(DevicePosture::Closed, &fold), 0.);
+        assert_eq!(posture_hinge(DevicePosture::HalfOpened, &fold), 90.);
+        assert_eq!(posture_hinge(DevicePosture::Opened, &fold), 180.);
+    }
+
+    #[test]
+    fn a_black_picture_is_dark_and_a_lit_one_isnt() {
+        let picture = |v: u8| {
+            let pixels = image::RgbaImage::from_pixel(40, 30, image::Rgba([v, v, v, 255]));
+            RenderImage::new(vec![image::Frame::new(pixels)])
+        };
+        assert!(is_dark(&picture(3)));
+        assert!(!is_dark(&picture(200)));
     }
 
     #[test]

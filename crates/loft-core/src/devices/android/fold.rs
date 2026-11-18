@@ -34,6 +34,8 @@ pub struct FoldConfig {
     pub folds_at: DevicePosture,
     /// The cover screen's size in pixels, when it has one.
     pub cover: Option<(u32, u32)>,
+    /// The main screen's size in pixels (`hw.lcd`).
+    pub main: Option<(u32, u32)>,
     /// The postures it takes and the hinge angles each covers.
     pub postures: Vec<PostureRange>,
     pub hinge_min: f32,
@@ -130,6 +132,10 @@ impl FoldConfig {
             (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((w as u32, h as u32)),
             _ => None,
         };
+        let main = match (num("hw.lcd.width"), num("hw.lcd.height")) {
+            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((w as u32, h as u32)),
+            _ => None,
+        };
         let axis = if get("hw.sensor.hinge.type") == Some("0") {
             FoldAxis::Horizontal
         } else {
@@ -137,6 +143,7 @@ impl FoldConfig {
         };
         Some(Self {
             axis,
+            main,
             folds_at,
             cover,
             postures,
@@ -198,6 +205,8 @@ impl FoldConfig {
             hinge_min: self.hinge_min,
             hinge_max: self.hinge_max,
             on_cover: self.on_cover(posture),
+            main_size: self.main,
+            cover_size: self.cover,
         }
     }
 

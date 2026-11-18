@@ -1,5 +1,8 @@
 // Folds a foldable iOS simulator (iPhone Duo) to a hinge position, run
-// inside it with `simctl spawn`: `fold <0.0-1.0>` (0 closed, 1 open flat).
+// inside it with `simctl spawn`: `fold <0.0-1.0>` (0 closed, 1 open flat),
+// or `fold --serve`, which stays and folds to each position it reads, one
+// a line (the daemon keeps one running per device: starting a program in
+// the simulator takes over a second, the fold itself under half of one).
 // Compiled by the daemon with this Mac's Xcode (`devices/ios.rs`,
 // `fold_tool`), with the entitlement below linked into its
 // `__TEXT,__entitlements` section, as Xcode does for simulator builds.
@@ -40,12 +43,45 @@ typedef struct {
 
 static const char *const ENCODING = "{?=qdqqBqdd}";
 
+/// One fold to `position`: 0 done, 3 no service, 4 SpringBoard didn't finish.
+static int fold(id service, Class service_class, double position) {
+    SEL swap = NSSelectorFromString(@"swapDisplayWithSettings:completion:");
+    SwapSettings settings = {
+        .reserved = 0,
+        .duration = -1.0,
+        .deviceOrientation = 0,
+        .profileOverride = 0,
+        .waitForCompletion = YES,
+        .targetMode = 1,
+        .targetHingePosition = position,
+        .unused = 0.0,
+    };
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    void (*send)(id, SEL, SwapSettings, void (^)(void)) = (void *)dlsym(RTLD_DEFAULT, "objc_msgSend");
+    send(service, swap, settings, ^{
+        dispatch_semaphore_signal(done);
+    });
+    long late = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+    return late ? 4 : 0;
+}
+
+/// A position from 0.0 to 1.0, or -1 when `text` isn't one.
+static double position_of(const char *text) {
+    char *end = NULL;
+    double position = strtod(text, &end);
+    while (end && (*end == '\n' || *end == '\r' || *end == ' ')) end++;
+    if (end == text || (end && *end != '\0') || position < 0.0 || position > 1.0) {
+        return -1;
+    }
+    return position;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
-        char *end = NULL;
-        double position = argc == 2 ? strtod(argv[1], &end) : -1;
-        if (argc != 2 || end == argv[1] || *end != '\0' || position < 0.0 || position > 1.0) {
-            fprintf(stderr, "usage: fold <0.0-1.0>\n");
+        BOOL serve = argc == 2 && strcmp(argv[1], "--serve") == 0;
+        double position = !serve && argc == 2 ? position_of(argv[1]) : -1;
+        if (!serve && position < 0) {
+            fprintf(stderr, "usage: fold <0.0-1.0> | fold --serve\n");
             return 2;
         }
         dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
@@ -55,30 +91,37 @@ int main(int argc, char **argv) {
         const char *types = method ? method_getTypeEncoding(method) : NULL;
         if (!types || !strstr(types, ENCODING)) {
             fprintf(stderr, "This simulator has no display tool service to fold it with (%s).\n", types ? types : "none");
+            if (serve) {
+                printf("error 3\n");
+                fflush(stdout);
+            }
             return 3;
         }
-        SwapSettings settings = {
-            .reserved = 0,
-            .duration = -1.0,
-            .deviceOrientation = 0,
-            .profileOverride = 0,
-            .waitForCompletion = YES,
-            .targetMode = 1,
-            .targetHingePosition = position,
-            .unused = 0.0,
-        };
         id service = [service_class new];
-        dispatch_semaphore_t done = dispatch_semaphore_create(0);
-        void (*send)(id, SEL, SwapSettings, void (^)(void)) = (void *)dlsym(RTLD_DEFAULT, "objc_msgSend");
-        send(service, swap, settings, ^{
-            dispatch_semaphore_signal(done);
-        });
-        long late = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
-        [service performSelector:NSSelectorFromString(@"invalidate")];
-        if (late) {
-            fprintf(stderr, "SpringBoard didn't finish folding.\n");
-            return 4;
+        int status = 0;
+        if (serve) {
+            // One position a line; each answered "done" or "error <status>"
+            // once the fold is over. Ends with its input.
+            printf("ready\n");
+            fflush(stdout);
+            char line[64];
+            while (fgets(line, sizeof line, stdin)) {
+                double at = position_of(line);
+                int folded = at < 0 ? 2 : fold(service, service_class, at);
+                if (folded == 0) {
+                    printf("done\n");
+                } else {
+                    printf("error %d\n", folded);
+                }
+                fflush(stdout);
+            }
+        } else {
+            status = fold(service, service_class, position);
+            if (status == 4) {
+                fprintf(stderr, "SpringBoard didn't finish folding.\n");
+            }
         }
-        return 0;
+        [service performSelector:NSSelectorFromString(@"invalidate")];
+        return status;
     }
 }
