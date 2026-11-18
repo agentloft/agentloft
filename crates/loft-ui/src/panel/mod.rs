@@ -159,6 +159,8 @@ pub enum PanelEvent {
     DocNote(ThreadId, String, docs::DocNote),
     /// Text selected in one of `thread`'s terminals, for its composer.
     AddToMessage(ThreadId, String),
+    /// Float `thread`'s device over the chat (its Device tab's button).
+    FloatDevice(ThreadId),
 }
 
 pub struct WorkbenchPanel {
@@ -737,8 +739,12 @@ impl WorkbenchPanel {
                     // Its device's name and state show on the tab.
                     cx.observe(&view, |_, _, cx| cx.notify()),
                     cx.subscribe(&view, move |_, _, event: &device::DeviceEvent, cx| {
-                        let device::DeviceEvent::Screenshot(png) = event;
-                        cx.emit(PanelEvent::Screenshot(id.clone(), png.clone()));
+                        cx.emit(match event {
+                            device::DeviceEvent::Screenshot(png) => {
+                                PanelEvent::Screenshot(id.clone(), png.clone())
+                            }
+                            device::DeviceEvent::Float => PanelEvent::FloatDevice(id.clone()),
+                        });
                     }),
                 ];
                 panel._subs.extend(subs);
@@ -778,6 +784,41 @@ impl WorkbenchPanel {
         if let Some(id) = id {
             view.update(cx, |v, cx| v.choose(Some(id), boot, cx));
         }
+    }
+
+    /// `thread_id`'s device for the card floating over the chat: its Device
+    /// tab (made if it has none), on `id` if given, and no longer the tab
+    /// the panel shows. `None` with no device to show; else whether the
+    /// panel still has other tabs to show.
+    pub fn float_device(
+        &mut self,
+        thread_id: &ThreadId,
+        id: Option<loft_protocol::DeviceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<device::DeviceView>, bool)> {
+        if !self.store.read(cx).pages_allowed() {
+            return None;
+        }
+        self.ensure_id(thread_id, window, cx)?;
+        let view = self.device_tab(thread_id, false, cx)?;
+        if let Some(id) = id
+            && view.read(cx).chosen() != Some(&id)
+        {
+            view.update(cx, |v, cx| v.choose(Some(id), false, cx));
+        }
+        let panel = self.threads.get_mut(thread_id)?;
+        if matches!(panel.active_tab(), Some(Open::Device { .. })) {
+            let other = (0..panel.tabs.len())
+                .rev()
+                .find(|&ix| !matches!(panel.tabs[ix], Open::Device { .. }));
+            if let Some(ix) = other {
+                panel.active = ix;
+            }
+        }
+        let others = panel.tabs.iter().any(|t| !matches!(t, Open::Device { .. }));
+        cx.notify();
+        Some((view, others))
     }
 
     /// `thread_id`'s Device tab, if it has one.
@@ -1520,7 +1561,10 @@ impl Render for WorkbenchPanel {
             Some(Open::Changes) => panel.changes.clone().into_any_element(),
             Some(Open::Terminal { pane, .. }) => pane.clone().into_any_element(),
             Some(Open::Page { view }) => view.clone().into_any_element(),
-            Some(Open::Device { view }) => view.clone().into_any_element(),
+            Some(Open::Device { view }) => {
+                view.update(cx, |v, _| v.set_floating(false));
+                view.clone().into_any_element()
+            }
             Some(Open::File { viewer, .. }) => viewer.clone().into_any_element(),
             Some(Open::Agent { view, .. }) => view.clone().into_any_element(),
             None => {

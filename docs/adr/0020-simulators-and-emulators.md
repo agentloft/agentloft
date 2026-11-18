@@ -40,5 +40,6 @@
 
 - iOS works only on macOS with Xcode and a runtime; Android wherever its SDK runs. Both report what's missing rather than failing quietly.
 - Simulators are heavy: booting one costs seconds and gigabytes of memory. The panel never boots one by itself: a person presses Start or an agent calls `device_boot`.
-- What T3 Code has that this doesn't yet: a floating window over the chat, the 3D device model and foldable postures, accessibility overlays, physical devices, devices on another computer over SSH beyond what an SSH window already gives.
+- When an agent uses a device and the panel isn't showing it, the device floats over the chat (like the browser's mini preview, but live: it can be touched and typed in), dragged by its bar; the panel's toolbar floats it too, and its bar puts it back in the panel.
+- What T3 Code has that this doesn't yet: resizing the floating device, the 3D device model and foldable postures, accessibility overlays, physical devices, devices on another computer over SSH beyond what an SSH window already gives.
 - Known gaps at first merge: one finger only (no pinch); an emulator Android Studio started (signed JWT, no token) is listed and can be stopped but not shown; a debug daemon encodes Android pictures about 3× slower than a release one; the panel's light/dark toggle shows what it last sent, not the device's own setting; on a phone browser the on-screen keyboard can't tell when the device has a text field focused.

@@ -45,6 +45,8 @@ const SCROLL_EVERY: Duration = Duration::from_millis(40);
 const UNSEEN_AFTER: Duration = Duration::from_millis(1500);
 /// Room around the phone in the panel.
 const MARGIN: f32 = 18.;
+/// Room around the phone when it floats over the chat.
+const FLOAT_MARGIN: f32 = 6.;
 /// The phone's frame around its screen.
 const BEZEL: f32 = 7.;
 /// A screen's size before its device has said (an iPhone's, in points).
@@ -55,6 +57,8 @@ const DEFAULT_SCREEN: (f32, f32) = (390., 844.);
 pub enum DeviceEvent {
     /// A picture of the screen (PNG).
     Screenshot(Vec<u8>),
+    /// Float the device over the chat (out of the side panel).
+    Float,
 }
 impl gpui_kit::EventEmitter<DeviceEvent> for DeviceView {}
 
@@ -117,6 +121,9 @@ pub struct DeviceView {
     /// Where the device picker is (its menu opens under it).
     picker: Rc<Cell<Option<Bounds<Pixels>>>>,
     marked: Option<String>,
+    /// Drawn in the card floating over the chat: the screen alone, with
+    /// less room around it (the card has its own bar).
+    floating: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -168,6 +175,7 @@ impl DeviceView {
             note: None,
             picker: Rc::default(),
             marked: None,
+            floating: false,
             _subs: subs,
         }
     }
@@ -223,6 +231,24 @@ impl DeviceView {
         });
         self.sync(cx);
         cx.notify();
+    }
+
+    /// Whether it is drawn floating over the chat (set by whoever draws it,
+    /// before it draws).
+    pub fn set_floating(&mut self, on: bool) {
+        self.floating = on;
+    }
+
+    /// How tall the card floating over the chat is for `width`: the screen
+    /// as wide as there is room for, and the room around it.
+    pub fn floating_height(&self, width: f32) -> f32 {
+        let (sw, sh) = self.screen_size();
+        let room = 2. * (FLOAT_MARGIN + BEZEL);
+        (width - room).max(0.) * sh / sw.max(1.) + room
+    }
+
+    fn margin(&self) -> f32 {
+        if self.floating { FLOAT_MARGIN } else { MARGIN }
     }
 
     /// The panel is going away: stop watching (the device keeps running).
@@ -561,6 +587,7 @@ impl DeviceView {
         let (x, y, w, h) = fit_screen(
             (f32::from(area.size.width), f32::from(area.size.height)),
             self.screen_size(),
+            self.margin(),
         );
         (w >= 1. && h >= 1.).then(|| {
             Bounds::new(
@@ -735,13 +762,13 @@ impl DeviceView {
 /// Where a screen of `screen` pixels is drawn in an area of `area` view
 /// pixels: its offset and size, scaled to fit (up or down) inside a margin
 /// and a bezel, keeping its shape, centred.
-fn fit_screen(area: (f32, f32), screen: (f32, f32)) -> (f32, f32, f32, f32) {
+fn fit_screen(area: (f32, f32), screen: (f32, f32), margin: f32) -> (f32, f32, f32, f32) {
     let (w, h) = area;
     let (sw, sh) = screen;
     if sw < 1. || sh < 1. {
         return (0., 0., 0., 0.);
     }
-    let room = 2. * (MARGIN + BEZEL);
+    let room = 2. * (margin + BEZEL);
     let s = ((w - room) / sw).min((h - room) / sh).max(0.);
     let (dw, dh) = (sw * s, sh * s);
     ((w - dw) / 2., (h - dh) / 2., dw, dh)
@@ -1035,6 +1062,14 @@ impl DeviceView {
                     )
                     .disabled(!running)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_dark(!dark, cx))),
+                )
+                .child(
+                    tool(
+                        "device-float",
+                        IconName::PictureInPicture2,
+                        "Float over the chat",
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DeviceEvent::Float))),
                 )
                 .child(
                     tool("device-power", IconName::Power, "Shut down")
@@ -1557,7 +1592,7 @@ impl Render for DeviceView {
         v_flex()
             .size_full()
             .bg(p.background)
-            .child(self.toolbar(&p, cx))
+            .when(!self.floating, |d| d.child(self.toolbar(&p, cx)))
             .child(body)
             .into_any_element()
     }
@@ -1571,18 +1606,18 @@ mod tests {
     fn a_screen_is_fitted_into_the_panel_keeping_its_shape() {
         let room = 2. * (MARGIN + BEZEL);
         // A tall phone in a wide panel: as tall as there is room for.
-        let (x, y, w, h) = fit_screen((800., 600.), (390., 844.));
+        let (x, y, w, h) = fit_screen((800., 600.), (390., 844.), MARGIN);
         assert!((h - (600. - room)).abs() < 0.01);
         assert!((w / h - 390. / 844.).abs() < 0.001);
         assert!((x - (800. - w) / 2.).abs() < 0.01);
         assert!((y - (600. - h) / 2.).abs() < 0.01);
         // Turned: as wide as there is room for.
-        let (_, _, w, h) = fit_screen((400., 900.), (844., 390.));
+        let (_, _, w, h) = fit_screen((400., 900.), (844., 390.), MARGIN);
         assert!((w - (400. - room)).abs() < 0.01);
         assert!((w / h - 844. / 390.).abs() < 0.001);
         // Nothing known yet, or no room: nothing drawn.
-        assert_eq!(fit_screen((400., 900.), (0., 0.)), (0., 0., 0., 0.));
-        let (_, _, w, h) = fit_screen((10., 10.), (390., 844.));
+        assert_eq!(fit_screen((400., 900.), (0., 0.), MARGIN), (0., 0., 0., 0.));
+        let (_, _, w, h) = fit_screen((10., 10.), (390., 844.), MARGIN);
         assert_eq!((w, h), (0., 0.));
     }
 
