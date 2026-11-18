@@ -264,16 +264,87 @@ pub fn is_dirty(dir: &Path) -> Result<bool> {
     Ok(!out.is_empty())
 }
 
-/// `git worktree remove [--force] <path>`; the branch is kept.
+/// What `git worktree remove [--force] <path>` does, without waiting for
+/// the files to go; the branch is kept. Without `force`, a worktree with
+/// changes or untracked files is refused, as git refuses it.
+///
+/// A worktree can hold gigabytes of build output, and deleting them takes
+/// minutes while callers hold the lock that new worktrees wait on. So the
+/// folder is renamed aside (instant, same folder), git forgets the
+/// worktree, and the files are deleted on a thread of their own. Folders
+/// left aside by a process that stopped first are deleted by
+/// [`sweep_aside`]. When the rename can't be done (a file held open on
+/// Windows), git removes it the usual way.
 pub fn remove(repo: &Path, path: &Path, force: bool) -> Result<()> {
-    let path = path.to_string_lossy();
-    let mut cmd = git(repo);
-    cmd.args(["worktree", "remove"]);
-    if force {
-        cmd.arg("--force");
+    if !force && path.exists() && is_dirty(path)? {
+        bail!(
+            "{} has changes or untracked files; commit or remove them first",
+            path.display()
+        );
     }
-    run(cmd.arg(path.as_ref()))?;
-    Ok(())
+    let aside = path.parent().zip(path.file_name()).map(|(parent, name)| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        parent.join(format!(
+            ".{}{ASIDE}{}-{nanos}",
+            name.to_string_lossy(),
+            std::process::id()
+        ))
+    });
+    match aside {
+        Some(aside) if std::fs::rename(path, &aside).is_ok() => {
+            prune(repo)?;
+            delete_in_background(aside);
+            Ok(())
+        }
+        _ => {
+            let mut cmd = git(repo);
+            cmd.args(["worktree", "remove"]);
+            if force {
+                cmd.arg("--force");
+            }
+            run(cmd.arg(path.to_string_lossy().as_ref()))?;
+            Ok(())
+        }
+    }
+}
+
+/// Marks a worktree folder set aside by [`remove`], waiting to be deleted.
+const ASIDE: &str = ".removing-";
+
+fn delete_in_background(dir: std::path::PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("worktree-delete".into())
+        .spawn(move || {
+            if let Err(err) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(dir = %dir.display(), "couldn't delete a removed worktree: {err}");
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!("couldn't start deleting a removed worktree: {err}");
+    }
+}
+
+/// Delete worktree folders [`remove`] set aside that weren't deleted yet
+/// (the process stopped first), in the folders under `worktrees_dir` (one
+/// per project), in the background.
+pub fn sweep_aside(worktrees_dir: &Path) {
+    let Ok(projects) = std::fs::read_dir(worktrees_dir) else {
+        return;
+    };
+    for project in projects.flatten() {
+        let Ok(entries) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') && name.contains(ASIDE) {
+                delete_in_background(entry.path());
+            }
+        }
+    }
 }
 
 pub fn prune(repo: &Path) -> Result<()> {
@@ -686,6 +757,89 @@ mod tests {
         std::fs::write(d.join(".gitignore"), ".env*\n").unwrap();
         commit_all(d, "init");
         dir
+    }
+
+    /// Wait until `path` is gone (deleted in the background).
+    fn gone(path: &Path) -> bool {
+        for _ in 0..500 {
+            if !path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn set_aside_in(parent: &Path) -> Vec<String> {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(ASIDE))
+            .collect()
+    }
+
+    #[test]
+    fn remove_frees_the_folder_at_once_and_deletes_it_behind() {
+        let dir = repo();
+        let root = dir.path();
+        let parent = tempfile::tempdir().unwrap();
+        let wt = parent.path().join("wt");
+        add(root, &wt, "agentloft/x", "main").unwrap();
+        // Ignored build output, as a Rust worktree's `target` would be.
+        std::fs::write(root.join(".gitignore"), ".env*\ntarget/\n").unwrap();
+        commit_all(root, "ignore target");
+        run(git(&wt).args(["merge", "-q", "main"])).unwrap();
+        for i in 0..200 {
+            let d = wt.join("target").join(format!("d{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("out.o"), [0u8; 4096]).unwrap();
+        }
+
+        remove(root, &wt, false).unwrap();
+        // The folder is free right away: git forgot the worktree, the
+        // branch can go, and a new worktree can be made at the same place.
+        assert!(!wt.exists());
+        let listed = run(git(root).args(["worktree", "list", "--porcelain"])).unwrap();
+        assert!(!listed.contains("agentloft/x"), "{listed}");
+        add(root, &wt, "agentloft/y", "main").unwrap();
+        delete_branch(root, "agentloft/x").unwrap();
+        // The old files go behind.
+        let aside = set_aside_in(parent.path());
+        assert!(aside.iter().all(|n| n.starts_with(".wt")), "{aside:?}");
+        for name in aside {
+            assert!(
+                gone(&parent.path().join(name)),
+                "the set-aside folder stayed"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_refuses_changes_unless_forced() {
+        let dir = repo();
+        let root = dir.path();
+        let parent = tempfile::tempdir().unwrap();
+        let wt = parent.path().join("wt");
+        add(root, &wt, "agentloft/x", "main").unwrap();
+        std::fs::write(wt.join("new.txt"), "not committed\n").unwrap();
+        assert!(remove(root, &wt, false).is_err());
+        assert!(wt.join("new.txt").exists(), "nothing was lost");
+        remove(root, &wt, true).unwrap();
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn folders_left_aside_are_swept() {
+        let worktrees = tempfile::tempdir().unwrap();
+        let project = worktrees.path().join("proj");
+        let left = project.join(format!(".wt{ASIDE}1-2"));
+        let kept = project.join("wt");
+        std::fs::create_dir_all(left.join("target")).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        sweep_aside(worktrees.path());
+        assert!(gone(&left));
+        assert!(kept.exists(), "a real worktree is never swept");
     }
 
     #[test]

@@ -153,6 +153,11 @@ impl Core {
         id: &ThreadId,
         text: &str,
     ) -> CoreResult<()> {
+        // Most messages go to a thread with nothing to set up: they never
+        // wait on another thread's worktree being made or cleaned up.
+        if !needs_workspace(&self.load_thread(id)?.workspace) {
+            return Ok(());
+        }
         let _guard = self.worktree_lock.lock().await;
         let mut thread = self.load_thread(id)?;
         let (requested, again) = match thread.workspace.clone() {
@@ -630,6 +635,9 @@ impl Core {
     /// Run [`Self::delete_expired_archived`] now, every hour, and whenever
     /// the config is reloaded; [`Self::check_all_landed`] now and hourly. Ends when the core is dropped (or abort it).
     pub fn spawn_archive_cleanup(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        // Worktrees removed just before the daemon last stopped.
+        let worktrees_dir = self.opts().worktrees_dir.clone();
+        tokio::task::spawn_blocking(move || wt::sweep_aside(&worktrees_dir));
         let core = Arc::downgrade(self);
         let mut changes = self.config_changes();
         tokio::spawn(async move {
@@ -656,6 +664,15 @@ impl Core {
 
 /// Whether two paths name the same folder (following symlinks when they
 /// exist, e.g. /tmp vs /private/tmp).
+/// Whether a thread's next message must first make it a worktree: a new
+/// one, or again after a cleanup.
+fn needs_workspace(workspace: &ThreadWorkspace) -> bool {
+    matches!(
+        workspace,
+        ThreadWorkspace::NewWorktree { .. } | ThreadWorkspace::Released { .. }
+    )
+}
+
 fn same_dir(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)

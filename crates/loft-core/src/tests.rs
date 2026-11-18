@@ -94,6 +94,29 @@ fn turn_done(_: &Thread, turns: &[loft_protocol::Turn]) -> bool {
     turns.last().is_some_and(|t| t.status.is_terminal())
 }
 
+/// A worktree being made or removed for another thread (a cleanup removing
+/// gigabytes of build output took half a minute) never holds up a message
+/// to a thread that has no worktree to set up.
+#[tokio::test]
+async fn a_message_never_waits_on_another_threads_worktree() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let held = f.core.worktree_lock.lock().await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        f.core.handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "hello".into(),
+            attachments: vec![],
+        }),
+    )
+    .await
+    .expect("the message waited for another thread's worktree")
+    .unwrap();
+    wait_for(&f.core, &thread.id, turn_done).await;
+    drop(held);
+}
+
 #[tokio::test]
 async fn message_streams_and_completes() {
     let f = fixture();
