@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod fake;
+pub mod ios;
 
 pub use backend::{Backend, BoxFut, Picture, Screen};
 
@@ -32,8 +33,23 @@ const DRIVEN_EVERY: Duration = Duration::from_secs(1);
 type Result<T> = std::result::Result<T, ErrorBody>;
 
 /// The backends a real daemon uses on this computer.
-pub fn system_backends(_env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
-    Vec::new()
+pub fn system_backends(env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
+    #[allow(unused_mut)]
+    let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
+    // iOS simulators: their screens come through a helper process, the
+    // daemon's own executable (`agentloftd simulator`).
+    // `AGENTLOFT_SIMULATOR_SET`: another device set than the user's
+    // simulators (for trying a scratch daemon without touching them).
+    #[cfg(target_os = "macos")]
+    if let Ok(exe) = std::env::current_exe() {
+        let mut ios = ios::IosBackend::new(ios::Helper::agentloftd(exe), env.clone());
+        if let Some(set) = std::env::var_os("AGENTLOFT_SIMULATOR_SET").filter(|s| !s.is_empty()) {
+            ios = ios.with_device_set(set.into());
+        }
+        backends.push(Arc::new(ios));
+    }
+    let _ = env;
+    backends
 }
 
 pub struct Devices {

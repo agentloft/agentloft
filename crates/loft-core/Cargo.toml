@@ -11,6 +11,8 @@ loft-protocol.workspace = true
 loft-view.workspace = true
 loft-page-script.workspace = true
 loft-page-exec.workspace = true
+# What the daemon says to its iOS simulator helper (devices/ios.rs).
+loft-sim.workspace = true
 url.workspace = true
 loft-store.workspace = true
 loft-harness.workspace = true

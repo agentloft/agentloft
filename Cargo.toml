@@ -28,6 +28,7 @@ loft-terminal = { path = "crates/loft-terminal" }
 loft-view = { path = "crates/loft-view" }
 loft-page-script = { path = "crates/loft-page-script" }
 loft-page-exec = { path = "crates/loft-page-exec" }
+loft-sim = { path = "crates/loft-sim" }
 # One build of each dependency whatever the cargo command (.config/hakari.toml).
 workspace-hack = { path = "crates/workspace-hack" }
 

@@ -4532,6 +4532,7 @@ dependencies = [
  "loft-page-exec",
  "loft-page-script",
  "loft-protocol",
+ "loft-sim",
  "loft-store",
  "loft-view",
  "portable-pty",
@@ -4668,6 +4669,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "loft-sim"
+version = "0.0.7"
+dependencies = [
+ "anyhow",
+ "block2 0.6.2",
+ "libc",
+ "loft-protocol",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "serde",
+ "serde_json",
+ "workspace-hack",
+]
+
+[[package]]
 name = "loft-store"
 version = "0.0.7"
 dependencies = [
@@ -4777,6 +4793,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "image",
  "libc",
  "loft-client",
  "loft-config",
@@ -4787,6 +4804,7 @@ dependencies = [
  "loft-harness-codex",
  "loft-page-script",
  "loft-protocol",
+ "loft-sim",
  "loft-store",
  "loft-view",
  "miniz_oxide 0.8.9",
