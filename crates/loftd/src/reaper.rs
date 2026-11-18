@@ -8,8 +8,13 @@ use std::time::Duration;
 
 pub(crate) fn reap_orphans(store: &Store) {
     let Ok(procs) = store.processes() else { return };
-    for (pid, kind) in procs {
-        if owned_by_live_daemon(pid) {
+    for (pid, kind, recorded_ms) in procs {
+        if started_after(pid, recorded_ms) {
+            // Not the process recorded (it was running when recorded): the
+            // pid went to another program since, maybe the user's own
+            // `claude` in a terminal.
+            tracing::info!(pid, %kind, "recorded pid is another process now; leaving it");
+        } else if owned_by_live_daemon(pid) {
             // Another daemon's (a second home on a copy of this database,
             // say): its agents are alive and well, not ours to end.
             tracing::info!(pid, %kind, "recorded agent belongs to a live daemon; leaving it");
@@ -23,6 +28,40 @@ pub(crate) fn reap_orphans(store: &Store) {
         }
         let _ = store.forget_process(pid);
     }
+}
+
+/// Whether `pid`'s process started after `recorded_ms` (with a few
+/// seconds' slack for `ps`'s whole seconds): then it isn't the one that
+/// was recorded, which was already running.
+fn started_after(pid: u32, recorded_ms: i64) -> bool {
+    let Some(elapsed) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "etime="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| elapsed_secs(String::from_utf8_lossy(&o.stdout).trim()))
+    else {
+        return false;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let started_ms = now_ms - elapsed * 1000;
+    started_ms > recorded_ms + 5_000
+}
+
+/// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`, in seconds.
+fn elapsed_secs(text: &str) -> Option<i64> {
+    let (days, rest) = match text.split_once('-') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, text),
+    };
+    let mut secs = 0;
+    for part in rest.split(':') {
+        secs = secs * 60 + part.parse::<i64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
 }
 
 /// Whether `pid`'s parent is a running agentloftd. A real orphan's daemon
@@ -76,6 +115,21 @@ mod tests {
         // A recorded pid now used by a different program must survive.
         let me = std::process::id();
         store.record_process(me, "claude", None).unwrap();
+        // So must one of the same kind started after the record (the
+        // user's own agent, which got the pid of one that is gone).
+        let mut reused = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let an_hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 3_600_000;
+        store
+            .record_process_at(reused.id(), "sleep", an_hour_ago)
+            .unwrap();
 
         reap_orphans(&store);
 
@@ -88,6 +142,16 @@ mod tests {
         });
         assert!(status.is_some(), "orphan was reaped");
         assert!(process_matches(me, ""), "the reused pid (us) is alive");
+        assert!(
+            reused.try_wait().unwrap().is_none(),
+            "a later process of the same kind is alive"
+        );
+        let _ = reused.kill();
+        assert_eq!(elapsed_secs("01:02"), Some(62));
+        assert_eq!(
+            elapsed_secs("2-03:04:05"),
+            Some(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)
+        );
         assert!(store.processes().unwrap().is_empty(), "records cleared");
     }
 

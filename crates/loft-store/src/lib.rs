@@ -198,6 +198,17 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::record_process`] as of `at_ms` (tests: a record older than
+    /// the process now holding its pid).
+    #[doc(hidden)]
+    pub fn record_process_at(&self, pid: u32, kind: &str, at_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO processes(pid, started_at_ms, kind, thread_id) VALUES (?1, ?2, ?3, NULL)",
+            params![pid, at_ms, kind],
+        )?;
+        Ok(())
+    }
+
     pub fn forget_process(&self, pid: u32) -> Result<()> {
         self.conn
             .execute("DELETE FROM processes WHERE pid = ?1", params![pid])?;
@@ -237,9 +248,18 @@ impl Store {
         Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
     }
 
-    pub fn processes(&self) -> Result<Vec<(u32, String)>> {
-        let mut stmt = self.conn.prepare("SELECT pid, kind FROM processes")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
+    /// Recorded agent processes: pid, kind, and when each was recorded.
+    pub fn processes(&self) -> Result<Vec<(u32, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pid, kind, started_at_ms FROM processes")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
