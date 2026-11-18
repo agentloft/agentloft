@@ -7,9 +7,11 @@
 //!   with Google there and approves (both sides show the same code). The
 //!   daemon, polling, then gets this computer's id and its own key, kept in
 //!   `<home>/web/website.json` (0600).
-//! - **Reporting**: while linked, the daemon tells the website its name and
-//!   the address browsers open it at, and whether that
-//!   address is public (Cloudflare Tunnel), on every change and every five minutes.
+//! - **Reporting**: while linked, the daemon tells the website the address
+//!   browsers open it at, and whether that address is public (Cloudflare
+//!   Tunnel), on every change and every five minutes. Not its name: the
+//!   website keeps the one it was linked with (its owner may rename it
+//!   there), and nothing here reads a name back.
 //!   Agentloft's traffic never goes through the website.
 //! - **Framing**: the website shows a public computer in a frame, so the
 //!   browser's address stays the website's. Only the linked website's
@@ -597,14 +599,12 @@ impl Website {
         if !due {
             return;
         }
-        let name = tokio::task::spawn_blocking(computer_name)
-            .await
-            .unwrap_or_else(|_| "A computer".into());
         let bearer = format!("{}.{}", linked.machine_id, linked.secret);
+        // No name: the website keeps the one approved at linking, and only
+        // its owner renames it there.
         let reply = post_async(
             format!("{}/api/machine/report", linked.website),
             serde_json::json!({
-                "name": name,
                 "url": at.as_ref().map(|a| a.url.as_str()),
                 "public": at.as_ref().is_some_and(|a| a.public),
                 "platform": std::env::consts::OS,

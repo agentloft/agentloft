@@ -1874,6 +1874,8 @@ async fn linking_to_the_website_reporting_and_unlinking() {
         "no address to give while local only"
     );
     assert_eq!(report["public"], false);
+    // The name is the one linked with; only its owner renames it there.
+    assert!(report.get("name").is_none(), "{report}");
     let saved = fx.paths.web_dir().join("website.json");
     assert!(saved.exists());
 

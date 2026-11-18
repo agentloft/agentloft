@@ -17,6 +17,7 @@
 //   GET  /api/me, POST /api/logout
 //   GET  /api/machines                          your computers
 //   POST /api/machines/:id/open                 → { url, name, framed } with a ticket
+//   POST /api/machines/:id/rename { name }      (only here: reports don't rename)
 //   POST /api/machines/:id/remove
 //   POST /api/link/info|approve|deny { key }    the page a computer opened
 //   POST /api/link/start, /api/link/poll        a computer linking (no cookie)
@@ -50,6 +51,8 @@ const LINKS_PER_HOUR = 20;
  *  every five minutes). */
 const ONLINE_MS = 12 * 60 * 1000;
 const MAX_BODY = 4096;
+/** A computer's name, in characters. */
+const MAX_NAME = 80;
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -145,10 +148,12 @@ async function route(request, env) {
   if (path === "/api/logout" && POST) return logout(request, env);
   if (path === "/api/account/delete" && POST) return deleteAccount(request, env);
   if (path === "/api/machines" && GET) return listMachines(request, env);
-  const machine = /^\/api\/machines\/([A-Za-z0-9_-]{1,64})\/(open|remove)$/.exec(path);
+  const machine = /^\/api\/machines\/([A-Za-z0-9_-]{1,64})\/(open|rename|remove)$/.exec(path);
   if (machine && POST) {
     const [, id, action] = machine;
-    return action === "open" ? openMachine(request, env, id) : removeMachine(request, env, id);
+    if (action === "open") return openMachine(request, env, id);
+    if (action === "rename") return renameMachine(request, env, id);
+    return removeMachine(request, env, id);
   }
   const link = /^\/api\/link\/(info|approve|deny)$/.exec(path);
   if (link && POST) return linkDecide(request, env, link[1]);
@@ -497,6 +502,20 @@ async function openMachine(request, env, id) {
   return json({ url: `${row.url}/#ticket=${ticket}`, name: row.name, framed: framed(row) });
 }
 
+/** A computer's name in the list, as its owner sets it (a computer's
+ *  reports never change it). */
+async function renameMachine(request, env, id) {
+  const user = await signedIn(request, env);
+  const input = await body(request);
+  const name = clean(input.name, MAX_NAME);
+  if (!name) throw fail(400, "name");
+  await ownMachine(env, user, id);
+  await env.DB.prepare("UPDATE machines SET name = ?1 WHERE id = ?2 AND user_id = ?3")
+    .bind(name, id, user.id)
+    .run();
+  return json({ ok: true, name });
+}
+
 async function removeMachine(request, env, id) {
   const user = await signedIn(request, env);
   await env.DB.prepare("DELETE FROM machines WHERE id = ?1 AND user_id = ?2").bind(id, user.id).run();
@@ -527,7 +546,7 @@ async function linkStart(request, env, url) {
       await sha256(deviceCode),
       await sha256(key),
       code,
-      clean(input.name, 80, "A computer"),
+      clean(input.name, MAX_NAME, "A computer"),
       clean(input.platform, 40),
       ip,
       now,
@@ -636,13 +655,15 @@ async function machineReport(request, env) {
   const input = await body(request);
   const url = input.url == null ? null : cleanOrigin(input.url);
   if (input.url != null && !url) throw fail(400, "bad_url");
+  // Not its name: that is the one approved when it was linked, and only
+  // its owner changes it here (renameMachine). A computer renaming itself
+  // could pass for another in its owner's list.
   await env.DB.prepare(
-    `UPDATE machines SET name = ?2, platform = ?3, version = ?4, url = ?5, last_seen_ms = ?6,
-     public = ?7 WHERE id = ?1`,
+    `UPDATE machines SET platform = ?2, version = ?3, url = ?4, last_seen_ms = ?5,
+     public = ?6 WHERE id = ?1`,
   )
     .bind(
       machine.id,
-      clean(input.name, 80, machine.name),
       clean(input.platform, 40, machine.platform),
       clean(input.version, 60, machine.version),
       url,

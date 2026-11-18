@@ -108,6 +108,17 @@ async function open(machine, button) {
   }
 }
 
+/** A computer keeps the name it was linked with; only this renames it. */
+async function rename(machine) {
+  const name = prompt(`New name for ${machine.name}:`, machine.name);
+  if (name === null || !name.trim() || name.trim() === machine.name) return;
+  $("machines-error").textContent = "";
+  const { ok, status } = await api(`/api/machines/${machine.id}/rename`, { body: { name } });
+  if (status === 401) return signIn("/app");
+  if (!ok) $("machines-error").textContent = "Couldn't rename it. Try again.";
+  await loadMachines();
+}
+
 async function remove(machine) {
   if (!confirm(`Remove ${machine.name} from your account? Link it again from its Settings to bring it back.`)) {
     return;
@@ -146,6 +157,7 @@ function machineRow(machine) {
       "div",
       { class: "actions" },
       openButton,
+      el("button", { type: "button", class: "ghost", onclick: () => rename(machine) }, "Rename"),
       el("button", { type: "button", class: "ghost", onclick: () => remove(machine) }, "Remove"),
     ),
   );
