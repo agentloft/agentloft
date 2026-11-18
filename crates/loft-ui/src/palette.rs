@@ -5,8 +5,8 @@ use crate::panel::Tab;
 use crate::workspace::QuoteSelection;
 use crate::workspace::{
     AddProject, ConnectToComputer, Interrupt, NewChat, NewTab, NewThread, NewWindow, OpenSettings,
-    ShowBrowser, ShowChanges, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar, ToggleTerminal,
-    ToggleTheme, WorkspaceView, harness_name,
+    ShowBrowser, ShowChanges, ShowDevice, ShowFiles, ShowTerminal, TogglePanel, ToggleSidebar,
+    ToggleTerminal, ToggleTheme, WorkspaceView, harness_name,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
@@ -659,6 +659,15 @@ fn build(
             |v, _, cx| v.open_settings(cx),
         ),
     ];
+    // Simulators and emulators go where the browser may (ADR-0020).
+    if store.pages_allowed() {
+        app.push(entry(
+            "Show device (simulator or emulator)",
+            IconName::Smartphone,
+            Some(Box::new(ShowDevice)),
+            |v, w, cx| v.show_tab(Tab::Device, w, cx),
+        ));
+    }
     // Another computer's Agentloft opens in a window of the desktop app.
     if !crate::host::IS_WEB {
         app.insert(

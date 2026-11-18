@@ -1342,7 +1342,7 @@ fn button(button: MouseButton) -> PageButton {
     }
 }
 
-fn modifiers(m: &Modifiers) -> u8 {
+pub(crate) fn modifiers(m: &Modifiers) -> u8 {
     let mut bits = 0;
     if m.alt {
         bits |= page_modifiers::ALT;

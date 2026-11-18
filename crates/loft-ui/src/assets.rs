@@ -92,6 +92,8 @@ gpui_kit::assets::icon_assets!(
         RotateCwSquare,
         Expand,
         Smartphone,
+        Power,
+        Play,
         Tablet,
         Monitor,
         Maximize2,
