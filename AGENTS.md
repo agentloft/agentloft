@@ -104,6 +104,15 @@ Run the full suite once, in the background if your tool allows it, saving the ou
 - Claude Code's `--prompt-suggestions` (a `prompt_suggestion` line after each result) backs off account-wide while its guesses go unused (`promptSuggestionUnusedStreak` in `~/.claude.json`) and has other gates of its own; in testing (2.1.322) it rarely answered. Next-message suggestions are asked for by the core instead (`crates/loft-core/src/suggestions.rs`, through `Core::ask_once`).
 - Before building on a guess about AppKit, read it: `lldb -b -o 'target create <binary linking AppKit>' -o "disassemble -n '<method>'"`.
 
+## Security rules the code relies on (review of 2026-11-18)
+
+- Agentloft's MCP tools are allowed without asking in every permission mode, so they must never give an agent more than its thread's mode: a spawned thread or automation is capped at the caller's mode, and `ChangeSetting { from: Some(thread) }` lets an agent below full access change only what `agent_limits::harmless` lists (`crates/loft-core/src/agent_limits.rs`). A new agent-facing tool that starts something, changes what runs, or writes settings goes through the same checks.
+- A project's `[worktree] setup` runs outside any sandbox: it is asked about in the thread (approval card) until the user allowed that very command for the project (`<home>/setup-approved.json`). Full-access threads aren't asked.
+- Links from agents', repositories' or another computer's text go through `file_links::open_outside` (http, https, mailto only), never `cx.open_url` directly: `file:` and app schemes run programs.
+- Folders in the temporary directory go through `loft_config::private_temp_dir` (on Linux `/tmp` is shared, and another account could plant the folder or a symlink). Agent CLIs never run with a shared folder as their working directory: they read project settings (MCP servers, plugins) from it.
+- Document parsers run in the app (and in a browser tab): an allocation that fails aborts the whole app, which `catch_unwind` can't stop. Check sizes a file declares before handing it to a library that allocates by them (`sheets::check_xls`, `pdf::images_fit`).
+- On Linux, a URL passed to `cx.open_url` is on `xdg-open`'s command line, which every account can read: links with a secret go through `settings::web::open_secret_link`.
+
 ## How the maintainer likes work done
 
 - Small UI fixes: make the obvious change, get it in front of them within minutes, and say early what is slowing things down.

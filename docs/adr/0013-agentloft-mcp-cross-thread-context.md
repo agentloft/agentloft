@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-09
+- **Not built as written (security review, 2026-11-18):** there is no capability token or `cross_thread_scope`. The bridge names its thread with `--thread`, and `list_threads` / `read_thread` / `get_thread_diff` reach every project's threads (the tool says so). Whether to limit them to the project, as below, is still the product owner's call.
 
 ## Context
 The product owner wants agents to be able to **read other threads**. Typical requests:

@@ -124,7 +124,7 @@ The product owner asked for the address bar to stay at `agentloft.promptanddone.
 - **The website can mint tickets for every linked computer.** Whoever controls the Worker, its `SECRETS_KEY` and its database can sign in to any of them: from anywhere when the computer is public (§4), else from its local network. Unlink, or remove the computer on the website, to withdraw that trust.
 - **The website is a service to run.** It is small (one Worker, one D1 database, two secrets), but it is one.
 - **Google OAuth app in "Testing"** (as set up on 2026-11-15): only the listed test users can sign in. Publishing it needs a privacy-policy page and a homepage.
-- **Device-code phishing:** someone can send a link of their own computer and ask you to approve it. Their computer would then show in your list. Opening it gives them nothing of yours: the ticket is for their computer. The page names the computer and shows the code to compare.
+- **Device-code phishing:** someone can send a link of their own computer and ask you to approve it. Their computer would then show in your list. The ticket is for their computer, but opening it shows their page under the website's address (a fake sign-in or a copy of the app, and the clipboard permission the frame is given), and the ticket tells them your account's id and email. So a link approved from another network than the one it was started from shows a warning and needs it confirmed (security review, 2026-11-18). The page names the computer and shows the code to compare.
 - **Cloudflare is in the path** (§4): it sees the traffic, and its account is part of the lock.
 
 ## Alternatives considered
