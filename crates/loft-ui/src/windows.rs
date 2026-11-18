@@ -80,6 +80,9 @@ struct SavedWindow {
     /// computer's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<String>,
+    /// The device each thread's Device panel showed (ADR-0020).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    devices: Vec<(ThreadId, loft_protocol::DeviceId)>,
 }
 
 /// Remember each window's threads and panes for next time.
@@ -101,6 +104,11 @@ pub fn save_session(cx: &mut App) {
             panes: Vec::new(),
             layout: store.layout.clone(),
             remote: store.remote().map(str::to_owned),
+            devices: store
+                .device_choice
+                .iter()
+                .map(|(t, d)| (t.clone(), d.clone()))
+                .collect(),
         });
     }
     if let Ok(json) = serde_json::to_vec_pretty(&saved) {
@@ -130,8 +138,13 @@ pub fn restore(cx: &mut App) {
     }
     // Windows that were tabs of one group come back as panes of one window.
     #[allow(clippy::type_complexity)]
-    let mut windows: Vec<(usize, Option<ThreadId>, Vec<Vec<ThreadId>>, Option<String>)> =
-        Vec::new();
+    let mut windows: Vec<(
+        usize,
+        Option<ThreadId>,
+        Vec<Vec<ThreadId>>,
+        Option<String>,
+        Vec<(ThreadId, loft_protocol::DeviceId)>,
+    )> = Vec::new();
     for w in saved {
         let mut layout = w.layout;
         if layout.is_empty() {
@@ -141,7 +154,8 @@ pub fn restore(cx: &mut App) {
             layout.extend(w.thread.clone().map(|t| vec![t]));
         }
         match windows.iter_mut().find(|(g, ..)| *g == w.group) {
-            Some((_, _, existing, _)) => {
+            Some((_, _, existing, _, devices)) => {
+                devices.extend(w.devices);
                 for col in layout {
                     let col: Vec<ThreadId> = col
                         .into_iter()
@@ -152,10 +166,10 @@ pub fn restore(cx: &mut App) {
                     }
                 }
             }
-            None => windows.push((w.group, w.thread, layout, w.remote)),
+            None => windows.push((w.group, w.thread, layout, w.remote, w.devices)),
         }
     }
-    for (_, thread, layout, remote) in windows {
+    for (_, thread, layout, remote, devices) in windows {
         if let Some(handle) = open_on(thread.clone(), remote, cx)
             && let Some(env) = cx.try_global::<AppEnv>()
             && let Some(store) = env
@@ -169,6 +183,7 @@ pub fn restore(cx: &mut App) {
                     s.ensure_thread(id, cx);
                 }
                 s.layout = layout;
+                s.device_choice.extend(devices);
                 if let Some(t) = &thread
                     && s.pane_at(t).is_none()
                 {

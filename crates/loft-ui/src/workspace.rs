@@ -46,6 +46,7 @@ actions!(
         ShowTerminal,
         ToggleTerminal,
         ShowBrowser,
+        ShowDevice,
         NewWindow,
         NewTab,
         OpenPalette,
@@ -114,6 +115,7 @@ pub fn app_menus() -> Vec<gpui_kit::Menu> {
             MenuItem::action("Terminal", ToggleTerminal),
             MenuItem::action("Terminal in Side Panel", ShowTerminal),
             MenuItem::action("Browser", ShowBrowser),
+            MenuItem::action("Device", ShowDevice),
             MenuItem::separator(),
             MenuItem::action("Command Palette…", OpenPalette),
             MenuItem::action("Search Threads", FocusSearch),
@@ -220,6 +222,10 @@ pub struct WorkspaceView {
     sidebar_width: f32,
     pub panel: Entity<WorkbenchPanel>,
     pub(crate) panel_open: bool,
+    /// When an agent last used each device for a thread (`DeviceDriven`):
+    /// the Device panel opens for the first use in a while, not again
+    /// every second after the person closed it.
+    device_driven: HashMap<(ThreadId, loft_protocol::DeviceId), web_time::Instant>,
     /// Terminals docked under the conversation (Ctrl+`).
     dock: Entity<crate::panel::dock::TerminalDock>,
     pub(crate) dock_open: bool,
@@ -385,6 +391,7 @@ impl WorkspaceView {
             sidebar_width: SIDEBAR_WIDTH,
             panel,
             panel_open: false,
+            device_driven: HashMap::new(),
             dock,
             dock_open: false,
             dock_slide: Slide::default(),
@@ -564,6 +571,9 @@ impl WorkspaceView {
             StoreEvent::PageDriven { thread_id, page } => {
                 self.page_driven(thread_id, page, window, cx)
             }
+            StoreEvent::DeviceDriven { thread_id, device } => {
+                self.device_driven(thread_id, device, window, cx)
+            }
             StoreEvent::PageTabs { thread_id, pages } => {
                 let (t, pages) = (thread_id.clone(), pages.clone());
                 self.panel
@@ -624,6 +634,14 @@ impl WorkspaceView {
             Some(("do", script)) => {
                 self.panel_open = false;
                 self.dev_script(script, thread, window, cx);
+            }
+            // `device:<id>`: the Device panel on that device, started if
+            // it is stopped (`ios:<udid>`, `android:<avd>`).
+            Some(("device", id)) => {
+                let id = loft_protocol::DeviceId(id.to_owned());
+                let t = thread_id.clone();
+                self.panel
+                    .update(cx, |p, cx| p.show_device(&t, Some(id), true, window, cx));
             }
             Some(("type", text)) => {
                 let composer = self.composer_for(thread, window, cx);
@@ -1419,6 +1437,9 @@ impl WorkspaceView {
                 "browser" => self
                     .panel
                     .update(cx, |p, cx| p.show(Tab::Browser, window, cx)),
+                "device" => self
+                    .panel
+                    .update(cx, |p, cx| p.show(Tab::Device, window, cx)),
                 // Another browser tab, as the panel's + menu opens one.
                 "browsertab" => {
                     self.panel_open = true;
@@ -1810,6 +1831,45 @@ impl WorkspaceView {
             view.update(cx, |b, cx| b.watch(cx));
             self.browser_preview_page = Some(page.id);
         }
+        cx.notify();
+    }
+
+    /// An agent uses a simulator or emulator for a thread: with the thread
+    /// open here and no Device panel showing, show that device. Only for
+    /// the first use in a while: closed meanwhile, it stays closed.
+    fn device_driven(
+        &mut self,
+        thread_id: &ThreadId,
+        device: &loft_protocol::DeviceInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+        let now = web_time::Instant::now();
+        let key = (thread_id.clone(), device.id.clone());
+        let before = self.device_driven.insert(key, now);
+        if self.store.read(cx).selected.as_ref() != Some(thread_id) {
+            return;
+        }
+        let showing = self.panel_open && self.panel.read(cx).active_tab(cx) == Some(Tab::Device);
+        let view = self.panel.read(cx).existing_device(thread_id);
+        if showing {
+            // Showing the list: show the device the agent uses.
+            if let Some(view) = view
+                && view.read(cx).chosen().is_none()
+            {
+                let id = device.id.clone();
+                view.update(cx, |v, cx| v.choose(Some(id), false, cx));
+            }
+            return;
+        }
+        if before.is_some_and(|at| now.duration_since(at) < AGAIN_AFTER) {
+            return;
+        }
+        self.panel_open = true;
+        let (t, id) = (thread_id.clone(), device.id.clone());
+        self.panel
+            .update(cx, |p, cx| p.show_device(&t, Some(id), false, window, cx));
         cx.notify();
     }
 
@@ -6448,6 +6508,7 @@ impl Render for WorkspaceView {
             .on_action(
                 cx.listener(|this, _: &ShowBrowser, w, cx| this.show_tab(Tab::Browser, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &ShowDevice, w, cx| this.show_tab(Tab::Device, w, cx)))
             .map(|d| match on_screen(window) {
                 // A phone's keyboard covers the page's lower part (the
                 // browser shrinks only what is visible): keep the window

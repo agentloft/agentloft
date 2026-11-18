@@ -168,6 +168,11 @@ pub enum StoreEvent {
         thread_id: ThreadId,
         page: Box<loft_protocol::PageInfo>,
     },
+    /// An agent is using a simulator or emulator for `thread_id`.
+    DeviceDriven {
+        thread_id: ThreadId,
+        device: Box<loft_protocol::DeviceInfo>,
+    },
     /// `thread_id`'s browser tabs are these now (oldest first).
     PageTabs {
         thread_id: ThreadId,
@@ -326,9 +331,23 @@ pub struct AppStore {
     /// Pages of the daemon's browser being shown, and their subscriptions.
     pages: HashMap<loft_protocol::PageId, WeakEntity<crate::panel::page::PageView>>,
     page_subs: HashMap<u64, loft_protocol::PageId>,
+    /// Device panels watching the list of simulators and emulators or one
+    /// of them (ADR-0020), and their subscriptions (none while away).
+    device_watch: Vec<DeviceWatch>,
+    /// The device each thread's Device panel showed last in this window
+    /// (kept in the session, so a restart shows it again).
+    pub device_choice: HashMap<ThreadId, loft_protocol::DeviceId>,
     /// Daemon pid of the current connection: a new pid means the daemon
     /// restarted and its PTYs are gone.
     daemon_pid: Option<u32>,
+}
+
+/// A Device panel watching a device topic, and the subscription that
+/// carries it.
+struct DeviceWatch {
+    topic: Topic,
+    view: WeakEntity<crate::panel::device::DeviceView>,
+    sub: Option<u64>,
 }
 
 /// Where things are on the SSH host a window shows.
@@ -397,6 +416,8 @@ impl AppStore {
             terminal_subs: HashMap::new(),
             pages: HashMap::new(),
             page_subs: HashMap::new(),
+            device_watch: Vec::new(),
+            device_choice: HashMap::new(),
             daemon_pid: None,
         };
         this.reload_agent_prefs(cx);
@@ -561,6 +582,13 @@ impl AppStore {
                 // lives on in the daemon, and a later connection that may
                 // use it picks it up again here.
                 self.pages.insert(id, view);
+            }
+        }
+        // Devices outlive their viewers' connections: watch them again.
+        self.device_watch.retain(|w| w.view.upgrade().is_some());
+        if let Some(client) = &self.client {
+            for watch in &mut self.device_watch {
+                watch.sub = pages_allowed.then(|| client.subscribe(watch.topic.clone()));
             }
         }
         let allowed = self.terminals_allowed();
@@ -835,6 +863,39 @@ impl AppStore {
         }
     }
 
+    /// Watch a device topic (the list, or one device) for a Device panel.
+    pub fn watch_device(
+        &mut self,
+        topic: Topic,
+        view: WeakEntity<crate::panel::device::DeviceView>,
+    ) {
+        let sub = self
+            .client
+            .as_ref()
+            .filter(|_| self.pages_allowed())
+            .map(|client| client.subscribe(topic.clone()));
+        self.device_watch.push(DeviceWatch { topic, view, sub });
+    }
+
+    /// Stop watching what `view` watches that `which` picks.
+    pub fn unwatch_device(&mut self, view: gpui_kit::EntityId, which: impl Fn(&Topic) -> bool) {
+        let client = self.client.clone();
+        self.device_watch.retain(|w| {
+            let gone = w.view.entity_id() == view && which(&w.topic);
+            if gone && let (Some(client), Some(sub)) = (&client, w.sub) {
+                client.unsubscribe(sub);
+            }
+            !gone
+        });
+    }
+
+    fn device_view(&self, sub_id: u64) -> Option<WeakEntity<crate::panel::device::DeviceView>> {
+        self.device_watch
+            .iter()
+            .find(|w| w.sub == Some(sub_id))
+            .map(|w| w.view.clone())
+    }
+
     fn page_view(&self, sub_id: u64) -> Option<WeakEntity<crate::panel::page::PageView>> {
         self.pages.get(self.page_subs.get(&sub_id)?).cloned()
     }
@@ -871,6 +932,9 @@ impl AppStore {
 
     fn on_disconnected(&mut self, cx: &mut Context<Self>) {
         self.client = None;
+        for watch in &mut self.device_watch {
+            watch.sub = None;
+        }
         self.ws_ready = false;
         crate::host::set_client(None);
         #[cfg(not(target_arch = "wasm32"))]
@@ -902,6 +966,26 @@ impl AppStore {
                     if let Some(pane) = self.terminal_pane(sub_id) {
                         let _ =
                             pane.update(cx, |p, cx| p.on_replay(&replay.0, terminal.exited, cx));
+                    }
+                } else if let Snapshot::Devices { devices, support } = snapshot {
+                    if let Some(view) = self.device_view(sub_id) {
+                        let _ = view.update(cx, |v, cx| v.on_list(devices, support, cx));
+                    }
+                } else if let Snapshot::Device { device, frame, .. } = snapshot {
+                    match self.device_view(sub_id) {
+                        Some(view) => {
+                            let _ = view.update(cx, |v, cx| {
+                                v.on_state(device, cx);
+                                if let Some(frame) = frame {
+                                    v.on_frame(sub_id, frame.seq, frame.jpeg.0, cx);
+                                }
+                            });
+                        }
+                        None => {
+                            if let (Some(client), Some(frame)) = (&self.client, frame) {
+                                client.ack_page_frame(sub_id, frame.seq);
+                            }
+                        }
                     }
                 } else if let Snapshot::Page { page, frame, .. } = snapshot {
                     if let Some(view) = self.page_view(sub_id) {
@@ -1048,11 +1132,41 @@ impl AppStore {
             ClientEvent::PageTabs { thread_id, pages } => {
                 cx.emit(StoreEvent::PageTabs { thread_id, pages });
             }
-            // Not shown yet: the device panel (ADR-0020) takes these.
-            ClientEvent::DeviceFrame { .. }
-            | ClientEvent::DeviceState { .. }
-            | ClientEvent::DeviceList { .. }
-            | ClientEvent::DeviceDriven { .. } => {}
+            // Simulators and emulators (ADR-0020), for Device panels.
+            ClientEvent::DeviceFrame {
+                sub_id, seq, jpeg, ..
+            } => match self.device_view(sub_id) {
+                Some(view) => {
+                    let _ = view.update(cx, |v, cx| v.on_frame(sub_id, seq, jpeg, cx));
+                }
+                // Nobody to show it to: don't hold the stream up.
+                None => {
+                    if let Some(client) = &self.client {
+                        client.ack_page_frame(sub_id, seq);
+                    }
+                }
+            },
+            ClientEvent::DeviceState { sub_id, device } => {
+                if let Some(view) = self.device_view(sub_id) {
+                    let _ = view.update(cx, |v, cx| v.on_state(device, cx));
+                }
+            }
+            ClientEvent::DeviceList {
+                sub_id,
+                devices,
+                support,
+            } => {
+                if let Some(view) = self.device_view(sub_id) {
+                    let _ = view.update(cx, |v, cx| v.on_list(devices, support, cx));
+                }
+            }
+            // An agent is using a device for a thread: its window shows it.
+            ClientEvent::DeviceDriven { thread_id, device } => {
+                cx.emit(StoreEvent::DeviceDriven {
+                    thread_id,
+                    device: Box::new(device),
+                });
+            }
             ClientEvent::Fatal(err) => self.fail(err.message, cx),
             ClientEvent::Disconnected => self.on_disconnected(cx),
         }

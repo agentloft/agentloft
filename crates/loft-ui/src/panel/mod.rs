@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod changes;
+pub mod device;
 pub mod dock;
 pub mod docs;
 pub mod files;
@@ -40,6 +41,8 @@ pub enum Tab {
     Changes,
     Terminal,
     Browser,
+    /// An iOS simulator or Android emulator (ADR-0020).
+    Device,
     File(String),
     Agent(ItemId),
 }
@@ -56,6 +59,10 @@ enum Open {
     /// the web client and the thread's agent see.
     Page {
         view: Entity<page::PageView>,
+    },
+    /// A simulator or emulator on the daemon's computer, streamed.
+    Device {
+        view: Entity<device::DeviceView>,
     },
     File {
         path: String,
@@ -74,6 +81,7 @@ impl Open {
             Open::Changes => Tab::Changes,
             Open::Terminal { .. } => Tab::Terminal,
             Open::Page { .. } => Tab::Browser,
+            Open::Device { .. } => Tab::Device,
             Open::File { path, .. } => Tab::File(path.clone()),
             Open::Agent { id, .. } => Tab::Agent(id.clone()),
         }
@@ -212,6 +220,7 @@ impl WorkbenchPanel {
                 match tab {
                     Open::Terminal { pane, .. } => pane.update(cx, |p, cx| p.close(cx)),
                     Open::Page { view } => view.update(cx, |v, cx| v.close(cx)),
+                    Open::Device { view } => view.update(cx, |v, cx| v.close(cx)),
                     _ => {}
                 }
             }
@@ -278,6 +287,12 @@ impl WorkbenchPanel {
             );
             // Its browser tabs live in the daemon: show the ones it has.
             self.fetch_tabs(thread_id, window, cx);
+            // The device it showed last time, behind the tab showing.
+            if self.store.read(cx).device_choice.contains_key(thread_id)
+                && self.store.read(cx).pages_allowed()
+            {
+                self.device_tab(thread_id, false, cx);
+            }
         }
         self.threads.get_mut(thread_id).expect("inserted above")
     }
@@ -698,6 +713,85 @@ impl WorkbenchPanel {
         .detach();
     }
 
+    // -- devices ---------------------------------------------------------------
+
+    /// `thread_id`'s Device tab, added (shown if `activate`) if it has none.
+    fn device_tab(
+        &mut self,
+        thread_id: &ThreadId,
+        activate: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<device::DeviceView>> {
+        let panel = self.threads.get_mut(thread_id)?;
+        let at = panel
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Open::Device { .. }));
+        let ix = match at {
+            Some(ix) => ix,
+            None => {
+                let store = self.store.clone();
+                let view = cx.new(|cx| device::DeviceView::new(store, thread_id.clone(), cx));
+                let id = thread_id.clone();
+                let subs = [
+                    // Its device's name and state show on the tab.
+                    cx.observe(&view, |_, _, cx| cx.notify()),
+                    cx.subscribe(&view, move |_, _, event: &device::DeviceEvent, cx| {
+                        let device::DeviceEvent::Screenshot(png) = event;
+                        cx.emit(PanelEvent::Screenshot(id.clone(), png.clone()));
+                    }),
+                ];
+                panel._subs.extend(subs);
+                panel.tabs.push(Open::Device { view });
+                panel.tabs.len() - 1
+            }
+        };
+        if activate || panel.tabs.len() == 1 {
+            panel.active = ix;
+        }
+        cx.notify();
+        match &panel.tabs[ix] {
+            Open::Device { view } => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// Show `thread_id`'s Device tab, on device `id` if given (started if
+    /// `boot` and it is stopped).
+    pub fn show_device(
+        &mut self,
+        thread_id: &ThreadId,
+        id: Option<loft_protocol::DeviceId>,
+        boot: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.store.read(cx).pages_allowed() {
+            return;
+        }
+        if self.ensure_id(thread_id, window, cx).is_none() {
+            return;
+        }
+        let Some(view) = self.device_tab(thread_id, true, cx) else {
+            return;
+        };
+        if let Some(id) = id {
+            view.update(cx, |v, cx| v.choose(Some(id), boot, cx));
+        }
+    }
+
+    /// `thread_id`'s Device tab, if it has one.
+    pub fn existing_device(&self, thread_id: &ThreadId) -> Option<Entity<device::DeviceView>> {
+        self.threads
+            .get(thread_id)?
+            .tabs
+            .iter()
+            .find_map(|t| match t {
+                Open::Device { view } => Some(view.clone()),
+                _ => None,
+            })
+    }
+
     // -- terminals -------------------------------------------------------------
 
     /// A new shell for `thread_id`, in the side panel or the dock. The
@@ -881,6 +975,9 @@ impl WorkbenchPanel {
                 // (or one already open elsewhere) shows where it is.
                 view.update(cx, |v, _| v.focus_address_if_blank());
             }
+            Tab::Device => {
+                self.show_device(thread_id, None, false, window, cx);
+            }
             Tab::File(path) => self.open_file(thread_id, path, window, cx),
             Tab::Agent(id) => self.open_agent(thread_id, id, window, cx),
         }
@@ -927,6 +1024,16 @@ impl WorkbenchPanel {
         if let Open::Page { view } = &tab {
             view.update(cx, |v, cx| v.close(cx));
         }
+        // Closing the panel leaves the device running; nor is it shown
+        // again next time.
+        if let Open::Device { view } = &tab {
+            view.update(cx, |v, cx| v.close(cx));
+            self.store
+                .update(cx, |s, _| s.device_choice.remove(thread_id));
+        }
+        let Some(panel) = self.threads.get_mut(thread_id) else {
+            return;
+        };
         if panel.active > ix || panel.active >= panel.tabs.len() {
             panel.active = panel.active.saturating_sub(1);
         }
@@ -1126,12 +1233,15 @@ impl WorkbenchPanel {
             })
             .shortcut(key)
         };
-        let entries = vec![
+        let mut entries = vec![
             item("Browser", IconName::Globe, 'b', Tab::Browser),
             item("Terminal", IconName::SquareTerminal, 't', Tab::Terminal),
             item("Files", IconName::FolderTree, 'f', Tab::Files),
             item("Changes", IconName::GitCompare, 'd', Tab::Changes),
         ];
+        if self.store.read(cx).pages_allowed() {
+            entries.insert(1, item("Device", IconName::Smartphone, 'p', Tab::Device));
+        }
         menu::open(window, at, entries, cx);
     }
 }
@@ -1203,6 +1313,18 @@ fn tab_face(tab: &Open, p: &Palette, cx: &gpui_kit::App) -> (AnyElement, String)
                 icon(IconName::Globe)
             };
             (face, title)
+        }
+        Open::Device { view } => {
+            let v = view.read(cx);
+            let face = if v.is_busy() {
+                Spinner::new()
+                    .xsmall()
+                    .color(p.muted_foreground)
+                    .into_any_element()
+            } else {
+                icon(IconName::Smartphone)
+            };
+            (face, v.title())
         }
         Open::File { path, .. } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_owned();
@@ -1398,9 +1520,13 @@ impl Render for WorkbenchPanel {
             Some(Open::Changes) => panel.changes.clone().into_any_element(),
             Some(Open::Terminal { pane, .. }) => pane.clone().into_any_element(),
             Some(Open::Page { view }) => view.clone().into_any_element(),
+            Some(Open::Device { view }) => view.clone().into_any_element(),
             Some(Open::File { viewer, .. }) => viewer.clone().into_any_element(),
             Some(Open::Agent { view, .. }) => view.clone().into_any_element(),
-            None => empty_state(&thread_id, &p, cx),
+            None => {
+                let devices = self.store.read(cx).pages_allowed();
+                empty_state(&thread_id, devices, &p, cx)
+            }
         };
         v_flex()
             .size_full()
@@ -1412,14 +1538,23 @@ impl Render for WorkbenchPanel {
 }
 
 /// No tabs open: offer the kinds.
-fn empty_state(thread_id: &ThreadId, p: &Palette, cx: &mut Context<WorkbenchPanel>) -> AnyElement {
+fn empty_state(
+    thread_id: &ThreadId,
+    devices: bool,
+    p: &Palette,
+    cx: &mut Context<WorkbenchPanel>,
+) -> AnyElement {
     let mut list = v_flex().gap_1().w(px(240.));
     for (kind, icon, label, key) in [
         (Tab::Browser, IconName::Globe, "Browser", "B"),
+        (Tab::Device, IconName::Smartphone, "Device", "P"),
         (Tab::Terminal, IconName::SquareTerminal, "Terminal", "T"),
         (Tab::Files, IconName::FolderTree, "Files", "F"),
         (Tab::Changes, IconName::GitCompare, "Changes", "D"),
-    ] {
+    ]
+    .into_iter()
+    .filter(|(kind, ..)| devices || *kind != Tab::Device)
+    {
         let id = thread_id.clone();
         list = list.child(
             h_flex()
