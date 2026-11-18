@@ -1522,6 +1522,8 @@ async fn worktree_setup_runs_before_the_first_prompt() {
         })
         .await
         .unwrap();
+        // The repository's own command: asked about first.
+        answer_setup(&core, &thread.id, DecisionKind::AllowOnce).await;
         wait_for(&core, &thread.id, turn_done).await;
         results.push(thread_snapshot(&core, &thread.id));
     }
@@ -1549,6 +1551,123 @@ async fn worktree_setup_runs_before_the_first_prompt() {
         })
         .collect();
     assert!(echoed.contains("setup command failed"), "{echoed}");
+}
+
+/// Wait for the worktree setup's request and answer it; returns the
+/// command it asked about.
+async fn answer_setup(core: &Arc<Core>, thread: &ThreadId, decision: DecisionKind) -> String {
+    wait_for(core, thread, |t, _| {
+        t.status == ThreadStatus::WaitingApproval
+    })
+    .await;
+    let (_, _, _, requests) = thread_snapshot(core, thread);
+    let request = requests
+        .iter()
+        .find(|r| r.status == RequestStatus::Open)
+        .unwrap();
+    assert!(request.title.starts_with("Worktree setup: "));
+    core.handle(Request::RespondRequest {
+        thread_id: thread.clone(),
+        request_id: request.id.clone(),
+        decision,
+        reply: None,
+    })
+    .await
+    .unwrap();
+    request.detail["input"]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A project's setup command comes from its own config (a cloned
+/// repository's, or one an agent edited): it runs only once the person
+/// allowed that very command, and is asked about again when it changes.
+#[tokio::test]
+async fn a_projects_setup_command_runs_only_once_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".agentloft")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    let set_setup = |cmd: &str| {
+        std::fs::write(
+            repo.join(".agentloft/config.toml"),
+            format!("[worktree]\nsetup = \"{cmd}\"\n"),
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "setup"]);
+    };
+    set_setup("echo one > ran.txt");
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(home.join("config.toml")),
+            flush_interval: Duration::from_millis(20),
+            worktrees_dir: dir.path().join("worktrees"),
+            ..Default::default()
+        },
+    );
+    let start = || async {
+        let thread = new_thread(&core, &repo).await;
+        core.handle(Request::SetThreadWorkspace {
+            thread_id: thread.id.clone(),
+            worktree: true,
+            base: None,
+        })
+        .await
+        .unwrap();
+        core.handle(Request::SendMessage {
+            thread_id: thread.id.clone(),
+            text: "go".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+        thread.id
+    };
+    let ran = |id: &ThreadId| {
+        let (thread, _, _, _) = thread_snapshot(&core, id);
+        PathBuf::from(thread.cwd).join("ran.txt").exists()
+    };
+
+    // Denied: the agent starts without it.
+    let first = start().await;
+    let asked = answer_setup(&core, &first, DecisionKind::Deny).await;
+    assert_eq!(asked, "echo one > ran.txt");
+    wait_for(&core, &first, turn_done).await;
+    assert!(!ran(&first));
+    let (_, turns, _, _) = thread_snapshot(&core, &first);
+    assert_eq!(turns[0].status, TurnStatus::Completed);
+
+    // Allowed: it runs, and runs again unasked.
+    let second = start().await;
+    answer_setup(&core, &second, DecisionKind::AllowOnce).await;
+    wait_for(&core, &second, turn_done).await;
+    assert!(ran(&second));
+    let third = start().await;
+    wait_for(&core, &third, turn_done).await;
+    assert!(ran(&third));
+    let (_, _, _, requests) = thread_snapshot(&core, &third);
+    assert!(requests.is_empty(), "not asked again");
+
+    // Another command: asked again; stopping ends the turn.
+    set_setup("echo two > ran.txt");
+    let fourth = start().await;
+    assert_eq!(
+        answer_setup(&core, &fourth, DecisionKind::DenyAndStop).await,
+        "echo two > ran.txt"
+    );
+    wait_for(&core, &fourth, turn_done).await;
+    assert!(!ran(&fourth));
+    let (thread, turns, _, _) = thread_snapshot(&core, &fourth);
+    assert_eq!(turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(thread.status, ThreadStatus::Idle);
 }
 
 #[test]

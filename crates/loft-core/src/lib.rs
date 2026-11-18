@@ -254,6 +254,11 @@ pub struct Core {
     commands: Mutex<CommandCache>,
     /// Worktree setup commands to run before a thread's first prompt.
     pending_setup: Mutex<HashMap<ThreadId, String>>,
+    /// The worktree setup command the user allowed per project (by id),
+    /// kept in `<home>/setup-approved.json`: a project's own config names
+    /// it, so a cloned repository (or an agent editing that file) must not
+    /// get a command run outside any sandbox unasked.
+    setup_approved: Mutex<HashMap<String, String>>,
     /// For a thread whose worktree was just made again: a notice for the
     /// conversation and a note for the agent, with its next prompt.
     pending_notes: Mutex<HashMap<ThreadId, (String, String)>>,
@@ -323,6 +328,7 @@ impl Core {
             models_listed: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
+            setup_approved: Mutex::new(HashMap::new()),
             pending_notes: Mutex::new(HashMap::new()),
             file_index: Mutex::new(HashMap::new()),
             file_walk: tokio::sync::Mutex::new(()),
@@ -393,6 +399,40 @@ impl Core {
 
     pub(crate) fn take_pending_setup(&self, thread: &ThreadId) -> Option<String> {
         lock(&self.pending_setup).remove(thread)
+    }
+
+    fn setup_approvals_file(&self) -> Option<PathBuf> {
+        let home = self.opts().config_file.as_ref()?.parent()?;
+        Some(home.join("setup-approved.json"))
+    }
+
+    /// Whether the user allowed exactly `cmd` as `project`'s worktree setup.
+    pub(crate) fn setup_approved(&self, project: &ProjectId, cmd: &str) -> bool {
+        let mut approved = lock(&self.setup_approved);
+        if approved.is_empty()
+            && let Some(file) = self.setup_approvals_file()
+            && let Ok(text) = std::fs::read_to_string(file)
+            && let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&text)
+        {
+            *approved = saved;
+        }
+        approved.get(project.as_str()).is_some_and(|c| c == cmd)
+    }
+
+    /// Remember that the user allowed `cmd` as `project`'s setup (until the
+    /// project's config names another command).
+    pub(crate) fn approve_setup(&self, project: &ProjectId, cmd: &str) {
+        let mut approved = lock(&self.setup_approved);
+        approved.insert(project.as_str().to_owned(), cmd.to_owned());
+        if let Some(file) = self.setup_approvals_file()
+            && let Ok(json) = serde_json::to_vec_pretty(&*approved)
+        {
+            let tmp = file.with_extension("json.tmp");
+            if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file))
+            {
+                tracing::warn!(%err, "couldn't save the setup command's approval");
+            }
+        }
     }
 
     pub(crate) fn take_pending_note(&self, thread: &ThreadId) -> Option<(String, String)> {

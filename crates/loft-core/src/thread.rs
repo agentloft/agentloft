@@ -189,6 +189,7 @@ pub(crate) fn spawn(core: Arc<Core>, thread: Thread) -> ThreadHandle {
         items: HashMap::new(),
         subagents: HashMap::new(),
         requests: HashMap::new(),
+        setup_asked: None,
         handovers: 0,
         dirty: HashSet::new(),
     };
@@ -237,6 +238,9 @@ struct ThreadActor {
     subagents: HashMap<String, ItemId>,
     /// app request id → native request id.
     requests: HashMap<RequestId, String>,
+    /// The project's worktree setup command, asked about before it runs:
+    /// the request asking, and the command.
+    setup_asked: Option<(RequestId, String)>,
     /// Browser tabs the agent handed the person that they haven't finished
     /// with (`ThreadCmd::Handover`).
     handovers: usize,
@@ -328,6 +332,10 @@ impl ThreadActor {
             ThreadCmd::Interrupt { reply } if self.pending_start.is_some() => {
                 // The prompt never reached the agent; just end the turn.
                 self.pending_start = None;
+                if self.setup_asked.take().is_some() {
+                    let _ =
+                        self.resolve_request(Self::SETUP_REQUEST, Some(DecisionKind::DenyAndStop));
+                }
                 let res = self
                     .finish_turn(TurnStatus::Interrupted, None, None)
                     .map(|_| Response::Ok);
@@ -791,6 +799,7 @@ impl ThreadActor {
         // A new worktree's setup runs first, so the turn's checkpoint (and
         // diff) start after it.
         match self.core.take_pending_setup(&self.thread.id) {
+            Some(cmd) if self.setup_needs_asking(&cmd) => self.ask_setup(&turn, cmd)?,
             Some(cmd) => self.run_setup(&turn, cmd)?,
             None => self.capture_checkpoint(&turn, true),
         }
@@ -856,6 +865,96 @@ impl ThreadActor {
                 ErrorCode::Conflict,
                 "the agent session closed; the message wasn't sent",
             ));
+        }
+        Ok(Response::Ok)
+    }
+
+    /// The setup command comes from the project's own config: a cloned
+    /// repository's, or one an agent just edited. It runs outside any
+    /// agent's sandbox, so it is asked about first, unless this very
+    /// command was allowed for the project before, or the thread has full
+    /// access (its agent could run it anyway).
+    fn setup_needs_asking(&self, cmd: &str) -> bool {
+        let mode = self
+            .core
+            .mode_or_default(&self.thread.harness, self.thread.permission_mode);
+        mode != PermissionMode::FullAccess
+            && !self.core.setup_approved(&self.thread.project_id, cmd)
+    }
+
+    const SETUP_REQUEST: &'static str = "agentloft-worktree-setup";
+
+    fn ask_setup(&mut self, turn: &Turn, cmd: String) -> CoreResult<()> {
+        let request = RuntimeRequest {
+            id: RequestId::new(),
+            thread_id: self.thread.id.clone(),
+            turn_id: Some(turn.id.clone()),
+            item_id: None,
+            kind: RequestKind::ToolApproval,
+            title: format!("Worktree setup: {cmd}"),
+            detail: serde_json::json!({
+                "input": { "command": cmd },
+                "decision_reason": "This project's .agentloft/config.toml asks to run this to set up \
+                    the new worktree, outside the agent's sandbox. Allowed, it runs without asking \
+                    until the command changes. Denied, the agent starts without it.",
+            }),
+            options: vec![
+                DecisionKind::AllowOnce,
+                DecisionKind::Deny,
+                DecisionKind::DenyAndStop,
+            ],
+            status: RequestStatus::Open,
+            decision: None,
+            opened_at_ms: now_ms(),
+            reply: None,
+        };
+        self.requests
+            .insert(request.id.clone(), Self::SETUP_REQUEST.to_owned());
+        self.setup_asked = Some((request.id.clone(), cmd));
+        self.thread.status = ThreadStatus::WaitingApproval;
+        self.thread.updated_at_ms = now_ms();
+        self.core.commit(vec![
+            Event::RequestOpened { request },
+            Event::ThreadUpdated {
+                thread: self.thread.clone(),
+            },
+        ])?;
+        Ok(())
+    }
+
+    /// The person answered whether the setup command may run.
+    fn answer_setup(&mut self, cmd: String, decision: DecisionKind) -> CoreResult<Response> {
+        self.resolve_request_with(Self::SETUP_REQUEST, Some(decision), None)?;
+        let Some(turn) = self.turn.clone() else {
+            return Ok(Response::Ok);
+        };
+        match decision {
+            DecisionKind::AllowOnce | DecisionKind::AllowSession => {
+                self.core.approve_setup(&self.thread.project_id, &cmd);
+                self.run_setup(&turn, cmd)?;
+            }
+            DecisionKind::Deny => {
+                let notice = self.new_item(
+                    Some(turn.id.clone()),
+                    ItemBody::Notice {
+                        level: loft_protocol::NoticeLevel::Warning,
+                        text: format!("Worktree setup skipped: `{cmd}`"),
+                    },
+                    ItemStatus::Completed,
+                )?;
+                self.core
+                    .commit(vec![Event::ItemUpserted { item: notice }])?;
+                self.pending_note = Some(
+                    "[Agentloft: the person chose not to run this project's worktree setup \
+                     command, so dependencies may be missing.]"
+                        .to_owned(),
+                );
+                self.capture_checkpoint(&turn, true);
+            }
+            DecisionKind::DenyAndStop => {
+                self.pending_start = None;
+                self.finish_turn(TurnStatus::Interrupted, None, None)?;
+            }
         }
         Ok(Response::Ok)
     }
@@ -1188,6 +1287,14 @@ impl ThreadActor {
         decision: DecisionKind,
         answer: Option<loft_protocol::RequestReply>,
     ) -> CoreResult<Response> {
+        if self
+            .setup_asked
+            .as_ref()
+            .is_some_and(|(id, _)| *id == request_id)
+            && let Some((_, cmd)) = self.setup_asked.take()
+        {
+            return self.answer_setup(cmd, decision);
+        }
         let native = self
             .requests
             .get(&request_id)
