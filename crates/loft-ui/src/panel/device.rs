@@ -1507,22 +1507,14 @@ impl DeviceView {
     fn device_row(&self, d: &DeviceInfo, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (open_id, boot_id) = (d.id.clone(), d.id.clone());
         let state: AnyElement = match d.state {
-            // A phone isn't started from here: plugged in and unlocked, it
-            // runs.
-            DeviceState::Stopped if d.physical => h_flex()
-                .gap_1p5()
-                .items_center()
-                .text_xs()
-                .text_color(p.muted_foreground)
-                .child(div().size(px(7.)).rounded_full().bg(p.faint_foreground))
-                .child("Not available")
-                .into_any_element(),
             DeviceState::Stopped => {
                 Button::new(SharedString::from(format!("device-start-{}", d.id)))
                     .cursor_pointer()
                     .small()
                     .icon(IconName::Play)
-                    .label("Start")
+                    // A phone isn't started: it waits to be allowed (its
+                    // error says how), then is looked for again.
+                    .label(if d.physical { "Try again" } else { "Start" })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.pick(boot_id.clone(), true, cx);
