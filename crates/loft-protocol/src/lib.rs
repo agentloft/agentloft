@@ -654,10 +654,14 @@ pub enum Request {
     /// Boot a stopped device, headless (its screen is only streamed).
     /// Answers `Ok` at once; its state comes on [`Topic::Devices`] and
     /// [`Topic::Device`]. `thread_id`: the thread whose agent asked, if one.
+    /// `wait` (agents): answer only once it runs, with
+    /// `Response::Device`, or fail if it doesn't within a few minutes.
     DeviceBoot {
         id: DeviceId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_id: Option<ThreadId>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        wait: bool,
     },
     DeviceShutdown {
         id: DeviceId,
@@ -672,6 +676,8 @@ pub enum Request {
     /// A PNG of the screen at its full size (`Response::Picture`).
     DeviceCapture {
         id: DeviceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<ThreadId>,
     },
     /// Install, start or stop an app, or open an address (`Ok`).
     DeviceApp {
@@ -1084,6 +1090,10 @@ pub enum Response {
     Devices {
         devices: Vec<DeviceInfo>,
         support: DeviceSupport,
+    },
+    /// One device (`Request::DeviceBoot` with `wait`).
+    Device {
+        device: DeviceInfo,
     },
     /// A picture (`Request::PageCapture`, `Request::DeviceCapture`).
     Picture {

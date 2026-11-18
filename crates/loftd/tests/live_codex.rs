@@ -26,6 +26,7 @@ async fn daemon(paths: &Paths) -> Daemon {
             home: paths.home.clone(),
         }),
         web_bundle: None,
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap()

@@ -1572,10 +1572,24 @@ impl Core {
                 let (devices, support) = self.devices.refresh().await;
                 Ok(Response::Devices { devices, support })
             }
-            Request::DeviceBoot { id, thread_id } => {
+            Request::DeviceBoot {
+                id,
+                thread_id,
+                wait: false,
+            } => {
                 self.devices.boot(&id, thread_id.as_ref()).await?;
                 Ok(Response::Ok)
             }
+            Request::DeviceBoot {
+                id,
+                thread_id,
+                wait: true,
+            } => Ok(Response::Device {
+                device: self
+                    .devices
+                    .boot_and_wait(&id, thread_id.as_ref(), devices::BOOT_WAIT)
+                    .await?,
+            }),
             Request::DeviceShutdown { id } => {
                 self.devices.shutdown(&id).await?;
                 Ok(Response::Ok)
@@ -1588,8 +1602,8 @@ impl Core {
                 self.devices.input(&id, input, thread_id.as_ref()).await?;
                 Ok(Response::Ok)
             }
-            Request::DeviceCapture { id } => Ok(Response::Picture {
-                png: self.devices.capture(&id, None).await?.into(),
+            Request::DeviceCapture { id, thread_id } => Ok(Response::Picture {
+                png: self.devices.capture(&id, thread_id.as_ref()).await?.into(),
             }),
             Request::DeviceApp { id, app, thread_id } => {
                 self.devices.app(&id, app, thread_id.as_ref()).await?;

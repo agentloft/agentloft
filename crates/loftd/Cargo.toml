@@ -33,6 +33,8 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 base64.workspace = true
 libc.workspace = true
+# Device screenshots are scaled down for the model (mcp_devices.rs).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # Web access (ADR-0016): HTTP/1.1 + WebSocket listener, optional TLS.
 hyper = { version = "1", features = ["http1", "server"] }

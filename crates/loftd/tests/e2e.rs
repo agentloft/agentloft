@@ -20,6 +20,7 @@ async fn start(paths: &Paths) -> Daemon {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap()
@@ -55,6 +56,7 @@ async fn full_turn_over_socket_with_reconnect() {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
+        device_backends: Some(Vec::new()),
     })
     .await;
     assert!(second.is_err(), "single-instance lock");

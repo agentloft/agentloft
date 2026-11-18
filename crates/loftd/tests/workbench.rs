@@ -37,6 +37,11 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 async fn setup() -> Env {
+    setup_with(Vec::new()).await
+}
+
+/// A daemon whose simulators and emulators are `devices`.
+async fn setup_with(devices: Vec<Arc<dyn loft_core::devices::Backend>>) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(dir.path().join("home"));
     let repo = dir.path().join("repo");
@@ -58,6 +63,7 @@ async fn setup() -> Env {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
+        device_backends: Some(devices),
     })
     .await
     .unwrap();
@@ -667,6 +673,254 @@ async fn agents_drive_the_browser_through_the_mcp_bridge() {
     );
     let threads = bridge.tool("list_threads", serde_json::json!({})).await;
     assert_eq!(threads["isError"], false);
+
+    bridge.stop().await;
+    env.daemon.shutdown().await;
+}
+
+/// An agent's device tools reach the simulators and emulators through the
+/// MCP bridge (ADR-0020): here two fake phones, which keep everything they
+/// were sent. Points are pixels of the agent's screenshot; the devices get
+/// fractions of the screen.
+#[tokio::test]
+async fn agents_use_devices_through_the_mcp_bridge() {
+    use loft_core::devices::fake::{FakeBackend, FakeEvent};
+    use serde_json::json;
+    let ios = Arc::new(FakeBackend::new(
+        DevicePlatform::Ios,
+        Duration::from_millis(200),
+    ));
+    let android = Arc::new(FakeBackend::new(
+        DevicePlatform::Android,
+        Duration::from_millis(200),
+    ));
+    let mut env = setup_with(vec![ios.clone(), android.clone()]).await;
+    let thread = fake_thread(&env).await;
+    env.client.subscribe(Topic::Thread(thread.id.clone()));
+    let mut bridge = Bridge::start(&env.paths, &thread.id).await;
+    let text = |v: &serde_json::Value| -> String {
+        v["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let ok = |v: &serde_json::Value| assert_eq!(v["isError"], false, "{v}");
+    let failed = |v: &serde_json::Value, says: &str| {
+        assert_eq!(v["isError"], true, "{v}");
+        assert!(text(v).contains(says), "{v}");
+    };
+    let id = ios.id().to_string();
+
+    let list = bridge.tool("device_list", json!({})).await;
+    ok(&list);
+    let listed: serde_json::Value = serde_json::from_str(&text(&list)).unwrap();
+    let devices = listed["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2, "{listed}");
+    let phone = devices.iter().find(|d| d["id"] == id).unwrap();
+    assert_eq!(phone["state"], "stopped");
+    assert_eq!(phone["screen"], "390x844 pixels at 1x");
+    assert!(listed.get("unavailable").is_none(), "{listed}");
+
+    // A stopped device has to be booted first, and the agent is told so.
+    let tap = bridge
+        .tool("device_tap", json!({"id": id, "x": 10, "y": 10}))
+        .await;
+    failed(&tap, "boot it first");
+    failed(
+        &bridge.tool("device_tap", json!({"x": 1, "y": 1})).await,
+        "id is required",
+    );
+
+    // Booting waits until it runs, and the thread's windows are told an
+    // agent is using it.
+    let boot = bridge.tool("device_boot", json!({"id": id})).await;
+    ok(&boot);
+    assert!(text(&boot).contains("\"running\""), "{boot}");
+    assert_eq!(ios.log(), vec![FakeEvent::Boot]);
+    loop {
+        if let ClientEvent::DeviceDriven { thread_id, device } = next(&mut env.rx).await {
+            assert_eq!(thread_id, thread.id);
+            assert_eq!(device.id, ios.id());
+            break;
+        }
+    }
+
+    let shot = bridge.tool("device_screenshot", json!({"id": id})).await;
+    ok(&shot);
+    assert_eq!(shot["content"][0]["type"], "image");
+    assert_eq!(shot["content"][0]["mimeType"], "image/jpeg");
+    let jpeg = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(shot["content"][0]["data"].as_str().unwrap())
+            .unwrap()
+    };
+    let picture = image::load_from_memory(&jpeg).unwrap();
+    assert_eq!((picture.width(), picture.height()), (390, 844));
+    assert!(text(&shot).contains("390x844 pixels"), "{shot}");
+
+    // A tap is a finger down and up, at fractions of the screen.
+    ok(&bridge
+        .tool("device_tap", json!({"id": id, "x": 195, "y": 211}))
+        .await);
+    let touch = |phase, x, y| FakeEvent::Input(DeviceInput::Touch { phase, x, y });
+    assert_eq!(
+        ios.log()[1..],
+        [
+            touch(TouchPhase::Down, 0.5, 0.25),
+            touch(TouchPhase::Up, 0.5, 0.25)
+        ]
+    );
+    failed(
+        &bridge
+            .tool("device_tap", json!({"id": id, "x": 391, "y": 10}))
+            .await,
+        "outside the screenshot",
+    );
+
+    // A swipe goes down, moves on its way and comes up at its end.
+    let before = ios.log().len();
+    ok(&bridge
+        .tool(
+            "device_swipe",
+            json!({"id": id, "from_x": 195, "from_y": 633, "to_x": 195, "to_y": 211, "duration_ms": 100}),
+        )
+        .await);
+    let swipe = ios.log()[before..].to_vec();
+    assert_eq!(swipe[0], touch(TouchPhase::Down, 0.5, 0.75));
+    assert_eq!(*swipe.last().unwrap(), touch(TouchPhase::Up, 0.5, 0.25));
+    let ys: Vec<f32> = swipe[1..swipe.len() - 1]
+        .iter()
+        .map(|e| match e {
+            FakeEvent::Input(DeviceInput::Touch {
+                phase: TouchPhase::Move,
+                y,
+                ..
+            }) => *y,
+            other => panic!("not a move: {other:?}"),
+        })
+        .collect();
+    assert!(ys.len() >= 4, "{ys:?}");
+    assert!(ys.windows(2).all(|w| w[1] < w[0]), "{ys:?}");
+    assert!((ys.last().unwrap() - 0.25).abs() < 1e-6);
+
+    // Text, keys and buttons.
+    let before = ios.log().len();
+    ok(&bridge
+        .tool(
+            "device_type",
+            json!({"id": id, "text": "hello", "submit": true}),
+        )
+        .await);
+    ok(&bridge
+        .tool(
+            "device_press",
+            json!({"id": id, "key": "Backspace", "count": 2}),
+        )
+        .await);
+    ok(&bridge
+        .tool("device_press", json!({"id": id, "button": "home"}))
+        .await);
+    let key = |k: &str| {
+        FakeEvent::Input(DeviceInput::Key {
+            key: k.into(),
+            modifiers: 0,
+        })
+    };
+    assert_eq!(
+        ios.log()[before..],
+        [
+            FakeEvent::Input(DeviceInput::Text {
+                text: "hello".into()
+            }),
+            key("Enter"),
+            key("Backspace"),
+            key("Backspace"),
+            FakeEvent::Input(DeviceInput::Button {
+                button: DeviceButton::Home
+            }),
+        ]
+    );
+    failed(
+        &bridge.tool("device_press", json!({"id": id})).await,
+        "exactly one",
+    );
+    failed(
+        &bridge
+            .tool("device_press", json!({"id": id, "button": "jump"}))
+            .await,
+        "Unknown button",
+    );
+
+    // Turned, the screen is wider than tall: points follow without a new
+    // screenshot.
+    ok(&bridge
+        .tool("device_press", json!({"id": id, "button": "rotate_left"}))
+        .await);
+    ok(&bridge
+        .tool("device_tap", json!({"id": id, "x": 844, "y": 0}))
+        .await);
+    assert_eq!(*ios.log().last().unwrap(), touch(TouchPhase::Up, 1.0, 0.0));
+
+    // Apps: a missing build fails before it reaches the device.
+    let before = ios.log().len();
+    let missing = env.paths.home.join("build/Missing.app");
+    failed(
+        &bridge
+            .tool(
+                "device_app",
+                json!({"id": id, "action": "install", "path": missing}),
+            )
+            .await,
+        "No app at",
+    );
+    failed(
+        &bridge
+            .tool("device_app", json!({"id": id, "action": "launch"}))
+            .await,
+        "app is required",
+    );
+    assert_eq!(ios.log().len(), before);
+    ok(&bridge
+        .tool(
+            "device_app",
+            json!({"id": id, "action": "launch", "app": "com.example.App"}),
+        )
+        .await);
+    assert_eq!(
+        *ios.log().last().unwrap(),
+        FakeEvent::App(DeviceApp::Launch {
+            app: "com.example.App".into()
+        })
+    );
+
+    // The other platform is its own backend.
+    let droid = android.id().to_string();
+    ok(&bridge.tool("device_boot", json!({"id": droid})).await);
+    ok(&bridge
+        .tool("device_press", json!({"id": droid, "button": "back"}))
+        .await);
+    assert_eq!(
+        *android.log().last().unwrap(),
+        FakeEvent::Input(DeviceInput::Button {
+            button: DeviceButton::Back
+        })
+    );
+
+    ok(&bridge.tool("device_shutdown", json!({"id": id})).await);
+    assert_eq!(*ios.log().last().unwrap(), FakeEvent::Shutdown);
+    let list = bridge.tool("device_list", json!({})).await;
+    let listed: serde_json::Value = serde_json::from_str(&text(&list)).unwrap();
+    let phone = listed["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == id)
+        .unwrap();
+    assert_eq!(phone["state"], "stopped");
 
     bridge.stop().await;
     env.daemon.shutdown().await;

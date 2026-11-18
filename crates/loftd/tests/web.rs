@@ -60,6 +60,7 @@ async fn start_seeded(extra: &str, seed: impl FnOnce(&Paths)) -> Fixture {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: Some(bundle),
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap();
@@ -338,6 +339,7 @@ async fn off_unless_enabled() {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap();
@@ -1352,6 +1354,7 @@ async fn sessions_survive_a_daemon_restart() {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: Some(dir.path().join("bundle")),
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap();
