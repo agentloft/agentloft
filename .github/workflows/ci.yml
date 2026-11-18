@@ -34,6 +34,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      # libghostty-vt's build needs the aro C front end, which its Zig
+      # packages fetch from codeberg.org; that host doesn't always resolve on
+      # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
+      # GitHub has the same package hash, so it goes in Zig's cache first.
+      - name: aro from GitHub
+        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
       - name: Format
         run: cargo fmt --all --check
       # `loft-terminal/test-support`: its view tests run on GPUI's test
@@ -82,6 +88,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      # libghostty-vt's build needs the aro C front end, which its Zig
+      # packages fetch from codeberg.org; that host doesn't always resolve on
+      # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
+      # GitHub has the same package hash, so it goes in Zig's cache first.
+      - name: aro from GitHub
+        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
       - name: Clippy (app and daemon)
         run: cargo clippy -p loft-app -p loftd --all-targets -- -D warnings
 
@@ -104,6 +116,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      # libghostty-vt's build needs the aro C front end, which its Zig
+      # packages fetch from codeberg.org; that host doesn't always resolve on
+      # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
+      # GitHub has the same package hash, so it goes in Zig's cache first.
+      - name: aro from GitHub
+        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
       - name: Clippy (app and daemon)
         run: cargo clippy -p loft-app -p loftd --all-targets -- -D warnings
       - name: Test (config, client, daemon end to end)
@@ -129,6 +147,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      # libghostty-vt's build needs the aro C front end, which its Zig
+      # packages fetch from codeberg.org; that host doesn't always resolve on
+      # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
+      # GitHub has the same package hash, so it goes in Zig's cache first.
+      - name: aro from GitHub
+        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
       # The browser-only code paths (cfg(target_arch = "wasm32")) that the
       # native clippy run never sees. RUSTC_BOOTSTRAP: see the `web` task in
       # xtask/src/main.rs.
