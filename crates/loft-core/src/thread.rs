@@ -2179,8 +2179,10 @@ impl ThreadActor {
         if decision.is_some() {
             request.decision = decision;
         }
-        if reply.is_some() {
-            request.reply = reply;
+        if let Some(reply) = reply {
+            // The agent was sent the answer itself; what is kept (and shown
+            // to every window) hides what was typed as a secret.
+            request.reply = Some(masked_reply(&request.questions(), reply));
         }
         let mut events = vec![Event::RequestUpdated { request }];
         // A browser tab handed to the person still waits for them.
@@ -2358,4 +2360,46 @@ fn move_in_line(queue: &mut Vec<QueuedMessage>, id: u64, to: u64) -> bool {
     let message = queue.remove(from);
     queue.insert(at, message);
     true
+}
+
+/// `reply` as it is kept: answers to questions marked secret (a password,
+/// a key) replaced by dots.
+fn masked_reply(
+    questions: &[loft_protocol::Question],
+    mut reply: loft_protocol::RequestReply,
+) -> loft_protocol::RequestReply {
+    for answer in &mut reply.answers {
+        if questions.iter().any(|q| q.id == answer.id && q.secret) {
+            answer.answers = vec!["•••".into()];
+        }
+    }
+    reply
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_secret_answer_is_not_kept() {
+        let question = |id: &str, secret: bool| {
+            serde_json::from_value::<loft_protocol::Question>(serde_json::json!({
+                "id": id, "header": "", "question": "?", "secret": secret,
+            }))
+            .unwrap()
+        };
+        let answer = |id: &str, text: &str| loft_protocol::QuestionAnswer {
+            id: id.into(),
+            answers: vec![text.into()],
+        };
+        let kept = masked_reply(
+            &[question("db", false), question("token", true)],
+            loft_protocol::RequestReply {
+                answers: vec![answer("db", "SQLite"), answer("token", "hunter2")],
+                message: None,
+            },
+        );
+        assert_eq!(kept.answers[0].answers, ["SQLite"]);
+        assert_eq!(kept.answers[1].answers, ["•••"]);
+    }
 }
