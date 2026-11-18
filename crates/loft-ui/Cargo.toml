@@ -27,6 +27,8 @@ loft-client.workspace = true
 loft-config.workspace = true
 loft-docs = { path = "../loft-docs" }
 loft-browser = { path = "../loft-browser" }
+# The Device panel's 3D device model (panel/device_model.rs).
+loft-raster.workspace = true
 loft-terminal.workspace = true
 anyhow.workspace = true
 futures.workspace = true

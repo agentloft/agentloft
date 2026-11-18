@@ -786,6 +786,24 @@ impl WorkbenchPanel {
         }
     }
 
+    /// The Device panel on device `id` as a 3D model turned `yaw` and
+    /// tipped `pitch` degrees, folded to `hinge` if given (the `device3d:`
+    /// dev hook). Started if stopped.
+    pub fn show_device_3d(
+        &mut self,
+        thread_id: &ThreadId,
+        id: loft_protocol::DeviceId,
+        (yaw, pitch): (f32, f32),
+        hinge: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_device(thread_id, Some(id), true, window, cx);
+        if let Some(view) = self.device_tab(thread_id, true, cx) {
+            view.update(cx, |v, cx| v.show_3d(yaw, pitch, hinge, cx));
+        }
+    }
+
     /// `thread_id`'s device for the card floating over the chat: its Device
     /// tab (made if it has none), on `id` if given, and no longer the tab
     /// the panel shows. `None` with no device to show; else whether the

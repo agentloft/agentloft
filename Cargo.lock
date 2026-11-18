@@ -4673,6 +4673,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "loft-raster"
+version = "0.0.7"
+dependencies = [
+ "workspace-hack",
+]
+
+[[package]]
 name = "loft-sim"
 version = "0.0.7"
 dependencies = [
@@ -4733,6 +4740,7 @@ dependencies = [
  "loft-config",
  "loft-docs",
  "loft-protocol",
+ "loft-raster",
  "loft-terminal",
  "loft-view",
  "objc2 0.6.5",

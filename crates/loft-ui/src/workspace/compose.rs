@@ -399,7 +399,9 @@ impl WorkspaceView {
     /// A step is `wait=<ms>`, `click=x,y`, `dclick=x,y` (a double-click),
     /// `rclick=x,y`, `move=x,y`,
     /// `drag=x,y,x2,y2` (or its parts `press=x,y`, `hold=x,y`, `release=x,y`),
-    /// `scroll=x,y,dy` (a wheel scroll at x,y; `dy` > 0 goes up), all in
+    /// `scroll=x,y,dy` (a wheel scroll at x,y; `dy` > 0 goes up),
+    /// `pinch=x,y,delta` (a trackpad pinch in steps adding up to `delta`,
+    /// positive spreading the fingers), all in
     /// window points, `'text` (typed a character at a time) or a keystroke
     /// (`up`, `enter`, `cmd-k`).
     pub(super) fn dev_script(
@@ -470,6 +472,24 @@ impl WorkspaceView {
                             ..Default::default()
                         }),
                     ],
+                    "pinch" => {
+                        let total = n.get(2).copied().unwrap_or(0.);
+                        let phase = |i: usize| match i {
+                            0 => gpui_kit::TouchPhase::Started,
+                            5 => gpui_kit::TouchPhase::Ended,
+                            _ => gpui_kit::TouchPhase::Moved,
+                        };
+                        let mut events = vec![moved(at(0), None)];
+                        for i in 0..=5 {
+                            events.push(PlatformInput::Pinch(gpui_kit::PinchEvent {
+                                position: at(0),
+                                delta: if (1..5).contains(&i) { total / 4. } else { 0. },
+                                modifiers,
+                                phase: phase(i),
+                            }));
+                        }
+                        events
+                    }
                     // A drag in parts, to look at it half way.
                     "press" => vec![moved(at(0), None), down(at(0), left)],
                     "hold" => vec![moved(at(0), Some(left))],

@@ -92,6 +92,8 @@ gpui_kit::assets::icon_assets!(
         RotateCwSquare,
         Expand,
         Smartphone,
+        // The Device panel's 3D model (panel/device_model.rs).
+        Rotate3d,
         PictureInPicture2,
         Power,
         Play,

@@ -12,7 +12,7 @@ use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, ElementInputHandler, Entity,
@@ -31,6 +31,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
+
+// The device as a 3D model you can turn, and a foldable's controls.
+#[path = "device_model.rs"]
+mod model;
 
 gpui_kit::actions!(device_view, [PasteToDevice]);
 
@@ -124,6 +128,8 @@ pub struct DeviceView {
     /// Drawn in the card floating over the chat: the screen alone, with
     /// less room around it (the card has its own bar).
     floating: bool,
+    /// The 3D model (`device_model.rs`).
+    model: model::Model3d,
     _subs: Vec<Subscription>,
 }
 
@@ -146,6 +152,7 @@ impl DeviceView {
                 if let Some(picture) = this.picture.take() {
                     cx.drop_image(picture, None);
                 }
+                this.model.release(cx);
             }),
             // Back in touch with the daemon (or let use its devices).
             cx.observe(&store, |_, _, cx| cx.notify()),
@@ -176,6 +183,7 @@ impl DeviceView {
             picker: Rc::default(),
             marked: None,
             floating: false,
+            model: model::Model3d::default(),
             _subs: subs,
         }
     }
@@ -216,6 +224,7 @@ impl DeviceView {
             self.info = None;
             self.drop_picture(cx);
             self.touching = false;
+            self.model.forget(cx);
         }
         self.note = None;
         self.chosen = id.clone();
@@ -599,6 +608,9 @@ impl DeviceView {
 
     /// A window position as a fraction of the screen, if it is on it.
     fn screen_point(&self, position: Point<Pixels>, clamp: bool) -> Option<(f32, f32)> {
+        if self.three_d() {
+            return self.screen_point_3d(position, clamp);
+        }
         let drawn = self.drawn()?;
         let (x, y) = to_fraction(
             (f32::from(position.x), f32::from(position.y)),
@@ -623,10 +635,14 @@ impl DeviceView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
-        if !self.is_running() || self.picture.is_none() {
-            return;
-        }
-        let Some((x, y)) = self.screen_point(event.position, false) else {
+        let on_screen = (self.is_running() && self.picture.is_some())
+            .then(|| self.screen_point(event.position, false))
+            .flatten();
+        let Some((x, y)) = on_screen else {
+            // Off the live screen, the 3D model turns.
+            if self.three_d() {
+                self.start_turn(event.position, cx);
+            }
             return;
         };
         cx.stop_propagation();
@@ -693,6 +709,9 @@ impl DeviceView {
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let (Some((x, y)), Some(drawn)) = (self.screen_point(event.position, false), self.drawn())
         else {
+            if self.three_d() {
+                self.zoom_3d(event, window, cx);
+            }
             return;
         };
         cx.stop_propagation();
@@ -1062,6 +1081,11 @@ impl DeviceView {
                     )
                     .disabled(!running)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_dark(!dark, cx))),
+                )
+                .child(
+                    tool("device-3d", IconName::Rotate3d, "3D model")
+                        .selected(self.model.on)
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_3d(cx))),
                 )
                 .child(
                     tool(
@@ -1450,6 +1474,12 @@ impl DeviceView {
             }
             _ => None,
         };
+        let phone = if self.three_d() {
+            self.model_view(cx)
+        } else {
+            phone
+        };
+        let turning = self.model.is_turning();
 
         div()
             .id("device-screen")
@@ -1462,6 +1492,9 @@ impl DeviceView {
             .when(self.is_running() && self.picture.is_some(), |d| {
                 d.cursor_pointer()
             })
+            .when(self.three_d(), |d| d.cursor(self.cursor_3d()))
+            .on_mouse_move(cx.listener(Self::hover_3d))
+            .on_pinch(cx.listener(Self::on_pinch))
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key_down))
@@ -1499,6 +1532,9 @@ impl DeviceView {
                             ElementInputHandler::new(bounds, entity.clone()),
                             cx,
                         );
+                        if turning {
+                            model::listen_turn(window, entity.clone());
+                        }
                         if touching {
                             let e = entity.clone();
                             window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
@@ -1569,6 +1605,12 @@ impl Render for DeviceView {
         if self.chosen.is_some() && self.area.get().is_none() {
             window.request_animation_frame();
         }
+        if self.chosen.is_some() && self.three_d() {
+            self.prepare_model(window, cx);
+        }
+        let fold_bar = (!self.floating)
+            .then(|| self.fold_bar(&p, window, cx))
+            .flatten();
         let body = if self.chosen.is_some() {
             self.render_screen(&p, cx)
         } else {
@@ -1593,6 +1635,7 @@ impl Render for DeviceView {
             .size_full()
             .bg(p.background)
             .when(!self.floating, |d| d.child(self.toolbar(&p, cx)))
+            .children(fold_bar)
             .child(body)
             .into_any_element()
     }

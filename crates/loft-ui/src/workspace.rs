@@ -653,6 +653,26 @@ impl WorkspaceView {
                 self.panel
                     .update(cx, |p, cx| p.show_device(&t, Some(id), true, window, cx));
             }
+            // `device3d:<id>@<yaw>,<pitch>[,<hinge>]`: the Device panel on
+            // that device as a 3D model at that angle (degrees), folded to
+            // `hinge` degrees if given; started if stopped.
+            Some(("device3d", spec)) => {
+                let (id, angles) = spec.rsplit_once('@').unwrap_or((spec, "0,0"));
+                let n: Vec<f32> = angles
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                let id = loft_protocol::DeviceId(id.to_owned());
+                let t = thread_id.clone();
+                let angle = (
+                    n.first().copied().unwrap_or(0.),
+                    n.get(1).copied().unwrap_or(0.),
+                );
+                let hinge = n.get(2).copied();
+                self.panel.update(cx, |p, cx| {
+                    p.show_device_3d(&t, id, angle, hinge, window, cx)
+                });
+            }
             Some(("type", text)) => {
                 let composer = self.composer_for(thread, window, cx);
                 let text = text.to_owned();
