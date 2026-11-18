@@ -7,6 +7,7 @@
 //! Each platform is a [`Backend`] (`ios.rs`, `android.rs`); `fake.rs` is a
 //! phone that needs neither, for tests and for trying the panel.
 
+pub mod android;
 pub mod backend;
 pub mod fake;
 
@@ -32,8 +33,8 @@ const DRIVEN_EVERY: Duration = Duration::from_secs(1);
 type Result<T> = std::result::Result<T, ErrorBody>;
 
 /// The backends a real daemon uses on this computer.
-pub fn system_backends(_env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
-    Vec::new()
+pub fn system_backends(env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
+    vec![Arc::new(android::AndroidBackend::new(env)) as Arc<dyn Backend>]
 }
 
 pub struct Devices {

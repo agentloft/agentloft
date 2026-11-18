@@ -59,6 +59,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 simd-adler32 = { version = "0.3" }
+slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
 stable_deref_trait = { version = "1", default-features = false, features = ["std"] }
 subtle = { version = "2" }
@@ -137,7 +138,6 @@ raw-window-handle = { version = "0.6", default-features = false, features = ["st
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 semver = { version = "1", default-features = false, features = ["serde"] }
-slab = { version = "0.4" }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -184,7 +184,6 @@ raw-window-handle = { version = "0.6", default-features = false, features = ["st
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 semver = { version = "1", default-features = false, features = ["serde"] }
-slab = { version = "0.4" }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
