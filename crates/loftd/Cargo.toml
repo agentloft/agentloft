@@ -21,6 +21,8 @@ loft-harness-codex.workspace = true
 loft-harness-acp.workspace = true
 loft-client.workspace = true
 loft-view.workspace = true
+# `agentloftd simulator`: an iOS simulator's screen and input (ADR-0020).
+loft-sim.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 futures.workspace = true
@@ -69,6 +71,8 @@ toml.workspace = true
 loft-page-script.workspace = true
 # TLS test: a throwaway self-signed certificate.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# The iOS simulator's live test compares pictures of the screen.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # One build of each dependency whatever the cargo command (.config/hakari.toml).
 [target.'cfg(target_os = "macos")'.dependencies]

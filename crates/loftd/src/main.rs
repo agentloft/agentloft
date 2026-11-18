@@ -36,6 +36,18 @@ enum Cmd {
     Bridge,
     /// Show web access as the running daemon has it: where it listens, the
     /// pairing link, and the browsers signed in.
+    /// Show one running iOS simulator's screen and take its input, over
+    /// stdin and stdout (spawned by the daemon for its device panel).
+    #[command(hide = true)]
+    Simulator {
+        udid: String,
+        /// The Xcode whose SimulatorKit to use.
+        #[arg(long)]
+        developer_dir: PathBuf,
+        /// A device set other than the user's.
+        #[arg(long)]
+        set: Option<PathBuf>,
+    },
     Web {
         /// Replace the pairing link and sign every browser out.
         #[arg(long)]
@@ -54,6 +66,15 @@ fn main() -> Result<()> {
             serde_json::json!({ "build": loftd::BUILD, "protocol": loft_protocol::PROTOCOL_VERSION })
         );
         return Ok(());
+    }
+    if let Some(Cmd::Simulator {
+        udid,
+        developer_dir,
+        set,
+    }) = cli.cmd
+    {
+        // stdout carries pictures; nothing else may write to it.
+        return simulator(udid, developer_dir, set);
     }
     let paths = match cli.home {
         Some(home) => Paths::new(home),
@@ -94,6 +115,20 @@ fn main() -> Result<()> {
         .thread_name("agentloftd")
         .build()?;
     runtime.block_on(run(paths))
+}
+
+#[cfg(target_os = "macos")]
+fn simulator(udid: String, developer_dir: PathBuf, set: Option<PathBuf>) -> Result<()> {
+    loft_sim::run(loft_sim::Options {
+        udid,
+        set,
+        developer_dir,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulator(_udid: String, _developer_dir: PathBuf, _set: Option<PathBuf>) -> Result<()> {
+    anyhow::bail!("iOS simulators need a Mac")
 }
 
 async fn run(paths: Paths) -> Result<()> {
