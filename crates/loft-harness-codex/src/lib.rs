@@ -379,6 +379,9 @@ fn app_server_call(
     result
 }
 
+/// How long Codex waits on one of our MCP tools (its own default is 60 s).
+const MCP_TOOL_TIMEOUT_SECS: u32 = 3600;
+
 /// `codex app-server` plus config overrides attaching MCP servers.
 pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
     let mut args = vec!["app-server".to_owned()];
@@ -395,6 +398,10 @@ pub fn build_args(cfg: &SessionConfig) -> Vec<String> {
             "{key}.args={}",
             serde_json::to_string(&server.args).unwrap_or_default()
         ));
+        // Some calls wait on the person (an approval, a handoff) or on
+        // other threads for minutes; Codex gives up on a tool after 60 s.
+        args.push("-c".into());
+        args.push(format!("{key}.tool_timeout_sec={MCP_TOOL_TIMEOUT_SECS}"));
     }
     args.extend(cfg.extra_args.iter().cloned());
     args
@@ -443,5 +450,6 @@ mod tests {
             &r#"mcp_servers.agentloft.command="/Apps/Agent loft/agentloftd""#.to_owned()
         ));
         assert!(args.contains(&r#"mcp_servers.agentloft.args=["mcp","--thread","T"]"#.to_owned()));
+        assert!(args.contains(&"mcp_servers.agentloft.tool_timeout_sec=3600".to_owned()));
     }
 }
