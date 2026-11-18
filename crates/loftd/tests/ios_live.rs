@@ -669,12 +669,21 @@ async fn live_settings_and_fingers() {
         Some(false)
     );
 
-    // A pinch in Maps zooms the map. Somewhere with streets, and Maps' two
+    // A pinch in Maps zooms the map. Somewhere with streets, and Maps'
     // first-run screens answered where they show (its location prompt's
-    // "Allow While Using App", then the Ads notice's Continue).
+    // "Allow While Using App", then the Ads notice's Continue; on iOS 27
+    // its contacts prompt is answered beforehand).
     set(DeviceSetting::Location {
         latitude: 51.5007,
         longitude: -0.1246,
+    })
+    .await
+    .unwrap();
+    // iOS 27's Maps asks for the contacts first, over the map.
+    set(DeviceSetting::Permission {
+        app: "com.apple.Maps".into(),
+        permission: "contacts".into(),
+        grant: true,
     })
     .await
     .unwrap();

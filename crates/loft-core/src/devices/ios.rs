@@ -222,22 +222,30 @@ impl IosBackend {
         sizes
     }
 
+    /// The main screen's size from the device type's bundle: its
+    /// `profile.plist` up to Xcode 26, its `capabilities.plist` from
+    /// Xcode 27 (whose profiles no longer have it).
     async fn read_screen(&self, bundle: &str) -> Option<(u32, u32, f32)> {
         if bundle.is_empty() {
             return None;
         }
-        let profile = Path::new(bundle).join("Contents/Resources/profile.plist");
-        let out = tokio::process::Command::new("/usr/bin/plutil")
-            .args(["-convert", "json", "-o", "-"])
-            .arg(&profile)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
+        let resources = Path::new(bundle).join("Contents/Resources");
+        if let Some(size) = plist_file_json(&resources.join("profile.plist"))
             .await
-            .ok()?;
-        out.status.success().then_some(())?;
-        screen_of_profile(&out.stdout)
+            .and_then(|json| screen_of_profile(&json))
+        {
+            return Some(size);
+        }
+        plist_file_json(&resources.join("capabilities.plist"))
+            .await
+            .and_then(|json| screen_of_capabilities(&json))
     }
+}
+
+/// A property list file as JSON.
+async fn plist_file_json(path: &Path) -> Option<Vec<u8>> {
+    let plist = tokio::fs::read(path).await.ok()?;
+    plist_json(&plist).await.ok()
 }
 
 /// A screen's width and height in pixels, and pixels per point.
@@ -343,6 +351,34 @@ fn screen_of_profile(json: &[u8]) -> Option<(u32, u32, f32)> {
         p.main_screen_width,
         p.main_screen_height,
         p.main_screen_scale,
+    ))
+}
+
+/// `(width, height, scale)` from a device type's `capabilities.plist` as
+/// JSON (Xcode 27).
+fn screen_of_capabilities(json: &[u8]) -> Option<(u32, u32, f32)> {
+    #[derive(Deserialize)]
+    struct File {
+        capabilities: Capabilities,
+    }
+    #[derive(Deserialize)]
+    struct Capabilities {
+        #[serde(rename = "ScreenDimensionsCapability")]
+        screen: Screen,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Screen {
+        main_screen_width: u32,
+        main_screen_height: u32,
+        main_screen_scale: f32,
+    }
+    let f: File = serde_json::from_slice(json).ok()?;
+    let s = f.capabilities.screen;
+    Some((
+        s.main_screen_width,
+        s.main_screen_height,
+        s.main_screen_scale,
     ))
 }
 
@@ -483,7 +519,16 @@ fn defaults_bool(read: &Result<String>) -> Option<bool> {
             "0" | "false" | "NO" => Some(false),
             _ => None,
         },
-        Err(e) if format!("{e:#}").contains("does not exist") => Some(false),
+        // Never set: "… does not exist" up to iOS 26, "Could not find key
+        // …" from iOS 27.
+        Err(e)
+            if {
+                let e = format!("{e:#}");
+                e.contains("does not exist") || e.contains("Could not find key")
+            } =>
+        {
+            Some(false)
+        }
         Err(_) => None,
     }
 }
@@ -1307,6 +1352,12 @@ mod tests {
         let profile = br#"{"mainScreenHeight": 2622, "mainScreenScale": 3, "mainScreenWidth": 1206, "mainScreenWidthDPI": 460}"#;
         assert_eq!(screen_of_profile(profile), Some((1206, 2622, 3.0)));
         assert_eq!(screen_of_profile(b"{}"), None);
+        let capabilities = br#"{"capabilities": {"MainScreenClass": 18, "ScreenDimensionsCapability": {"main-screen-height": 2622, "main-screen-pitch": 460, "main-screen-scale": 3, "main-screen-width": 1206}}}"#;
+        assert_eq!(
+            screen_of_capabilities(capabilities),
+            Some((1206, 2622, 3.0))
+        );
+        assert_eq!(screen_of_capabilities(b"{}"), None);
     }
 
     #[test]
@@ -1350,6 +1401,10 @@ mod tests {
             "The domain/default pair of (com.apple.Accessibility, ReduceMotionEnabled) does not exist"
         );
         assert_eq!(defaults_bool(&Err(never_set)), Some(false));
+        let never_set_27 = anyhow!(
+            "Error: Could not find key 'ReduceMotionEnabled' in domain 'com.apple.Accessibility'."
+        );
+        assert_eq!(defaults_bool(&Err(never_set_27)), Some(false));
         assert_eq!(
             defaults_bool(&Err(anyhow!("Unable to lookup in current state: Shutdown"))),
             None

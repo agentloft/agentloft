@@ -53,7 +53,12 @@ use std::time::Duration;
 
 const CORE_SIMULATOR: &str =
     "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator";
-const SIMULATOR_KIT: &str = "Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit";
+/// SimulatorKit, relative to the developer directory: Xcode 27 moved it
+/// from the developer directory's own frameworks to Xcode's shared ones.
+const SIMULATOR_KIT: &[&str] = &[
+    "../SharedFrameworks/SimulatorKit.framework/SimulatorKit",
+    "Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit",
+];
 
 /// `SimDevice.state` when the device is running.
 pub const BOOTED: u64 = 3;
@@ -187,8 +192,13 @@ impl Device {
     /// Find a running device by UDID, in the default set or in `set`.
     pub fn open(udid: &str, set: Option<&Path>, developer_dir: &Path) -> Result<Self> {
         open_library(CORE_SIMULATOR).context("Xcode's CoreSimulator isn't installed")?;
-        let kit = developer_dir.join(SIMULATOR_KIT);
-        let kit = open_library(&kit.to_string_lossy()).context("this Xcode has no SimulatorKit")?;
+        let kit = SIMULATOR_KIT
+            .iter()
+            .map(|path| developer_dir.join(path))
+            .find(|path| path.exists())
+            .context("this Xcode has no SimulatorKit")?;
+        let kit =
+            open_library(&kit.to_string_lossy()).context("this Xcode's SimulatorKit won't load")?;
         // SAFETY: the exported functions, with the signatures read from
         // this Xcode's SimulatorKit (see the module's documentation).
         let (mouse, button, keyboard, arbitrary) = unsafe {
