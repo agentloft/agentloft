@@ -33,6 +33,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # and recordings kept at one size.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 regex = "1"
+# Android emulators' gRPC control service (devices/android/grpc.rs): plain
+# HTTP/2 on localhost, messages written by hand.
+h2 = "0.4"
+http = "1"
+bytes.workspace = true
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 # The headless browser's DevTools pipes, on its fds 3 and 4 (pages/cdp.rs).

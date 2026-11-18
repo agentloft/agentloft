@@ -4522,8 +4522,11 @@ version = "0.0.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "command-fds",
+ "h2",
+ "http",
  "ignore",
  "image",
  "loft-config",
@@ -4535,6 +4538,7 @@ dependencies = [
  "loft-store",
  "loft-view",
  "portable-pty",
+ "prost",
  "regex",
  "serde",
  "serde_json",
@@ -6625,6 +6629,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ef0b569d1d907ab3a28596aee62cf1f61dacb0529a4bedcd8e7460e2d5228b4"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
