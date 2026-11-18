@@ -3751,3 +3751,31 @@ async fn only_images_become_project_icons() {
             .starts_with(&*home.join("icons").to_string_lossy())
     );
 }
+
+/// An agent's browser opens local pages from its workspace unless its
+/// thread has full access.
+#[tokio::test]
+async fn only_full_access_opens_any_local_file() {
+    let f = fixture();
+    let thread = new_thread(&f.core, f._dir.path()).await;
+    let options = f.core.drive_options(Some(&thread));
+    assert!(!options.any_local_file);
+    assert!(
+        options
+            .file_roots
+            .contains(&std::path::PathBuf::from(&thread.cwd))
+    );
+    f.core
+        .handle(Request::SetPermissionMode {
+            thread_id: thread.id.clone(),
+            mode: Some(PermissionMode::FullAccess),
+        })
+        .await
+        .unwrap();
+    let thread = f
+        .core
+        .with_store(|s| s.thread(&thread.id))
+        .unwrap()
+        .unwrap();
+    assert!(f.core.drive_options(Some(&thread)).any_local_file);
+}

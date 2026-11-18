@@ -199,7 +199,7 @@ async fn network_off(
 
 /// Where the thread's captures are saved: a folder of its own in the
 /// temporary directory, the user's only.
-fn folder(page: &Page) -> Result<PathBuf, BrowserError> {
+pub(in crate::pages) fn folder(page: &Page) -> Result<PathBuf, BrowserError> {
     let thread = lock(&page.state).info.thread_id.clone();
     let failed = |dir: &std::path::Path, e: std::io::Error| {
         BrowserError::Action(format!(

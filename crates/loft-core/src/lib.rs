@@ -1105,18 +1105,32 @@ impl Core {
         Ok((profile, self.config().browser.executable))
     }
 
-    /// How an agent's browser commands run for a thread working in `cwd`.
-    fn drive_options(&self, cwd: &str) -> pages::DriveOptions {
+    /// How an agent's browser commands run for `thread`.
+    fn drive_options(&self, thread: Option<&Thread>) -> pages::DriveOptions {
         let config = self.config();
+        // Its workspace: where it works (a worktree, say), and its
+        // project's folder.
+        let project_root = thread
+            .and_then(|t| self.with_store(|s| s.project(&t.project_id)).ok().flatten())
+            .map(|p| p.root_path);
+        let file_roots = thread
+            .map(|t| t.cwd.clone())
+            .into_iter()
+            .chain(project_root)
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .collect();
+        let any_local_file = thread.is_some_and(|t| {
+            self.mode_or_default(&t.harness, t.permission_mode)
+                == loft_protocol::PermissionMode::FullAccess
+        });
         pages::DriveOptions {
             search_template: config.browser.search_template(),
             human_input: config.browser.human_input(),
             // Uploads come from the thread's own workspace (or the
-            // temporary folder).
-            file_roots: Some(std::path::PathBuf::from(cwd))
-                .filter(|p| p.is_absolute())
-                .into_iter()
-                .collect(),
+            // temporary folder); local pages from the workspace.
+            file_roots,
+            any_local_file,
         }
     }
 

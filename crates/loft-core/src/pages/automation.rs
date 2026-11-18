@@ -94,8 +94,13 @@ pub struct DriveOptions {
     /// Human-like pointer paths and typing (`[browser] human_input`).
     pub human_input: bool,
     /// Folders whose files `upload` may hand to a page (the thread's
-    /// workspace); the system's temporary folder always may.
+    /// workspace); the system's temporary folder always may. An agent
+    /// below full access opens local pages from these and its own
+    /// captures folder only (`uploads::check_open`).
     pub file_roots: Vec<PathBuf>,
+    /// The thread has full access: it may open any local file (its agent
+    /// can read any anyway).
+    pub any_local_file: bool,
 }
 
 /// The main frame's loads, as the browser reports them.
@@ -322,7 +327,8 @@ impl Pages {
     }
 
     /// Run an agent's command on the page and answer with its result
-    /// (plain input, uploads from the temporary folder only).
+    /// (plain input, uploads from the temporary folder only, any local
+    /// file opened).
     #[cfg(test)]
     pub async fn drive(
         &self,
@@ -332,6 +338,7 @@ impl Pages {
     ) -> Result<Value, BrowserError> {
         let options = DriveOptions {
             search_template: search_template.to_owned(),
+            any_local_file: true,
             ..DriveOptions::default()
         };
         self.drive_with(id, command, &options).await
@@ -839,6 +846,7 @@ impl Agent<'_> {
         // Tabs and handoff (C): only where the tab was opened to go.
         self.browser.may_go(self.page, &target).await?;
         if url.scheme() == "file" {
+            self.may_open_file(&url)?;
             // Agents open pages they built; the page itself may not go on
             // to other local files.
             self.browser
@@ -870,6 +878,24 @@ impl Agent<'_> {
             self.wait_for_load(mark, &target).await?;
         }
         Ok(self.summary().await)
+    }
+
+    /// Refuse a local file outside the thread's workspace and its own
+    /// captures, unless the thread has full access.
+    fn may_open_file(&self, url: &url::Url) -> Result<(), BrowserError> {
+        if self.options.any_local_file {
+            return Ok(());
+        }
+        let path = url
+            .to_file_path()
+            .map_err(|_| BrowserError::Blocked(format!("{url} isn't a local file's address")))?;
+        let mut roots = self.options.file_roots.clone();
+        if let Ok(captures) = super::capture::folder(self.page) {
+            roots.push(captures);
+        }
+        super::uploads::check_open(&path, &super::uploads::real_roots(&roots))
+            .map(|_| ())
+            .map_err(BrowserError::Blocked)
     }
 
     /// Back (`-1`) or forward (`1`) in the page's history.
@@ -1307,6 +1333,30 @@ mod tests {
                 .is_some_and(|e| e.contains("local file")),
             "{stopped}"
         );
+        // Below full access, only the workspace's (and its captures'): a
+        // file elsewhere is refused before the page goes there.
+        let within = DriveOptions {
+            search_template: search.to_owned(),
+            file_roots: vec![dir.path().to_path_buf()],
+            ..DriveOptions::default()
+        };
+        let restricted = async |command: Value| {
+            let command: BrowserCommand = serde_json::from_value(command).unwrap();
+            pages.drive_with(&page.id, command, &within).await
+        };
+        let mine = restricted(json!({ "action": "navigate", "url": built.to_string_lossy() }))
+            .await
+            .unwrap();
+        assert_eq!(mine["title"], "Built", "{mine}");
+        let hosts = restricted(json!({ "action": "navigate", "url": "file:///etc/hosts" })).await;
+        assert!(
+            matches!(&hosts, Err(BrowserError::Blocked(m)) if m.contains("full access")),
+            "{hosts:?}"
+        );
+        let still = drive(json!({ "action": "eval", "script": "document.title" }))
+            .await
+            .unwrap();
+        assert_eq!(still, json!("Built"));
         // Other schemes stay out.
         assert!(matches!(
             drive(json!({ "action": "navigate", "url": "chrome://settings" })).await,

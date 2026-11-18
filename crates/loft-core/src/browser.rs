@@ -121,7 +121,7 @@ impl Core {
             command => {
                 let id = self.agent_tab(thread_id, tab, true).await?;
                 self.pages.used_by_agent(&id);
-                let options = self.drive_options(&thread.cwd);
+                let options = self.drive_options(Some(&thread));
                 let ran = self.pages.drive_with(&id, command, &options).await;
                 let (new_tabs, notes) = self.pages.take_news(&id);
                 match ran {
@@ -246,11 +246,8 @@ impl Core {
         let mut value = json!({ "opened": true });
         let mut notes = Vec::new();
         if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
-            let cwd = self
-                .with_store(|s| s.thread(thread_id))?
-                .map(|thread| thread.cwd)
-                .unwrap_or_default();
-            let options = self.drive_options(&cwd);
+            let thread = self.with_store(|s| s.thread(thread_id))?;
+            let options = self.drive_options(thread.as_ref());
             match self
                 .pages
                 .drive_with(&id, BrowserCommand::Navigate { url }, &options)
