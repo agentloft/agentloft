@@ -2113,7 +2113,8 @@ impl Core {
                 .trim_end_matches(".git")
                 .trim_matches('/')
                 .to_owned();
-            if repo.split('/').count() != 2 {
+            // Never an option for `gh` or git (`--upload-pack=…`).
+            if repo.split('/').count() != 2 || repo.starts_with('-') {
                 return Err(ErrorBody::new(ErrorCode::BadRequest, "use owner/repo"));
             }
             loft_git::CloneSource::GitHub(repo)

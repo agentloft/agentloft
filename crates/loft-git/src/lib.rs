@@ -1108,6 +1108,7 @@ pub fn clone_repo(
             c.args([
                 "clone",
                 "--quiet",
+                "--",
                 &format!("https://github.com/{repo}.git"),
             ])
             .arg(dest);
@@ -1115,7 +1116,8 @@ pub fn clone_repo(
         }
         CloneSource::Url(url) => {
             let mut c = Command::new("git");
-            c.args(["clone", "--quiet", url]).arg(dest);
+            // `--`: a URL is never read as an option (`--upload-pack=…`).
+            c.args(["clone", "--quiet", "--", url]).arg(dest);
             c
         }
     };
@@ -1163,6 +1165,21 @@ fn which(bin: &str, env: &std::collections::HashMap<String, String>) -> bool {
 #[cfg(test)]
 mod source_tests {
     use super::CloneSource;
+
+    #[test]
+    fn a_url_is_never_taken_for_an_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let url = format!("--upload-pack=touch {}", marker.display());
+        let source = CloneSource::Url(url);
+        let err = super::clone_repo(&source, &dir.path().join("x"), &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(!marker.exists());
+        // git looked for a repository by that name.
+        assert!(err.contains("clone failed"), "{err}");
+        assert!(!err.contains("unknown option"), "{err}");
+    }
 
     #[test]
     fn clone_folders_are_named_after_the_repo() {
