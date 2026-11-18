@@ -1,6 +1,6 @@
 use super::fake::{FakeBackend, FakeEvent};
 use super::*;
-use loft_protocol::{DeviceButton, DevicePlatform, TouchPhase};
+use loft_protocol::{DeviceButton, DevicePlatform, DevicePosture, TouchPhase};
 
 fn devices() -> (Arc<Devices>, Arc<FakeBackend>, broadcast::Receiver<BusMsg>) {
     let (bus, rx) = broadcast::channel(256);
@@ -163,4 +163,64 @@ async fn a_running_device_boots_at_once_despite_an_old_error() {
         .await
         .unwrap();
     assert_eq!(info.state, DeviceState::Running);
+}
+
+#[tokio::test]
+async fn a_foldable_folds_and_its_viewers_are_told() {
+    let (bus, mut rx) = broadcast::channel(256);
+    let phone = Arc::new(FakeBackend::new(
+        DevicePlatform::Android,
+        Duration::from_millis(10),
+    ));
+    let fold = Arc::new(FakeBackend::foldable(Duration::from_millis(10)));
+    let devices = Arc::new(Devices::new(vec![phone.clone(), fold.clone()], bus));
+    let (list, _) = devices.list().await;
+    assert_eq!(list.len(), 2, "both Android fakes are listed");
+    let id = fold.id();
+    devices
+        .boot_and_wait(&id, None, Duration::from_secs(5))
+        .await
+        .unwrap();
+    // The phone's own backend took the boot, not the first Android one.
+    assert!(fold.log().contains(&FakeEvent::Boot));
+    assert!(!phone.log().contains(&FakeEvent::Boot));
+    let open = devices.info(&id).unwrap();
+    assert_eq!(open.fold.as_ref().unwrap().posture, DevicePosture::Opened);
+
+    while rx.try_recv().is_ok() {}
+    devices
+        .set(
+            &id,
+            DeviceSetting::Posture {
+                posture: DevicePosture::Closed,
+            },
+        )
+        .await
+        .unwrap();
+    let shut = devices.info(&id).unwrap();
+    let f = shut.fold.as_ref().unwrap();
+    assert_eq!(f.posture, DevicePosture::Closed);
+    assert!(f.on_cover);
+    assert!(shut.width < open.width, "the cover screen is narrower");
+    let mut told = false;
+    while let Ok(msg) = rx.try_recv() {
+        told |= matches!(msg, BusMsg::DeviceState { id: ref d } if *d == id);
+    }
+    assert!(told, "viewers hear about the fold");
+
+    // A phone that doesn't fold says so.
+    let err = devices
+        .set(&phone.id(), DeviceSetting::Hinge { degrees: 90. })
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("doesn't fold"), "{}", err.message);
+
+    // Settings read back what was set.
+    devices
+        .set(&id, DeviceSetting::Contrast { high: true })
+        .await
+        .unwrap();
+    let settings = devices.settings(&id).await.unwrap();
+    assert_eq!(settings.contrast, Some(true));
+    assert!(settings.supported.iter().any(|s| s == "posture"));
 }

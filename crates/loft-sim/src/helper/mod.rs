@@ -556,6 +556,9 @@ fn input(
                 }
                 DeviceButton::Back => Err(anyhow::anyhow!("iOS has no Back button.")),
             },
+            DeviceInput::Touches { .. } => Err(anyhow::anyhow!(
+                "several fingers at once aren't supported on iOS simulators yet"
+            )),
         };
         state.done(request.id, result);
     }

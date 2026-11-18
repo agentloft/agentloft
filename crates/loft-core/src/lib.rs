@@ -1613,6 +1613,9 @@ impl Core {
                 self.devices.set(&id, setting).await?;
                 Ok(Response::Ok)
             }
+            Request::DeviceSettings { id } => Ok(Response::DeviceSettings {
+                settings: self.devices.settings(&id).await?,
+            }),
             Request::PageList { thread_id } => Ok(Response::Pages {
                 pages: self.pages.tabs(&thread_id),
             }),

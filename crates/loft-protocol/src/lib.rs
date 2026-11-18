@@ -690,6 +690,10 @@ pub enum Request {
         id: DeviceId,
         setting: DeviceSetting,
     },
+    /// The device's settings as they are now (`Response::DeviceSettings`).
+    DeviceSettings {
+        id: DeviceId,
+    },
     /// An agent starts another thread (orchestration): a child of `from`,
     /// with `from`'s agent, model, effort and permissions unless given, in
     /// `from`'s workspace (or a new worktree from it), sent `prompt` at
@@ -1085,6 +1089,10 @@ pub enum Response {
     /// What an agent's browser command answered (`Request::BrowserCall`).
     Browser {
         reply: Box<BrowserReply>,
+    },
+    /// `Request::DeviceSettings`.
+    DeviceSettings {
+        settings: DeviceSettings,
     },
     /// `Request::DeviceList`.
     Devices {

@@ -254,6 +254,8 @@ impl AndroidBackend {
             scale: density_scale(avd.density),
             error: None,
             agent: None,
+            physical: false,
+            fold: None,
         }
     }
 
@@ -670,6 +672,7 @@ impl Backend for AndroidBackend {
                         }
                     }
                 }
+                other => anyhow::bail!("{other:?} isn't supported on Android emulators yet."),
             }
             Ok(())
         })
@@ -1041,6 +1044,9 @@ impl Screen for AndroidScreen {
                         self.press(key, 0).await
                     }
                 },
+                DeviceInput::Touches { .. } => {
+                    Err(anyhow!("several fingers at once aren't supported here yet"))
+                }
             }
         })
     }

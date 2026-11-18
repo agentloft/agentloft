@@ -418,6 +418,7 @@ impl Core {
             | Request::DeviceCapture { .. }
             | Request::DeviceApp { .. }
             | Request::DeviceSet { .. }
+            | Request::DeviceSettings { .. }
             | Request::PageOpen { .. }
             | Request::PageList { .. }
             | Request::PageNavigate { .. }

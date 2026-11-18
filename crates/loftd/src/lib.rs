@@ -262,6 +262,7 @@ fn device_backends(
                 DevicePlatform::Android,
                 Duration::from_secs(3),
             )),
+            Arc::new(FakeBackend::foldable(Duration::from_secs(3))),
         ];
     }
     loft_core::devices::system_backends(env)

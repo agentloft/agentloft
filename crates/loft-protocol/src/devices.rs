@@ -28,6 +28,17 @@ impl DeviceId {
         Self(format!("android:{avd}"))
     }
 
+    /// A physical Android phone, by its adb serial: `android:@<serial>`
+    /// (an AVD's name never has an `@`).
+    pub fn android_phone(serial: &str) -> Self {
+        Self(format!("android:@{serial}"))
+    }
+
+    /// The adb serial of a physical Android phone.
+    pub fn phone_serial(&self) -> Option<&str> {
+        self.0.strip_prefix("android:@")
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -90,6 +101,67 @@ pub struct DeviceInfo {
     /// The thread whose agent used it last, if one has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<ThreadId>,
+    /// A real phone plugged in (or paired over Wi-Fi), not an emulator. It
+    /// can't be booted or shut down from here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub physical: bool,
+    /// A device that folds: how, and how it is folded now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<DeviceFold>,
+}
+
+/// How a foldable device folds, and its posture now (ADR-0020 §5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceFold {
+    /// Where the hinge runs: `vertical` folds like a book (Pixel Fold),
+    /// `horizontal` like a flip phone.
+    pub axis: FoldAxis,
+    /// The main screen is inside when folded shut (fold-in), not outside.
+    pub inward: bool,
+    /// It has a cover screen, used while folded shut.
+    pub cover_screen: bool,
+    /// The postures it can be put in.
+    pub postures: Vec<DevicePosture>,
+    pub posture: DevicePosture,
+    /// The hinge's angle in degrees: 0 folded shut, 180 flat (up to 360
+    /// for a fold-out).
+    pub hinge: f32,
+    pub hinge_min: f32,
+    pub hinge_max: f32,
+    /// The pictures show the cover screen now (the device is folded shut),
+    /// not the main one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_cover: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FoldAxis {
+    Vertical,
+    Horizontal,
+}
+
+/// A foldable's posture, as Android names them.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DevicePosture {
+    /// Folded shut.
+    Closed,
+    /// Half open: a laptop on a table (tabletop) or an open book.
+    HalfOpened,
+    /// Open flat.
+    Opened,
+    /// Folded back on itself, screen outward (fold-out).
+    Flipped,
+    /// Stood on its edges like a tent (fold-out).
+    Tent,
+}
+
+/// One finger of several (`DeviceInput::Touches`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct TouchPoint {
+    pub x: f32,
+    pub y: f32,
 }
 
 /// What the daemon can run, and why not when it can't, for a panel with no
@@ -175,6 +247,12 @@ pub enum DeviceInput {
     Button {
         button: DeviceButton,
     },
+    /// Several fingers at once (a pinch, a two-finger turn): they go down,
+    /// move and lift together, `touches` in the same order each time.
+    Touches {
+        phase: TouchPhase,
+        touches: Vec<TouchPoint>,
+    },
 }
 
 /// Apps on a device (for agents, and for a project's run actions).
@@ -214,4 +292,112 @@ pub enum DeviceSetting {
         latitude: f64,
         longitude: f64,
     },
+    /// A foldable's posture (its hinge goes where the posture puts it).
+    Posture {
+        posture: DevicePosture,
+    },
+    /// A foldable's hinge, in degrees.
+    Hinge {
+        degrees: f32,
+    },
+    TextSize {
+        size: DeviceTextSize,
+    },
+    /// Higher contrast (iOS Increase Contrast, Android high-contrast text).
+    Contrast {
+        high: bool,
+    },
+    ReduceMotion {
+        on: bool,
+    },
+    /// VoiceOver (iOS) or TalkBack (Android).
+    ScreenReader {
+        on: bool,
+    },
+    /// Outline what accessibility sees: the frame of every element it
+    /// knows, drawn over the screen (Android's layout bounds; iOS: the
+    /// accessibility inspector's frames where available).
+    AccessibilityFrames {
+        on: bool,
+    },
+    /// Grant or take back one of an app's permissions. `permission` is the
+    /// platform's own name: iOS `simctl privacy` services (`photos`,
+    /// `camera`, `location`, `contacts`, `microphone`, `all`…) or Android
+    /// permissions (`android.permission.CAMERA`, or just `CAMERA`).
+    Permission {
+        app: String,
+        permission: String,
+        grant: bool,
+    },
+    /// A test push notification for `app` (an APNs payload on iOS; on
+    /// Android the payload's `aps.alert` title and body are posted as a
+    /// notification).
+    Push {
+        app: String,
+        payload: serde_json::Value,
+    },
+    /// The network on or off (Android: Wi-Fi and mobile data).
+    Network {
+        on: bool,
+    },
+    /// The interface's direction: what the rotate buttons turn to, set
+    /// directly.
+    Orientation {
+        orientation: DeviceOrientation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTextSize {
+    ExtraSmall,
+    Small,
+    /// The system's own default.
+    Default,
+    Large,
+    ExtraLarge,
+    /// The accessibility sizes' largest.
+    Largest,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceOrientation {
+    Portrait,
+    LandscapeLeft,
+    LandscapeRight,
+    PortraitUpsideDown,
+}
+
+/// What the device's settings are now, read back from it after each change
+/// (`Request::DeviceSettings`). `None`: not known, or not something this
+/// device has. `supported` names the [`DeviceSetting`]s it takes
+/// (`"appearance"`, `"text_size"`…), so the panel shows only those.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeviceSettings {
+    #[serde(default)]
+    pub supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_size: Option<DeviceTextSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contrast: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce_motion: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_reader: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessibility_frames: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<DeviceOrientation>,
+    /// The app in front: bundle id or package name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_app: Option<String>,
+    /// Apps installed by the user (not the system's), for the permission
+    /// and push tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<String>,
 }

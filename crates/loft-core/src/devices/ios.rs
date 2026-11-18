@@ -365,6 +365,8 @@ pub(crate) fn devices_of(
                 scale,
                 error: None,
                 agent: None,
+                physical: false,
+                fold: None,
             });
         }
     }
@@ -455,6 +457,7 @@ impl Backend for IosBackend {
                     let at = format!("{latitude},{longitude}");
                     self.simctl(&["location", native, "set", &at]).await
                 }
+                other => anyhow::bail!("{other:?} isn't supported on iOS simulators yet."),
             }
             .map(drop)
         })

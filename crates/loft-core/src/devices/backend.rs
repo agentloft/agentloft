@@ -2,7 +2,9 @@
 //! manager in `devices/mod.rs`. Each platform is one [`Backend`]; a running
 //! device's screen, once attached, is one [`Screen`].
 
-use loft_protocol::{DeviceApp, DeviceInfo, DeviceInput, DevicePlatform, DeviceSetting};
+use loft_protocol::{
+    DeviceApp, DeviceInfo, DeviceInput, DevicePlatform, DeviceSetting, DeviceSettings,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,6 +49,12 @@ pub trait Backend: Send + Sync + 'static {
     fn app<'a>(&'a self, native: &'a str, app: DeviceApp) -> BoxFut<'a, ()>;
 
     fn set<'a>(&'a self, native: &'a str, setting: DeviceSetting) -> BoxFut<'a, ()>;
+
+    /// The device's settings as they are now, read from it (not what was
+    /// last asked for), and which ones it takes.
+    fn settings<'a>(&'a self, _native: &'a str) -> BoxFut<'a, DeviceSettings> {
+        Box::pin(async { Ok(DeviceSettings::default()) })
+    }
 }
 
 /// A running device's screen and input.

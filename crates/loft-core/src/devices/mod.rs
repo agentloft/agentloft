@@ -16,8 +16,8 @@ pub use backend::{Backend, BoxFut, Picture, Screen};
 
 use crate::BusMsg;
 use loft_protocol::{
-    DeviceApp, DeviceFrame, DeviceId, DeviceInfo, DeviceInput, DeviceSetting, DeviceState,
-    DeviceSupport, ErrorBody, ErrorCode, ThreadId,
+    DeviceApp, DeviceFrame, DeviceId, DeviceInfo, DeviceInput, DeviceSetting, DeviceSettings,
+    DeviceState, DeviceSupport, ErrorBody, ErrorCode, ThreadId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -65,6 +65,8 @@ pub struct Devices {
 struct Inner {
     /// The last listing, by id.
     known: BTreeMap<DeviceId, DeviceInfo>,
+    /// Which backend listed each device (several may share a platform).
+    owner: HashMap<DeviceId, usize>,
     support: DeviceSupport,
     listed: bool,
     /// Why a device couldn't boot or stream (cleared when it does).
@@ -116,6 +118,11 @@ impl Devices {
 
     fn backend(&self, id: &DeviceId) -> Result<Arc<dyn Backend>> {
         let platform = id.platform().ok_or_else(|| not_found(id))?;
+        if let Some(&ix) = self.lock().owner.get(id)
+            && let Some(backend) = self.backends.get(ix)
+        {
+            return Ok(backend.clone());
+        }
         self.backends
             .iter()
             .find(|b| b.platform() == platform)
@@ -137,7 +144,11 @@ impl Devices {
     pub async fn refresh(&self) -> (Vec<DeviceInfo>, DeviceSupport) {
         let mut support = DeviceSupport::default();
         let mut listed = Vec::new();
-        for backend in &self.backends {
+        let mut owner = HashMap::new();
+        // Several backends of a platform: it can run if any of them can.
+        let mut ios_ok = None::<std::result::Result<(), String>>;
+        let mut android_ok = None::<std::result::Result<(), String>>;
+        for (ix, backend) in self.backends.iter().enumerate() {
             let ok = match backend.support().await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(why)) => Err(why),
@@ -146,6 +157,7 @@ impl Devices {
             let ok = match ok {
                 Ok(()) => match backend.list().await {
                     Ok(devices) => {
+                        owner.extend(devices.iter().map(|d| (d.id.clone(), ix)));
                         listed.extend(devices);
                         Ok(())
                     }
@@ -153,16 +165,21 @@ impl Devices {
                 },
                 err => err,
             };
-            match backend.platform() {
-                loft_protocol::DevicePlatform::Ios => {
-                    support.ios = ok.is_ok();
-                    support.ios_problem = ok.err();
-                }
-                loft_protocol::DevicePlatform::Android => {
-                    support.android = ok.is_ok();
-                    support.android_problem = ok.err();
-                }
+            let slot = match backend.platform() {
+                loft_protocol::DevicePlatform::Ios => &mut ios_ok,
+                loft_protocol::DevicePlatform::Android => &mut android_ok,
+            };
+            if !matches!(slot, Some(Ok(()))) {
+                *slot = Some(ok);
             }
+        }
+        if let Some(ok) = ios_ok {
+            support.ios = ok.is_ok();
+            support.ios_problem = ok.err();
+        }
+        if let Some(ok) = android_ok {
+            support.android = ok.is_ok();
+            support.android_problem = ok.err();
         }
         let (changed, devices, attach) = {
             let mut inner = self.lock();
@@ -170,6 +187,7 @@ impl Devices {
             let known: BTreeMap<DeviceId, DeviceInfo> =
                 listed.into_iter().map(|d| (d.id.clone(), d)).collect();
             inner.known = known;
+            inner.owner = owner;
             let support_changed = inner.support != support;
             inner.support = support.clone();
             let first = !inner.listed;
@@ -491,6 +509,12 @@ impl Devices {
     }
 
     pub async fn shutdown(&self, id: &DeviceId) -> Result<()> {
+        if id.phone_serial().is_some() {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                "A phone can't be shut down from here.",
+            ));
+        }
         let backend = self.backend(id)?;
         self.lock().screens.remove(id);
         backend.shutdown(id.native()).await.map_err(failed)?;
@@ -531,7 +555,23 @@ impl Devices {
 
     pub async fn set(&self, id: &DeviceId, setting: DeviceSetting) -> Result<()> {
         let backend = self.backend(id)?;
-        backend.set(id.native(), setting).await.map_err(failed)
+        let folds = matches!(
+            setting,
+            DeviceSetting::Posture { .. } | DeviceSetting::Hinge { .. }
+        );
+        backend.set(id.native(), setting).await.map_err(failed)?;
+        // A fold shows in the device's info: tell its viewers.
+        if folds {
+            self.refresh().await;
+            let _ = self.bus.send(BusMsg::DeviceState { id: id.clone() });
+        }
+        Ok(())
+    }
+
+    /// The device's settings, read back from it.
+    pub async fn settings(&self, id: &DeviceId) -> Result<DeviceSettings> {
+        let backend = self.backend(id)?;
+        backend.settings(id.native()).await.map_err(failed)
     }
 
     /// Drop screens nobody watched or used for a while (called now and
