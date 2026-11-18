@@ -41,7 +41,10 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - run: cargo xtask web --release
+      # Building libghostty-vt (the terminal) downloads its Zig packages,
+      # and a dropped download has failed releases: tried up to three times.
+      - run: |
+          for try in 1 2 3; do cargo xtask web --release && exit 0; sleep 30; done; exit 1
       - uses: actions/upload-artifact@v4
         with:
           name: web
@@ -63,7 +66,10 @@ jobs:
           version: 0.17.1
       # The stable bundle (the green icon, data in ~/.agentloft); the web
       # client goes in when it is packaged.
-      - run: cargo xtask bundle --stable --no-web
+      # Building libghostty-vt (the terminal) downloads its Zig packages,
+      # and a dropped download has failed releases: tried up to three times.
+      - run: |
+          for try in 1 2 3; do cargo xtask bundle --stable --no-web && exit 0; sleep 30; done; exit 1
       - run: tar -C target/bundle/stable -cf Agentloft.app.tar Agentloft.app
       - uses: actions/upload-artifact@v4
         with:
@@ -88,7 +94,15 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - run: cargo build --release -p loft-app -p loftd
+      # Building libghostty-vt (the terminal) downloads its Zig packages,
+      # and a dropped download has failed releases: tried up to three times.
+      - run: |
+          foreach ($try in 1..3) {
+            cargo build --release -p loft-app -p loftd
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 30
+          }
+          exit 1
       - uses: actions/upload-artifact@v4
         with:
           name: build-windows
@@ -127,7 +141,10 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - run: cargo build --release -p loft-app -p loftd
+      # Building libghostty-vt (the terminal) downloads its Zig packages,
+      # and a dropped download has failed releases: tried up to three times.
+      - run: |
+          for try in 1 2 3; do cargo build --release -p loft-app -p loftd && exit 0; sleep 30; done; exit 1
       - uses: actions/upload-artifact@v4
         with:
           name: build-linux

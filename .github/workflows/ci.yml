@@ -11,6 +11,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # libghostty-vt's finished builds (vendor/ghostty-vt-sys), kept between
+  # runs by the cache step before each Zig build: building it downloads its
+  # Zig packages, and that download failing has failed releases.
+  GHOSTTY_VT_CACHE_DIR: ${{ github.workspace }}/.ghostty-vt
   RUSTFLAGS: -D warnings
 
 jobs:
@@ -22,6 +26,10 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       # loft-terminal builds libghostty-vt, which needs Zig.
       - uses: mlugg/setup-zig@v2
         with:
@@ -67,6 +75,10 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
@@ -85,6 +97,10 @@ jobs:
           # Windows builds are slow (no Linux-speed disk): keep what was
           # built even when a later step fails.
           cache-on-failure: true
+      - uses: actions/cache@v4
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
@@ -104,6 +120,10 @@ jobs:
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       # The terminal in the browser is libghostty-vt built for wasm32, which
       # needs Zig like the native build does.
       - uses: mlugg/setup-zig@v2
