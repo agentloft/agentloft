@@ -38,6 +38,44 @@ pub const BOOT_WAIT: Duration = Duration::from_secs(180);
 
 type Result<T> = std::result::Result<T, ErrorBody>;
 
+/// `adb shell` with no command line: the lines of `script` go to the
+/// device's shell on adb's stdin. What they carry (text an agent types)
+/// is then on no command line of this computer, which every account here
+/// can read (`ps`, `/proc/<pid>/cmdline`). `adb` is a command for adb on
+/// the device (`-s <serial>`), its output piped.
+///
+/// No terminal (`-T`): the device's shell reads the lines as a script, as
+/// `uinput -` reads touches. The closing `exit` ends it with the last
+/// command's status, also where adb can't close the device's stdin.
+pub(crate) async fn adb_shell_script(
+    mut adb: tokio::process::Command,
+    script: &str,
+    timeout: Duration,
+) -> anyhow::Result<std::process::Output> {
+    use anyhow::Context as _;
+    use tokio::io::AsyncWriteExt as _;
+    adb.args(["shell", "-T"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let input = format!("{script}\nexit\n");
+    let run = async {
+        let mut child = adb.spawn().context("running adb")?;
+        let mut stdin = child.stdin.take().context("adb's stdin")?;
+        // Written beside reading what it prints: a long script fills the
+        // pipe before the device has read it.
+        let write = async move {
+            let _ = stdin.write_all(input.as_bytes()).await;
+        };
+        let (_, out) = tokio::join!(write, child.wait_with_output());
+        out.context("running adb")
+    };
+    tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("adb shell took longer than {}s", timeout.as_secs()))?
+}
+
 /// The backends a real daemon uses on this computer.
 pub fn system_backends(env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
@@ -718,6 +756,24 @@ async fn follow(
             .screens
             .remove(&id);
     }
+}
+
+/// A stand-in adb (a shell script) in `dir` that appends each run's
+/// arguments, one a line, to `<dir>/argv` and its stdin to `<dir>/stdin`.
+#[cfg(all(test, unix))]
+pub(crate) fn recording_adb(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let adb = dir.join("adb");
+    std::fs::write(
+        &adb,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{dir}/argv'\n/bin/cat >> '{dir}/stdin'\n",
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    adb
 }
 
 #[cfg(test)]

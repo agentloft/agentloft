@@ -61,13 +61,9 @@ struct Adb {
 }
 
 impl Adb {
-    /// Run adb (on `serial` when given) and return what it printed.
-    async fn run(
-        &self,
-        serial: Option<&str>,
-        args: &[&str],
-        timeout: Duration,
-    ) -> anyhow::Result<String> {
+    /// A command running adb (on `serial` when given), its output piped,
+    /// killed when dropped.
+    fn command(&self, serial: Option<&str>) -> anyhow::Result<tokio::process::Command> {
         let adb = self
             .path
             .as_ref()
@@ -86,6 +82,17 @@ impl Adb {
         if let Some(serial) = serial {
             cmd.args(["-s", serial]);
         }
+        Ok(cmd)
+    }
+
+    /// Run adb (on `serial` when given) and return what it printed.
+    async fn run(
+        &self,
+        serial: Option<&str>,
+        args: &[&str],
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
+        let mut cmd = self.command(serial)?;
         cmd.args(args);
         let out = tokio::time::timeout(timeout, cmd.output())
             .await
@@ -97,16 +104,22 @@ impl Adb {
                 )
             })?
             .context("running adb")?;
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let why = [stderr.trim(), stdout.trim()]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .unwrap_or("it failed");
-            bail!("adb {}: {why}", args.first().copied().unwrap_or_default());
-        }
-        Ok(stdout)
+        succeeded(out, args.first().copied().unwrap_or_default())
+    }
+
+    /// A shell command on the device whose words go to adb on its stdin,
+    /// never on its command line ([`super::adb_shell_script`]): for what
+    /// an agent types.
+    async fn shell_on_stdin(&self, serial: &str, words: &[&str]) -> anyhow::Result<String> {
+        let line = words
+            .iter()
+            .map(|w| sdk::shell_quote(w))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out =
+            super::adb_shell_script(self.command(Some(serial))?, &line, Duration::from_secs(60))
+                .await?;
+        succeeded(out, "shell")
     }
 
     /// A shell command on the device; adb joins the words with spaces, so
@@ -120,6 +133,43 @@ impl Adb {
         self.run(Some(serial), &["shell", &line], Duration::from_secs(60))
             .await
     }
+}
+
+/// Type printable ASCII `text` with adb's `input`, for devices without a
+/// keyboard. `input text` types one line, `%s` for each space; newlines
+/// and tabs are keys. The text goes to adb on its stdin: what an agent
+/// types is on no command line of this computer.
+async fn type_by_adb(adb: &Adb, serial: &str, text: &str) -> anyhow::Result<()> {
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            adb.shell(serial, &["input", "keyevent", "66"]).await?;
+        }
+        for (j, part) in line.split('\t').enumerate() {
+            if j > 0 {
+                adb.shell(serial, &["input", "keyevent", "61"]).await?;
+            }
+            if !part.is_empty() {
+                adb.shell_on_stdin(serial, &["input", "text", &part.replace(' ', "%s")])
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What adb printed, if it succeeded; else why it failed (`what`: adb's
+/// command, for the message).
+fn succeeded(out: std::process::Output, what: &str) -> anyhow::Result<String> {
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let why = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("it failed");
+        bail!("adb {what}: {why}");
+    }
+    Ok(stdout)
 }
 
 fn serial(running: &Running) -> anyhow::Result<String> {
@@ -1057,22 +1107,7 @@ impl AndroidScreen {
                 })])
                 .await;
         };
-        // `input text` types one line, `%s` for each space.
-        for (i, line) in text.split('\n').enumerate() {
-            if i > 0 {
-                adb.shell(serial, &["input", "keyevent", "66"]).await?;
-            }
-            for (j, part) in line.split('\t').enumerate() {
-                if j > 0 {
-                    adb.shell(serial, &["input", "keyevent", "61"]).await?;
-                }
-                if !part.is_empty() {
-                    adb.shell(serial, &["input", "text", &part.replace(' ', "%s")])
-                        .await?;
-                }
-            }
-        }
-        Ok(())
+        type_by_adb(adb, serial, &text).await
     }
 
     async fn rotate(&self, counter_clockwise: bool) -> anyhow::Result<()> {

@@ -869,6 +869,18 @@ fn text_commands(text: &str) -> Option<Vec<String>> {
     Some(commands)
 }
 
+/// Type `text` on the phone with `input`. The commands go to adb on its
+/// stdin: what an agent types is on no command line of this computer.
+async fn type_text(adb: &Adb, serial: &str, text: &str) -> anyhow::Result<()> {
+    let commands = text_commands(text).ok_or_else(|| {
+        anyhow!("adb can only type plain ASCII on a phone: type the rest on the phone itself")
+    })?;
+    for chunk in commands.chunks(8) {
+        adb.script_on_stdin(serial, &chunk.join("\n")).await?;
+    }
+    Ok(())
+}
+
 /// How touches reach the phone.
 enum TouchPath {
     /// Not set up yet (or broken: set up again at the next touch).
@@ -1284,17 +1296,8 @@ impl Screen for PhoneScreen {
                     Ok(())
                 }
                 DeviceInput::Text { text } => {
-                    let commands = text_commands(&text).ok_or_else(|| {
-                        anyhow!(
-                            "adb can only type plain ASCII on a phone: type the rest on the \
-                             phone itself"
-                        )
-                    })?;
                     let _order = self.keys.lock().await;
-                    for chunk in commands.chunks(8) {
-                        self.adb.script(&self.serial, &chunk.join("; ")).await?;
-                    }
-                    Ok(())
+                    type_text(&self.adb, &self.serial, &text).await
                 }
                 DeviceInput::Key { key, modifiers } => {
                     let code =

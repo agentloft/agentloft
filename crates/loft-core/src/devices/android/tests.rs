@@ -2,6 +2,32 @@ use super::*;
 use loft_protocol::{DeviceOrientation, DevicePosture, DeviceTextSize};
 use std::time::Instant;
 
+/// What an agent types on an emulator without a keyboard goes to adb on its
+/// stdin: every account on this computer can read a process's arguments.
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_text_is_on_no_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let adb = Adb {
+        path: Some(crate::devices::recording_adb(dir.path())),
+        env: Arc::new(HashMap::new()),
+    };
+    type_by_adb(&adb, "emulator-5554", "it's secret\nword")
+        .await
+        .unwrap();
+    let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+    assert!(!argv.contains("secret") && !argv.contains("word"), "{argv}");
+    assert!(
+        argv.contains("input keyevent 66"),
+        "keys stay as they were: {argv}"
+    );
+    let stdin = std::fs::read_to_string(dir.path().join("stdin")).unwrap();
+    assert_eq!(
+        stdin,
+        "input text 'it'\\''s%ssecret'\nexit\ninput text word\nexit\n"
+    );
+}
+
 /// An SDK folder with what `files` says, and an AVD folder.
 fn scratch(with_tools: bool, with_avd: bool) -> (tempfile::TempDir, HashMap<String, String>) {
     let dir = tempfile::tempdir().unwrap();

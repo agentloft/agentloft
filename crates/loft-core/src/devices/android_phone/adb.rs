@@ -106,16 +106,7 @@ impl Adb {
                 )
             })?
             .context("running adb")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let why = [stderr.trim(), stdout.trim()]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .unwrap_or("it failed");
-            bail!("adb {}: {why}", args.first().copied().unwrap_or_default());
-        }
-        Ok(out.stdout)
+        succeeded(out, args.first().copied().unwrap_or_default())
     }
 
     pub async fn run(
@@ -145,6 +136,20 @@ impl Adb {
             .await
     }
 
+    /// Lines for the phone's shell, given to adb on its stdin, never on its
+    /// command line ([`crate::devices::adb_shell_script`]): for what an
+    /// agent types.
+    pub async fn script_on_stdin(&self, serial: &str, script: &str) -> anyhow::Result<String> {
+        let out = crate::devices::adb_shell_script(
+            self.command(Some(serial))?,
+            script,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let out = succeeded(out, "shell")?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
     /// `adb devices -l`.
     pub async fn devices(&self) -> anyhow::Result<Vec<Listed>> {
         let out = self
@@ -152,6 +157,21 @@ impl Adb {
             .await?;
         Ok(parse_devices(&out))
     }
+}
+
+/// What adb printed, if it succeeded; else why it failed (`what`: adb's
+/// command, for the message).
+fn succeeded(out: std::process::Output, what: &str) -> anyhow::Result<Vec<u8>> {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let why = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("it failed");
+        bail!("adb {what}: {why}");
+    }
+    Ok(out.stdout)
 }
 
 /// No console window for adb on Windows.

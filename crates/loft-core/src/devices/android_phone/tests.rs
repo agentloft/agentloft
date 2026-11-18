@@ -380,6 +380,35 @@ fn keys_and_text_for_input() {
     assert!(text_commands("café").is_none());
 }
 
+/// What an agent types goes to adb on its stdin: every account on this
+/// computer can read a process's arguments.
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_text_is_on_no_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::devices::recording_adb(dir.path());
+    let env = HashMap::from([
+        ("PATH".to_owned(), dir.path().display().to_string()),
+        ("HOME".to_owned(), dir.path().display().to_string()),
+    ]);
+    let adb = Adb::find(&env);
+    type_text(&adb, "R5CT", "my secret\tpass\nword")
+        .await
+        .unwrap();
+    let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+    assert!(
+        !["secret", "pass", "word"].iter().any(|w| argv.contains(w)),
+        "{argv}"
+    );
+    assert!(argv.starts_with("-s\nR5CT\nshell\n"), "{argv}");
+    let stdin = std::fs::read_to_string(dir.path().join("stdin")).unwrap();
+    assert_eq!(
+        stdin,
+        "input text my%ssecret\ninput keyevent 61\ninput text pass\n\
+         input keyevent 66\ninput text word\nexit\n"
+    );
+}
+
 #[test]
 fn reads_settings_back() {
     let text = "night=Night mode: yes\nfont=1.15\ncontrast=0\nanim=0.0\n\
