@@ -34,7 +34,7 @@ web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Location",
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # One build of each dependency whatever the cargo command (.config/hakari.toml).
 [target.'cfg(target_os = "macos")'.dependencies]

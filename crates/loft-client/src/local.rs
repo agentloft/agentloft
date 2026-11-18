@@ -96,6 +96,15 @@ mod windows {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match ClientOptions::new().open(socket.as_os_str()) {
+                // Anyone may make a pipe of a name nobody holds: another
+                // user's program could be serving ours while the daemon
+                // isn't running, and hear everything the app says.
+                Ok(client) if !same_user(pipe_process(&client, false)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "another user's program is serving Agentloft's pipe",
+                    ));
+                }
                 Ok(client) => return Ok(client),
                 Err(err)
                     if err.raw_os_error() == Some(ERROR_PIPE_BUSY)
@@ -149,8 +158,88 @@ mod windows {
     /// A pipe disappears with its last handle.
     pub fn unbind(_socket: &Path) {}
 
-    /// The pipe's security already keeps other users out.
-    pub fn peer_allowed(_stream: &ServerStream, _home_dir: &Path) -> bool {
-        true
+    /// Only this user's programs (the pipe's default security already lets
+    /// only them, administrators and the system write to it).
+    pub fn peer_allowed(stream: &ServerStream, _home_dir: &Path) -> bool {
+        same_user(pipe_process(stream, true))
+    }
+
+    /// The process at the other end of a pipe: its client (`client`) or
+    /// its server.
+    #[allow(unsafe_code)]
+    fn pipe_process(pipe: &impl std::os::windows::io::AsRawHandle, client: bool) -> Option<u32> {
+        use windows_sys::Win32::System::Pipes::{
+            GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+        };
+        let handle = pipe.as_raw_handle();
+        let mut pid = 0u32;
+        // SAFETY: a live pipe handle, and a place for the id.
+        let ok = unsafe {
+            if client {
+                GetNamedPipeClientProcessId(handle, &mut pid)
+            } else {
+                GetNamedPipeServerProcessId(handle, &mut pid)
+            }
+        };
+        (ok != 0).then_some(pid)
+    }
+
+    /// Whether process `pid` runs as the user this one does.
+    fn same_user(pid: Option<u32>) -> bool {
+        let Some(pid) = pid else { return false };
+        match (process_user(Some(pid)), process_user(None)) {
+            (Some(theirs), Some(mine)) => theirs == mine,
+            _ => false,
+        }
+    }
+
+    /// The account (SID, as bytes) process `pid` runs as; `None`: this one.
+    #[allow(unsafe_code)]
+    fn process_user(pid: Option<u32>) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: every handle is checked before use and closed after;
+        // the token's user is read from a buffer aligned for it, within
+        // the length the system wrote.
+        unsafe {
+            let process: HANDLE = match pid {
+                Some(pid) => OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid),
+                None => GetCurrentProcess(),
+            };
+            if process.is_null() {
+                return None;
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0;
+            if pid.is_some() {
+                CloseHandle(process);
+            }
+            if !opened {
+                return None;
+            }
+            // u64s: aligned for the pointers in TOKEN_USER.
+            let mut buf = vec![0u64; 64];
+            let mut len = 0u32;
+            let read = GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &mut len,
+            ) != 0;
+            CloseHandle(token);
+            if !read {
+                return None;
+            }
+            let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let sid = user.User.Sid;
+            let n = GetLengthSid(sid) as usize;
+            Some(std::slice::from_raw_parts(sid as *const u8, n).to_vec())
+        }
     }
 }
