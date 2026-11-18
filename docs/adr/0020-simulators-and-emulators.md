@@ -36,7 +36,8 @@
 
 ### 4. Agents
 
-- `device_*` tools on the Agentloft MCP server: list, boot, screenshot, tap, swipe, type, press, apps, shut down. Coordinates are the screenshot's pixels. Inspect, act, verify with a new screenshot, as with the browser tools.
+- `device_*` tools on the Agentloft MCP server: list, boot, screenshot, tap, swipe, pinch, gesture (up to five fingers along paths), type, press, apps, fold, settings (read back) and set, permission, push, shut down. Coordinates are the screenshot's pixels. Inspect, act, verify with a new screenshot, as with the browser tools.
+- The same operations are a command line in agents' shells, `agent-device` (`agentloftd device …`), for agents that script or prefer a shell: the daemon puts it first on every agent's `PATH` and names the thread in `AGENTLOFT_THREAD_ID`, so the user's window shows the device the agent uses. Its screenshots are PNG files; points are pixels of the thread's last screenshot of the device, whichever of the two took it.
 
 ## Consequences
 

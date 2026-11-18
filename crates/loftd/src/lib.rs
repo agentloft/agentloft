@@ -3,6 +3,7 @@
 
 pub mod bridge;
 mod conn;
+pub mod device_cli;
 mod http;
 pub mod mcp;
 mod mcp_automations;

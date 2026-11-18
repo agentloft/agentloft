@@ -926,6 +926,471 @@ async fn agents_use_devices_through_the_mcp_bridge() {
     env.daemon.shutdown().await;
 }
 
+/// The MCP tools for several fingers, folding, settings, permissions and
+/// pushes reach the fake devices as the daemon's own requests.
+#[tokio::test]
+async fn agents_pinch_fold_and_change_settings_through_the_mcp_bridge() {
+    use loft_core::devices::fake::{FakeBackend, FakeEvent};
+    use serde_json::json;
+    let phone = Arc::new(FakeBackend::new(
+        DevicePlatform::Android,
+        Duration::from_millis(50),
+    ));
+    let fold = Arc::new(FakeBackend::foldable(Duration::from_millis(50)));
+    let env = setup_with(vec![phone.clone(), fold.clone()]).await;
+    let thread = fake_thread(&env).await;
+    let mut bridge = Bridge::start(&env.paths, &thread.id).await;
+    let text = |v: &serde_json::Value| -> String {
+        v["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let ok = |v: &serde_json::Value| {
+        assert_eq!(v["isError"], false, "{v}");
+        serde_json::from_str::<serde_json::Value>(&text(v)).unwrap_or_default()
+    };
+    let failed = |v: &serde_json::Value, says: &str| {
+        assert_eq!(v["isError"], true, "{v}");
+        assert!(text(v).contains(says), "{v}");
+    };
+    let id = phone.id().to_string();
+    ok(&bridge.tool("device_boot", json!({"id": id})).await);
+    ok(&bridge.tool("device_screenshot", json!({"id": id})).await);
+
+    // A pinch: two fingers down together, apart, and up together, around
+    // the point (390 wide: a quarter of it is 97.5 pixels, 0.25).
+    let before = phone.log().len();
+    ok(&bridge
+        .tool(
+            "device_pinch",
+            json!({"id": id, "x": 195, "y": 422, "scale": 2, "duration_ms": 100}),
+        )
+        .await);
+    let pinch: Vec<(TouchPhase, Vec<TouchPoint>)> = phone.log()[before..]
+        .iter()
+        .map(|e| match e {
+            FakeEvent::Input(DeviceInput::Touches { phase, touches }) => (*phase, touches.clone()),
+            other => panic!("not two fingers: {other:?}"),
+        })
+        .collect();
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+    let (first, last) = (&pinch[0], pinch.last().unwrap());
+    assert_eq!(first.0, TouchPhase::Down);
+    assert!(
+        near(first.1[0].x, 0.375) && near(first.1[1].x, 0.625),
+        "{first:?}"
+    );
+    assert_eq!(last.0, TouchPhase::Up);
+    assert!(
+        near(last.1[0].x, 0.25) && near(last.1[1].x, 0.75),
+        "{last:?}"
+    );
+    assert!(pinch.iter().flat_map(|p| &p.1).all(|t| near(t.y, 0.5)));
+    assert!(
+        pinch[1..pinch.len() - 1]
+            .iter()
+            .all(|p| p.0 == TouchPhase::Move)
+    );
+    failed(
+        &bridge
+            .tool(
+                "device_pinch",
+                json!({"id": id, "x": 1, "y": 1, "scale": 1}),
+            )
+            .await,
+        "not 1",
+    );
+
+    // A gesture: each finger along its own path; one finger is a touch.
+    let before = phone.log().len();
+    ok(&bridge
+        .tool(
+            "device_gesture",
+            json!({"id": id, "fingers": [[[0, 0], [390, 0]], [[0, 844]]], "duration_ms": 50}),
+        )
+        .await);
+    let log = phone.log()[before..].to_vec();
+    assert_eq!(
+        log.last().unwrap(),
+        &FakeEvent::Input(DeviceInput::Touches {
+            phase: TouchPhase::Up,
+            touches: vec![TouchPoint { x: 1.0, y: 0.0 }, TouchPoint { x: 0.0, y: 1.0 }],
+        })
+    );
+    ok(&bridge
+        .tool(
+            "device_gesture",
+            json!({"id": id, "fingers": [[[195, 844], [195, 422]]], "duration_ms": 50}),
+        )
+        .await);
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Input(DeviceInput::Touch {
+            phase: TouchPhase::Up,
+            x: 0.5,
+            y: 0.5
+        })
+    );
+    failed(
+        &bridge
+            .tool(
+                "device_gesture",
+                json!({"id": id, "fingers": [[[1, 2, 3]]]}),
+            )
+            .await,
+        "Finger 1",
+    );
+
+    // Settings: changed together, then read back.
+    let set = ok(&bridge
+        .tool(
+            "device_set",
+            json!({"id": id, "appearance": "dark", "network": false, "text_size": "largest", "location": {"latitude": 48.85, "longitude": 2.29}}),
+        )
+        .await);
+    assert_eq!(
+        set["set"],
+        json!(["appearance", "text_size", "network", "location"])
+    );
+    assert_eq!(set["settings"]["dark"], true);
+    assert_eq!(set["settings"]["network"], false);
+    assert_eq!(set["settings"]["text_size"], "largest");
+    assert!(
+        phone
+            .log()
+            .contains(&FakeEvent::Set(DeviceSetting::Location {
+                latitude: 48.85,
+                longitude: 2.29
+            }))
+    );
+    let settings = ok(&bridge.tool("device_settings", json!({"id": id})).await);
+    assert_eq!(settings["dark"], true);
+    assert!(
+        settings["supported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("push"))
+    );
+    assert!(settings.get("fold").is_none());
+    // Nothing is changed when one of them isn't understood.
+    let before = phone.log().len();
+    failed(
+        &bridge
+            .tool(
+                "device_set",
+                json!({"id": id, "appearance": "light", "volume": 3}),
+            )
+            .await,
+        "Unknown setting `volume`",
+    );
+    failed(
+        &bridge
+            .tool(
+                "device_set",
+                json!({"id": id, "appearance": "light", "network": "maybe"}),
+            )
+            .await,
+        "network is on or off",
+    );
+    assert_eq!(phone.log().len(), before);
+
+    // Permissions and pushes.
+    ok(&bridge
+        .tool(
+            "device_permission",
+            json!({"id": id, "app": "com.example.fake", "permission": "CAMERA", "grant": true}),
+        )
+        .await);
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Set(DeviceSetting::Permission {
+            app: "com.example.fake".into(),
+            permission: "CAMERA".into(),
+            grant: true
+        })
+    );
+    ok(&bridge
+        .tool(
+            "device_push",
+            json!({"id": id, "app": "com.example.fake", "title": "Hi", "body": "There"}),
+        )
+        .await);
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Set(DeviceSetting::Push {
+            app: "com.example.fake".into(),
+            payload: json!({"aps": {"alert": {"title": "Hi", "body": "There"}}})
+        })
+    );
+
+    // A phone that doesn't fold says so; the foldable folds shut onto its
+    // cover screen, and the list and its settings show how it is folded.
+    failed(
+        &bridge
+            .tool("device_fold", json!({"id": id, "posture": "closed"}))
+            .await,
+        "doesn't fold",
+    );
+    let fid = fold.id().to_string();
+    ok(&bridge.tool("device_boot", json!({"id": fid})).await);
+    let folded = ok(&bridge
+        .tool("device_fold", json!({"id": fid, "posture": "closed"}))
+        .await);
+    assert_eq!(folded["fold"]["posture"], "closed");
+    assert_eq!(folded["fold"]["on_cover"], true);
+    assert_eq!(folded["screen"], "360x780 pixels");
+    assert_eq!(
+        *fold.log().last().unwrap(),
+        FakeEvent::Set(DeviceSetting::Posture {
+            posture: DevicePosture::Closed
+        })
+    );
+    let half = ok(&bridge
+        .tool("device_fold", json!({"id": fid, "hinge": 90}))
+        .await);
+    assert_eq!(half["fold"]["posture"], "half_opened");
+    let settings = ok(&bridge.tool("device_settings", json!({"id": fid})).await);
+    assert_eq!(settings["fold"]["hinge"], 90.0);
+    let listed = ok(&bridge.tool("device_list", json!({})).await);
+    let listed_fold = listed["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == fid.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(listed_fold["fold"]["posture"], "half_opened");
+    failed(
+        &bridge
+            .tool(
+                "device_fold",
+                json!({"id": fid, "posture": "closed", "hinge": 3}),
+            )
+            .await,
+        "exactly one",
+    );
+
+    bridge.stop().await;
+    env.daemon.shutdown().await;
+}
+
+/// `agent-device`, the same tools as a command line in an agent's shell:
+/// the real binary against a daemon with fake devices. Its screenshots set
+/// what points are in for the thread's MCP tools too.
+#[tokio::test]
+async fn agent_device_runs_the_device_tools_from_a_shell() {
+    use loft_core::devices::fake::{FakeBackend, FakeEvent};
+    let phone = Arc::new(FakeBackend::new(
+        DevicePlatform::Ios,
+        Duration::from_millis(50),
+    ));
+    let fold = Arc::new(FakeBackend::foldable(Duration::from_millis(50)));
+    let env = setup_with(vec![phone.clone(), fold.clone()]).await;
+    let thread = fake_thread(&env).await;
+    let home = env.paths.home.clone();
+    let thread_id = thread.id.clone();
+    let cli = move |args: &[&str]| {
+        let (home, thread_id) = (home.clone(), thread_id.clone());
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        async move {
+            let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_agentloftd"))
+                .arg("--home")
+                .arg(&home)
+                .arg("device")
+                .args(&args)
+                .env(loft_core::THREAD_ENV, thread_id.as_str())
+                .output()
+                .await
+                .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        }
+    };
+    let json_of = |(code, stdout, stderr): (Option<i32>, String, String)| {
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .unwrap_or_else(|e| panic!("{e}: {stdout}"))
+    };
+    let id = phone.id().to_string();
+
+    let (code, help, _) = cli(&["help"]).await;
+    assert_eq!(code, Some(0));
+    assert!(
+        help.contains("Usage: agent-device") && help.contains("Coordinates"),
+        "{help}"
+    );
+
+    let (code, list, _) = cli(&["list"]).await;
+    assert_eq!(code, Some(0));
+    assert!(
+        list.contains(&format!("{id}  Fake Phone  iOS 0.0  stopped")),
+        "{list}"
+    );
+    let listed = json_of(cli(&["list", "--json"]).await);
+    assert_eq!(listed["devices"].as_array().unwrap().len(), 2);
+
+    // Booting tells the thread's windows its agent uses the device.
+    let booted = json_of(cli(&["--json", "boot", &id]).await);
+    assert_eq!(booted["state"], "running");
+    assert_eq!(booted["used_by"], "this thread");
+
+    // A screenshot is a PNG where it was asked for, of the size it says.
+    let out = env.paths.home.join("shots/phone.png");
+    let (code, said, err) = cli(&["screenshot", &id, "--out", &out.to_string_lossy()]).await;
+    assert_eq!(code, Some(0), "{err}");
+    assert!(said.starts_with(&*out.to_string_lossy()), "{said}");
+    assert!(said.contains("390x844 pixels"), "{said}");
+    let png = std::fs::read(&out).unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+    let picture = image::load_from_memory(&png).unwrap();
+    assert_eq!((picture.width(), picture.height()), (390, 844));
+    let shot = json_of(cli(&["screenshot", &id, "--json"]).await);
+    assert!(std::path::Path::new(shot["path"].as_str().unwrap()).is_file());
+    assert_eq!(shot["width"], 390);
+    std::fs::remove_file(shot["path"].as_str().unwrap()).unwrap();
+
+    // Taps are points of that screenshot.
+    let (code, said, _) = cli(&["tap", &id, "195", "211"]).await;
+    assert_eq!(
+        (code, said.trim()),
+        (Some(0), "Done. Take a new screenshot to see the result.")
+    );
+    let touch = |phase, x, y| FakeEvent::Input(DeviceInput::Touch { phase, x, y });
+    assert_eq!(
+        phone.log()[phone.log().len() - 2..],
+        [
+            touch(TouchPhase::Down, 0.5, 0.25),
+            touch(TouchPhase::Up, 0.5, 0.25)
+        ]
+    );
+    let done = json_of(cli(&["--json", "press", &id, "home"]).await);
+    assert_eq!(done["ok"], true);
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Input(DeviceInput::Button {
+            button: DeviceButton::Home
+        })
+    );
+    ok_typed(&cli(&["type", &id, "hello", "world"]).await);
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Input(DeviceInput::Text {
+            text: "hello world".into()
+        })
+    );
+    ok_typed(&cli(&["pinch", &id, "195", "422", "0.5", "--ms", "60"]).await);
+    assert!(matches!(
+        phone.log().last().unwrap(),
+        FakeEvent::Input(DeviceInput::Touches {
+            phase: TouchPhase::Up,
+            ..
+        })
+    ));
+
+    // Mistakes: the status says so, and --json says why.
+    let (code, _, err) = cli(&["tap", &id, "391", "0"]).await;
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains("outside the screenshot, which is 390x844"),
+        "{err}"
+    );
+    let (code, out, _) = cli(&["--json", "tap", "ios:NOPE", "1", "1"]).await;
+    assert_eq!(code, Some(1));
+    assert!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["error"].is_string());
+    let (code, _, err) = cli(&["tap", &id]).await;
+    assert_eq!(code, Some(2), "{err}");
+
+    // Settings, as words.
+    let set = json_of(
+        cli(&[
+            "set",
+            &id,
+            "appearance",
+            "dark",
+            "reduce-motion",
+            "on",
+            "--json",
+        ])
+        .await,
+    );
+    assert_eq!(set["settings"]["dark"], true);
+    assert_eq!(set["settings"]["reduce_motion"], true);
+    let settings = json_of(cli(&["settings", &id, "--json"]).await);
+    assert_eq!(settings["dark"], true);
+    let (code, said, _) = cli(&["settings", &id]).await;
+    assert_eq!(code, Some(0));
+    assert!(said.contains("dark: true"), "{said}");
+    ok_typed(&cli(&["permission", &id, "com.example.fake", "photos", "revoke"]).await);
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Set(DeviceSetting::Permission {
+            app: "com.example.fake".into(),
+            permission: "photos".into(),
+            grant: false
+        })
+    );
+    ok_typed(
+        &cli(&[
+            "push",
+            &id,
+            "com.example.fake",
+            "--payload",
+            r#"{"aps":{"badge":3}}"#,
+        ])
+        .await,
+    );
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        FakeEvent::Set(DeviceSetting::Push {
+            app: "com.example.fake".into(),
+            payload: serde_json::json!({"aps": {"badge": 3}})
+        })
+    );
+
+    // Folding.
+    let fid = fold.id().to_string();
+    json_of(cli(&["boot", &fid, "--json"]).await);
+    let folded = json_of(cli(&["fold", &fid, "half-opened", "--json"]).await);
+    assert_eq!(folded["fold"]["posture"], "half_opened");
+    let folded = json_of(cli(&["fold", &fid, "--hinge", "0", "--json"]).await);
+    assert_eq!(folded["fold"]["posture"], "closed");
+    assert_eq!(
+        *fold.log().last().unwrap(),
+        FakeEvent::Set(DeviceSetting::Hinge { degrees: 0.0 })
+    );
+
+    // The thread's MCP tools take points in the CLI's screenshot's pixels.
+    let mut bridge = Bridge::start(&env.paths, &thread.id).await;
+    let tapped = bridge
+        .tool(
+            "device_tap",
+            serde_json::json!({"id": id, "x": 390, "y": 844}),
+        )
+        .await;
+    assert_eq!(tapped["isError"], false, "{tapped}");
+    assert_eq!(
+        *phone.log().last().unwrap(),
+        touch(TouchPhase::Up, 1.0, 1.0)
+    );
+    bridge.stop().await;
+
+    ok_typed(&cli(&["shutdown", &id]).await);
+    assert_eq!(*phone.log().last().unwrap(), FakeEvent::Shutdown);
+    env.daemon.shutdown().await;
+}
+
+/// A command that worked.
+fn ok_typed((code, out, err): &(Option<i32>, String, String)) {
+    assert_eq!(*code, Some(0), "{out}{err}");
+}
+
 /// The whole path with a real browser: an agent's tools (through the MCP
 /// bridge) drive the thread's page of the daemon's browser, and a client
 /// that has the thread open is told so. Needs Chrome (or Chromium, Edge,
