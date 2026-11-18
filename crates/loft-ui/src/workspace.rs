@@ -72,6 +72,7 @@ const TRAFFIC_LIGHTS_INSET: f32 = if cfg!(target_os = "macos") { 78. } else { 16
 pub fn bind_keys(cx: &mut gpui_kit::App) {
     // Every shortcut, with the user's own keys (Settings → Shortcuts).
     crate::keymap::apply(cx);
+    cx.bind_keys(crate::browser_paste::key_bindings());
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
 
@@ -3202,9 +3203,11 @@ impl WorkspaceView {
     /// ⌘V (or Edit ▸ Paste) in a thread's composer. Images become
     /// attachments and big text a chip; other text is left to the textarea.
     ///
-    /// In a browser the clipboard can only be read asynchronously, and the
-    /// textarea's own fallback read keeps just the text, so there the read is
-    /// ours: it must start now, inside the key press that allowed it.
+    /// In a browser no key gets here (⌘V and Ctrl+V are the browser's own
+    /// paste, `browser_paste`), only the context menu's Paste. The clipboard
+    /// can only be read asynchronously there, and the textarea's own
+    /// fallback read keeps just the text, so the read is ours: it must start
+    /// now, inside the click that allowed it.
     fn paste_in_composer(&mut self, id: &ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = cx.read_from_clipboard() {
             if self.take_paste(id, &item, cx) {

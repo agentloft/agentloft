@@ -1,20 +1,46 @@
 //! The browser's own paste, for the composer.
 //!
-//! In a browser, ⌘V is not a key GPUI binds (gpui-kit binds `cmd-v` only when
-//! built for macOS): the browser pastes, and its `paste` event reaches the
-//! focused text input as `InputHandler::paste`, images included. gpui-kit's
-//! text input keeps only the text of it. So the composer's input handler is
-//! wrapped: everything goes to the textarea as before, except a paste the
-//! composer takes itself (images, a big block of text).
+//! In a browser, ⌘V and Ctrl+V are not keys GPUI binds in a text field
+//! (gpui-kit binds `cmd-v` only when built for macOS, and [`key_bindings`]
+//! takes back the `ctrl-v` it binds everywhere else): the browser pastes,
+//! and its `paste` event reaches the focused text input as
+//! `InputHandler::paste`, images included, with no clipboard permission
+//! asked. gpui-kit's text input keeps only the text of it. So the composer's
+//! input handler is wrapped: everything goes to the textarea as before,
+//! except a paste the composer takes itself (images, a big block of text).
 
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::{
     App, Bounds, ClipboardItem, ElementInputHandler, Entity, Focusable as _, InputHandler,
-    IntoElement, Pixels, Point, Styled as _, TextInputConfiguration, UTF16Selection, Window,
-    canvas,
+    IntoElement, KeyBinding, NoAction, Pixels, Point, Styled as _, TextInputConfiguration,
+    UTF16Selection, Window, canvas,
 };
 use std::ops::Range;
 use std::rc::Rc;
+
+/// gpui-kit's text fields' key context.
+const INPUT_CONTEXT: &str = "Input";
+
+/// Keys a text field leaves to the browser, so that the browser's own
+/// `paste` event follows them. Bound after gpui-kit's own bindings.
+///
+/// gpui-kit binds `ctrl-v` to `Paste` in every build but macOS's, the
+/// browser's included. A key GPUI handles is cancelled by its web platform
+/// (`preventDefault` on the `keydown`), so no `paste` event came, and
+/// `Paste` could only read through the asynchronous clipboard read, which
+/// asks for the clipboard permission. Unbound, Ctrl+V is the browser's
+/// paste, as ⌘V is. A field's context menu Paste still reads that way (its
+/// click allows the read; no key can do it for the menu).
+pub fn key_bindings() -> Vec<KeyBinding> {
+    bindings_for(crate::host::IS_WEB)
+}
+
+fn bindings_for(web: bool) -> Vec<KeyBinding> {
+    if !web {
+        return Vec::new();
+    }
+    vec![KeyBinding::new("ctrl-v", NoAction, Some(INPUT_CONTEXT))]
+}
 
 /// Takes a paste (true) or leaves it to the textarea (false).
 pub type OnPaste = Rc<dyn Fn(&ClipboardItem, &mut Window, &mut App) -> bool>;
@@ -183,5 +209,38 @@ impl InputHandler for Composer {
         cx: &mut App,
     ) -> TextInputConfiguration {
         self.inner.text_input_configuration(window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::component::input::Paste;
+    use gpui_kit::{Action as _, KeyContext, Keymap, Keystroke};
+
+    /// What Ctrl+V runs in a text field, with gpui-kit's binding as every
+    /// build but macOS's has it, then ours.
+    fn ctrl_v_in_a_field(web: bool) -> Vec<&'static str> {
+        let mut bindings = vec![KeyBinding::new("ctrl-v", Paste, Some(INPUT_CONTEXT))];
+        bindings.extend(bindings_for(web));
+        let keymap = Keymap::new(bindings);
+        let field = [
+            KeyContext::parse("Workspace").unwrap(),
+            KeyContext::parse(INPUT_CONTEXT).unwrap(),
+        ];
+        let (matched, pending) =
+            keymap.bindings_for_input(&[Keystroke::parse("ctrl-v").unwrap()], &field);
+        assert!(!pending);
+        matched.iter().map(|b| b.action().name()).collect()
+    }
+
+    #[test]
+    fn ctrl_v_in_a_browser_is_the_browsers_paste() {
+        assert_eq!(ctrl_v_in_a_field(true), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn ctrl_v_on_the_desktop_stays_paste() {
+        assert_eq!(ctrl_v_in_a_field(false), vec![Paste.name()]);
     }
 }
