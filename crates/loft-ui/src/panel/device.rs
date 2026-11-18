@@ -21,7 +21,7 @@ use gpui_kit::{
     AnyElement, App, AppContext as _, Bounds, ClipboardItem, Context, DispatchPhase,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement as _, PinchEvent, Pixels, Point, Render,
+    MouseMoveEvent, MouseUpEvent, NoAction, ParentElement as _, PinchEvent, Pixels, Point, Render,
     RenderImage, ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Task, UTF16Selection, Window, canvas, div, img, px,
 };
@@ -87,10 +87,16 @@ fn init(cx: &mut App) {
         return;
     }
     cx.set_global(Initialized);
+    let ctx = Some(KEY_CONTEXT);
+    // Tab goes to the device, not to the app's next control: these keep
+    // Root's focus-next binding from taking it before `on_key_down`.
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, ctx),
+        KeyBinding::new("shift-tab", NoAction, ctx),
+    ]);
     // In a browser its own paste brings the text
     // (`EntityInputHandler::paste`); the app reads the clipboard itself.
     if !crate::host::IS_WEB {
-        let ctx = Some(KEY_CONTEXT);
         cx.bind_keys([
             KeyBinding::new("cmd-v", PasteToDevice, ctx),
             KeyBinding::new("ctrl-v", PasteToDevice, ctx),

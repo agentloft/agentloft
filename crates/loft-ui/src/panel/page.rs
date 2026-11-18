@@ -21,7 +21,7 @@ use gpui_kit::{
     App, AppContext as _, Bounds, ClipboardItem, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollEvent,
+    MouseUpEvent, NoAction, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollEvent,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, UTF16Selection, Window,
     canvas, div, img, px,
 };
@@ -207,6 +207,11 @@ fn init(cx: &mut App) {
     // only where the app can read the clipboard itself: in a browser, the
     // browser's own paste brings the text (`EntityInputHandler::paste`).
     let mut bindings = vec![
+        // Tab moves through the page's fields, not the app's controls:
+        // these keep Root's focus-next binding from taking it first, so it
+        // reaches `on_key_down`.
+        KeyBinding::new("tab", NoAction, ctx),
+        KeyBinding::new("shift-tab", NoAction, ctx),
         KeyBinding::new("cmd-c", CopySelection, ctx),
         KeyBinding::new("ctrl-c", CopySelection, ctx),
         KeyBinding::new("cmd-x", CutSelection, ctx),
