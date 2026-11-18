@@ -45,6 +45,10 @@ enum Cmd {
         /// A device set other than the user's.
         #[arg(long)]
         set: Option<PathBuf>,
+        /// A built-in screen to follow besides the main one (a foldable's
+        /// inner screen); may be given more than once.
+        #[arg(long = "screen")]
+        screens: Vec<u32>,
     },
     /// `agent-device`: agents' device command line (ADR-0020). The daemon's
     /// `<home>/bin/agent-device` runs this; `agentloftd device help` says
@@ -79,10 +83,11 @@ fn main() -> Result<()> {
         udid,
         developer_dir,
         set,
+        screens,
     }) = cli.cmd
     {
         // stdout carries pictures; nothing else may write to it.
-        return simulator(udid, developer_dir, set);
+        return simulator(udid, developer_dir, set, screens);
     }
     let paths = match cli.home {
         Some(home) => Paths::new(home),
@@ -134,16 +139,27 @@ fn main() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn simulator(udid: String, developer_dir: PathBuf, set: Option<PathBuf>) -> Result<()> {
+fn simulator(
+    udid: String,
+    developer_dir: PathBuf,
+    set: Option<PathBuf>,
+    screens: Vec<u32>,
+) -> Result<()> {
     loft_sim::run(loft_sim::Options {
         udid,
         set,
         developer_dir,
+        screens,
     })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn simulator(_udid: String, _developer_dir: PathBuf, _set: Option<PathBuf>) -> Result<()> {
+fn simulator(
+    _udid: String,
+    _developer_dir: PathBuf,
+    _set: Option<PathBuf>,
+    _screens: Vec<u32>,
+) -> Result<()> {
     anyhow::bail!("iOS simulators need a Mac")
 }
 

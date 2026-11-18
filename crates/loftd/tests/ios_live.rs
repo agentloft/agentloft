@@ -2,8 +2,9 @@
 //! (`agentloftd simulator`): boot, pictures, a swipe, Home, turning, a
 //! capture, shutdown; and settings read back, permissions, a push, the app
 //! in front, an orientation, accessibility frames, a pinch in Maps and three
-//! fingers on a web page. Needs Xcode with an iOS
-//! runtime; takes a minute or two.
+//! fingers on a web page; and an iPhone Duo folded and unfolded, when a
+//! runtime has one (Xcode 27.1 on). Needs Xcode with an iOS runtime; takes
+//! a minute or two.
 //!
 //! `cargo test -p loftd --test ios_live -- --ignored --nocapture`
 //!
@@ -15,8 +16,8 @@
 use loft_core::devices::ios::{Helper, IosBackend};
 use loft_core::devices::{Backend, Picture, Screen};
 use loft_protocol::{
-    DeviceApp, DeviceButton, DeviceInput, DeviceOrientation, DeviceSetting, DeviceState,
-    DeviceTextSize, TouchPhase, TouchPoint,
+    DeviceApp, DeviceButton, DeviceInput, DeviceOrientation, DevicePosture, DeviceSetting,
+    DeviceState, DeviceTextSize, TouchPhase, TouchPoint,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,16 +33,20 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
+        let (device_type, runtime) = newest_iphone();
+        Self::with(name, &device_type, &runtime)
+    }
+
+    fn with(name: &str, device_type: &str, runtime: &str) -> Self {
         let set = PathBuf::from(format!(
             "/private/tmp/loft-ios-live-{name}-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&set).unwrap();
-        let (device_type, runtime) = newest_iphone();
         let out = Command::new("xcrun")
             .args(["simctl", "--set"])
             .arg(&set)
-            .args(["create", "Loft Live iPhone", &device_type, &runtime])
+            .args(["create", "Loft Live iPhone", device_type, runtime])
             .output()
             .unwrap();
         assert!(
@@ -67,18 +72,31 @@ impl Drop for Sandbox {
     }
 }
 
-/// The newest iOS runtime and an iPhone it supports.
+/// The newest iOS runtime with an ordinary iPhone Pro, and that iPhone. A
+/// runtime made for one new device (Xcode 27's iPhone Duo runtime has the
+/// same version as the general one) is passed over.
 fn newest_iphone() -> (String, String) {
     let out = Command::new("xcrun")
         .args(["simctl", "list", "-j", "runtimes"])
         .output()
         .unwrap();
     let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let pro = |t: &serde_json::Value| {
+        t["productFamily"] == "iPhone"
+            && t["name"]
+                .as_str()
+                .is_some_and(|n| n.contains("Pro") && !n.contains("Duo"))
+    };
     let runtime = list["runtimes"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|r| r["platform"] == "iOS" && r["isAvailable"] == true)
+        .filter(|r| {
+            r["supportedDeviceTypes"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(pro))
+        })
         .max_by(|a, b| {
             let v = |r: &serde_json::Value| {
                 r["version"]
@@ -96,9 +114,7 @@ fn newest_iphone() -> (String, String) {
         .unwrap()
         .iter()
         .rev()
-        .find(|t| {
-            t["productFamily"] == "iPhone" && t["name"].as_str().is_some_and(|n| n.contains("Pro"))
-        })
+        .find(|t| pro(t))
         .or_else(|| {
             runtime["supportedDeviceTypes"]
                 .as_array()
@@ -111,6 +127,25 @@ fn newest_iphone() -> (String, String) {
         iphone["identifier"].as_str().unwrap().to_string(),
         runtime["identifier"].as_str().unwrap().to_string(),
     )
+}
+
+/// A runtime with an iPhone Duo (a foldable), and its device type.
+fn a_duo() -> Option<(String, String)> {
+    let out = Command::new("xcrun")
+        .args(["simctl", "list", "-j", "runtimes"])
+        .output()
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    list["runtimes"].as_array()?.iter().find_map(|r| {
+        let duo = r["supportedDeviceTypes"]
+            .as_array()?
+            .iter()
+            .find(|t| t["name"].as_str().is_some_and(|n| n.contains("Duo")))?;
+        Some((
+            duo["identifier"].as_str()?.to_string(),
+            r["identifier"].as_str()?.to_string(),
+        ))
+    })
 }
 
 fn simulator_app_running() -> bool {
@@ -822,4 +857,163 @@ async fn live_settings_and_fingers() {
 
     backend.shutdown(udid).await.unwrap();
     drop(screen);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots a real iOS simulator (needs Xcode 27.1 or later)"]
+async fn live_an_iphone_duo() {
+    let Some((duo, runtime)) = a_duo() else {
+        eprintln!("no runtime has an iPhone Duo: skipped");
+        return;
+    };
+    let sandbox = Sandbox::with("duo", &duo, &runtime);
+    let helper = Helper::agentloftd(PathBuf::from(env!("CARGO_BIN_EXE_agentloftd")));
+    let backend =
+        IosBackend::new(helper, loft_config::process_env()).with_device_set(sandbox.set.clone());
+    let udid = sandbox.udid.clone();
+    let find = |list: &[loft_protocol::DeviceInfo]| {
+        list.iter()
+            .find(|d| d.id.native() == udid)
+            .cloned()
+            .expect("the Duo is listed")
+    };
+
+    // Listed as a book-style foldable, closed, at its cover's size.
+    let listed = find(&backend.list().await.unwrap());
+    let fold = listed.fold.clone().expect("the Duo folds");
+    assert_eq!(fold.posture, DevicePosture::Closed);
+    assert!(fold.on_cover && fold.cover_screen, "{fold:?}");
+    let cover = (listed.width, listed.height);
+    assert!(cover.1 > cover.0, "{listed:?}");
+
+    backend.boot(&udid).await.unwrap();
+    let screen = backend.attach(&udid).await.unwrap();
+    screen.watching(true);
+    assert_eq!(screen.size().map(|(w, h, _)| (w, h)), Some(cover));
+    let settings = backend.settings(&udid).await.unwrap();
+    for name in ["posture", "hinge"] {
+        assert!(settings.supported.iter().any(|s| s == name), "{name}");
+    }
+    let mut pictures = screen.pictures();
+    tokio::time::timeout(Duration::from_secs(10), pictures.wait_for(|p| p.is_some()))
+        .await
+        .expect("a first picture")
+        .unwrap();
+    settle(
+        &screen,
+        Duration::from_millis(1500),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Opened: the inner screen, wider than tall, is shown.
+    let started = Instant::now();
+    backend
+        .set(
+            &udid,
+            DeviceSetting::Posture {
+                posture: DevicePosture::Opened,
+            },
+        )
+        .await
+        .unwrap();
+    eprintln!("opened in {:.1}s", started.elapsed().as_secs_f64());
+    let open = find(&backend.list().await.unwrap());
+    let fold = open.fold.clone().unwrap();
+    assert_eq!(fold.posture, DevicePosture::Opened, "{fold:?}");
+    assert!(!fold.on_cover);
+    let inner = (open.width, open.height);
+    assert!(inner.0 > inner.1 && inner.0 > cover.0, "{open:?}");
+    let shown = Instant::now();
+    while screen.size().map(|(w, h, _)| (w, h)) != Some(inner)
+        && shown.elapsed() < Duration::from_secs(3)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(screen.size().map(|(w, h, _)| (w, h)), Some(inner));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pictures.wait_for(|p| p.as_ref().is_some_and(|p| p.width > p.height)),
+    )
+    .await
+    .expect("a picture of the inner screen")
+    .unwrap();
+    settle(
+        &screen,
+        Duration::from_millis(1500),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    // Touches reach the inner screen: a swipe turns the home screen's page.
+    let home = decode(&latest(&screen));
+    touch(&screen, TouchPhase::Down, 0.8, 0.5).await;
+    for step in 1..=10 {
+        tokio::time::sleep(Duration::from_millis(16)).await;
+        touch(&screen, TouchPhase::Move, 0.8 - 0.06 * step as f32, 0.5).await;
+    }
+    touch(&screen, TouchPhase::Up, 0.2, 0.5).await;
+    changed_from(&screen, &home, 8.0, Duration::from_secs(5))
+        .await
+        .expect("the swipe changed the inner screen");
+
+    // Half open stays on the inner screen.
+    backend
+        .set(
+            &udid,
+            DeviceSetting::Posture {
+                posture: DevicePosture::HalfOpened,
+            },
+        )
+        .await
+        .unwrap();
+    let fold = find(&backend.list().await.unwrap()).fold.unwrap();
+    assert_eq!(fold.posture, DevicePosture::HalfOpened, "{fold:?}");
+    assert!(!fold.on_cover);
+
+    // Closed: back to the cover.
+    backend
+        .set(
+            &udid,
+            DeviceSetting::Posture {
+                posture: DevicePosture::Closed,
+            },
+        )
+        .await
+        .unwrap();
+    let closed = find(&backend.list().await.unwrap());
+    let fold = closed.fold.clone().unwrap();
+    assert_eq!(fold.posture, DevicePosture::Closed, "{fold:?}");
+    assert!(fold.on_cover);
+    assert_eq!((closed.width, closed.height), cover);
+    // The cover's interface turns upright a moment after it is shown.
+    let shown = Instant::now();
+    while screen.size().map(|(w, h, _)| (w, h)) != Some(cover)
+        && shown.elapsed() < Duration::from_secs(3)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(screen.size().map(|(w, h, _)| (w, h)), Some(cover));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pictures.wait_for(|p| p.as_ref().is_some_and(|p| p.height > p.width)),
+    )
+    .await
+    .expect("a picture of the cover")
+    .unwrap();
+
+    // Flipping outward isn't something it does.
+    assert!(
+        backend
+            .set(
+                &udid,
+                DeviceSetting::Posture {
+                    posture: DevicePosture::Flipped,
+                },
+            )
+            .await
+            .is_err()
+    );
+    drop(screen);
+    backend.shutdown(&udid).await.unwrap();
 }

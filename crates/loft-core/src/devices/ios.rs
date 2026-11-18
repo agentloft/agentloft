@@ -19,13 +19,20 @@
 //! gave the focal UI role (simulator apps are this Mac's processes, so their
 //! role reads with `getpriority(PRIO_DARWIN_ROLE)`). What a simulator can't
 //! do: VoiceOver (not in the simulator's runtime), turning its network off
-//! (it is this Mac's), folding (Xcode has no foldable device).
+//! (it is this Mac's).
+//!
+//! Folding (the iPhone Duo, Xcode 27.1 on): a device type with a second
+//! built-in screen folds like a book, its main screen (screen ID 1) being
+//! the cover. It is folded by SpringBoard's own display tool service, from
+//! a small program run inside the device (`ios_fold.m`, compiled here with
+//! this Mac's Xcode the first time it's needed); the helper notices which
+//! screen is in use (the other is black) and shows that one.
 
 use super::{Backend, BoxFut, Picture, Screen};
 use anyhow::{Context, Result, anyhow, bail};
 use loft_protocol::{
-    DeviceApp, DeviceId, DeviceInfo, DeviceInput, DeviceOrientation, DevicePlatform, DeviceSetting,
-    DeviceSettings, DeviceState, DeviceTextSize,
+    DeviceApp, DeviceFold, DeviceId, DeviceInfo, DeviceInput, DeviceOrientation, DevicePlatform,
+    DevicePosture, DeviceSetting, DeviceSettings, DeviceState, DeviceTextSize, FoldAxis,
 };
 use loft_sim::wire::{self, Command, Event, Request};
 use serde::Deserialize;
@@ -79,6 +86,16 @@ pub struct IosBackend {
     /// The devices whose accessibility frames are to be outlined (a
     /// helper attached later outlines them too).
     outlined: Mutex<std::collections::HashSet<String>>,
+    /// The foldable devices (by UDID), as last listed.
+    /// The foldable devices (by UDID), with their inner screen's ID.
+    foldables: Mutex<HashMap<String, u32>>,
+    /// The hinge each foldable was last folded to, in degrees, while it runs.
+    hinges: Mutex<HashMap<String, f32>>,
+    /// The fold program, once compiled (see `ios_fold.m`).
+    fold_tool: tokio::sync::Mutex<Option<PathBuf>>,
+    /// Held while a device folds: SpringBoard drops a fold asked for while
+    /// another is going on.
+    folding: tokio::sync::Mutex<()>,
 }
 
 impl IosBackend {
@@ -93,6 +110,10 @@ impl IosBackend {
             screens: Mutex::default(),
             attached: Mutex::default(),
             outlined: Mutex::default(),
+            foldables: Mutex::default(),
+            hinges: Mutex::default(),
+            fold_tool: tokio::sync::Mutex::new(None),
+            folding: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -195,7 +216,7 @@ impl IosBackend {
 
     /// The screen size of each device type in `list`, read from its profile
     /// the first time it's seen.
-    async fn screen_sizes(&self, list: &SimctlList) -> HashMap<String, (u32, u32, f32)> {
+    async fn screen_sizes(&self, list: &SimctlList) -> HashMap<String, ScreenOf> {
         let mut sizes = HashMap::new();
         for device_type in &list.devicetypes {
             let known = self
@@ -224,22 +245,43 @@ impl IosBackend {
 
     /// The main screen's size from the device type's bundle: its
     /// `profile.plist` up to Xcode 26, its `capabilities.plist` from
-    /// Xcode 27 (whose profiles no longer have it).
-    async fn read_screen(&self, bundle: &str) -> Option<(u32, u32, f32)> {
+    /// Xcode 27 (whose profiles no longer have it); and a foldable's inner
+    /// screen, from the displays its capabilities list.
+    async fn read_screen(&self, bundle: &str) -> Option<ScreenOf> {
         if bundle.is_empty() {
             return None;
         }
         let resources = Path::new(bundle).join("Contents/Resources");
-        if let Some(size) = plist_file_json(&resources.join("profile.plist"))
+        let capabilities = plist_file_json(&resources.join("capabilities.plist")).await;
+        let main = match plist_file_json(&resources.join("profile.plist"))
             .await
             .and_then(|json| screen_of_profile(&json))
         {
-            return Some(size);
-        }
-        plist_file_json(&resources.join("capabilities.plist"))
-            .await
-            .and_then(|json| screen_of_capabilities(&json))
+            Some(size) => size,
+            None => capabilities.as_deref().and_then(screen_of_capabilities)?,
+        };
+        Some(ScreenOf {
+            width: main.0,
+            height: main.1,
+            scale: main.2,
+            inner: capabilities.as_deref().and_then(inner_screen),
+        })
     }
+}
+
+/// The program that folds a foldable simulator, run inside it.
+const FOLD_SOURCE: &str = include_str!("ios_fold.m");
+/// The entitlement SpringBoard's display tool service asks of its clients.
+const FOLD_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.springboard.sbdisplay.service</key><true/></dict></plist>
+"#;
+
+/// FNV-1a: a hash that stays the same from one build to the next.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// A property list file as JSON.
@@ -248,8 +290,17 @@ async fn plist_file_json(path: &Path) -> Option<Vec<u8>> {
     plist_json(&plist).await.ok()
 }
 
-/// A screen's width and height in pixels, and pixels per point.
-type ScreenOf = (u32, u32, f32);
+/// A device type's main screen: its width and height in pixels, and pixels
+/// per point; and a foldable's inner screen, as it is shown (its width and
+/// height in pixels).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScreenOf {
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    /// A foldable's inner screen: its screen ID, and its width and height.
+    pub inner: Option<(u32, u32, u32)>,
+}
 
 const NO_XCODE: &str = "Xcode isn't installed. Install it from the App Store and open it once to finish setting it up.";
 const ONLY_TOOLS: &str = "Only Xcode's Command Line Tools are selected, and iOS simulators need Xcode itself. Install Xcode, then run `sudo xcode-select -s /Applications/Xcode.app`.";
@@ -382,6 +433,94 @@ fn screen_of_capabilities(json: &[u8]) -> Option<(u32, u32, f32)> {
     ))
 }
 
+/// A foldable's inner screen from a device type's `capabilities.plist` as
+/// JSON: a second built-in display (screen ID other than 1), as it is shown
+/// (turned by its `nativeRotation`).
+fn inner_screen(json: &[u8]) -> Option<(u32, u32, u32)> {
+    #[derive(Deserialize)]
+    struct File {
+        capabilities: Capabilities,
+    }
+    #[derive(Deserialize)]
+    struct Capabilities {
+        #[serde(default)]
+        displays: Vec<Display>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Display {
+        #[serde(default)]
+        display_type: String,
+        #[serde(rename = "screenID", default)]
+        screen_id: u32,
+        #[serde(default)]
+        width: u32,
+        #[serde(default)]
+        height: u32,
+        #[serde(default)]
+        native_rotation: u32,
+    }
+    let f: File = serde_json::from_slice(json).ok()?;
+    let d = f
+        .capabilities
+        .displays
+        .into_iter()
+        .find(|d| d.display_type == "integrated" && d.screen_id != 1 && d.width > 0)?;
+    Some(if d.native_rotation % 180 == 90 {
+        (d.screen_id, d.height, d.width)
+    } else {
+        (d.screen_id, d.width, d.height)
+    })
+}
+
+/// How a running foldable is folded: its hinge, and whether it shows its
+/// cover screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FoldNow {
+    pub hinge: f32,
+    pub on_cover: bool,
+}
+
+impl FoldNow {
+    /// As it boots: closed.
+    const CLOSED: Self = Self {
+        hinge: 0.0,
+        on_cover: true,
+    };
+
+    fn fold(self) -> DeviceFold {
+        let posture = match self.hinge {
+            h if h <= 0.0 => DevicePosture::Closed,
+            h if h >= 170.0 => DevicePosture::Opened,
+            _ => DevicePosture::HalfOpened,
+        };
+        DeviceFold {
+            axis: FoldAxis::Vertical,
+            inward: true,
+            cover_screen: true,
+            postures: vec![
+                DevicePosture::Closed,
+                DevicePosture::HalfOpened,
+                DevicePosture::Opened,
+            ],
+            posture,
+            hinge: self.hinge,
+            hinge_min: 0.0,
+            hinge_max: 180.0,
+            on_cover: self.on_cover,
+        }
+    }
+}
+
+/// The hinge of SpringBoard's "book" position (about 100 degrees).
+const BOOK_HINGE: f32 = 100.0;
+
+/// The fold program's hinge position for a hinge in degrees: 0 closed, 1
+/// open flat.
+fn fold_position(degrees: f32) -> String {
+    format!("{:.4}", (degrees / 180.0).clamp(0.0, 1.0))
+}
+
 fn device_state(state: &str) -> DeviceState {
     match state {
         "Booted" => DeviceState::Running,
@@ -392,10 +531,12 @@ fn device_state(state: &str) -> DeviceState {
 }
 
 /// The iPhones and iPads in `simctl list -j`, with their screens' sizes
-/// from `sizes` (by device type).
+/// from `sizes` (by device type); a running foldable folded as `fold_of`
+/// says (by UDID), else closed.
 pub(crate) fn devices_of(
     list: &SimctlList,
-    sizes: &HashMap<String, (u32, u32, f32)>,
+    sizes: &HashMap<String, ScreenOf>,
+    fold_of: &dyn Fn(&str) -> Option<FoldNow>,
 ) -> Vec<DeviceInfo> {
     let families: HashMap<&str, &str> = list
         .devicetypes
@@ -423,23 +564,35 @@ pub(crate) fn devices_of(
             } else {
                 runtime.name.clone()
             };
-            let (width, height, scale) = sizes
-                .get(&device.device_type_identifier)
-                .copied()
-                .unwrap_or((0, 0, 0.0));
+            let screen = sizes.get(&device.device_type_identifier).copied();
+            let (mut width, mut height, scale) =
+                screen.map_or((0, 0, 0.0), |s| (s.width, s.height, s.scale));
+            let state = device_state(&device.state);
+            // A foldable shows the size of the screen it's using.
+            let fold = screen.and_then(|s| s.inner).map(|(_, iw, ih)| {
+                let inner = (iw, ih);
+                let now = Some(&state)
+                    .filter(|s| **s == DeviceState::Running)
+                    .and_then(|_| fold_of(&device.udid))
+                    .unwrap_or(FoldNow::CLOSED);
+                if !now.on_cover {
+                    (width, height) = inner;
+                }
+                now.fold()
+            });
             out.push(DeviceInfo {
                 id: DeviceId::ios(&device.udid),
                 platform: DevicePlatform::Ios,
                 name: device.name.clone(),
                 os,
-                state: device_state(&device.state),
+                state,
                 width,
                 height,
                 scale,
                 error: None,
                 agent: None,
                 physical: false,
-                fold: None,
+                fold,
             });
         }
     }
@@ -637,6 +790,11 @@ async fn plist_json(plist: &[u8]) -> Result<Vec<u8>> {
 }
 
 impl IosBackend {
+    /// A foldable's inner screen ID (as last listed).
+    fn inner_screen_of(&self, udid: &str) -> Option<u32> {
+        self.foldables.lock().unwrap().get(udid).copied()
+    }
+
     /// The device's attached screen, or a helper of its own for as long as
     /// `f` needs it.
     async fn helper_for(&self, udid: &str) -> Result<Arc<IosScreen>> {
@@ -645,7 +803,14 @@ impl IosBackend {
         }
         let developer_dir = self.check_support().await.map_err(|why| anyhow!(why))?;
         Ok(Arc::new(
-            IosScreen::start(&self.helper, udid, &developer_dir, self.set.as_deref()).await?,
+            IosScreen::start(
+                &self.helper,
+                udid,
+                &developer_dir,
+                self.set.as_deref(),
+                self.inner_screen_of(udid),
+            )
+            .await?,
         ))
     }
 
@@ -702,6 +867,154 @@ impl IosBackend {
             .filter(|s| s.ended.borrow().is_none())
     }
 
+    /// How a running foldable is folded: the hinge it was last folded to,
+    /// and the screen its attached helper shows (SpringBoard swaps screens
+    /// at a different angle opening than closing, so a half-open device
+    /// may show either).
+    fn fold_now(&self, udid: &str) -> FoldNow {
+        let hinge = self.hinges.lock().unwrap().get(udid).copied();
+        let shown = self
+            .attached(udid)
+            .and_then(|s| *s.screen_id.lock().unwrap())
+            .map(|id| id == 1);
+        match (hinge, shown) {
+            (Some(hinge), Some(on_cover)) => FoldNow { hinge, on_cover },
+            (Some(hinge), None) => FoldNow {
+                hinge,
+                on_cover: hinge <= 0.0,
+            },
+            // Not folded here since it booted: closed, unless it shows the
+            // inner screen.
+            (None, Some(false)) => FoldNow {
+                hinge: 180.0,
+                on_cover: false,
+            },
+            (None, _) => FoldNow::CLOSED,
+        }
+    }
+
+    /// Fold `udid` to `degrees` (0 closed, 180 open), then wait for its
+    /// helper to show the screen that goes with it.
+    async fn fold(&self, udid: &str, degrees: f32) -> Result<()> {
+        if !self.foldables.lock().unwrap().contains_key(udid) {
+            bail!("This simulator doesn't fold: only foldables (an iPhone Duo) do.");
+        }
+        let tool = self.fold_tool().await?;
+        let tool = tool.to_string_lossy();
+        let _one_at_a_time = self.folding.lock().await;
+        self.simctl(&["spawn", udid, &tool, &fold_position(degrees)])
+            .await
+            .context("SpringBoard didn't fold the device")?;
+        self.hinges
+            .lock()
+            .unwrap()
+            .insert(udid.to_string(), degrees);
+        // The helper notices within a quarter of a second; a hinge between
+        // closed and open may not change screens, so wait only for those.
+        let cover = match degrees {
+            d if d <= 0.0 => Some(true),
+            d if d >= BOOK_HINGE => Some(false),
+            _ => None,
+        };
+        if let (Some(cover), Some(screen)) = (cover, self.attached(udid)) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if screen.screen_id.lock().unwrap().map(|id| id == 1) == Some(cover) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// The fold program (`ios_fold.m`), compiled with this Mac's Xcode for
+    /// the simulator the first time it's needed, with its entitlement
+    /// linked into its `__TEXT,__entitlements` section. Kept in the
+    /// temporary folder, by the source, Xcode and architecture it was built
+    /// from.
+    async fn fold_tool(&self) -> Result<PathBuf> {
+        let mut built = self.fold_tool.lock().await;
+        if let Some(path) = built.as_ref().filter(|p| p.exists()) {
+            return Ok(path.clone());
+        }
+        let developer_dir = self.check_support().await.map_err(|why| anyhow!(why))?;
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let key = fnv1a(
+            [
+                FOLD_SOURCE.as_bytes(),
+                developer_dir.as_os_str().as_encoded_bytes(),
+                arch.as_bytes(),
+            ]
+            .concat()
+            .as_slice(),
+        );
+        let path = std::env::temp_dir().join(format!("agentloft-ios-fold-{key:016x}"));
+        if !path.exists() {
+            let dir = path.with_extension(format!("build-{}", std::process::id()));
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .context("no temporary folder for the fold program")?;
+            let result = self.build_fold_tool(&dir, arch, &path).await;
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            result?;
+        }
+        *built = Some(path.clone());
+        Ok(path)
+    }
+
+    /// Compile and sign the fold program in `dir`, and move it to `path`.
+    async fn build_fold_tool(&self, dir: &Path, arch: &str, path: &Path) -> Result<()> {
+        {
+            let source = dir.join("fold.m");
+            let entitlements = dir.join("entitlements.plist");
+            let out = dir.join("fold");
+            tokio::fs::write(&source, FOLD_SOURCE).await?;
+            tokio::fs::write(&entitlements, FOLD_ENTITLEMENTS).await?;
+            let built = self
+                .xcrun()
+                .args(["--sdk", "iphonesimulator", "clang", "-arch", arch])
+                .args(["-mios-simulator-version-min=27.1", "-fobjc-arc", "-O2"])
+                .arg("-Wno-arc-performSelector-leaks")
+                .args(["-framework", "Foundation"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&out)
+                .args(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT"])
+                .args(["-Xlinker", "__entitlements", "-Xlinker"])
+                .arg(&entitlements)
+                .output()
+                .await
+                .context("couldn't run Xcode's clang")?;
+            if !built.status.success() {
+                bail!(
+                    "couldn't build the fold program: {}",
+                    String::from_utf8_lossy(&built.stderr).trim()
+                );
+            }
+            let signed = tokio::process::Command::new("/usr/bin/codesign")
+                .args(["-f", "-s", "-"])
+                .arg(&out)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .context("couldn't run codesign")?;
+            if !signed.status.success() {
+                bail!(
+                    "couldn't sign the fold program: {}",
+                    String::from_utf8_lossy(&signed.stderr).trim()
+                );
+            }
+            tokio::fs::rename(&out, path)
+                .await
+                .context("couldn't keep the fold program")?;
+        }
+        Ok(())
+    }
+
     /// The orientation of the device's interface, from its helper (one is
     /// started for it when none is attached).
     async fn orientation(&self, udid: &str) -> Result<Option<DeviceOrientation>> {
@@ -725,12 +1038,32 @@ impl Backend for IosBackend {
             let list: SimctlList =
                 serde_json::from_str(&json).context("simctl's list isn't JSON")?;
             let sizes = self.screen_sizes(&list).await;
-            Ok(devices_of(&list, &sizes))
+            let devices = devices_of(&list, &sizes, &|udid| Some(self.fold_now(udid)));
+            {
+                let mut foldables = self.foldables.lock().unwrap();
+                foldables.clear();
+                foldables.extend(list.devices.values().flatten().filter_map(|d| {
+                    let (id, _, _) = sizes.get(&d.device_type_identifier)?.inner?;
+                    Some((d.udid.clone(), id))
+                }));
+                // A hinge is remembered only while the device runs.
+                let running: std::collections::HashSet<&str> = devices
+                    .iter()
+                    .filter(|d| d.state == DeviceState::Running)
+                    .map(|d| d.id.native())
+                    .collect();
+                self.hinges
+                    .lock()
+                    .unwrap()
+                    .retain(|udid, _| running.contains(udid.as_str()));
+            }
+            Ok(devices)
         })
     }
 
     fn boot<'a>(&'a self, native: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            self.hinges.lock().unwrap().remove(native);
             // `simctl boot` starts the device without Simulator.app.
             if let Err(e) = self.simctl(&["boot", native]).await
                 && !already(&e, "Booted")
@@ -762,7 +1095,14 @@ impl Backend for IosBackend {
         Box::pin(async move {
             let developer_dir = self.check_support().await.map_err(|why| anyhow!(why))?;
             let screen = Arc::new(
-                IosScreen::start(&self.helper, native, &developer_dir, self.set.as_deref()).await?,
+                IosScreen::start(
+                    &self.helper,
+                    native,
+                    &developer_dir,
+                    self.set.as_deref(),
+                    self.inner_screen_of(native),
+                )
+                .await?,
             );
             {
                 let mut attached = self.attached.lock().unwrap();
@@ -860,9 +1200,21 @@ impl Backend for IosBackend {
                 DeviceSetting::Network { .. } => bail!(
                     "An iOS simulator uses this Mac's network: it can't be turned off on its own."
                 ),
-                DeviceSetting::Posture { .. } | DeviceSetting::Hinge { .. } => {
-                    bail!("No iOS simulator folds.")
+                DeviceSetting::Posture { posture } => {
+                    let degrees = match posture {
+                        DevicePosture::Closed => 0.0,
+                        DevicePosture::HalfOpened => BOOK_HINGE,
+                        DevicePosture::Opened => 180.0,
+                        DevicePosture::Flipped | DevicePosture::Tent => {
+                            bail!("This iPhone folds only inward.")
+                        }
+                    };
+                    self.fold(native, degrees).await.map(|()| String::new())
                 }
+                DeviceSetting::Hinge { degrees } => self
+                    .fold(native, degrees.clamp(0.0, 180.0))
+                    .await
+                    .map(|()| String::new()),
             }
             .map(drop)
         })
@@ -888,8 +1240,12 @@ impl Backend for IosBackend {
                 self.simctl(&motion),
                 self.apps(native),
             );
+            let mut supported: Vec<String> = SETTINGS.iter().map(|s| s.to_string()).collect();
+            if self.foldables.lock().unwrap().contains_key(native) {
+                supported.extend(["posture".into(), "hinge".into()]);
+            }
             let mut settings = DeviceSettings {
-                supported: SETTINGS.iter().map(|s| s.to_string()).collect(),
+                supported,
                 dark: appearance.ok().and_then(|a| ui_value(&a, "dark", "light")),
                 text_size: size.ok().and_then(|s| text_size_of(&s)),
                 contrast: contrast
@@ -940,6 +1296,8 @@ struct IosScreen {
     size: Arc<Mutex<Option<(u32, u32, f32)>>>,
     /// Which way the interface faces now.
     orientation: Arc<Mutex<Option<DeviceOrientation>>>,
+    /// A foldable's built-in screen shown now (1: the cover).
+    screen_id: Arc<Mutex<Option<u32>>>,
     /// Accessibility frames are outlined in its pictures.
     outlining: Mutex<bool>,
     requests: mpsc::UnboundedSender<String>,
@@ -957,11 +1315,15 @@ impl Drop for IosScreen {
 }
 
 impl IosScreen {
+    /// `inner`: a foldable's inner screen ID, for the helper to follow
+    /// besides the main screen (other built-in screen IDs are CarPlay's and
+    /// TV out's, never the device's own).
     async fn start(
         helper: &Helper,
         udid: &str,
         developer_dir: &Path,
         set: Option<&Path>,
+        inner: Option<u32>,
     ) -> Result<Self> {
         let mut command = tokio::process::Command::new(&helper.exe);
         command
@@ -971,6 +1333,9 @@ impl IosScreen {
             .arg(developer_dir);
         if let Some(set) = set {
             command.arg("--set").arg(set);
+        }
+        if let Some(inner) = inner {
+            command.arg("--screen").arg(inner.to_string());
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -987,6 +1352,7 @@ impl IosScreen {
         let ended = watch::channel(None).0;
         let size = Arc::new(Mutex::new(None));
         let orientation = Arc::new(Mutex::new(None));
+        let screen_id = Arc::new(Mutex::new(None));
         let waiting: Waiting = Arc::default();
         let (requests, mut requests_rx) = mpsc::unbounded_channel::<String>();
         let (stop, mut stopped) = oneshot::channel::<()>();
@@ -1035,11 +1401,12 @@ impl IosScreen {
 
         // Pictures and answers out.
         {
-            let (pictures, ended, size, orientation, waiting) = (
+            let (pictures, ended, size, orientation, screen_id, waiting) = (
                 pictures.clone(),
                 ended.clone(),
                 size.clone(),
                 orientation.clone(),
+                screen_id.clone(),
                 waiting.clone(),
             );
             tokio::spawn(async move {
@@ -1072,6 +1439,7 @@ impl IosScreen {
                                 *size.lock().unwrap() =
                                     Some((screen.width, screen.height, screen.scale));
                                 *orientation.lock().unwrap() = screen.orientation;
+                                *screen_id.lock().unwrap() = screen.screen;
                                 if let Some(ready) = ready.take() {
                                     let _ = ready.send(Ok(()));
                                 }
@@ -1080,6 +1448,7 @@ impl IosScreen {
                                 *size.lock().unwrap() =
                                     Some((screen.width, screen.height, screen.scale));
                                 *orientation.lock().unwrap() = screen.orientation;
+                                *screen_id.lock().unwrap() = screen.screen;
                             }
                             Ok(Event::Done { id, error }) => {
                                 if let Some(tx) = waiting.lock().unwrap().remove(&id) {
@@ -1115,6 +1484,7 @@ impl IosScreen {
             ended,
             size,
             orientation,
+            screen_id,
             outlining: Mutex::new(false),
             requests,
             waiting,
@@ -1317,9 +1687,14 @@ mod tests {
         let list: SimctlList = serde_json::from_str(LIST).unwrap();
         let sizes = HashMap::from([(
             "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro".to_string(),
-            (1206, 2622, 3.0),
+            ScreenOf {
+                width: 1206,
+                height: 2622,
+                scale: 3.0,
+                inner: None,
+            },
         )]);
-        let devices = devices_of(&list, &sizes);
+        let devices = devices_of(&list, &sizes, &|_| None);
         let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["iPhone 17 Pro", "iPad Air", "Leaving", "Starting"]);
         let phone = &devices[0];
@@ -1336,6 +1711,72 @@ mod tests {
         assert_eq!((pad.width, pad.height), (0, 0));
         assert_eq!(devices[2].state, DeviceState::ShuttingDown);
         assert_eq!(devices[3].state, DeviceState::Booting);
+    }
+
+    #[test]
+    fn a_foldable_shows_the_screen_it_uses() {
+        let list: SimctlList = serde_json::from_str(LIST).unwrap();
+        let duo = ScreenOf {
+            width: 1398,
+            height: 2034,
+            scale: 3.0,
+            inner: Some((3, 2853, 2007)),
+        };
+        let sizes = HashMap::from([(
+            "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro".to_string(),
+            duo,
+        )]);
+        // Not known to be folded: closed, on its cover.
+        let devices = devices_of(&list, &sizes, &|_| None);
+        let phone = &devices[0];
+        let fold = phone.fold.as_ref().expect("it folds");
+        assert_eq!(fold.posture, DevicePosture::Closed);
+        assert!(fold.on_cover && fold.cover_screen && fold.inward);
+        assert_eq!(fold.axis, FoldAxis::Vertical);
+        assert_eq!((phone.width, phone.height), (1398, 2034));
+        // Opened: the inner screen.
+        let open = FoldNow {
+            hinge: 180.0,
+            on_cover: false,
+        };
+        let devices = devices_of(&list, &sizes, &|_| Some(open));
+        let phone = &devices[0];
+        let fold = phone.fold.as_ref().unwrap();
+        assert_eq!(fold.posture, DevicePosture::Opened);
+        assert!(!fold.on_cover);
+        assert_eq!((phone.width, phone.height), (2853, 2007));
+        // A booting one is taken as closed whatever was said of it.
+        let starting = devices.iter().find(|d| d.name == "Starting").unwrap();
+        assert_eq!(
+            starting.fold.as_ref().unwrap().posture,
+            DevicePosture::Closed
+        );
+        // Half open.
+        let book = FoldNow {
+            hinge: BOOK_HINGE,
+            on_cover: false,
+        };
+        assert_eq!(book.fold().posture, DevicePosture::HalfOpened);
+    }
+
+    #[test]
+    fn a_foldables_inner_screen_from_its_capabilities() {
+        let duo = br#"{"capabilities": {"displays": [
+            {"displayType": "integrated", "screenID": 1, "width": 1398, "height": 2034, "nativeRotation": 0},
+            {"displayType": "integrated", "screenID": 3, "width": 2007, "height": 2853, "nativeRotation": 270},
+            {"displayType": "tvOut", "screenID": 2, "width": 720, "height": 480}
+        ]}}"#;
+        assert_eq!(inner_screen(duo), Some((3, 2853, 2007)));
+        let phone = br#"{"capabilities": {"displays": [
+            {"displayType": "integrated", "screenID": 1, "width": 1206, "height": 2622},
+            {"displayType": "scene", "screenID": 4, "width": 7680, "height": 4320}
+        ]}}"#;
+        assert_eq!(inner_screen(phone), None);
+        assert_eq!(inner_screen(b"{}"), None);
+        assert_eq!(fold_position(0.0), "0.0000");
+        assert_eq!(fold_position(180.0), "1.0000");
+        assert_eq!(fold_position(90.0), "0.5000");
+        assert_eq!(fold_position(400.0), "1.0000");
     }
 
     #[test]

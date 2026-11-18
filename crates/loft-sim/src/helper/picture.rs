@@ -124,6 +124,40 @@ pub fn surface_size(surface: *const c_void) -> (usize, usize) {
     unsafe { (IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface)) }
 }
 
+/// Whether every pixel of a grid across `surface` is black: a screen the
+/// device isn't using (a foldable's other screen). `None` when it can't be
+/// read.
+pub fn is_black(surface: *const c_void) -> Option<bool> {
+    const GRID: usize = 24;
+    // SAFETY: an IOSurface the caller holds; it is locked while read, and
+    // read only within its rows.
+    unsafe {
+        if IOSurfaceGetPixelFormat(surface) != BGRA {
+            return None;
+        }
+        if IOSurfaceLock(surface, READ_ONLY, std::ptr::null_mut()) != 0 {
+            return None;
+        }
+        let base = IOSurfaceGetBaseAddress(surface) as *const u8;
+        let (width, height) = (IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
+        let row_bytes = IOSurfaceGetBytesPerRow(surface);
+        let mut black = !base.is_null() && width > 0 && height > 0;
+        'grid: for gy in 0..GRID {
+            let y = (2 * gy + 1) * height / (2 * GRID);
+            for gx in 0..GRID {
+                let x = (2 * gx + 1) * width / (2 * GRID);
+                if !black {
+                    break 'grid;
+                }
+                let pixel = base.add(y * row_bytes + x * 4);
+                black = *pixel < 8 && *pixel.add(1) < 8 && *pixel.add(2) < 8;
+            }
+        }
+        IOSurfaceUnlock(surface, READ_ONLY, std::ptr::null_mut());
+        Some(black)
+    }
+}
+
 /// Read `surface` at `width` × `height` (its own size or smaller, as built)
 /// and turn it upright for `turn`.
 pub fn read(surface: *const c_void, width: usize, height: usize, turn: Turn) -> Result<Pixels> {

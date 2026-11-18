@@ -64,6 +64,11 @@ pub struct ScreenSize {
     /// iPhone's home screen stays upright whichever way it is turned).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation: Option<DeviceOrientation>,
+    /// Which of the device's built-in screens is shown, when it has more
+    /// than one (a foldable): its screen ID, 1 being its main screen (the
+    /// cover).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

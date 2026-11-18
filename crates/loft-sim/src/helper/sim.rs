@@ -48,6 +48,7 @@ use std::ffi::{CStr, CString, c_void};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -173,10 +174,14 @@ unsafe impl<T> Send for Shared<T> {}
 // SAFETY: see above.
 unsafe impl<T> Sync for Shared<T> {}
 
-/// The device, its main display and its HID client.
+/// The device, its built-in screens and its HID client.
 pub struct Device {
     device: Retained<AnyObject>,
-    display: Retained<AnyObject>,
+    /// Each built-in screen's display (its screen ID, the main screen's
+    /// first): one, or a foldable's cover and inner screens.
+    displays: Vec<(u32, Retained<AnyObject>)>,
+    /// The one in use, which pictures and touches go to.
+    current: AtomicUsize,
     hid: Retained<AnyObject>,
     queue: *mut AnyObject,
     mouse: MouseFn,
@@ -190,7 +195,12 @@ pub struct Device {
 
 impl Device {
     /// Find a running device by UDID, in the default set or in `set`.
-    pub fn open(udid: &str, set: Option<&Path>, developer_dir: &Path) -> Result<Self> {
+    pub fn open(
+        udid: &str,
+        set: Option<&Path>,
+        developer_dir: &Path,
+        screens: &[u32],
+    ) -> Result<Self> {
         open_library(CORE_SIMULATOR).context("Xcode's CoreSimulator isn't installed")?;
         let kit = SIMULATOR_KIT
             .iter()
@@ -222,12 +232,17 @@ impl Device {
             )
         };
         guarded("Opening the simulator", || {
-            Self::find(udid, set, developer_dir)
+            Self::find(udid, set, developer_dir, screens)
         })??
         .with_functions(mouse, button, keyboard, arbitrary)
     }
 
-    fn find(udid: &str, set: Option<&Path>, developer_dir: &Path) -> Result<Parts> {
+    fn find(
+        udid: &str,
+        set: Option<&Path>,
+        developer_dir: &Path,
+        screens: &[u32],
+    ) -> Result<Parts> {
         let context_class = AnyClass::get(c"SimServiceContext")
             .context("CoreSimulator has no SimServiceContext")?;
         let mut error: *mut AnyObject = std::ptr::null_mut();
@@ -266,13 +281,14 @@ impl Device {
             bail!("the simulator isn't running");
         }
 
-        // The main display among the device's IO ports.
+        // The built-in displays among the device's IO ports: the main one
+        // (screen ID 1) and, on a foldable, its other one.
         // SAFETY: `-[SimDevice io]` and `-[SimDeviceIOClient ioPorts]`.
         let io: Retained<AnyObject> = unsafe { msg_send![&*device, io] };
         let ports: Retained<AnyObject> = unsafe { msg_send![&*io, ioPorts] };
         // SAFETY: NSArray.
         let count: usize = unsafe { msg_send![&*ports, count] };
-        let mut display = None;
+        let mut displays = Vec::new();
         for i in 0..count {
             // SAFETY: NSArray, and the port's `descriptor`.
             let port: Retained<AnyObject> = unsafe { msg_send![&*ports, objectAtIndex: i] };
@@ -285,12 +301,17 @@ impl Device {
             {
                 continue;
             }
-            if screen_id(&descriptor) == Some(1) {
-                display = Some(descriptor);
-                break;
+            let Some(id) = screen_id(&descriptor) else {
+                continue;
+            };
+            if id == 1 || screens.contains(&id) {
+                displays.push((id, descriptor));
             }
         }
-        let display = display.context("the simulator has no main display")?;
+        displays.sort_by_key(|(id, _)| *id);
+        if displays.first().is_none_or(|(id, _)| *id != 1) {
+            bail!("the simulator has no main display");
+        }
 
         // SAFETY: `-[SimDevice deviceType]` and `-[SimDeviceType mainScreenScale]`.
         let device_type: Option<Retained<AnyObject>> = unsafe { msg_send![&*device, deviceType] };
@@ -308,7 +329,7 @@ impl Device {
         let hid = hid.ok_or_else(|| anyhow!("no input for the simulator: {}", describe(error)))?;
         Ok(Parts {
             device,
-            display,
+            displays,
             hid,
             scale,
         })
@@ -331,11 +352,43 @@ impl Device {
         })
     }
 
+    /// The screen in use.
+    fn display(&self) -> &Retained<AnyObject> {
+        &self.displays[self.current.load(Ordering::SeqCst)].1
+    }
+
+    /// The screen in use: its screen ID.
+    pub fn screen(&self) -> u32 {
+        self.displays[self.current.load(Ordering::SeqCst)].0
+    }
+
+    /// The built-in screens' IDs, the main one's first.
+    pub fn screens(&self) -> Vec<u32> {
+        self.displays.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// Use screen `id` from now on.
+    pub fn use_screen(&self, id: u32) {
+        if let Some(i) = self.displays.iter().position(|(d, _)| *d == id) {
+            self.current.store(i, Ordering::SeqCst);
+        }
+    }
+
     /// The framebuffer as it is now (a new one after the surfaces change).
     pub fn surface(&self) -> Result<Shared<Retained<AnyObject>>> {
+        self.surface_of(self.screen())
+    }
+
+    /// Screen `id`'s framebuffer as it is now.
+    pub fn surface_of(&self, id: u32) -> Result<Shared<Retained<AnyObject>>> {
+        let (_, display) = self
+            .displays
+            .iter()
+            .find(|(d, _)| *d == id)
+            .with_context(|| format!("the simulator has no screen {id}"))?;
         // SAFETY: `framebufferSurface`, an IOSurface.
         let surface: Option<Retained<AnyObject>> = guarded("Reading the screen", || unsafe {
-            msg_send![&*self.display, framebufferSurface]
+            msg_send![&**display, framebufferSurface]
         })?;
         surface
             .map(Shared)
@@ -347,7 +400,7 @@ impl Device {
         guarded("Reading the screen's orientation", || {
             // SAFETY: `screenProperties.uiOrientation`, checked to exist.
             let properties: Option<Retained<AnyObject>> =
-                unsafe { msg_send![&*self.display, screenProperties] };
+                unsafe { msg_send![&**self.display(), screenProperties] };
             match properties {
                 Some(p) if responds(&p, c"uiOrientation") => unsafe {
                     msg_send![&*p, uiOrientation]
@@ -357,44 +410,52 @@ impl Device {
         })
     }
 
-    /// Call `changed` whenever the screen changes, and `surfaces` when the
-    /// framebuffer is replaced. Returns what [`Device::stop_watching`] takes.
+    /// Call `changed` whenever a built-in screen changes, and `surfaces`
+    /// when its framebuffer is replaced, with its screen ID. Returns what
+    /// [`Device::stop_watching`] takes.
     pub fn watch(
         &self,
-        changed: impl Fn() + 'static,
-        surfaces: impl Fn() + 'static,
-    ) -> Result<(Retained<AnyObject>, Retained<AnyObject>)> {
+        changed: impl Fn(u32) + Clone + 'static,
+        surfaces: impl Fn(u32) + Clone + 'static,
+    ) -> Result<Watched> {
         guarded("Following the screen", || {
-            // SAFETY: NSUUID, and the display's two callbacks, whose blocks
-            // take one object (the damaged rectangles; the new surfaces).
-            unsafe {
-                let damage_id: Retained<AnyObject> = msg_send![class!(NSUUID), UUID];
-                let surfaces_id: Retained<AnyObject> = msg_send![class!(NSUUID), UUID];
-                let on_damage = block(move |_rects| changed());
-                let on_surfaces = block(move |_surfaces| surfaces());
-                let _: () = msg_send![
-                    &*self.display,
-                    registerCallbackWithUUID: &*damage_id,
-                    damageRectanglesCallback: &*on_damage
-                ];
-                let _: () = msg_send![
-                    &*self.display,
-                    registerCallbackWithUUID: &*surfaces_id,
-                    ioSurfacesChangeCallback: &*on_surfaces
-                ];
-                (damage_id, surfaces_id)
+            let mut watched = Vec::new();
+            for (id, display) in &self.displays {
+                let id = *id;
+                let (changed, surfaces) = (changed.clone(), surfaces.clone());
+                // SAFETY: NSUUID, and the display's two callbacks, whose
+                // blocks take one object (the damaged rectangles; the new
+                // surfaces).
+                unsafe {
+                    let damage_id: Retained<AnyObject> = msg_send![class!(NSUUID), UUID];
+                    let surfaces_id: Retained<AnyObject> = msg_send![class!(NSUUID), UUID];
+                    let on_damage = block(move |_rects| changed(id));
+                    let on_surfaces = block(move |_surfaces| surfaces(id));
+                    let _: () = msg_send![
+                        &**display,
+                        registerCallbackWithUUID: &*damage_id,
+                        damageRectanglesCallback: &*on_damage
+                    ];
+                    let _: () = msg_send![
+                        &**display,
+                        registerCallbackWithUUID: &*surfaces_id,
+                        ioSurfacesChangeCallback: &*on_surfaces
+                    ];
+                    watched.push((display.clone(), damage_id, surfaces_id));
+                }
             }
+            Watched(watched)
         })
     }
 
-    pub fn stop_watching(&self, ids: &(Retained<AnyObject>, Retained<AnyObject>)) {
+    pub fn stop_watching(&self, watched: &Watched) {
         let _ = guarded("Leaving the screen", || {
-            // SAFETY: the unregistering halves of the calls in `watch`.
-            unsafe {
-                let _: () =
-                    msg_send![&*self.display, unregisterDamageRectanglesCallbackWithUUID: &*ids.0];
-                let _: () =
-                    msg_send![&*self.display, unregisterIOSurfacesChangeCallbackWithUUID: &*ids.1];
+            for (display, damage_id, surfaces_id) in &watched.0 {
+                // SAFETY: the unregistering halves of the calls in `watch`.
+                unsafe {
+                    let _: () = msg_send![&**display, unregisterDamageRectanglesCallbackWithUUID: &**damage_id];
+                    let _: () = msg_send![&**display, unregisterIOSurfacesChangeCallbackWithUUID: &**surfaces_id];
+                }
             }
         });
     }
@@ -585,9 +646,18 @@ fn more_fingers(message: *mut c_void, more: &[(f64, f64)]) -> Result<*mut c_void
     }
 }
 
+/// The callbacks [`Device::watch`] registered: each display's two.
+pub struct Watched(
+    Vec<(
+        Retained<AnyObject>,
+        Retained<AnyObject>,
+        Retained<AnyObject>,
+    )>,
+);
+
 struct Parts {
     device: Retained<AnyObject>,
-    display: Retained<AnyObject>,
+    displays: Vec<(u32, Retained<AnyObject>)>,
     hid: Retained<AnyObject>,
     scale: f32,
 }
@@ -604,7 +674,8 @@ impl Parts {
         let queue = unsafe { dispatch_get_global_queue(0x21, 0) };
         Ok(Device {
             device: self.device,
-            display: self.display,
+            displays: self.displays,
+            current: AtomicUsize::new(0),
             hid: self.hid,
             queue,
             mouse,

@@ -43,6 +43,10 @@ pub struct Options {
     pub set: Option<PathBuf>,
     /// The Xcode whose SimulatorKit to use (`xcode-select -p`).
     pub developer_dir: PathBuf,
+    /// Built-in screens to follow besides the main one (a foldable's inner
+    /// screen), as the device type lists them. Other screen IDs are
+    /// CarPlay's and TV out's.
+    pub screens: Vec<u32>,
 }
 
 struct State {
@@ -56,6 +60,12 @@ struct State {
     /// The accessibility frames outlined, in points of the screen as the
     /// interface shows it (empty while off).
     outlines: Mutex<Vec<ax::Frame>>,
+    /// The size of the screen in use, as built (its framebuffer's).
+    native: Mutex<(u32, u32)>,
+    /// When each built-in screen was last drawn on (a foldable's screen in
+    /// use is; the other keeps its last frame, or is kept lit for a moment
+    /// after a fold, without new ones).
+    drawn: Mutex<std::collections::HashMap<u32, Instant>>,
 }
 
 #[derive(Default)]
@@ -105,6 +115,23 @@ impl State {
     fn turn(&self) -> Turn {
         *self.turn.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn native(&self) -> (u32, u32) {
+        *self.native.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The screen in use as it is turned now.
+    fn screen(&self, device: &Device, turn: Turn) -> ScreenSize {
+        let (width, height) = self.native();
+        let (width, height) = turn.shown_size(width, height);
+        ScreenSize {
+            width,
+            height,
+            scale: device.scale,
+            orientation: Some(turn.orientation()),
+            screen: (device.screens().len() > 1).then(|| device.screen()),
+        }
+    }
 }
 
 /// Run the helper until stdin ends or the device stops.
@@ -117,13 +144,20 @@ pub fn run(options: Options) -> Result<()> {
         turn: Mutex::default(),
         changes: AtomicU64::new(0),
         outlines: Mutex::default(),
+        native: Mutex::default(),
+        drawn: Mutex::default(),
     });
     let opened = Device::open(
         &options.udid,
         options.set.as_deref(),
         &options.developer_dir,
+        &options.screens,
     )
     .and_then(|device| {
+        // A foldable shows the screen it's using; the other is black.
+        if let Some(id) = screen_in_use(&device, &Default::default()) {
+            device.use_screen(id);
+        }
         let surface = device.surface()?;
         let turn = Turn::from_interface(device.interface_orientation().unwrap_or(1));
         Ok((Arc::new(Shared(device)), surface, turn))
@@ -138,33 +172,34 @@ pub fn run(options: Options) -> Result<()> {
         }
     };
     let (width, height) = picture::surface_size(surface_ptr(&surface));
-    let native = (width as u32, height as u32);
+    *state.native.lock().unwrap_or_else(|e| e.into_inner()) = (width as u32, height as u32);
     let scale = device.0.scale;
-    let screen = |turn: Turn| {
-        let (width, height) = turn.shown_size(native.0, native.1);
-        ScreenSize {
-            width,
-            height,
-            scale,
-            orientation: Some(turn.orientation()),
-        }
-    };
     *state.turn.lock().unwrap_or_else(|e| e.into_inner()) = turn;
 
+    // Only the screen in use counts (a foldable's other one is blanked).
     let on_change = {
-        let state = state.clone();
-        move || {
-            state.changes.fetch_add(1, Ordering::Relaxed);
-            state.change(|f| f.dirty = true)
+        let (state, device) = (state.clone(), device.clone());
+        move |id: u32| {
+            state
+                .drawn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, Instant::now());
+            if id == device.0.screen() {
+                state.changes.fetch_add(1, Ordering::Relaxed);
+                state.change(|f| f.dirty = true)
+            }
         }
     };
     let on_surfaces = {
-        let state = state.clone();
-        move || {
-            state.change(|f| {
-                f.surfaces_changed = true;
-                f.dirty = true;
-            })
+        let (state, device) = (state.clone(), device.clone());
+        move |id: u32| {
+            if id == device.0.screen() {
+                state.change(|f| {
+                    f.surfaces_changed = true;
+                    f.dirty = true;
+                })
+            }
         }
     };
     let watched = match device.0.watch(on_change, on_surfaces) {
@@ -177,7 +212,7 @@ pub fn run(options: Options) -> Result<()> {
         }
     };
     state.event(&Event::Ready {
-        screen: screen(turn),
+        screen: state.screen(&device.0, turn),
     });
 
     let (inputs, input_rx) = mpsc::channel::<Request>();
@@ -202,9 +237,7 @@ pub fn run(options: Options) -> Result<()> {
         }),
         spawn("accessibility", {
             let (state, device) = (state.clone(), device.clone());
-            // The screen's area in points, to leave out the app's window.
-            let area = native.0 as f64 * native.1 as f64 / (scale as f64 * scale as f64);
-            move || accessibility(&state, &device, outlining_rx, area)
+            move || accessibility(&state, &device, outlining_rx)
         }),
     ];
 
@@ -212,19 +245,49 @@ pub fn run(options: Options) -> Result<()> {
     // device's state.
     let mut checked_state = Instant::now();
     let mut checked_turn = Instant::now();
+    // A foldable's other screen, seen in use at the last check: it is
+    // switched to when seen twice running (a screen fading through black
+    // as the hinge moves isn't a switch).
+    let mut other_seen: Option<u32> = None;
     while !state.stopped() {
         run_loop_for(Duration::from_millis(50));
         if checked_turn.elapsed() >= Duration::from_millis(250) {
             checked_turn = Instant::now();
+            // A foldable folded or unfolded: show the screen it uses now.
+            let drawn = state
+                .drawn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let other = screen_in_use(&device.0, &drawn).filter(|id| *id != device.0.screen());
+            let confirmed = other.filter(|id| other_seen == Some(*id));
+            other_seen = other;
+            let switched = match confirmed {
+                Some(id) => {
+                    other_seen = None;
+                    device.0.use_screen(id);
+                    match device.0.surface() {
+                        Ok(surface) => {
+                            let (w, h) = picture::surface_size(surface_ptr(&surface));
+                            *state.native.lock().unwrap_or_else(|e| e.into_inner()) =
+                                (w as u32, h as u32);
+                        }
+                        Err(e) => eprintln!("simulator helper: {e:#}"),
+                    }
+                    state.change(|f| f.surfaces_changed = true);
+                    true
+                }
+                None => false,
+            };
             if let Ok(orientation) = device.0.interface_orientation() {
                 let now = Turn::from_interface(orientation);
                 let changed = {
                     let mut turn = state.turn.lock().unwrap_or_else(|e| e.into_inner());
                     std::mem::replace(&mut *turn, now) != now
                 };
-                if changed {
+                if changed || switched {
                     state.event(&Event::Size {
-                        screen: screen(now),
+                        screen: state.screen(&device.0, now),
                     });
                     state.change(|f| f.dirty = true);
                 }
@@ -252,6 +315,41 @@ pub fn run(options: Options) -> Result<()> {
     device.0.stop_watching(&watched);
     let _ = pictures.join();
     Ok(())
+}
+
+/// The built-in screen a foldable is using: another one if it was drawn
+/// on after the one in use and isn't black; else the one in use (black when
+/// asleep). Before either was drawn on, the one in use unless it is black
+/// and another isn't. `None` for a device with one screen.
+fn screen_in_use(device: &Device, drawn: &std::collections::HashMap<u32, Instant>) -> Option<u32> {
+    let screens = device.screens();
+    if screens.len() < 2 {
+        return None;
+    }
+    let lit = |id: u32| {
+        device
+            .surface_of(id)
+            .ok()
+            .and_then(|s| picture::is_black(surface_ptr(&s)))
+            == Some(false)
+    };
+    let at = |id: u32| drawn.get(&id).copied();
+    let current = device.screen();
+    let newer = screens
+        .iter()
+        .copied()
+        .filter(|id| *id != current && at(*id) > at(current) && lit(*id))
+        .max_by_key(|id| at(*id));
+    if let Some(id) = newer {
+        return Some(id);
+    }
+    if at(current).is_none() && !lit(current) {
+        return screens
+            .into_iter()
+            .find(|id| *id != current && at(*id).is_none() && lit(*id))
+            .or(Some(current));
+    }
+    Some(current)
 }
 
 fn surface_ptr(
@@ -448,12 +546,13 @@ const OUTLINES_AT_LEAST: Duration = Duration::from_secs(3);
 
 /// While accessibility frames are outlined, read them again after the
 /// screen changes, and have them pictured.
-fn accessibility(
-    state: &State,
-    device: &Shared<Device>,
-    requests: mpsc::Receiver<Request>,
-    area: f64,
-) {
+fn accessibility(state: &State, device: &Shared<Device>, requests: mpsc::Receiver<Request>) {
+    // The screen's area in points, to leave out the app's window.
+    let area = || {
+        let (w, h) = state.native();
+        let scale = device.0.scale as f64;
+        w as f64 * h as f64 / (scale * scale)
+    };
     let mut reader: Option<ax::Accessibility> = None;
     let mut on = false;
     let mut seen = u64::MAX;
@@ -500,7 +599,7 @@ fn accessibility(
                 }
             }
             // A device that just started has no app in front for a while.
-            let mut result = read_outlines(state, reader.as_ref(), area);
+            let mut result = read_outlines(state, reader.as_ref(), area());
             for _ in 0..10 {
                 let empty = state
                     .outlines
@@ -511,7 +610,7 @@ fn accessibility(
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(300));
-                result = read_outlines(state, reader.as_ref(), area);
+                result = read_outlines(state, reader.as_ref(), area());
             }
             seen = state.changes.load(Ordering::Relaxed);
             read_at = Some(Instant::now());
@@ -523,7 +622,7 @@ fn accessibility(
         if changes != seen || stale {
             seen = changes;
             read_at = Some(Instant::now());
-            if let Err(e) = read_outlines(state, reader.as_ref(), area) {
+            if let Err(e) = read_outlines(state, reader.as_ref(), area()) {
                 eprintln!("simulator helper: {e:#}");
             }
         }
