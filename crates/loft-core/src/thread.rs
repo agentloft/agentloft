@@ -1293,7 +1293,12 @@ impl ThreadActor {
             new_session_id: new_session_id.clone(),
             fork_from,
             fork_at,
-            env: std::sync::Arc::new(crate::agent_env(&opts.env, &hcfg)),
+            env: std::sync::Arc::new(crate::session_env(
+                &opts.env,
+                &hcfg,
+                opts.mcp_bridge.as_ref(),
+                &self.thread.id,
+            )),
             binary: (hcfg.path != "auto").then(|| hcfg.path.clone().into()),
             extra_args: hcfg.extra_args.clone(),
             mcp_servers: opts

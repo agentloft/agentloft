@@ -1582,6 +1582,58 @@ fn agent_defaults_for_new_threads() {
     assert_eq!(env["PATH"], "/bin");
 }
 
+/// Agents' sessions name their thread and find `agent-device` first on
+/// their PATH; the script it is runs `agentloftd device` on the home.
+#[test]
+fn agents_get_the_device_command_on_their_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = McpBridge {
+        exe: dir.path().join("agentloftd"),
+        home: dir.path().join("home with 'quotes'"),
+    };
+    let thread = ThreadId("t-1".into());
+    let sep = loft_config::PATH_SEPARATOR;
+    let base = std::collections::HashMap::from([("PATH".to_owned(), "/bin".to_owned())]);
+    let hcfg = loft_config::HarnessConfig::default();
+    let env = crate::session_env(&base, &hcfg, Some(&bridge), &thread);
+    let bin = bridge.bin_dir().to_string_lossy().into_owned();
+    assert_eq!(env["PATH"], format!("{bin}{sep}/bin"));
+    assert_eq!(env[THREAD_ENV], "t-1");
+    // Without the bridge there is no command, but the thread is still named.
+    let env = crate::session_env(&base, &hcfg, None, &thread);
+    assert_eq!(env["PATH"], "/bin");
+    assert_eq!(env[THREAD_ENV], "t-1");
+
+    bridge.install_cli().unwrap();
+    let script = bridge.bin_dir().join("agent-device");
+    let text = std::fs::read_to_string(&script).unwrap();
+    assert!(text.contains(" device \"$@\""), "{text}");
+    #[cfg(unix)]
+    {
+        // The script runs the daemon's binary with the home and its words.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(
+            &bridge.exe,
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"[$a]\"; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bridge.exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new(&script)
+            .args(["tap", "ios:X", "1 2"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "[--home]\n[{}]\n[device]\n[tap]\n[ios:X]\n[1 2]\n",
+                bridge.home.display()
+            )
+        );
+    }
+    #[cfg(windows)]
+    assert!(bridge.bin_dir().join("agent-device.cmd").is_file());
+}
+
 #[tokio::test]
 async fn search_finds_threads_by_their_messages() {
     let f = fixture();

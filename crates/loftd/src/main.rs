@@ -34,8 +34,6 @@ enum Cmd {
     /// daemon if it isn't running. Another computer's Agentloft runs this
     /// over SSH to reach this one: SSH has already said who it is.
     Bridge,
-    /// Show web access as the running daemon has it: where it listens, the
-    /// pairing link, and the browsers signed in.
     /// Show one running iOS simulator's screen and take its input, over
     /// stdin and stdout (spawned by the daemon for its device panel).
     #[command(hide = true)]
@@ -48,6 +46,16 @@ enum Cmd {
         #[arg(long)]
         set: Option<PathBuf>,
     },
+    /// `agent-device`: agents' device command line (ADR-0020). The daemon's
+    /// `<home>/bin/agent-device` runs this; `agentloftd device help` says
+    /// what it takes.
+    #[command(hide = true, disable_help_flag = true)]
+    Device {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Show web access as the running daemon has it: where it listens, the
+    /// pairing link, and the browsers signed in.
     Web {
         /// Replace the pairing link and sign every browser out.
         #[arg(long)]
@@ -87,6 +95,14 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?;
         return runtime.block_on(loftd::mcp::run(paths, loft_protocol::ThreadId(thread)));
+    }
+    if let Some(Cmd::Device { args }) = cli.cmd {
+        // Its answers go to stdout and stderr: no logging there.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let status = runtime.block_on(loftd::device_cli::run(paths, args));
+        std::process::exit(status);
     }
     if let Some(Cmd::Bridge) = cli.cmd {
         // stdout carries the connection: log to a file only.

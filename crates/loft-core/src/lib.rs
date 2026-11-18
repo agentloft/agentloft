@@ -125,6 +125,59 @@ pub struct McpBridge {
     pub home: PathBuf,
 }
 
+/// Names the thread an agent process works for, in its environment (the
+/// `agent-device` command line passes it on to the daemon).
+pub const THREAD_ENV: &str = "AGENTLOFT_THREAD_ID";
+
+impl McpBridge {
+    /// Where the commands agents run in their shells live (`agent-device`);
+    /// first on their `PATH`.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.home.join("bin")
+    }
+
+    /// Write `agent-device` into [`McpBridge::bin_dir`]: a script that runs
+    /// `agentloftd device` on this home (ADR-0020). A shell script on Unix;
+    /// on Windows a `.cmd` (PowerShell, cmd) and the shell script too (Git
+    /// Bash, which runs Claude Code's commands there, doesn't run `.cmd`
+    /// files by their bare name).
+    pub fn install_cli(&self) -> std::io::Result<()> {
+        let dir = self.bin_dir();
+        std::fs::create_dir_all(&dir)?;
+        let (exe, home) = (self.exe.to_string_lossy(), self.home.to_string_lossy());
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let sh = format!(
+            "#!/bin/sh\n# Written by Agentloft at each start: agents' device command line.\n\
+             exec {} --home {} device \"$@\"\n",
+            quote(&exe),
+            quote(&home)
+        );
+        write_executable(&dir.join("agent-device"), &sh)?;
+        if cfg!(windows) {
+            let cmd = format!(
+                "@echo off\r\nrem Written by Agentloft at each start: agents' device command line.\r\n\
+                 \"{}\" --home \"{}\" device %*\r\n",
+                exe.replace('%', "%%"),
+                home.replace('%', "%%")
+            );
+            write_executable(&dir.join("agent-device.cmd"), &cmd)?;
+        }
+        Ok(())
+    }
+}
+
+/// Write a file whole (a script being run never sees half of it), runnable.
+fn write_executable(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// Slash commands per (harness, folder), with when they were asked.
 type CommandCache =
     HashMap<(String, String), (std::time::Instant, Vec<loft_protocol::SlashCommandInfo>)>;
@@ -244,6 +297,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Core {
     pub fn new(store: Store, harnesses: Vec<Arc<dyn Harness>>, opts: CoreOptions) -> Arc<Self> {
         let (bus, _) = broadcast::channel(4096);
+        if let Some(bridge) = &opts.mcp_bridge
+            && let Err(err) = bridge.install_cli()
+        {
+            tracing::warn!(%err, "couldn't write agents' agent-device command");
+        }
         let devices = Arc::new(devices::Devices::new(
             opts.device_backends.clone(),
             bus.clone(),
@@ -2418,6 +2476,36 @@ pub(crate) fn agent_env(
 ) -> std::collections::HashMap<String, String> {
     let mut env = base.clone();
     env.extend(hcfg.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
+/// What an agent's session runs with: [`agent_env`], plus the thread it
+/// works for ([`THREAD_ENV`]) and, with the MCP bridge, the commands of
+/// [`McpBridge::bin_dir`] first on its `PATH`.
+pub(crate) fn session_env(
+    base: &std::collections::HashMap<String, String>,
+    hcfg: &loft_config::HarnessConfig,
+    bridge: Option<&McpBridge>,
+    thread: &ThreadId,
+) -> std::collections::HashMap<String, String> {
+    let mut env = agent_env(base, hcfg);
+    env.insert(THREAD_ENV.into(), thread.to_string());
+    if let Some(bridge) = bridge {
+        // Windows' names aren't case-sensitive: one `PATH`, however spelt.
+        let key = env
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case("PATH"))
+            .cloned()
+            .unwrap_or_else(|| "PATH".into());
+        let path = env.remove(&key).unwrap_or_default();
+        let dir = bridge.bin_dir().to_string_lossy().into_owned();
+        let path = if path.is_empty() {
+            dir
+        } else {
+            format!("{dir}{}{path}", loft_config::PATH_SEPARATOR)
+        };
+        env.insert("PATH".into(), path);
+    }
     env
 }
 

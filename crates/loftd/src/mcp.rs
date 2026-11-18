@@ -27,6 +27,8 @@ pub async fn run(paths: Paths, thread_id: ThreadId) -> Result<()> {
         Client::connect(&paths.socket_file(), ClientKind::McpBridge, crate::BUILD)
             .await
             .context("connect to agentloftd")?;
+    // What the agent's points on each device are in (`mcp_devices`).
+    let pictures = crate::mcp_devices::Pictures::new(&paths, Some(&thread_id));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     // Replies go out as they are ready: a call that waits for a person
     // (`browser_handoff`) or for other threads doesn't hold up the rest.
@@ -89,8 +91,9 @@ pub async fn run(paths: Paths, thread_id: ThreadId) -> Result<()> {
                     .to_owned();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let (client, thread_id, out) = (client.clone(), thread_id.clone(), out.clone());
+                let pictures = pictures.clone();
                 tokio::spawn(async move {
-                    let result = call_tool(&client, &thread_id, &name, &args).await;
+                    let result = call_tool(&client, &thread_id, &pictures, &name, &args).await;
                     let _ = out.send(ok_reply(id, result));
                 });
                 continue;
@@ -898,7 +901,13 @@ fn drag_end(end: Option<&Value>) -> Value {
     }
 }
 
-async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value) -> Value {
+async fn call_tool(
+    client: &Client,
+    thread: &ThreadId,
+    pictures: &crate::mcp_devices::Pictures,
+    name: &str,
+    args: &Value,
+) -> Value {
     // Every browser tool takes a `tab`; the command itself doesn't.
     let mut args = args.clone();
     let tab = if name.starts_with("browser_") {
@@ -939,7 +948,12 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
     if let Some(result) = crate::mcp_automations::call(client, thread, name, args).await {
         return result;
     }
-    if let Some(result) = crate::mcp_devices::call(client, thread, name, args).await {
+    let devices = crate::mcp_devices::Ctx {
+        client,
+        thread: Some(thread),
+        pictures,
+    };
+    if let Some(result) = crate::mcp_devices::call(&devices, name, args).await {
         return result;
     }
     let request = match name {
