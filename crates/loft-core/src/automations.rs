@@ -48,6 +48,16 @@ impl Core {
         from: Option<ThreadId>,
     ) -> CoreResult<Response> {
         let spec = self.checked_spec(spec)?;
+        // An agent's automation runs with no more than the agent's own mode
+        // (`agent_limits`), whoever's automation it changes.
+        if let Some(from) = &from {
+            let project = self
+                .with_store(|s| s.project(&spec.project_id))?
+                .ok_or_else(|| bad("no such project"))?;
+            let harness = self.run_harness(&spec, &project)?;
+            let runs_with = self.mode_or_default(&harness, spec.permission_mode);
+            self.check_agent_grants(from, runs_with, "the automation's runs")?;
+        }
         let now = now_ms();
         let automation = match id {
             Some(id) => {

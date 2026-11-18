@@ -493,7 +493,10 @@ impl Core {
                 .map_err(internal)?;
                 Ok(Response::FilesExist { files })
             }
-            Request::GetSettings => self.handle(Request::GetSettings).await.map(redact_settings),
+            Request::GetSettings => self
+                .handle(Request::GetSettings)
+                .await
+                .map(redact_settings_response),
             Request::UiFiles { known } => Ok(Response::UiFiles {
                 files: self.ui_files(known.as_deref(), true)?.map(Box::new),
             }),
@@ -534,10 +537,17 @@ impl Core {
 
 /// Settings as a remote session sees them: agents' environment variables
 /// (often API keys) are named but not shown, and web access is left out.
-fn redact_settings(response: Response) -> Response {
-    let Response::Json { mut value } = response else {
+fn redact_settings_response(response: Response) -> Response {
+    let Response::Json { value } = response else {
         return response;
     };
+    Response::Json {
+        value: redact_settings(value),
+    }
+}
+
+/// `GetSettings`'s answer as a browser session or an agent sees it.
+pub fn redact_settings(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(current) = value.get_mut("current").and_then(|c| c.as_object_mut()) {
         current.remove("web");
         if let Some(agents) = current.get_mut("harness").and_then(|h| h.as_object_mut()) {
@@ -550,7 +560,7 @@ fn redact_settings(response: Response) -> Response {
             }
         }
     }
-    Response::Json { value }
+    value
 }
 
 #[cfg(test)]
@@ -836,7 +846,7 @@ mod tests {
         assert!(is_forbidden(
             &remote(&f, icon(Some(secret.to_string_lossy().into_owned()))).await
         ));
-        std::fs::write(f.project.join("icon.png"), b"x").unwrap();
+        std::fs::write(f.project.join("icon.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         let own = f.project.join("icon.png").to_string_lossy().into_owned();
         assert!(remote(&f, icon(Some(own))).await.is_ok());
         assert!(remote(&f, icon(None)).await.is_ok());
@@ -859,6 +869,7 @@ mod tests {
         let set = |key: &str, value: serde_json::Value| Request::ChangeSetting {
             key: key.into(),
             value,
+            from: None,
         };
         for key in [
             "harness.claude.path",
@@ -1028,11 +1039,15 @@ mod tests {
         };
         let none = remote(&f, icon(&f.project_id)).await.unwrap_err();
         assert_eq!(none.code, ErrorCode::NotFound);
+        // Named as an icon but not one: not served.
         std::fs::write(f.project.join("favicon.png"), b"png!").unwrap();
+        assert!(remote(&f, icon(&f.project_id)).await.is_err());
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        std::fs::write(f.project.join("favicon.png"), png).unwrap();
         let Response::File { file } = remote(&f, icon(&f.project_id)).await.unwrap() else {
             panic!()
         };
-        assert_eq!(file.bytes.0, b"png!");
+        assert_eq!(file.bytes.0, png);
         assert!(remote(&f, icon(&ProjectId::new())).await.is_err());
     }
 

@@ -48,6 +48,32 @@ pub fn drawable(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .is_some_and(|e| DRAWABLE.contains(&e.to_ascii_lowercase().as_str()))
         && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() < 2_000_000)
+        && looks_like_image(path)
+}
+
+/// Whether the file starts the way an image does. An icon is copied into
+/// Agentloft's home and served to browser sessions (`ProjectIcon`), so a
+/// file that only *says* it is an image (`~/.ssh/id_rsa` picked as an icon,
+/// or a repository's page linking to one) is never taken for one.
+pub fn looks_like_image(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(8192);
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.take(8192).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let starts = |magic: &[u8]| head.starts_with(magic);
+    starts(b"\x89PNG\r\n\x1a\n")
+        || starts(b"\xff\xd8\xff")
+        || starts(b"GIF87a")
+        || starts(b"GIF89a")
+        || (starts(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
+        || starts(b"\0\0\x01\0")
+        || std::str::from_utf8(&head)
+            .ok()
+            .is_some_and(|text| text.to_ascii_lowercase().contains("<svg"))
 }
 
 /// The favicon a page links to (`<link rel="icon" href="/x.svg">`), if any.
@@ -210,6 +236,32 @@ pub fn find(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// The start of a PNG: enough to be taken for one.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    #[test]
+    fn only_images_count_whatever_their_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        assert!(drawable(&file("a.png", PNG)));
+        assert!(drawable(&file("b.svg", b"<?xml version=\"1.0\"?>\n<svg/>")));
+        assert!(drawable(&file("c.jpg", b"\xff\xd8\xff\xe0")));
+        // A key or a config file picked as an icon, or linked as one.
+        assert!(!drawable(&file(
+            "id_rsa.png",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----"
+        )));
+        assert!(!drawable(&file(
+            "config.svg",
+            b"[harness.claude]\nenv = {}"
+        )));
+        assert!(!drawable(&file("png", PNG)), "no extension");
+    }
+
     #[test]
     fn finds_favicons_where_projects_keep_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -227,7 +279,7 @@ mod tests {
             Some(dir.path().join("public/img/Logo.svg"))
         );
         // A favicon at a known spot wins.
-        std::fs::write(dir.path().join("public/favicon.png"), [1u8, 2, 3]).unwrap();
+        std::fs::write(dir.path().join("public/favicon.png"), PNG).unwrap();
         assert_eq!(
             find(dir.path()),
             Some(dir.path().join("public/favicon.png"))
@@ -247,7 +299,7 @@ mod tests {
         ] {
             let path = root.join(f);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, [1u8, 2, 3]).unwrap();
+            std::fs::write(&path, PNG).unwrap();
         }
         // The one nearest 256 px.
         assert_eq!(

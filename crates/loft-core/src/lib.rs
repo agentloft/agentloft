@@ -2,6 +2,7 @@
 //! active thread that drives its harness session, persists domain events and
 //! fans them out on a broadcast bus together with ephemeral streaming deltas.
 
+mod agent_limits;
 mod agent_updates;
 mod automations;
 mod browser;
@@ -34,7 +35,7 @@ use loft_protocol::{
     Topic, TurnStatus,
 };
 use loft_store::{Store, now_ms};
-pub use remote::RemotePolicy;
+pub use remote::{RemotePolicy, redact_settings};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1277,7 +1278,12 @@ impl Core {
                 from_day,
                 to_day,
             } => self.usage_report(utc_offset_min, from_day, to_day),
-            Request::ChangeSetting { key, value } => self.change_setting(&key, &value),
+            Request::ChangeSetting { key, value, from } => {
+                if let Some(from) = &from {
+                    self.check_agent_setting(from, &key, &value)?;
+                }
+                self.change_setting(&key, &value)
+            }
             Request::SaveTheme { toml, select, id } => {
                 self.save_theme(&toml, select, id.as_deref())
             }
@@ -1293,13 +1299,24 @@ impl Core {
                     self.opts().config_file.as_ref().and_then(|f| f.parent()),
                 ) {
                     (Some(src), Some(home))
-                        if !std::path::Path::new(&src).starts_with(home.join("icons")) =>
+                        if !already_an_icon(std::path::Path::new(&src), home) =>
                     {
                         let src = expand_tilde(&src);
                         if !src.is_file() {
                             return Err(ErrorBody::new(
                                 ErrorCode::BadRequest,
                                 format!("{} isn't a file", src.display()),
+                            ));
+                        }
+                        // It becomes readable to browser sessions: an image,
+                        // never any other file named as one.
+                        if !loft_config::icons::drawable(&src) {
+                            return Err(ErrorBody::new(
+                                ErrorCode::BadRequest,
+                                format!(
+                                    "{} isn't an image (SVG, PNG, ICO, JPEG, WebP or GIF under 2 MB)",
+                                    src.display()
+                                ),
                             ));
                         }
                         let ext = src
@@ -2451,6 +2468,15 @@ pub(crate) fn harness_config(
         HarnessId::OPENCODE => config.harness.opencode.clone(),
         HarnessId::GEMINI => config.harness.gemini.clone(),
         _ => loft_config::HarnessConfig::default(),
+    }
+}
+
+/// Whether `icon` is already one Agentloft keeps (in `<home>/icons`), so it
+/// isn't copied again. Resolved first: `icons/../x` is not in there.
+fn already_an_icon(icon: &std::path::Path, home: &std::path::Path) -> bool {
+    match (icon.canonicalize(), home.join("icons").canonicalize()) {
+        (Ok(icon), Ok(dir)) => icon.parent() == Some(dir.as_path()),
+        _ => false,
     }
 }
 

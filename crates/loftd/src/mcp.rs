@@ -1178,8 +1178,10 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
             }
             json_result(&Value::Array(list))
         }
+        // Agents' environment values (API keys) and web access left out, as
+        // for a browser session.
         "get_settings" => match client.request(Request::GetSettings).await {
-            Ok(Response::Json { value }) => json_result(&value),
+            Ok(Response::Json { value }) => json_result(&loft_core::redact_settings(value)),
             Ok(other) => text_result(format!("unexpected response: {other:?}"), true),
             Err(err) => text_result(err.message, true),
         },
@@ -1188,7 +1190,12 @@ async fn orchestrate(client: &Client, me: &ThreadId, name: &str, args: &Value) -
                 return Some(text_result("key is required", true));
             };
             let value = args.get("value").cloned().unwrap_or(Value::Null);
-            match client.request(Request::ChangeSetting { key, value }).await {
+            let request = Request::ChangeSetting {
+                key,
+                value,
+                from: Some(me.clone()),
+            };
+            match client.request(request).await {
                 Ok(Response::Text { text }) => text_result(text, false),
                 Ok(_) => text_result("Changed.", false),
                 Err(err) => text_result(err.message, true),

@@ -1101,6 +1101,7 @@ async fn a_browser_session_is_held_to_its_limits() {
                 Request::ChangeSetting {
                     key: "harness.claude.path".into(),
                     value: serde_json::json!("/tmp/evil"),
+                    from: None,
                 },
             )
             .await,

@@ -98,6 +98,24 @@ impl Core {
         if self.harness(&harness).is_none() {
             return Err(bad(format!("unknown agent `{harness}`")));
         }
+        // Never more than the spawning thread's own mode: its agent's tools
+        // here are allowed without asking (`agent_limits`).
+        let have = self.mode_or_default(&parent.harness, parent.permission_mode);
+        let permission_mode = match spec.permission_mode {
+            Some(wanted) => {
+                self.check_agent_grants(&parent.id, wanted, "the new thread")?;
+                Some(wanted)
+            }
+            None => {
+                let inherited = parent.permission_mode;
+                let would = self.mode_or_default(&harness, inherited);
+                if crate::agent_limits::rank(would) > crate::agent_limits::rank(have) {
+                    Some(have)
+                } else {
+                    inherited
+                }
+            }
+        };
         let same = harness == parent.harness;
         let (default_model, _, default_effort) = crate::thread_defaults(&self.config(), &harness);
         let model = spec.model.or_else(|| {
@@ -194,7 +212,7 @@ impl Core {
             harness,
             cwd,
             model,
-            permission_mode: spec.permission_mode.or(parent.permission_mode),
+            permission_mode,
             effort,
             native_session_id: None,
             status: ThreadStatus::Idle,

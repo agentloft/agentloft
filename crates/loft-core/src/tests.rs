@@ -2016,12 +2016,14 @@ async fn agents_change_settings_and_add_themes() {
     call(Request::ChangeSetting {
         key: "ui.theme".into(),
         value: serde_json::json!("dark"),
+        from: None,
     })
     .await
     .unwrap();
     call(Request::ChangeSetting {
         key: "harness.codex.default_model".into(),
         value: serde_json::json!("gpt-6"),
+        from: None,
     })
     .await
     .unwrap();
@@ -2037,7 +2039,8 @@ async fn agents_change_settings_and_add_themes() {
         assert!(
             call(Request::ChangeSetting {
                 key: key.into(),
-                value
+                value,
+                from: None,
             })
             .await
             .is_err()
@@ -3216,4 +3219,180 @@ async fn tab_tools_without_a_browser() {
     // The thread's status is untouched by any of it.
     let (t, _, _, _) = thread_snapshot(&f.core, &thread.id);
     assert_eq!(t.status, ThreadStatus::Idle);
+}
+
+/// Agentloft's tools are allowed without asking in every mode, so through
+/// them an agent never gets more than its own thread's permission mode.
+#[tokio::test]
+async fn agents_never_grant_more_than_their_own_mode() {
+    use loft_protocol::{AutomationSpec, Schedule};
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(dir.path().join("config.toml")),
+            flush_interval: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let thread = new_thread(&core, &work).await;
+    let set_mode = |mode: PermissionMode| {
+        core.handle(Request::SetPermissionMode {
+            thread_id: thread.id.clone(),
+            mode: Some(mode),
+        })
+    };
+    set_mode(PermissionMode::ReadOnly).await.unwrap();
+    let forbidden = |r: CoreResult<Response>| matches!(r, Err(e) if e.code == ErrorCode::Forbidden);
+    let spawn = |mode: Option<PermissionMode>| {
+        core.handle(Request::SpawnThread {
+            from: thread.id.clone(),
+            prompt: "look around".into(),
+            title: None,
+            harness: None,
+            model: None,
+            effort: None,
+            permission_mode: mode,
+            worktree: false,
+            top_level: false,
+            project: None,
+            chat: false,
+        })
+    };
+    let setting = |key: &str, value: serde_json::Value, from: Option<ThreadId>| {
+        core.handle(Request::ChangeSetting {
+            key: key.into(),
+            value,
+            from,
+        })
+    };
+    let automation = |mode: Option<PermissionMode>| {
+        core.handle(Request::SaveAutomation {
+            id: None,
+            spec: AutomationSpec {
+                name: "Nightly".into(),
+                prompt: "check the build".into(),
+                project_id: thread.project_id.clone(),
+                schedule: Schedule::Interval { minutes: 60 },
+                enabled: false,
+                harness: Some(HarnessId(HarnessId::FAKE.into())),
+                model: None,
+                effort: None,
+                permission_mode: mode,
+                worktree: false,
+            },
+            from: Some(thread.id.clone()),
+        })
+    };
+    let me = Some(thread.id.clone());
+
+    // A read-only thread starts nothing that may do more.
+    assert!(forbidden(spawn(Some(PermissionMode::FullAccess)).await));
+    let Response::Thread { thread: child } = spawn(None).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(child.permission_mode, Some(PermissionMode::ReadOnly));
+    assert!(forbidden(
+        automation(Some(PermissionMode::FullAccess)).await
+    ));
+    // Unset: the agent's default, which asks.
+    assert!(forbidden(automation(None).await));
+    automation(Some(PermissionMode::ReadOnly)).await.unwrap();
+
+    // Nor changes what runs, or the default mode of new threads upward.
+    for (key, value) in [
+        ("harness.claude.path", serde_json::json!("/tmp/not-claude")),
+        (
+            "harness.claude.extra_args",
+            serde_json::json!(["--settings", "{}"]),
+        ),
+        (
+            "harness.claude.env",
+            serde_json::json!({"NODE_OPTIONS": "--import=x"}),
+        ),
+        ("browser.executable", serde_json::json!("/tmp/not-chrome")),
+        (
+            "harness.codex.default_permission_mode",
+            serde_json::json!("full-access"),
+        ),
+    ] {
+        assert!(forbidden(setting(key, value, me.clone()).await), "{key}");
+    }
+    setting("ui.theme", serde_json::json!("dark"), me.clone())
+        .await
+        .unwrap();
+    setting(
+        "harness.codex.default_permission_mode",
+        serde_json::json!("read-only"),
+        me.clone(),
+    )
+    .await
+    .unwrap();
+
+    // A full-access agent could run anything anyway: no limits.
+    set_mode(PermissionMode::FullAccess).await.unwrap();
+    setting(
+        "harness.claude.path",
+        serde_json::json!("/tmp/x"),
+        me.clone(),
+    )
+    .await
+    .unwrap();
+    automation(Some(PermissionMode::FullAccess)).await.unwrap();
+    // The person in the app is not an agent.
+    set_mode(PermissionMode::ReadOnly).await.unwrap();
+    setting("browser.executable", serde_json::json!("/tmp/y"), None)
+        .await
+        .unwrap();
+}
+
+/// An icon is copied into Agentloft's home, where browser sessions can read
+/// it: only an image is, whatever another file is called.
+#[tokio::test]
+async fn only_images_become_project_icons() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(FakeHarness)],
+        CoreOptions {
+            config_file: Some(home.join("config.toml")),
+            ..Default::default()
+        },
+    );
+    let project = new_thread(&core, &work).await.project_id;
+    let set = |path: &std::path::Path| {
+        core.handle(Request::SetProjectIcon {
+            project_id: project.clone(),
+            icon: Some(path.to_string_lossy().into_owned()),
+        })
+    };
+    let key = dir.path().join("id_ed25519");
+    std::fs::write(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+    assert!(set(&key).await.is_err(), "no extension: was copied as .png");
+    let named = dir.path().join("key.png");
+    std::fs::copy(&key, &named).unwrap();
+    assert!(set(&named).await.is_err());
+    // Not in the icons folder just by naming it in the path.
+    std::fs::create_dir_all(home.join("icons")).unwrap();
+    assert!(set(&home.join("icons/../../key.png")).await.is_err());
+    assert!(!home.join("icons").read_dir().unwrap().any(|_| true));
+
+    let png = dir.path().join("logo.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+    let Response::Project { project } = set(&png).await.unwrap() else {
+        panic!()
+    };
+    assert!(
+        project
+            .icon
+            .unwrap()
+            .starts_with(&*home.join("icons").to_string_lossy())
+    );
 }

@@ -143,6 +143,10 @@ pub enum Request {
     ChangeSetting {
         key: String,
         value: serde_json::Value,
+        /// The thread whose agent asks (Agentloft's MCP server): it may
+        /// change only what its own permission mode covers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<ThreadId>,
     },
     /// Save a colour theme (its TOML) and optionally switch to it. Saved
     /// under `id` (`custom:<name>`) when given, else under a name made from
