@@ -11,6 +11,7 @@ anyhow.workspace = true
 zip.workspace = true
 quick-xml.workspace = true
 calamine.workspace = true
+cfb.workspace = true
 csv.workspace = true
 hayro.workspace = true
 
