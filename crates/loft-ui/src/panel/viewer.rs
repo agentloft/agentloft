@@ -741,6 +741,11 @@ impl Render for FileViewer {
                     .child(
                         div().absolute().inset_0().px_6().py_4().child(
                             TextView::new(preview)
+                                // A repository's Markdown: its links are
+                                // its author's, not the user's.
+                                .on_link_click(|url, _, _, cx| {
+                                    crate::file_links::open_outside(url, cx)
+                                })
                                 .selectable(true)
                                 .scrollable(true)
                                 .size_full(),

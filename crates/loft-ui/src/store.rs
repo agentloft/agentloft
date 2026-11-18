@@ -2236,7 +2236,8 @@ impl AppStore {
                 cx.emit(StoreEvent::Progress { message: None });
                 match result {
                     Ok(Response::Text { text: url }) => {
-                        cx.open_url(&url);
+                        // What `gh` printed (on another computer, maybe).
+                        crate::file_links::open_outside(&url, cx);
                         store.notify_result(Ok(format!("Pull request: {url}")), cx);
                     }
                     Ok(_) => {}

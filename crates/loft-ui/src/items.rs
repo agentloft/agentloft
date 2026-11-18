@@ -160,8 +160,9 @@ pub(crate) fn reply_text_view(
                 (Some(open), Some(store), Some(thread)) => {
                     store.update(cx, |s, cx| s.open_file(thread, open, cx));
                 }
-                // Not a local file of ours (an http link, say): as before.
-                _ => cx.open_url(url),
+                // Not a local file of ours: a web or mail link opens in the
+                // browser; anything else is never handed to the system.
+                _ => crate::file_links::open_outside(url, cx),
             }
         })
         .image_source(local_images(cwd, source_thread))
@@ -230,7 +231,7 @@ pub(crate) fn reply_text_view(
                 None => {
                     let url = image.src.clone();
                     frame
-                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .on_click(move |_, _, cx| crate::file_links::open_outside(&url, cx))
                         .into_any_element()
                 }
             }

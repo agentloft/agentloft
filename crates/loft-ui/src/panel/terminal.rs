@@ -128,8 +128,22 @@ impl TerminalPane {
                     self.store.update(cx, |_, cx| {
                         cx.emit(crate::store::StoreEvent::Browse { url })
                     });
+                } else if url.starts_with("file://") {
+                    // A file: shown in the side panel, never handed to the
+                    // system (which would run a program or a script).
+                    if let FsRoot::Thread(thread) = &self.root {
+                        let thread = thread.clone();
+                        let cwd = self
+                            .store
+                            .read(cx)
+                            .thread_cwd(&thread, cx)
+                            .unwrap_or_default();
+                        if let Some(open) = crate::file_links::link_file_target(url, &cwd) {
+                            self.store.update(cx, |s, cx| s.open_file(thread, open, cx));
+                        }
+                    }
                 } else {
-                    cx.open_url(url);
+                    crate::file_links::open_outside(url, cx);
                 }
             }
         }

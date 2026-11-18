@@ -40,6 +40,28 @@ struct FileLink {
     label: String,
 }
 
+/// Whether a link from text an agent, a repository or another computer wrote
+/// may be handed to the system to open: web and mail links only. Anything
+/// else is the system's to run: `file:` reaches programs (`run%2Ecommand`
+/// slips past the check for a file and opens in Terminal; a `.app` is a
+/// folder, not a file), and other schemes start whatever app claims them.
+pub(crate) fn opens_outside(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
+/// Open `url` in the user's browser (or mail app) if it is a web or mail
+/// link ([`opens_outside`]); anything else is left alone.
+pub(crate) fn open_outside(url: &str, cx: &mut gpui_kit::App) {
+    if opens_outside(url) {
+        cx.open_url(url);
+    } else {
+        tracing::info!(url = %url.chars().take(200).collect::<String>(), "not opening a link that isn't a web or mail link");
+    }
+}
+
 /// A Markdown link whose target is the path of a file on this machine
 /// (`/abs/path`, `~/path` or a path inside `cwd`, each with an optional
 /// `:line[:column]`): what the side panel should be asked for. `None` for
@@ -315,6 +337,29 @@ impl MarkdownPlugin for FileLinks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_web_and_mail_links_are_opened_outside() {
+        for url in [
+            "https://example.com/a",
+            "HTTP://example.com",
+            "mailto:me@example.com",
+        ] {
+            assert!(opens_outside(url), "{url}");
+        }
+        for url in [
+            "file:///Users/me/repo/run%2Ecommand",
+            "file:///Applications/Calculator.app",
+            "smb://host/share",
+            "vscode://file/x",
+            "x-apple.systempreferences:com.apple.preference.security",
+            "javascript:alert(1)",
+            "/Users/me/repo/run.command",
+            "docs/readme.md",
+        ] {
+            assert!(!opens_outside(url), "{url}");
+        }
+    }
 
     #[test]
     fn paths_elsewhere_are_asked_once_and_linked_by_the_answer() {

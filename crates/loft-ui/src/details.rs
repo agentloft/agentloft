@@ -959,7 +959,7 @@ impl Render for DetailsCard {
                             .children(status),
                     )
                     .on_click(move |_, window, cx| {
-                        cx.open_url(&url);
+                        crate::file_links::open_outside(&url, cx);
                         Self::dismiss(place, window, cx);
                     }),
             );

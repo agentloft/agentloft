@@ -108,7 +108,7 @@ pub fn badge(pr: &PullRequest, p: &Palette) -> AnyElement {
             gpui_kit::component::tooltip::Tooltip::new(about.clone()).build(window, cx)
         })
         .claims_press()
-        .on_click(move |_, _, cx| cx.open_url(&url))
+        .on_click(move |_, _, cx| crate::file_links::open_outside(&url, cx))
         .into_any_element()
 }
 
