@@ -573,3 +573,73 @@ fn stop_dev() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// The workflows' files, with their names.
+    fn workflows() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows");
+        let mut found: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "yml" || e == "yaml"))
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).unwrap();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    text,
+                )
+            })
+            .collect();
+        found.sort();
+        assert!(!found.is_empty(), "no workflows in {}", dir.display());
+        found
+    }
+
+    /// What CI installs to build a release is an exact version, never
+    /// whatever a package manager has today.
+    #[test]
+    fn package_installs_in_workflows_are_pinned() {
+        for (name, text) in workflows() {
+            for (n, line) in text.lines().enumerate() {
+                if line.contains("choco install") || line.contains("choco upgrade") {
+                    assert!(
+                        line.contains("--version"),
+                        "{name}:{}: an unpinned Chocolatey install: {}",
+                        n + 1,
+                        line.trim()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Windows installer is built with an Inno Setup whose installer
+    /// was checked against a SHA-256 written in the workflow.
+    #[test]
+    fn inno_setup_is_pinned_and_checked() {
+        let (_, release) = workflows()
+            .into_iter()
+            .find(|(name, _)| name == "release.yml")
+            .unwrap();
+        let value = |key: &str| {
+            release
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(key))
+                .and_then(|rest| rest.strip_suffix('\''))
+                .map(str::to_owned)
+        };
+        let sha = value("$innoSha256 = '").expect("release.yml names the installer's SHA-256");
+        assert!(
+            sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{sha}"
+        );
+        let version = value("$innoVersion = '").expect("release.yml names the Inno Setup version");
+        assert!(
+            version.split('.').count() == 3 && version.split('.').all(|p| p.parse::<u32>().is_ok()),
+            "{version}"
+        );
+        assert!(release.contains("Get-FileHash -Algorithm SHA256 $innoSetup"));
+        assert!(release.contains("-ne $innoSha256"));
+    }
+}

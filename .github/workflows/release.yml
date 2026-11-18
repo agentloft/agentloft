@@ -239,9 +239,33 @@ jobs:
       - name: Installer
         shell: pwsh
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup --no-progress -y
+          # Inno Setup, pinned: the official installer from jrsoftware's own
+          # release (github.com/jrsoftware/issrc, tag is-6_7_4), checked
+          # against the SHA-256 of that file as downloaded and hashed on
+          # 2026-11-18 (the same digest GitHub lists for the asset). Not the
+          # runner's copy or Chocolatey's package: their version changes
+          # under us. Staying on 6.x: packaging/windows/agentloft.iss is
+          # written for Inno Setup 6.
+          $innoVersion = '6.7.4'
+          $innoSha256 = 'a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c'
+          $innoSetup = Join-Path $env:RUNNER_TEMP "innosetup-$innoVersion.exe"
+          $innoTag = 'is-' + $innoVersion.Replace('.', '_')
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$innoTag/innosetup-$innoVersion.exe" -OutFile $innoSetup
+          $innoHash = (Get-FileHash -Algorithm SHA256 $innoSetup).Hash
+          if ($innoHash -ne $innoSha256) {
+            throw "innosetup-$innoVersion.exe has SHA-256 $innoHash, expected $innoSha256"
+          }
+          $innoDir = Join-Path $env:RUNNER_TEMP 'InnoSetup'
+          $install = Start-Process -FilePath $innoSetup -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$innoDir"
+          if ($install.ExitCode -ne 0) { throw "Inno Setup's installer failed ($($install.ExitCode))" }
+          # Where it went (a copy already on the runner is updated in place),
+          # and that it is the version checked above.
+          $iscc = @("$innoDir\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe isn't where Inno Setup was installed" }
+          $isccInfo = (Get-Item $iscc).VersionInfo
+          $isccVersion = [string]($isccInfo.ProductVersion ?? $isccInfo.FileVersion)
+          if (-not $isccVersion.StartsWith($innoVersion)) {
+            throw "$iscc is Inno Setup $isccVersion, expected $innoVersion"
           }
           # [workspace.package] version in Cargo.toml.
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
