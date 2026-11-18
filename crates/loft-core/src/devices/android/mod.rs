@@ -282,10 +282,10 @@ impl AndroidBackend {
     }
 
     /// Where an emulator Agentloft starts writes what it says.
-    fn log_file(avd: &str) -> PathBuf {
-        std::env::temp_dir()
-            .join("agentloft-devices")
-            .join(format!("android-{avd}.log"))
+    fn log_file(avd: &str) -> std::io::Result<PathBuf> {
+        // The user's own folder: on Linux the temporary folder is shared,
+        // and a log file planted there as a symlink would be overwritten.
+        Ok(loft_config::private_temp_dir("agentloft-devices")?.join(format!("android-{avd}.log")))
     }
 
     async fn start(&self, avd: &str) -> anyhow::Result<()> {
@@ -297,10 +297,7 @@ impl AndroidBackend {
         if self.sdk.avd(avd).is_none() {
             bail!("there's no Android virtual device named {avd}");
         }
-        let log = Self::log_file(avd);
-        if let Some(dir) = log.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+        let log = Self::log_file(avd)?;
         let out = std::fs::File::create(&log)?;
         let mut cmd = tokio::process::Command::new(emulator);
         cmd.envs(&self.env)

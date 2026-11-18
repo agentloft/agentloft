@@ -189,7 +189,7 @@ impl SettingsView {
                 match result {
                     Ok(Response::WebStatus { status }) => {
                         if let Some(link) = &status.website.pending {
-                            cx.open_url(&link.verify_url);
+                            open_secret_link(cx, &link.verify_url);
                         }
                         this.web.status = Some(status);
                     }
@@ -446,7 +446,7 @@ impl SettingsView {
                                 .outline()
                                 .icon(Icon::new(IconName::ExternalLink))
                                 .label("Open in browser")
-                                .on_click(move |_, _, cx| cx.open_url(&open_link)),
+                                .on_click(move |_, _, cx| open_secret_link(cx, &open_link)),
                         )
                         .child(
                             Button::new("web-reveal")
@@ -770,7 +770,7 @@ impl SettingsView {
                         .outline()
                         .icon(Icon::new(IconName::ExternalLink))
                         .label("Open the page again")
-                        .on_click(move |_, _, cx| cx.open_url(&again)),
+                        .on_click(move |_, _, cx| open_secret_link(cx, &again)),
                 )
                 .child(
                     Button::new("web-site-cancel")
@@ -944,9 +944,79 @@ impl SettingsView {
     }
 }
 
+/// Open a link whose fragment is a secret (the pairing token, the
+/// website's link key) in the browser. On Linux the URL would be the
+/// command line of `xdg-open` and of the browser, which every account on
+/// the computer can read (`/proc/<pid>/cmdline`): there the browser is
+/// sent to a page of the user's own that goes on to the link instead.
+fn open_secret_link(cx: &mut gpui_kit::App, url: &str) {
+    #[cfg(target_os = "linux")]
+    if let Some(page) = redirect_page(url) {
+        cx.open_url(&page);
+        return;
+    }
+    cx.open_url(url);
+}
+
+/// Write the page that sends a browser on to `url` (0600, in a folder of
+/// the user's own), and return its `file://` address.
+#[cfg(target_os = "linux")]
+fn redirect_page(url: &str) -> Option<String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = loft_config::private_temp_dir("agentloft-open").ok()?;
+    let path = dir.join("link.html");
+    let _ = std::fs::remove_file(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    file.write_all(redirect_html(url).as_bytes()).ok()?;
+    Some(format!("file://{}", path.display()))
+}
+
+/// A page that goes straight on to `url`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn redirect_html(url: &str) -> String {
+    let attr: String = url
+        .chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_owned(),
+            '"' => "&quot;".to_owned(),
+            '<' => "&lt;".to_owned(),
+            '>' => "&gt;".to_owned(),
+            c => c.to_string(),
+        })
+        .collect();
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\">\
+         <meta http-equiv=\"refresh\" content=\"0;url={attr}\"><title>Agentloft</title>\
+         <a href=\"{attr}\">Open Agentloft</a>\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secret_link_goes_through_a_page_not_a_command_line() {
+        let page = redirect_html("http://127.0.0.1:4780/#token=abc\"><script>x</script>&y");
+        assert!(page.contains("url=http://127.0.0.1:4780/#token=abc&quot;&gt;&lt;script&gt;"));
+        assert!(!page.contains("<script>"));
+        #[cfg(target_os = "linux")]
+        {
+            let opened = redirect_page("http://127.0.0.1:4780/#token=s3cret").unwrap();
+            assert!(opened.starts_with("file://") && !opened.contains("s3cret"));
+            let file = std::path::PathBuf::from(opened.trim_start_matches("file://"));
+            assert!(std::fs::read_to_string(&file).unwrap().contains("s3cret"));
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn the_qr_code_is_an_svg_of_the_link() {

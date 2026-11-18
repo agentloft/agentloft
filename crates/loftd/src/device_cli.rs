@@ -459,7 +459,9 @@ async fn save_shot(
     let path = match out {
         Some(path) => path,
         None => {
-            let dir = std::env::temp_dir().join("agent-device");
+            // The user's own folder (on Linux the temporary one is shared).
+            let dir = loft_config::private_temp_dir("agent-device")
+                .map_err(|e| format!("a folder for the screenshot: {e}"))?;
             let name: String = shot
                 .id
                 .as_str()

@@ -201,22 +201,17 @@ async fn network_off(
 /// temporary directory, the user's only.
 fn folder(page: &Page) -> Result<PathBuf, BrowserError> {
     let thread = lock(&page.state).info.thread_id.clone();
-    let dir = std::env::temp_dir()
-        .join("agentloft-browser")
-        .join(thread.as_str());
-    std::fs::create_dir_all(&dir).map_err(|e| {
+    let failed = |dir: &std::path::Path, e: std::io::Error| {
         BrowserError::Action(format!(
             "couldn't make the folder for captures ({}): {e}",
             dir.display()
         ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        for private in [dir.as_path(), dir.parent().unwrap_or(&dir)] {
-            let _ = std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700));
-        }
-    }
+    };
+    // Both levels the user's own (on Linux the temporary folder is shared).
+    let base = loft_config::private_temp_dir("agentloft-browser")
+        .map_err(|e| failed(&std::env::temp_dir().join("agentloft-browser"), e))?;
+    let dir = base.join(thread.as_str());
+    loft_config::private_dir(&dir).map_err(|e| failed(&dir, e))?;
     Ok(dir)
 }
 

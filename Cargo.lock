@@ -4507,6 +4507,7 @@ name = "loft-config"
 version = "0.0.8"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

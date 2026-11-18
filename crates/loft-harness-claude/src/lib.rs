@@ -359,7 +359,12 @@ fn probe_models(
     binary: &std::path::Path,
     env: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<loft_protocol::ModelInfo>> {
-    let v = probe_initialize(binary, env, &std::env::temp_dir())?;
+    // An empty folder of the user's own, not the shared `/tmp` (on Linux).
+    let v = probe_initialize(
+        binary,
+        env,
+        &loft_config::private_temp_dir("agentloft-ask")?,
+    )?;
     let models = translate::models(&v);
     anyhow::ensure!(!models.is_empty(), "no models in the initialize response");
     Ok(models)

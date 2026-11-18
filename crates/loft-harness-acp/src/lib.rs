@@ -151,7 +151,9 @@ fn probe_session(
     env: &HashMap<String, String>,
 ) -> Result<Vec<loft_protocol::ModelInfo>> {
     use std::io::{BufRead as _, Write as _};
-    let cwd = std::env::temp_dir();
+    // An empty folder of the user's own, not the shared `/tmp` (on Linux)
+    // whose project settings anyone could have planted.
+    let cwd = loft_config::private_temp_dir("agentloft-ask")?;
     let mut cmd = std::process::Command::new(binary);
     cmd.args(args)
         .current_dir(&cwd)

@@ -2347,7 +2347,12 @@ impl Core {
         let kind = harness.clone();
         let run = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             use anyhow::Context as _;
-            let dir = std::env::temp_dir();
+            // An empty folder of the user's own: the CLI reads its project
+            // settings (MCP servers, plugins, instructions) from where it
+            // runs, and on Linux the temporary folder is shared with every
+            // account on the computer.
+            let dir = loft_config::private_temp_dir("agentloft-ask")
+                .context("a private folder to ask in")?;
             let answer_file = dir.join(format!("agentloft-ask-{}.txt", uuid::Uuid::new_v4()));
             let mut cmd = std::process::Command::new(&binary);
             match kind.as_str() {

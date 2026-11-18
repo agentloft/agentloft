@@ -1053,7 +1053,10 @@ impl IosBackend {
             .concat()
             .as_slice(),
         );
-        let path = std::env::temp_dir().join(format!("agentloft-ios-fold-{key:016x}"));
+        // In a folder of the user's own: what is there is run in the device.
+        let path = loft_config::private_temp_dir("agentloft-ios-fold")
+            .context("no temporary folder for the fold program")?
+            .join(format!("{key:016x}"));
         if !path.exists() {
             let dir = path.with_extension(format!("build-{}", std::process::id()));
             tokio::fs::create_dir_all(&dir)

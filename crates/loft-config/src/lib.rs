@@ -144,11 +144,66 @@ impl Paths {
         for dir in [&self.home, &self.logs_dir(), &self.backups_dir()] {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
+        // The user's only: it holds every conversation, agents' API keys
+        // (`config.toml`), logs and worktrees, and its files are made with
+        // the usual modes (readable by the other accounts on the computer).
+        // Best effort: a home someone set up elsewhere may not be ours to
+        // change.
+        let _ = set_mode(&self.home, 0o700);
         for dir in [self.run_dir(), self.socket_dir()] {
             std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             set_mode(&dir, 0o700)?;
         }
         Ok(())
+    }
+}
+
+/// A folder of the temporary directory for this user's files alone:
+/// `<temp>/<name>`, made 0700, or, when it is already there, checked to be
+/// a real folder of this user's (and made 0700). On Linux the temporary
+/// directory is `/tmp`, shared by every account: another one could make the
+/// folder first, or a symlink in its place, and read or replace what we
+/// write there. Then this fails instead.
+pub fn private_temp_dir(name: &str) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(name);
+    private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// [`private_temp_dir`] for any folder whose parent is safe.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let meta = std::fs::symlink_metadata(dir)?;
+        // SAFETY: geteuid has no preconditions and can't fail.
+        #[allow(unsafe_code)]
+        let me = unsafe { libc::geteuid() };
+        if !meta.is_dir() || meta.uid() != me {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} belongs to someone else (or isn't a folder); remove it and try again",
+                    dir.display()
+                ),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
     }
 }
 
@@ -993,6 +1048,7 @@ pub enum SettingValue {
 /// Set one key in `config.toml` (e.g. `["ui", "theme"]`), keeping the rest
 /// of the file — comments and formatting included — as the user wrote it.
 pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result<()> {
+    let _one_at_a_time = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let file = paths.config_file();
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
@@ -1004,12 +1060,28 @@ pub fn write_setting(paths: &Paths, key: &[&str], value: SettingValue) -> Result
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // Write-then-rename so a crash never leaves a truncated config.
-    let tmp = file.with_extension("toml.tmp");
-    std::fs::write(&tmp, edited)?;
-    std::fs::rename(&tmp, &file)?;
-    Ok(())
+    // Write-then-rename so a crash never leaves a truncated config: a
+    // temporary file of this write's own, keeping the file's mode (a config
+    // made private stays so).
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = file.with_extension(format!("toml.{}-{n}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, edited)
+        .and_then(|()| match std::fs::metadata(&file) {
+            Ok(meta) => std::fs::set_permissions(&tmp, meta.permissions()),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&tmp, &file));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(written?)
 }
+
+/// One settings change at a time in this process: each reads the file,
+/// edits it and writes it back, so two at once would lose one of them
+/// (agents' tool calls run side by side).
+static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// [`write_setting`] on the text of a config file: the text with one key
 /// set, the rest as it was.
@@ -1277,6 +1349,69 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_folder_is_never_one_planted_for_us() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // Made private, or made so.
+        let fresh = dir.path().join("fresh");
+        private_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        private_dir(&open).unwrap();
+        assert_eq!(mode(&open), 0o700);
+        // A symlink in its place (to somewhere the planter reads) or a file.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(private_dir(&link).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(private_dir(&file).is_err());
+    }
+
+    #[test]
+    fn settings_written_at_once_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::thread::scope(|scope| {
+            for n in 0..20 {
+                let paths = &paths;
+                scope.spawn(move || {
+                    let key = format!("k{n}");
+                    write_setting(paths, &["ui", &key], SettingValue::Int(n)).unwrap();
+                });
+            }
+        });
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let doc: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(doc["ui"].as_table().unwrap().len(), 20, "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_home_and_a_private_config_stay_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = Paths::new(&home);
+        paths.ensure_dirs().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&home), 0o700);
+        std::fs::write(paths.config_file(), "").unwrap();
+        std::fs::set_permissions(paths.config_file(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        write_setting(&paths, &["ui", "theme"], SettingValue::Str("dark".into())).unwrap();
+        assert_eq!(mode(&paths.config_file()), 0o600);
+    }
 
     #[test]
     fn web_is_off_and_local_by_default() {
