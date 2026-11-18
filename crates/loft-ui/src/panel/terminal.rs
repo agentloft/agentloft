@@ -287,10 +287,7 @@ impl TerminalPane {
     // -- fed by the store ---------------------------------------------------
 
     pub fn on_replay(&mut self, bytes: &[u8], exited: Option<i32>, cx: &mut Context<Self>) {
-        self.view.update(cx, |v, cx| {
-            v.reset(cx);
-            v.feed(bytes, cx);
-        });
+        self.view.update(cx, |v, cx| v.replay(bytes, cx));
         self.exited = exited;
         cx.notify();
     }
