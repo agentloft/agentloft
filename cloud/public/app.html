@@ -70,8 +70,9 @@
 </main>
 
 <!-- A public computer, shown in place: the page inside comes from that
-     computer and talks only to it. -->
-<iframe id="frame" title="Agentloft" allow="clipboard-read; clipboard-write; fullscreen" referrerpolicy="no-referrer" hidden></iframe>
+     computer and talks only to it. It may copy, not read the clipboard:
+     pasting is the browser's own paste event, which needs no permission. -->
+<iframe id="frame" title="Agentloft" allow="clipboard-write; fullscreen"referrerpolicy="no-referrer" hidden></iframe>
 
 <main id="link-done" class="center" hidden>
   <img src="/icon.png" alt="" width="56" height="56" class="logo">
