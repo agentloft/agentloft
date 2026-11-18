@@ -67,6 +67,12 @@
     const href = link.getAttribute("href") || "";
     if (href.startsWith("#") || href.toLowerCase().startsWith("javascript:")) return;
     event.preventDefault();
+    // The user's own click only: a page's `link.click()` is a click event
+    // too, and would open things in their browser by itself.
+    if (!event.isTrusted || !gesture()) {
+      post({ kind: "refused", what: "open" });
+      return;
+    }
     post({ kind: "open", text: link.href });
   };
 
@@ -242,6 +248,14 @@
   listen(document, "agentloft:call", onCall, true);
   listen(document, "click", onClick, false);
   listen(document, "submit", onSubmit, false);
+  // What the page's policy refused (a fetch or WebSocket to a host a view
+  // may not reach): said to the agent, as for requests stopped elsewhere.
+  listen(
+    document,
+    "securitypolicyviolation",
+    (event) => post({ kind: "blocked", url: String(event.blockedURI || "") }),
+    true,
+  );
   // Images and fonts arriving change the height without a resize of ours.
   listen(document, "load", measure, true);
   if (real) {

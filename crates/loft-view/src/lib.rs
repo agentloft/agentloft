@@ -404,6 +404,18 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "fonts.gstatic.com",
 ];
 
+/// What a view's page may connect to, as a Content-Security-Policy: the
+/// same hosts. Its requests are also stopped one by one (`allowed_url`),
+/// but a WebSocket or an EventSource doesn't pass that way, so the page's
+/// policy says it too.
+pub fn content_security_policy() -> String {
+    let hosts: Vec<String> = ALLOWED_HOSTS
+        .iter()
+        .map(|h| format!("https://{h}"))
+        .collect();
+    format!("connect-src {}", hosts.join(" "))
+}
+
 /// Whether a view may fetch `url`: `https`, from one of [`ALLOWED_HOSTS`].
 pub fn allowed_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
@@ -417,7 +429,10 @@ pub fn allowed_url(url: &str) -> bool {
 
 /// The address a view's page lives at. It is never fetched: the daemon
 /// answers for it. A real, per-view origin gives the page storage of its
-/// own and a secure context.
+/// own and a secure context. Each view is a site of its own too (`invalid`
+/// is a top-level name, so `v<item>.invalid` is the whole registrable
+/// domain): views under one shared name could pass notes to each other in
+/// a cookie for that name, across threads.
 pub fn origin(item_id: &str) -> String {
     let label: String = item_id
         .chars()
@@ -425,7 +440,7 @@ pub fn origin(item_id: &str) -> String {
         .take(40)
         .collect::<String>()
         .to_ascii_lowercase();
-    format!("https://v{label}.view.agentloft.invalid/")
+    format!("https://v{label}.invalid/")
 }
 
 #[cfg(test)]
@@ -541,7 +556,7 @@ mod tests {
     #[test]
     fn each_view_has_an_origin_of_its_own() {
         let a = origin("01A1-c8e7-B410");
-        assert_eq!(a, "https://v01a1c8e7b410.view.agentloft.invalid/");
+        assert_eq!(a, "https://v01a1c8e7b410.invalid/");
         assert_ne!(a, origin("01a1c8e7b411"));
     }
 }

@@ -2,7 +2,7 @@
 //! agent's own HTML instead of a site.
 //!
 //! - **A place of its own.** Each view lives at an address made up for it
-//!   (`https://v<item>.view.agentloft.invalid/`) in a browser context apart
+//!   (`https://v<item>.invalid/`, a site of its own) in a browser context apart
 //!   from the user's tabs: its own storage, none of their cookies. The
 //!   address is never fetched: every request a view makes stops here
 //!   first, and only our own answer for its document and a short list of
@@ -740,6 +740,12 @@ impl Browser {
                     "responseHeaders": [
                         { "name": "Content-Type", "value": "text/html; charset=utf-8" },
                         { "name": "Cache-Control", "value": "no-store" },
+                        // WebSockets and EventSource don't stop at
+                        // `Fetch`: the page's own policy keeps them in.
+                        {
+                            "name": "Content-Security-Policy",
+                            "value": loft_view::content_security_policy(),
+                        },
                     ],
                     "body": base64::engine::general_purpose::STANDARD.encode(SHELL),
                 }),
@@ -819,6 +825,16 @@ impl Browser {
                         id: page.id.clone(),
                     });
                 }
+                return;
+            }
+            Some("blocked") => {
+                self.note_problem(
+                    view,
+                    format!(
+                        "Blocked {}: a view has no network beyond the script and font hosts show_ui lists. Put everything else in the page.",
+                        clip(call["url"].as_str().unwrap_or_default(), 120)
+                    ),
+                );
                 return;
             }
             Some("refused") => {
@@ -956,7 +972,12 @@ pub(super) mod tests {
             <button id=\"go\" style=\"position:fixed;left:0;top:0;width:200px;height:60px\" \
               onclick=\"agentloft.setState({ clicks: (agentloft.state?.clicks || 0) + 1 }); \
                        agentloft.send('picked ' + agentloft.state.clicks)\">go</button>\
+            <a id=\"out\" href=\"https://example.com/out\">out</a>\
             <script>agentloft.send('nobody clicked'); fetch('https://example.com/x').catch(() => {});\
+            document.getElementById('out').click();\
+            new WebSocket('wss://127.0.0.1:9/');\
+            document.cookie = 'note=1; secure; domain=' + location.hostname.split('.').slice(1).join('.');\
+            if (document.cookie.includes('note')) throw new Error('a cookie other views see');\
             </script><script>missing()</script>";
         let request = |html: &str, done: bool| ViewRequest {
             thread: thread.clone(),
@@ -993,6 +1014,15 @@ pub(super) mod tests {
         assert!(said.contains("Blocked https://example.com/x"), "{said}");
         assert!(
             said.contains("agentloft.send() was called with no click"),
+            "{said}"
+        );
+        // A WebSocket doesn't stop at `Fetch`: the page's policy refuses it.
+        assert!(said.contains("Blocked wss://127.0.0.1:9"), "{said}");
+        // No cookie for a name other views share.
+        assert!(!said.contains("a cookie other views see"), "{said}");
+        // A link the page clicks itself opens nothing.
+        assert!(
+            said.contains("agentloft.open() was called with no click"),
             "{said}"
         );
 
