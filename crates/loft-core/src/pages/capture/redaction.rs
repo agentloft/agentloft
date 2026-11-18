@@ -51,7 +51,7 @@ const MIN_ONE_TIME: usize = 4;
 /// name that is only `key`'s cousins (`keyboard`). The whole name `key`
 /// does (an API key in `?key=`).
 pub(super) fn is_secret_name(name: &str) -> bool {
-    const ANYWHERE: [&str; 14] = [
+    const ANYWHERE: [&str; 22] = [
         "cookie",
         "credential",
         "csrf",
@@ -66,6 +66,16 @@ pub(super) fn is_secret_name(name: &str) -> bool {
         "passphrase",
         "signature",
         "jwt",
+        // SAML and OAuth client assertions, CAS tickets.
+        "assertion",
+        "saml",
+        "ticket",
+        // A wallet's recovery words; a card's security code.
+        "mnemonic",
+        "seedphrase",
+        "cvc",
+        "cvv",
+        "cvn",
     ];
     let lower = name.to_ascii_lowercase();
     if ANYWHERE.iter().any(|w| lower.contains(w))
@@ -81,7 +91,16 @@ pub(super) fn is_secret_name(name: &str) -> bool {
     {
         return true;
     }
+    // A card's number: `card_number`, `cardNumber`, `card[number]`.
+    if lower.contains("card") && (lower.contains("number") || lower.contains("num]")) {
+        return true;
+    }
     let segments: Vec<&str> = segments(&lower).collect();
+    // `Ocp-Apim-Subscription-Key`, `x-functions-key`: a name ending in a
+    // `key` segment.
+    if segments.len() > 1 && segments.last() == Some(&"key") {
+        return true;
+    }
     segments.iter().enumerate().any(|(i, s)| match *s {
         "sig" | "pin" => true,
         "code" => !(i > 0 && HARMLESS_CODES.contains(&segments[i - 1])),
@@ -461,6 +480,12 @@ impl Redactor {
                         self.learn(&value, Some(&name));
                         return format!("{raw_name}={REDACTED}");
                     }
+                    // A token under a name that doesn't say so (`?t=…`,
+                    // `?invite=…`), judged by its shape as path segments are.
+                    if looks_like_token(&value) {
+                        self.learn(&value, None);
+                        return format!("{raw_name}={REDACTED}");
+                    }
                 }
                 piece.to_owned()
             })
@@ -773,6 +798,33 @@ fn encode_uri_component(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn credentials_named_otherwise_or_shaped_like_tokens() {
+        for name in [
+            "SAMLResponse",
+            "client_assertion",
+            "assertion",
+            "ticket",
+            "mnemonic",
+            "card[number]",
+            "cardNumber",
+            "card[cvc]",
+            "cvv",
+            "Ocp-Apim-Subscription-Key",
+            "x-functions-key",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+        for name in ["keyboard", "key_count", "monkey", "status_code", "author"] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+        let mut redactor = Redactor::default();
+        let url = redactor
+            .url("https://x.example/reset?t=8f3a9c1e2b7d4f6a8c0e1b3d5f7a9c2e4b6d8f0a&page=2");
+        assert!(url.contains(&format!("t={REDACTED}")), "{url}");
+        assert!(url.contains("page=2"), "{url}");
+    }
 
     #[test]
     fn secret_names() {
