@@ -35,7 +35,12 @@ wildcards = "allow"
 # Unmaintained notices for GPUI's transitive deps aren't actionable here;
 # only flag crates we depend on directly. Vulnerabilities always fail.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # chrono is unmaintained (jiff is the suggested successor). GPUI and
+    # gpui-kit depend on it, so it stays in the tree whatever we use; moving
+    # loft-core and loft-ui to jiff alone wouldn't remove it.
+    { id = "RUSTSEC-2026-0543", reason = "chrono comes with GPUI; unmaintained, not vulnerable" },
+]
 
 [sources]
 unknown-registry = "deny"
