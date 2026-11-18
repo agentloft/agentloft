@@ -120,6 +120,7 @@ async fn run(paths: Paths) -> Result<()> {
         check_agent_updates: true,
         mcp_bridge,
         web_bundle: None,
+        device_backends: None,
     })
     .await
     {

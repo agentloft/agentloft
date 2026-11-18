@@ -4,6 +4,8 @@
 //!   which the user sees in the thread's Browser tab;
 //! - `list_threads` / `read_thread` / `get_thread_diff` read other threads;
 //! - `show_ui` shows a page of the agent's own HTML in the chat (ADR-0018).
+//! - `device_*` use the iOS simulators and Android emulators the user sees in
+//!   the Device panel (ADR-0020, `mcp_devices.rs`).
 //!
 //! Transport: newline-delimited JSON-RPC 2.0 on stdin/stdout. Nothing else
 //! may be written to stdout.
@@ -71,8 +73,9 @@ pub async fn run(paths: Paths, thread_id: ThreadId) -> Result<()> {
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "agentloft", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": format!(
-                        "Agentloft tools. {BROWSER_INSTRUCTIONS} {INSTRUCTIONS} {}",
-                        crate::mcp_tabs::INSTRUCTIONS
+                        "Agentloft tools. {BROWSER_INSTRUCTIONS} {INSTRUCTIONS} {} {}",
+                        crate::mcp_tabs::INSTRUCTIONS,
+                        crate::mcp_devices::INSTRUCTIONS,
                     ),
                 }),
             ),
@@ -530,6 +533,7 @@ pub fn tools() -> Vec<Value> {
         ),
     ];
     tools.extend(crate::mcp_automations::tools());
+    tools.extend(crate::mcp_devices::tools());
     tools.extend(capture_tools());
     tools.extend(crate::mcp_tabs::tools());
     crate::mcp_tabs::add_tab_property(&mut tools);
@@ -933,6 +937,9 @@ async fn call_tool(client: &Client, thread: &ThreadId, name: &str, args: &Value)
         return result;
     }
     if let Some(result) = crate::mcp_automations::call(client, thread, name, args).await {
+        return result;
+    }
+    if let Some(result) = crate::mcp_devices::call(client, thread, name, args).await {
         return result;
     }
     let request = match name {

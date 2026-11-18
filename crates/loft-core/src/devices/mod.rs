@@ -28,6 +28,9 @@ const IDLE_SCREEN: Duration = Duration::from_secs(120);
 const LIST_EVERY: Duration = Duration::from_secs(4);
 /// `DeviceDriven` at most this often per device.
 const DRIVEN_EVERY: Duration = Duration::from_secs(1);
+/// How long an agent's boot waits for the device to run (a cold Android
+/// emulator can take minutes).
+pub const BOOT_WAIT: Duration = Duration::from_secs(180);
 
 type Result<T> = std::result::Result<T, ErrorBody>;
 
@@ -445,13 +448,15 @@ impl Devices {
         loop {
             {
                 let inner = self.lock();
-                if let Some(error) = inner.errors.get(id) {
-                    return Err(ErrorBody::new(ErrorCode::Internal, error.clone()));
-                }
+                // Running first: an error left by an earlier broken stream
+                // doesn't make a running device unusable.
                 if let Some(info) = decorate(&inner, id)
                     && info.state == DeviceState::Running
                 {
                     return Ok(info);
+                }
+                if let Some(error) = inner.errors.get(id) {
+                    return Err(ErrorBody::new(ErrorCode::Internal, error.clone()));
                 }
             }
             match tokio::time::timeout_at(deadline, bus.recv()).await {
@@ -501,6 +506,9 @@ impl Devices {
         thread: Option<&ThreadId>,
     ) -> Result<()> {
         let backend = self.backend(id)?;
+        if let DeviceApp::Install { path } = &app {
+            check_install_path(path)?;
+        }
         self.used_by(id, thread);
         backend.app(id.native(), app).await.map_err(failed)
     }
@@ -519,6 +527,25 @@ impl Devices {
             watchers.get(id).is_some_and(|n| *n > 0) || a.last_used.elapsed() < IDLE_SCREEN
         });
     }
+}
+
+/// An app to install must be on this computer, named by its whole path
+/// (the daemon has no folder of its own to resolve a relative one in).
+fn check_install_path(path: &str) -> Result<()> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err(ErrorBody::new(
+            ErrorCode::BadRequest,
+            format!("Give the app's absolute path, not `{path}`."),
+        ));
+    }
+    if !p.exists() {
+        return Err(ErrorBody::new(
+            ErrorCode::NotFound,
+            format!("No app at {path}: build it first, or check the path."),
+        ));
+    }
+    Ok(())
 }
 
 /// `id` as viewers see it: the backend's listing, with boots under way,

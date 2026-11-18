@@ -111,3 +111,56 @@ async fn unknown_platform_is_not_found() {
         .unwrap_err();
     assert!(err.message.contains("aren't available"), "{}", err.message);
 }
+
+#[tokio::test]
+async fn installing_needs_an_app_that_is_there() {
+    let (devices, fake, _bus) = devices();
+    let id = fake.id();
+    let install = |path: &str| DeviceApp::Install { path: path.into() };
+    let err = devices
+        .app(&id, install("build/App.app"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    let missing = std::env::temp_dir().join("agentloft-no-such-app.app");
+    let err = devices
+        .app(&id, install(&missing.to_string_lossy()), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(err.message.contains("No app at"), "{}", err.message);
+    // Neither reached the device.
+    assert!(fake.log().is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("App.app");
+    std::fs::create_dir(&app).unwrap();
+    devices
+        .app(&id, install(&app.to_string_lossy()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.log(),
+        vec![FakeEvent::App(install(&app.to_string_lossy()))]
+    );
+}
+
+#[tokio::test]
+async fn a_running_device_boots_at_once_despite_an_old_error() {
+    let (devices, fake, _bus) = devices();
+    let id = fake.id();
+    devices
+        .boot_and_wait(&id, None, Duration::from_secs(5))
+        .await
+        .unwrap();
+    // As an earlier stream that broke leaves it.
+    devices
+        .lock()
+        .errors
+        .insert(id.clone(), "The device's stream stopped.".into());
+    let info = devices
+        .boot_and_wait(&id, None, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(info.state, DeviceState::Running);
+}

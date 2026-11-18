@@ -6,6 +6,7 @@ mod conn;
 mod http;
 pub mod mcp;
 mod mcp_automations;
+mod mcp_devices;
 mod mcp_tabs;
 mod prices;
 mod reaper;
@@ -40,6 +41,9 @@ pub struct DaemonOptions {
     pub mcp_bridge: Option<loft_core::McpBridge>,
     /// The web client's files, instead of the usual places (tests).
     pub web_bundle: Option<std::path::PathBuf>,
+    /// Simulators and emulators (ADR-0020). `None`: this computer's (or
+    /// fakes with `AGENTLOFT_FAKE_DEVICES=1`); tests give none or fakes.
+    pub device_backends: Option<Vec<Arc<dyn loft_core::devices::Backend>>>,
 }
 
 /// A running daemon. Dropping it does not stop it; call [`Daemon::shutdown`].
@@ -85,7 +89,9 @@ impl Daemon {
             tracing::warn!(%err, "invalid config.toml; using defaults");
             loft_config::Config::default()
         });
-        let device_backends = device_backends(&env);
+        let device_backends = opts
+            .device_backends
+            .unwrap_or_else(|| device_backends(&env));
         let core = Core::new(
             store,
             opts.harnesses,

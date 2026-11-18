@@ -91,6 +91,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap();
@@ -214,6 +215,7 @@ async fn live_claude_turns_approval_interrupt_resume() {
         check_agent_updates: false,
         mcp_bridge: None,
         web_bundle: None,
+        device_backends: Some(Vec::new()),
     })
     .await
     .unwrap();
