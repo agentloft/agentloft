@@ -142,7 +142,6 @@ fn xls_span(data: &[u8]) -> u64 {
                         u16_at(record, 8),
                         u16_at(record, 10),
                     )
-                        .into()
                 } else {
                     (
                         u16_at(record, 0).map(u32::from),
@@ -150,7 +149,6 @@ fn xls_span(data: &[u8]) -> u64 {
                         u16_at(record, 4),
                         u16_at(record, 6),
                     )
-                        .into()
                 };
                 if let (Some(r0), Some(r1), Some(c0), Some(c1)) = (r0, r1, c0, c1) {
                     let rows = u64::from(r1.saturating_sub(r0)) + 1;
