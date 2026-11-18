@@ -21,7 +21,7 @@ use super::{Browser, Page, Pages, State, bad, internal, lock, metrics};
 use crate::BusMsg;
 use base64::Engine as _;
 use loft_protocol::{ErrorBody, ErrorCode, ItemId, PageAction, PageId, PageInfo, ThreadId};
-use loft_view::{BINDING, BRIDGE_JS, MAX_HEIGHT, MAX_STATE, MIN_HEIGHT, Theme, WORLD};
+use loft_view::{BINDING, BRIDGE_JS, GUARD_JS, MAX_HEIGHT, MAX_STATE, MIN_HEIGHT, Theme, WORLD};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -258,9 +258,13 @@ impl Browser {
 
     /// A command to a view's page that gives up rather than wait forever.
     async fn ask(&self, page: &Page, method: &str, params: Value) -> Result<Value, String> {
-        match tokio::time::timeout(PATIENCE, self.cdp.send(method, params, Some(&page.session)))
-            .await
-        {
+        self.ask_on(&page.session, method, params).await
+    }
+
+    /// The same, over one of its sessions: the page's own, or that of a
+    /// frame of it in a process of its own.
+    async fn ask_on(&self, session: &str, method: &str, params: Value) -> Result<Value, String> {
+        match tokio::time::timeout(PATIENCE, self.cdp.send(method, params, Some(session))).await {
             Ok(result) => result,
             Err(_) => Err(format!("the page didn't answer `{method}`")),
         }
@@ -410,15 +414,9 @@ impl Browser {
             tokio::spawn(self.clone().sweep_views());
         }
         let setup = async {
-            self.ask(&page, "Page.enable", json!({})).await?;
+            // `Page.enable` too.
+            self.wall_in(&page.session).await?;
             self.ask(&page, "Runtime.enable", json!({})).await?;
-            // Every request the page makes stops at `on_view_request`.
-            self.ask(
-                &page,
-                "Fetch.enable",
-                json!({ "patterns": [{ "urlPattern": "*" }] }),
-            )
-            .await?;
             self.ask(&page, "Emulation.setDeviceMetricsOverride", metrics(&info))
                 .await?;
             self.ask(
@@ -442,6 +440,71 @@ impl Browser {
             return Err(err);
         }
         Ok(lock(&page.state).info.clone())
+    }
+
+    /// What holds in every document of a view, put in place over `session`
+    /// (the page's, or a frame's in a process of its own) before anything of
+    /// the page's runs there. Views only: tabs are sites' own pages.
+    async fn wall_in(&self, session: &str) -> Result<(), String> {
+        // No WebRTC, no windows (`loft_view::GUARD_JS`), in every document
+        // and same-process frame from now on, and the one there already.
+        // (Without `Page.enable` the script is taken and never run.)
+        self.ask_on(session, "Page.enable", json!({})).await?;
+        self.ask_on(
+            session,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": GUARD_JS, "runImmediately": true }),
+        )
+        .await?;
+        // Every request stops at `on_view_request`.
+        self.ask_on(
+            session,
+            "Fetch.enable",
+            json!({ "patterns": [{ "urlPattern": "*" }] }),
+        )
+        .await?;
+        // A frame in a process of its own (Chrome gives a sandboxed frame
+        // one) has a session of its own and sees none of the above. It
+        // waits, blank, until it has them too (`on_view_frame`).
+        self.ask_on(
+            session,
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A frame of a view's (or a worker) came over a session of its own,
+    /// paused. Walled in like the page and then let go; one that can't be
+    /// stays paused, and blank.
+    async fn on_view_frame(self: Arc<Self>, page: Arc<Page>, params: Value) {
+        let Some(session) = params["sessionId"].as_str() else {
+            return;
+        };
+        // What it says comes to `on_view_event` as the page's.
+        lock(&self.sessions).insert(session.to_owned(), page.id.clone());
+        let walled = if params["targetInfo"]["type"] == "iframe" {
+            match self.wall_in(session).await {
+                Ok(()) => self
+                    .ask_on(session, "Runtime.enable", json!({}))
+                    .await
+                    .map(|_| ()),
+                Err(err) => Err(err),
+            }
+        } else {
+            // A worker: its requests already stop at its page's `Fetch`,
+            // and it has no WebRTC.
+            Ok(())
+        };
+        match walled {
+            Ok(()) => {
+                let _ = self
+                    .ask_on(session, "Runtime.runIfWaitingForDebugger", json!({}))
+                    .await;
+            }
+            Err(err) => tracing::debug!(%err, "a view's frame stays blank"),
+        }
     }
 
     /// What the browser itself must know of the look: light or dark, and
@@ -654,9 +717,22 @@ impl Browser {
             return false;
         };
         let params = &event.params;
+        // The page's own session, or a frame's in a process of its own: a
+        // frame's is heard for its requests, its frames and its mistakes.
+        let session = event.session.as_deref().unwrap_or(&page.session);
+        let framed = session != page.session;
         match event.method.as_str() {
-            "Fetch.requestPaused" => self.on_view_request(page, view, params).await,
-            "Runtime.bindingCalled" if params["name"] == BINDING => {
+            "Fetch.requestPaused" => self.on_view_request(view, session, params).await,
+            "Target.attachedToTarget" => {
+                tokio::spawn(self.clone().on_view_frame(page.clone(), params.clone()));
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(gone) = params["sessionId"].as_str() {
+                    lock(&self.sessions).remove(gone);
+                }
+            }
+            // The bridge is the page's, in its own document only.
+            "Runtime.bindingCalled" if !framed && params["name"] == BINDING => {
                 if let Ok(call) =
                     serde_json::from_str::<Value>(params["payload"].as_str().unwrap_or_default())
                 {
@@ -688,6 +764,8 @@ impl Browser {
                     .collect();
                 self.note_problem(view, format!("console.error: {}", said.join(" ")));
             }
+            // The rest of a frame's is no business of the view's.
+            _ if framed => {}
             "Page.frameNavigated" => {
                 let frame = &params["frame"];
                 let url = frame["url"].as_str().unwrap_or_default();
@@ -725,7 +803,7 @@ impl Browser {
 
     /// A request the page made: its own document is answered here, the few
     /// hosts a view may load from go through, the rest never leaves.
-    async fn on_view_request(&self, page: &Page, view: &ViewPage, params: &Value) {
+    async fn on_view_request(&self, view: &ViewPage, session: &str, params: &Value) {
         let id = params["requestId"].clone();
         let request = &params["request"];
         let url = request["url"].as_str().unwrap_or_default();
@@ -778,7 +856,7 @@ impl Browser {
                 json!({ "requestId": id, "errorReason": "BlockedByClient" }),
             )
         };
-        if let Err(err) = self.ask(page, method, answer).await {
+        if let Err(err) = self.ask_on(session, method, answer).await {
             tracing::debug!(%err, "answering a view's request");
         }
     }
@@ -1385,6 +1463,303 @@ pub(super) mod tests {
                 pages.info(&page.id).unwrap().cursor
             );
         }
+        pages.shutdown().await;
+    }
+
+    /// A view can't open a peer connection (WebRTC goes past `Fetch` and the
+    /// page's `connect-src`): not in its page, not through a frame it makes
+    /// and reaches into before anything ran there, not in frames running
+    /// their own script (a sandboxed one is a process of its own), and not
+    /// in a window it opens on a click. Each way is given a STUN server of
+    /// its own on this computer, so a way that got out is a packet that came
+    /// in. A sandboxed frame (a process of its own) and a worker don't get
+    /// past `Fetch` with plain requests either. A tab of the thread's, on the
+    /// same browser, still has WebRTC.
+    ///
+    /// Except, still: a sandboxed `srcdoc` frame. Chrome runs it in a
+    /// process of its own without holding it for DevTools, so its script
+    /// runs before anything can be put in it (ADR-0018, "What's left").
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a real browser"]
+    async fn live_a_view_cannot_open_a_peer_connection() {
+        use loft_protocol::{PageButton, PageInput, PageMouse};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const WAYS: [&str; 17] = [
+            "page",
+            "prefixed",
+            "redefined",
+            "fresh",
+            "frames",
+            "nested",
+            "deeper",
+            "srcdoc",
+            "blob",
+            "data",
+            "same_origin",
+            "sandboxed_data",
+            "sandboxed_blob",
+            "sandboxed_srcdoc",
+            "popup",
+            "popup_blob",
+            "tab",
+        ];
+        /// Ways not closed yet (see above).
+        const OPEN: [&str; 1] = ["sandboxed_srcdoc"];
+        let heard: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let mut ports = serde_json::Map::new();
+        for way in WAYS {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            ports.insert(way.into(), json!(socket.local_addr().unwrap().port()));
+            let heard = heard.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1500];
+                if socket.recv(&mut buf).await.is_ok() {
+                    lock(&heard).push(way);
+                }
+            });
+        }
+        let ports = Value::Object(ports);
+        // Makes an offer with a data channel: that gathers candidates, which
+        // asks the STUN server.
+        let attempt = format!(
+            "const ports = {ports};\
+             const offer = async (PC, way) => {{\
+               if (typeof PC !== 'function') return false;\
+               try {{\
+                 const pc = new PC({{ iceServers: [{{ urls: 'stun:127.0.0.1:' + ports[way] }}] }});\
+                 pc.createDataChannel('out');\
+                 await pc.setLocalDescription(await pc.createOffer());\
+                 return true;\
+               }} catch (_) {{ return false; }}\
+             }};"
+        );
+
+        // This computer's web server: the tab's page, and whatever else
+        // reaches it (nothing from the view should).
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tab_page = format!(
+            "<!doctype html><title>trying</title><script>{attempt}\
+             offer(window.RTCPeerConnection, 'tab')\
+             .then((ok) => document.title = ok ? 'opened' : 'refused');</script>"
+        );
+        {
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (body, asked) = (tab_page.clone(), asked.clone());
+                    tokio::spawn(async move {
+                        let mut request = [0u8; 2048];
+                        let read = socket.read(&mut request).await.unwrap_or(0);
+                        let line = String::from_utf8_lossy(&request[..read])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned();
+                        lock(&asked).push(line);
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    });
+                }
+            });
+        }
+
+        // A document that tries by its own script, and tells whoever made it.
+        let own = |way: &str, extra: &str| {
+            format!(
+                "<script>{extra}{attempt}offer(globalThis.RTCPeerConnection, '{way}')\
+                 .then((ok) => ok && (opener || parent).postMessage('{way}', '*'));</script>"
+            )
+        };
+        // A string in the page's script (that mustn't end the script).
+        let quoted = |html: String| Value::String(html).to_string().replace("</", "<\\/");
+        let html = format!(
+            "<button id=\"go\" style=\"position:fixed;z-index:9;left:0;top:0;width:200px;height:60px\">go</button>\
+             <script>{attempt}\
+             const opened = [];\
+             const note = (way) => (ok) => ok && opened.push(way);\
+             addEventListener('message', (e) => opened.push(String(e.data)));\
+             const frame = (into) => {{ const f = into.createElement('iframe'); into.body.append(f); return f; }};\
+             offer(window.RTCPeerConnection, 'page').then(note('page'));\
+             offer(window.webkitRTCPeerConnection, 'prefixed').then(note('prefixed'));\
+             try {{ delete window.RTCPeerConnection; }} catch (_) {{}}\
+             try {{ Object.defineProperty(window, 'RTCPeerConnection', {{ get: () => frame(document).contentWindow.RTCPeerConnection }}); }} catch (_) {{}}\
+             offer(window.RTCPeerConnection, 'redefined').then(note('redefined'));\
+             offer(frame(document).contentWindow.RTCPeerConnection, 'fresh').then(note('fresh'));\
+             frame(document); offer(window.frames[window.frames.length - 1].RTCPeerConnection, 'frames').then(note('frames'));\
+             const outer = frame(document);\
+             const inner = frame(outer.contentDocument);\
+             offer(inner.contentWindow.RTCPeerConnection, 'nested').then(note('nested'));\
+             offer(frame(inner.contentDocument).contentWindow.RTCPeerConnection, 'deeper').then(note('deeper'));\
+             const srcdoc = document.createElement('iframe');\
+             srcdoc.srcdoc = {srcdoc}; document.body.append(srcdoc);\
+             const sandboxed = document.createElement('iframe');\
+             sandboxed.sandbox = 'allow-scripts'; sandboxed.srcdoc = {sandboxed_srcdoc}; document.body.append(sandboxed);\
+             const blob = document.createElement('iframe');\
+             blob.src = URL.createObjectURL(new Blob([{blob}], {{ type: 'text/html' }})); document.body.append(blob);\
+             const data = document.createElement('iframe');\
+             data.src = 'data:text/html,' + encodeURIComponent({data}); document.body.append(data);\
+             const sandboxedData = document.createElement('iframe'); sandboxedData.sandbox = 'allow-scripts';\
+             sandboxedData.src = 'data:text/html,' + encodeURIComponent({sandboxed_data}); document.body.append(sandboxedData);\
+             const sandboxedBlob = document.createElement('iframe'); sandboxedBlob.sandbox = 'allow-scripts';\
+             sandboxedBlob.src = URL.createObjectURL(new Blob([{sandboxed_blob}], {{ type: 'text/html' }})); document.body.append(sandboxedBlob);\
+             const same = document.createElement('iframe'); same.src = '/inner';\
+             same.onload = () => offer(same.contentWindow.RTCPeerConnection, 'same_origin').then(note('same_origin'));\
+             document.body.append(same);\
+             new Worker(URL.createObjectURL(new Blob([\"importScripts('http://{addr}/worker-import')\"])));\
+             const report = () => console.error('webrtc opened: [' + opened.sort().join(' ') + ']');\
+             let clicks = 0, last;\
+             document.getElementById('go').onclick = () => {{\
+               clicks += 1;\
+               try {{\
+                 if (clicks === 1) {{ const w = window.open(''); w && offer(w.RTCPeerConnection, 'popup').then(note('popup')); }}\
+                 if (clicks === 2) window.open(URL.createObjectURL(new Blob([{popup}], {{ type: 'text/html' }})));\
+                 if (clicks === 3) window.open('http://{addr}/popup-nav');\
+               }} catch (_) {{}}\
+               clearTimeout(last); last = setTimeout(report, 3000);\
+             }};\
+             </script>",
+            srcdoc = quoted(own("srcdoc", "")),
+            sandboxed_srcdoc = quoted(own("sandboxed_srcdoc", "")),
+            blob = quoted(own("blob", "")),
+            data = quoted(own("data", "")),
+            // An image isn't the page's policy's business: `Fetch` must see it.
+            sandboxed_data = quoted(own(
+                "sandboxed_data",
+                &format!("new Image().src = 'http://{addr}/sandboxed-img';")
+            )),
+            sandboxed_blob = quoted(own("sandboxed_blob", "")),
+            popup = quoted(own("popup_blob", "")),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let (bus, _heard) = tokio::sync::broadcast::channel(4096);
+        let pages = Pages::default();
+        let (thread, item) = (ThreadId::new(), ItemId::new());
+        let request = ViewRequest {
+            thread: thread.clone(),
+            item: item.clone(),
+            html,
+            done: true,
+            width: 600,
+            scale: 1.0,
+            theme: Some(Theme::default()),
+            state: Value::Null,
+            keep: Arc::new(|_, _, _| {}),
+        };
+        let view = pages
+            .open_view(request, None, &profile, bus.clone())
+            .await
+            .unwrap();
+        pages.watching(&view.id, true).await;
+        // The ways that need no click have had their go; then three real
+        // clicks, each a window opened.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for _ in 0..3 {
+            for action in [PageMouse::Down, PageMouse::Up] {
+                pages
+                    .input(
+                        &view.id,
+                        PageInput::Mouse {
+                            action,
+                            x: 30.0,
+                            y: 20.0,
+                            button: PageButton::Left,
+                            click_count: 1,
+                            modifiers: 0,
+                        },
+                    )
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        let said = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let problems = pages
+                    .view_problems(&thread, &item, Duration::from_millis(200))
+                    .await;
+                if problems.iter().any(|p| p.contains("webrtc opened")) {
+                    return problems.join(" | ");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        let Ok(said) = said else {
+            let problems = pages.view_problems(&thread, &item, Duration::ZERO).await;
+            panic!("the view didn't say how it went: {problems:?}");
+        };
+
+        // A tab of the thread's, on the same browser: WebRTC is the page's.
+        let tab = pages
+            .open(
+                thread.clone(),
+                super::super::Which::Current,
+                Some(format!("http://{addr}/")),
+                600,
+                400,
+                1.0,
+                None,
+                &profile,
+                bus.clone(),
+            )
+            .await
+            .unwrap();
+        pages.watching(&tab.id, true).await;
+        let title = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let title = pages.info(&tab.id).unwrap().title;
+                if title == "opened" || title == "refused" {
+                    return title;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the tab says how it went");
+        // Packets take a moment.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut heard = lock(&heard).clone();
+        heard.sort_unstable();
+        let asked = lock(&asked).clone();
+        eprintln!("view: {said}\ntab: {title}\nSTUN heard from: {heard:?}\nHTTP asked: {asked:?}");
+        assert_eq!(title, "opened", "a tab keeps WebRTC");
+        heard.retain(|way| !OPEN.contains(way));
+        assert_eq!(heard, ["tab"], "only the tab reached the network: {said}");
+        let opened = said
+            .split("webrtc opened: [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or_default();
+        assert!(
+            opened
+                .split(' ')
+                .all(|way| way.is_empty() || OPEN.contains(&way)),
+            "{said}"
+        );
+        // Requests from a worker, and from a frame in a process of its own,
+        // still stop at `Fetch`.
+        for path in ["worker-import", "sandboxed-img"] {
+            assert!(
+                said.contains(&format!("Blocked http://{addr}/{path}")),
+                "{said}"
+            );
+        }
+        // Nothing of the view's reached this computer's server (a window it
+        // opened used to), only the tab.
+        assert!(
+            asked
+                .iter()
+                .all(|line| line.starts_with("GET / ") || line.starts_with("GET /favicon.ico ")),
+            "only the tab's page was asked for: {asked:?}"
+        );
         pages.shutdown().await;
     }
 }

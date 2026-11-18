@@ -833,7 +833,8 @@ impl Browser {
         let Some(page) = lock(&self.pages).remove(id) else {
             return;
         };
-        lock(&self.sessions).remove(&page.session);
+        // Its own session, and a view's frames' (`views::on_view_frame`).
+        lock(&self.sessions).retain(|_, of| of != id);
         self.captures.forget_frames(id);
         // An agent waiting for a person there hears it closed.
         self.end_handover(&page, HandoffOutcome::Closed);

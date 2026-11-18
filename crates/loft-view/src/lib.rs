@@ -5,8 +5,8 @@
 //! it can reach nothing but a few script and font hosts, and streams it to
 //! whoever is looking. This crate is the part everyone shares: what a view
 //! is ([`View`], [`parse`], [`partial`]), the document it is written into
-//! ([`head`], [`BRIDGE_JS`]), what it may load ([`allowed_url`]) and a few
-//! views to try it with ([`samples`]).
+//! ([`head`], [`BRIDGE_JS`], [`GUARD_JS`]), what it may load
+//! ([`allowed_url`]) and a few views to try it with ([`samples`]).
 
 pub mod samples;
 
@@ -37,6 +37,9 @@ pub const WORLD: &str = "agentloft";
 pub const BINDING: &str = "__agentloft";
 /// The bridge: see `js/bridge.js`.
 pub const BRIDGE_JS: &str = include_str!("js/bridge.js");
+/// No WebRTC in a view's page, and no windows: see `js/guard.js`. In the
+/// page's own world, first in every document and frame of it.
+pub const GUARD_JS: &str = include_str!("js/guard.js");
 const API_JS: &str = include_str!("js/api.js");
 const BASE_CSS: &str = include_str!("base.css");
 
@@ -408,13 +411,33 @@ pub const ALLOWED_HOSTS: &[&str] = &[
 /// same hosts. Its requests are also stopped one by one (`allowed_url`),
 /// but a WebSocket or an EventSource doesn't pass that way, so the page's
 /// policy says it too.
+///
+/// And it opens no windows (a sandbox without `allow-popups`, which holds
+/// for every frame in it too). A window it opened would be a page of the
+/// browser's that none of a view's walls are on: its requests aren't
+/// stopped, and its script, or the view's reaching into it, has WebRTC. A
+/// link still opens for the user, through the bridge.
 pub fn content_security_policy() -> String {
     let hosts: Vec<String> = ALLOWED_HOSTS
         .iter()
         .map(|h| format!("https://{h}"))
         .collect();
-    format!("connect-src {}", hosts.join(" "))
+    format!(
+        "connect-src {}; sandbox {}",
+        hosts.join(" "),
+        SANDBOX.join(" ")
+    )
 }
+
+/// What a view's page may still do in its sandbox: run script, keep its own
+/// origin (and storage), handle forms, show alerts, lock the pointer.
+const SANDBOX: &[&str] = &[
+    "allow-scripts",
+    "allow-same-origin",
+    "allow-forms",
+    "allow-modals",
+    "allow-pointer-lock",
+];
 
 /// Whether a view may fetch `url`: `https`, from one of [`ALLOWED_HOSTS`].
 pub fn allowed_url(url: &str) -> bool {
@@ -551,6 +574,22 @@ mod tests {
         assert!(!allowed_url("https://user@cdn.jsdelivr.net/x.js"));
         assert!(!allowed_url("https://cdn.jsdelivr.net:8443/x.js"));
         assert!(!allowed_url("data:text/html,hi"));
+    }
+
+    #[test]
+    fn a_view_connects_only_to_listed_hosts_and_opens_no_windows() {
+        let policy = content_security_policy();
+        let directives: Vec<&str> = policy.split(';').map(str::trim).collect();
+        assert!(directives[0].starts_with("connect-src https://cdn.jsdelivr.net "));
+        let sandbox = directives
+            .iter()
+            .find_map(|d| d.strip_prefix("sandbox "))
+            .expect("a sandbox");
+        assert!(sandbox.contains("allow-scripts") && sandbox.contains("allow-same-origin"));
+        // `allow-popups-to-escape-sandbox` and the rest are out too.
+        for kept_out in ["popups", "top-navigation", "downloads"] {
+            assert!(!sandbox.contains(kept_out), "{sandbox}");
+        }
     }
 
     #[test]
