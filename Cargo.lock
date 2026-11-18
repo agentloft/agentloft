@@ -3585,6 +3585,7 @@ checksum = "eb5c7f3a4eb551c2bb7fa16e268f728d4bc2a5c9b090554b8dc0ee2503fb5840"
 dependencies = [
  "fearless_simd 1.2.0",
  "hayro-ccitt",
+ "image",
 ]
 
 [[package]]
@@ -4576,6 +4577,7 @@ dependencies = [
  "cfb",
  "csv",
  "hayro",
+ "hayro-jbig2",
  "quick-xml 0.42.0",
  "tempfile",
  "workspace-hack",

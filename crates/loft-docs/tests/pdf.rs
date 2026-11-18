@@ -169,3 +169,86 @@ fn a_page_gives_its_text_and_links() {
 
     assert!(doc.page_text(3).is_err());
 }
+
+/// One page showing one image XObject: `dict` its dictionary's entries,
+/// `data` its stream.
+fn pdf_with_image(dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let content = "q 100 0 0 100 0 0 cm /Im0 Do Q";
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()).into_bytes(),
+        [
+            format!("<< /Type /XObject /Subtype /Image {dict} /Length {} >>\nstream\n", data.len())
+                .into_bytes(),
+            data.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+        out.extend(body);
+        out.extend(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).into_bytes());
+    for o in offsets {
+        out.extend(format!("{o:010} 00000 n \n").into_bytes());
+    }
+    out.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .into_bytes(),
+    );
+    out
+}
+
+/// A JBIG2 page information segment (embedded form) for a `w` × `h` page.
+fn jbig2_page(w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(0u32.to_be_bytes()); // segment number
+    out.push(48); // page information
+    out.push(0); // refers to no segment
+    out.push(1); // page 1
+    out.extend(19u32.to_be_bytes()); // data length
+    out.extend(w.to_be_bytes());
+    out.extend(h.to_be_bytes());
+    out.extend(0u32.to_be_bytes()); // x resolution
+    out.extend(0u32.to_be_bytes()); // y resolution
+    out.push(0); // flags
+    out.extend(0u16.to_be_bytes()); // striping
+    out
+}
+
+#[test]
+fn an_image_saying_it_is_huge_is_not_drawn() {
+    let gray = "/ColorSpace /DeviceGray /BitsPerComponent 1";
+    // Its dictionary says so.
+    let said = pdf_with_image(
+        &format!("/Width 65535 /Height 65535 {gray} /Filter /JBIG2Decode"),
+        &jbig2_page(10, 10),
+    );
+    // Its JBIG2 data says so, under a small dictionary (what is decoded is
+    // what the data says).
+    let hidden = pdf_with_image(
+        &format!("/Width 10 /Height 10 {gray} /Filter /JBIG2Decode"),
+        &jbig2_page(65535, 65535),
+    );
+    for bytes in [said, hidden] {
+        let err = open(&bytes).render(0, 1.).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+    // An ordinary one is drawn.
+    let fine = pdf_with_image(
+        &format!("/Width 10 /Height 10 {gray} /Filter /JBIG2Decode"),
+        &jbig2_page(10, 10),
+    );
+    assert!(open(&fine).render(0, 1.).is_ok());
+}

@@ -14,6 +14,7 @@ calamine.workspace = true
 cfb.workspace = true
 csv.workspace = true
 hayro.workspace = true
+hayro-jbig2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -63,6 +63,69 @@ fn open(data: &Arc<Vec<u8>>) -> anyhow::Result<Pdf> {
     })
 }
 
+/// Largest image a page may hold, in pixels, before it is drawn. Images are
+/// decoded at the size their file says, whatever size the page is drawn
+/// at: a 724-byte PDF with a JBIG2 image saying 65535 × 65535 took 4.8 GB.
+const MAX_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
+
+/// Refuse a page whose images (in its XObjects, forms' included) say they
+/// are larger than [`MAX_IMAGE_PIXELS`]: by their dictionary, and for JBIG2
+/// by the size in the image data itself, which is what is decoded.
+fn images_fit(resources: &hayro::hayro_syntax::page::Resources<'_>) -> anyhow::Result<()> {
+    use hayro::hayro_syntax::object::{Array, Dict, Name, Stream};
+    use hayro::hayro_syntax::page::Resources;
+    fn walk(x_objects: &Dict<'_>, depth: usize, seen: &mut usize) -> anyhow::Result<()> {
+        if depth > 8 {
+            return Ok(());
+        }
+        for key in x_objects.keys() {
+            *seen += 1;
+            if *seen > 10_000 {
+                bail!("this page has too many images to draw");
+            }
+            let Some(stream) = x_objects.get::<Stream<'_>>(key.as_ref()) else {
+                continue;
+            };
+            let dict = stream.dict();
+            let subtype = dict.get::<Name<'_>>(b"Subtype");
+            match subtype.as_ref().map(|n| n.as_ref()) {
+                Some(b"Image") => {
+                    let side = |k: &[u8]| dict.get::<i64>(k).unwrap_or(0).max(0) as u64;
+                    let mut pixels = side(b"Width").saturating_mul(side(b"Height"));
+                    let filters: Vec<Vec<u8>> = match dict.get::<Name<'_>>(b"Filter") {
+                        Some(name) => vec![name.as_ref().to_vec()],
+                        None => dict
+                            .get::<Array<'_>>(b"Filter")
+                            .map(|a| a.iter::<Name<'_>>().map(|n| n.as_ref().to_vec()).collect())
+                            .unwrap_or_default(),
+                    };
+                    if filters.first().map(Vec::as_slice) == Some(b"JBIG2Decode".as_slice()) {
+                        let data = stream.raw_data();
+                        let settings = hayro_jbig2::DecodeSettings { strict: false };
+                        if let Ok(page) = hayro_jbig2::Page::new_embedded(&data, None, &settings) {
+                            pixels = pixels.max(
+                                u64::from(page.width()).saturating_mul(u64::from(page.height())),
+                            );
+                        }
+                    }
+                    if pixels > MAX_IMAGE_PIXELS {
+                        bail!("an image on this page is too large to draw");
+                    }
+                }
+                Some(b"Form") => {
+                    if let Some(resources) = dict.get::<Dict<'_>>(b"Resources") {
+                        let inner = Resources::new(resources);
+                        walk(&inner.x_objects, depth + 1, seen)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    walk(&resources.x_objects, 0, &mut 0)
+}
+
 pub fn parse(bytes: Vec<u8>) -> anyhow::Result<PdfDoc> {
     let data = Arc::new(bytes);
     let pdf = open(&data)?;
@@ -324,6 +387,7 @@ impl PdfDoc {
         let drawn = std::panic::catch_unwind(move || -> anyhow::Result<_> {
             let pdf = open(&data)?;
             let page = pdf.pages().get(index).context("no such page")?;
+            images_fit(page.resources())?;
             let cache = RenderCache::new();
             Ok(hayro::render(
                 page,

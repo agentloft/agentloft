@@ -85,6 +85,7 @@ cfb = "0.14"
 csv = "1.4"
 # PDF pages as pictures, drawn on the CPU (also in the browser build)
 hayro = "0.9"
+hayro-jbig2 = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
