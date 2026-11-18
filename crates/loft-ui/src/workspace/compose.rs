@@ -399,9 +399,12 @@ impl WorkspaceView {
     /// A step is `wait=<ms>`, `click=x,y`, `dclick=x,y` (a double-click),
     /// `rclick=x,y`, `move=x,y`,
     /// `drag=x,y,x2,y2` (or its parts `press=x,y`, `hold=x,y`, `release=x,y`),
-    /// `scroll=x,y,dy` (a wheel scroll at x,y; `dy` > 0 goes up), all in
+    /// `scroll=x,y,dy` (a wheel scroll at x,y; `dy` > 0 goes up),
+    /// `pinch=x,y,delta` (a trackpad pinch; `delta` > 0 spreads), all in
     /// window points, `'text` (typed a character at a time) or a keystroke
-    /// (`up`, `enter`, `cmd-k`).
+    /// (`up`, `enter`, `cmd-k`). A pointer step can be held with modifiers:
+    /// `alt+drag=…`, `alt+shift+press=…` (a two-finger pinch or pan on a
+    /// device).
     pub(super) fn dev_script(
         &mut self,
         script: &str,
@@ -420,8 +423,9 @@ impl WorkspaceView {
         cx.spawn_in(window, async move |_, cx| {
             let executor = cx.background_executor().clone();
             let pause = |ms: u64| executor.timer(std::time::Duration::from_millis(ms));
-            let modifiers = Modifiers::default();
+            let held = std::cell::Cell::new(Modifiers::default());
             let moved = |position, pressed_button| {
+                let modifiers = held.get();
                 PlatformInput::MouseMove(MouseMoveEvent {
                     position,
                     pressed_button,
@@ -429,6 +433,7 @@ impl WorkspaceView {
                 })
             };
             let down = |position, button| {
+                let modifiers = held.get();
                 PlatformInput::MouseDown(MouseDownEvent {
                     button,
                     position,
@@ -438,6 +443,7 @@ impl WorkspaceView {
                 })
             };
             let up = |position, button| {
+                let modifiers = held.get();
                 PlatformInput::MouseUp(MouseUpEvent {
                     button,
                     position,
@@ -447,6 +453,21 @@ impl WorkspaceView {
             };
             for step in steps {
                 let (name, arg) = step.split_once('=').unwrap_or((step.as_str(), ""));
+                // `alt+shift+drag`: the pointer step with those keys held.
+                let mut mods = Modifiers::default();
+                let mut name = name;
+                while let Some((key, rest)) = name.split_once('+').filter(|_| !arg.is_empty()) {
+                    match key {
+                        "alt" => mods.alt = true,
+                        "shift" => mods.shift = true,
+                        "cmd" => mods.platform = true,
+                        "ctrl" => mods.control = true,
+                        _ => break,
+                    }
+                    name = rest;
+                }
+                held.set(mods);
+                let modifiers = mods;
                 let n: Vec<f32> = arg.split(',').filter_map(|v| v.parse().ok()).collect();
                 let at = |i: usize| {
                     let v = |i: usize| px(n.get(i).copied().unwrap_or(0.));
@@ -470,6 +491,27 @@ impl WorkspaceView {
                             ..Default::default()
                         }),
                     ],
+                    // A trackpad pinch at x,y: begun, zoomed by `delta`
+                    // (0.5: 50% bigger) in two steps, ended.
+                    "pinch" => {
+                        let delta = n.get(2).copied().unwrap_or(0.5);
+                        let pinch = |phase, delta| {
+                            PlatformInput::Pinch(gpui_kit::PinchEvent {
+                                position: at(0),
+                                delta,
+                                modifiers: held.get(),
+                                phase,
+                            })
+                        };
+                        use gpui_kit::TouchPhase::{Ended, Moved, Started};
+                        vec![
+                            moved(at(0), None),
+                            pinch(Started, 0.),
+                            pinch(Moved, delta / 2.),
+                            pinch(Moved, delta / 2.),
+                            pinch(Ended, 0.),
+                        ]
+                    }
                     // A drag in parts, to look at it half way.
                     "press" => vec![moved(at(0), None), down(at(0), left)],
                     "hold" => vec![moved(at(0), Some(left))],
@@ -477,6 +519,7 @@ impl WorkspaceView {
                     "click" => vec![moved(at(0), None), down(at(0), left), up(at(0), left)],
                     "dclick" => {
                         let press = |click_count| {
+                            let modifiers = held.get();
                             [
                                 PlatformInput::MouseDown(MouseDownEvent {
                                     button: left,

@@ -36,10 +36,17 @@
 
 - `device_*` tools on the Agentloft MCP server: list, boot, screenshot, tap, swipe, type, press, apps, shut down. Coordinates are the screenshot's pixels. Inspect, act, verify with a new screenshot, as with the browser tools.
 
+### The panel's tools, tabs and fingers
+
+- A tools drawer beside the screen shows the app in front and the settings the device says it takes (`DeviceSettings::supported`): appearance, text size, contrast, reduce motion, the screen reader, accessibility frames, the network, orientation, a fake location, an app's permissions and a test push (an APNs-style alert). Each control shows what the device reads back after a change, not what was clicked; the toolbar's light/dark button too.
+- One Device tab per device; only the tab showing streams. Picking a device another tab shows switches to that tab. Tabs can be renamed and are kept per thread in the window's session.
+- Two fingers as Simulator.app makes them: Option-drag pinches around the screen's centre, Option+Shift-drag moves both, and a trackpad pinch over the screen is a pinch (where the platform delivers it: macOS; not the web client).
+- A plugged-in phone is listed with its platform's emulators, marked as a phone: it has no Start and no power button, and one that is locked out shows why (accept the prompt on the phone).
+
 ## Consequences
 
 - iOS works only on macOS with Xcode and a runtime; Android wherever its SDK runs. Both report what's missing rather than failing quietly.
 - Simulators are heavy: booting one costs seconds and gigabytes of memory. The panel never boots one by itself: a person presses Start or an agent calls `device_boot`.
-- When an agent uses a device and the panel isn't showing it, the device floats over the chat (like the browser's mini preview, but live: it can be touched and typed in), dragged by its bar; the panel's toolbar floats it too, and its bar puts it back in the panel.
-- What T3 Code has that this doesn't yet: resizing the floating device, the 3D device model and foldable postures, accessibility overlays, physical devices, devices on another computer over SSH beyond what an SSH window already gives.
-- Known gaps at first merge: one finger only (no pinch); an emulator Android Studio started (signed JWT, no token) is listed and can be stopped but not shown; a debug daemon encodes Android pictures about 3× slower than a release one; the panel's light/dark toggle shows what it last sent, not the device's own setting; on a phone browser the on-screen keyboard can't tell when the device has a text field focused.
+- When an agent uses a device and the panel isn't showing it, the device floats over the chat (like the browser's mini preview, but live: it can be touched and typed in), dragged by its bar and resized from its edges and corners (its height follows the device's shape); the panel's toolbar floats it too, and its bar puts it back in the panel.
+- What T3 Code has that this doesn't yet: the 3D device model and foldable postures, devices on another computer over SSH beyond what an SSH window already gives.
+- Known gaps at first merge: an emulator Android Studio started (signed JWT, no token) is listed and can be stopped but not shown; a debug daemon encodes Android pictures about 3× slower than a release one; on a phone browser the on-screen keyboard can't tell when the device has a text field focused.

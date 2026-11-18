@@ -5,6 +5,9 @@
 //! Closing the panel never shuts a device down: others (an agent, another
 //! window) may be using it.
 
+use super::device_tabs::DeviceTab;
+use super::device_tools::DeviceTools;
+use super::device_touch::{Fingers, TrackpadPinch, TwoFingers, finger_marks};
 use super::page::{Seen, modifiers};
 use crate::press::ClaimsPress as _;
 use crate::spinner::Spinner;
@@ -12,18 +15,19 @@ use crate::store::{AppStore, request_in};
 use crate::theme::Palette;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, RenderImage, ScrollEvent, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, UTF16Selection, Window, canvas, div, img, px,
+    AnyElement, App, AppContext as _, Bounds, ClipboardItem, Context, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, PinchEvent, Pixels, Point, Render,
+    RenderImage, ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, UTF16Selection, Window, canvas, div, img, px,
 };
 use loft_protocol::{
     DeviceButton, DeviceId, DeviceInfo, DeviceInput, DevicePlatform, DeviceSetting, DeviceState,
-    DeviceSupport, Request, Response, ThreadId, Topic, TouchPhase,
+    DeviceSupport, Request, Response, Topic, TouchPhase, TouchPoint,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -49,6 +53,8 @@ const MARGIN: f32 = 18.;
 const FLOAT_MARGIN: f32 = 6.;
 /// The phone's frame around its screen.
 const BEZEL: f32 = 7.;
+/// Room around the screen when it floats: margin and frame, both sides.
+pub const FLOAT_ROOM: f32 = 2. * (FLOAT_MARGIN + BEZEL);
 /// A screen's size before its device has said (an iPhone's, in points).
 const DEFAULT_SCREEN: (f32, f32) = (390., 844.);
 
@@ -59,6 +65,11 @@ pub enum DeviceEvent {
     Screenshot(Vec<u8>),
     /// Float the device over the chat (out of the side panel).
     Float,
+    /// What the tab shows or is called changed (for the window's session).
+    Changed,
+    /// The person picked a device in the list or the picker: the panel
+    /// shows it here, or in the tab that shows it already.
+    Pick { device: DeviceId, boot: bool },
 }
 impl gpui_kit::EventEmitter<DeviceEvent> for DeviceView {}
 
@@ -83,7 +94,6 @@ fn init(cx: &mut App) {
 
 pub struct DeviceView {
     store: Entity<AppStore>,
-    thread: ThreadId,
     focus: FocusHandle,
     /// The devices and what can run, once the daemon has said.
     devices: Option<(Vec<DeviceInfo>, DeviceSupport)>,
@@ -114,8 +124,18 @@ pub struct DeviceView {
     /// Wheel turns not sent yet: where, and how far.
     scroll: Option<(f32, f32, f32, f32)>,
     scroll_pending: bool,
-    /// The appearance last asked for (the device doesn't say).
-    dark: bool,
+    /// The name the tab was given (none: the device's own).
+    name: Option<String>,
+    /// The tools drawer (made once a device is chosen), and whether it is
+    /// open.
+    tools: Option<Entity<DeviceTools>>,
+    tools_open: bool,
+    /// Two fingers from one pointer (Option-drag), while down.
+    fingers: Option<Fingers>,
+    /// Where they would go with Option held over the screen (not down).
+    ghost: Option<[TouchPoint; 2]>,
+    /// A trackpad pinch over the screen, while it lasts.
+    pinch: Option<TrackpadPinch>,
     /// What went wrong asking the daemon (a boot that failed).
     note: Option<String>,
     /// Where the device picker is (its menu opens under it).
@@ -134,9 +154,9 @@ impl Focusable for DeviceView {
 }
 
 impl DeviceView {
-    pub fn new(store: Entity<AppStore>, thread: ThreadId, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<AppStore>, tab: DeviceTab, cx: &mut Context<Self>) -> Self {
         init(cx);
-        let chosen = store.read(cx).device_choice.get(&thread).cloned();
+        let chosen = tab.device;
         let me = cx.entity_id();
         let subs = vec![
             // Going away stops watching (the device keeps running).
@@ -152,7 +172,6 @@ impl DeviceView {
         ];
         Self {
             store,
-            thread,
             focus: cx.focus_handle(),
             devices: None,
             chosen,
@@ -171,7 +190,12 @@ impl DeviceView {
             last_move: None,
             scroll: None,
             scroll_pending: false,
-            dark: false,
+            name: tab.name,
+            tools: None,
+            tools_open: false,
+            fingers: None,
+            ghost: None,
+            pinch: None,
             note: None,
             picker: Rc::default(),
             marked: None,
@@ -198,10 +222,47 @@ impl DeviceView {
         self.devices.as_ref()?.0.iter().find(|d| &d.id == id)
     }
 
-    /// For the panel's tab: the device's name, and whether it is busy.
-    pub fn title(&self) -> String {
-        self.device()
-            .map_or_else(|| "Device".to_owned(), |d| d.name.clone())
+    /// For the panel's tab: the name it was given, else the device's.
+    pub fn title(&self, cx: &App) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+        if let Some(d) = self.device() {
+            return d.name.clone();
+        }
+        // Out of sight, it hasn't the list: the store knows the name.
+        self.chosen
+            .as_ref()
+            .and_then(|id| self.store.read(cx).device_names.get(id).cloned())
+            .unwrap_or_else(|| "Device".to_owned())
+    }
+
+    /// Call the tab `name` (none: by its device's name).
+    pub fn set_name(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+        if self.name != name {
+            self.name = name;
+            cx.emit(DeviceEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    /// The tab as the window's session keeps it.
+    pub fn saved(&self) -> DeviceTab {
+        DeviceTab {
+            device: self.chosen.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    /// A real phone, not a simulator or emulator: it can't be started or
+    /// shut down from here.
+    fn is_physical(&self) -> bool {
+        self.device().is_some_and(|d| d.physical)
+    }
+
+    /// Ask the panel to show `device` (here or in its own tab).
+    pub fn pick(&mut self, device: DeviceId, boot: bool, cx: &mut Context<Self>) {
+        cx.emit(DeviceEvent::Pick { device, boot });
     }
 
     pub fn is_busy(&self) -> bool {
@@ -212,23 +273,19 @@ impl DeviceView {
     /// Show device `id` (none: the list), starting it if `boot` and it is
     /// stopped.
     pub fn choose(&mut self, id: Option<DeviceId>, boot: bool, cx: &mut Context<Self>) {
-        if self.chosen != id {
+        let changed = self.chosen != id;
+        if changed {
             self.info = None;
             self.drop_picture(cx);
-            self.touching = false;
+            self.end_touches(cx);
+            self.tools = None;
         }
         self.note = None;
         self.chosen = id.clone();
         self.boot_when_listed = boot && id.is_some();
-        let thread = self.thread.clone();
-        self.store.update(cx, |s, _| match id {
-            Some(id) => {
-                s.device_choice.insert(thread, id);
-            }
-            None => {
-                s.device_choice.remove(&thread);
-            }
-        });
+        if changed {
+            cx.emit(DeviceEvent::Changed);
+        }
         self.sync(cx);
         cx.notify();
     }
@@ -239,12 +296,11 @@ impl DeviceView {
         self.floating = on;
     }
 
-    /// How tall the card floating over the chat is for `width`: the screen
-    /// as wide as there is room for, and the room around it.
-    pub fn floating_height(&self, width: f32) -> f32 {
+    /// How tall the screen is for its width (as it is turned now), for
+    /// the card floating over the chat.
+    pub fn screen_aspect(&self) -> f32 {
         let (sw, sh) = self.screen_size();
-        let room = 2. * (FLOAT_MARGIN + BEZEL);
-        (width - room).max(0.) * sh / sw.max(1.) + room
+        sh / sw.max(1.)
     }
 
     fn margin(&self) -> f32 {
@@ -302,9 +358,8 @@ impl DeviceView {
             self.chosen = None;
             self.info = None;
             self.boot_when_listed = false;
-            let thread = self.thread.clone();
-            self.store
-                .update(cx, |s, _| s.device_choice.remove(&thread));
+            self.tools = None;
+            cx.emit(DeviceEvent::Changed);
         }
         if self.watching != self.chosen {
             let entity = cx.entity_id();
@@ -388,6 +443,17 @@ impl DeviceView {
         if device.state != DeviceState::Running {
             self.drop_picture(cx);
             self.touching = false;
+            self.fingers = None;
+            self.pinch = None;
+        }
+        // Read its settings once it runs (after the store is done: asking
+        // needs it).
+        if let Some(tools) = self.tools.clone() {
+            let running = device.state == DeviceState::Running;
+            cx.spawn(async move |_, cx| {
+                tools.update(cx, |t, cx| t.set_running(running, cx));
+            })
+            .detach();
         }
         if let Some((list, _)) = &mut self.devices
             && let Some(listed) = list.iter_mut().find(|d| d.id == device.id)
@@ -520,18 +586,55 @@ impl DeviceView {
         self.input(DeviceInput::Button { button }, cx);
     }
 
+    /// Light or dark, through the tools (which read it back).
     fn set_dark(&mut self, dark: bool, cx: &mut Context<Self>) {
-        if let Some(id) = self.chosen.clone() {
-            self.dark = dark;
-            self.ask(
-                Request::DeviceSet {
-                    id,
-                    setting: DeviceSetting::Appearance { dark },
-                },
-                cx,
-            );
-            cx.notify();
+        if let Some(tools) = &self.tools {
+            tools.update(cx, |t, cx| t.set(DeviceSetting::Appearance { dark }, cx));
         }
+    }
+
+    /// The device's appearance as it last said (none: not known, or not a
+    /// setting it has).
+    fn dark(&self, cx: &App) -> Option<bool> {
+        let tools = self.tools.as_ref()?.read(cx);
+        if !tools.supports("appearance") {
+            return None;
+        }
+        tools.settings()?.dark
+    }
+
+    /// The tools for the chosen device (made on first need: they hold text
+    /// fields, made with the window).
+    fn ensure_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.chosen.clone() else {
+            self.tools = None;
+            return;
+        };
+        if self
+            .tools
+            .as_ref()
+            .is_some_and(|t| t.read(cx).device() == &id)
+        {
+            return;
+        }
+        let platform = id.platform().unwrap_or(DevicePlatform::Android);
+        let (store, running) = (self.store.clone(), self.is_running());
+        let tools = cx.new(|cx| DeviceTools::new(store, id, platform, running, window, cx));
+        if self.tools_open {
+            tools.update(cx, |t, cx| t.set_open(true, cx));
+        }
+        self._subs.push(cx.observe(&tools, |_, _, cx| cx.notify()));
+        self.tools = Some(tools);
+    }
+
+    /// Open or close the tools drawer.
+    pub fn toggle_tools(&mut self, cx: &mut Context<Self>) {
+        self.tools_open = !self.tools_open;
+        let open = self.tools_open;
+        if let Some(tools) = &self.tools {
+            tools.update(cx, |t, cx| t.set_open(open, cx));
+        }
+        cx.notify();
     }
 
     fn take_screenshot(&mut self, cx: &mut Context<Self>) {
@@ -633,14 +736,118 @@ impl DeviceView {
         self.touching = true;
         self.last_touch = (x, y);
         self.last_move = Some(Instant::now());
-        self.input(
-            DeviceInput::Touch {
-                phase: TouchPhase::Down,
-                x,
-                y,
-            },
-            cx,
-        );
+        // Option: two fingers, as Simulator.app does it.
+        let m = &event.modifiers;
+        self.fingers = TwoFingers::from_modifiers(m.alt, m.shift).map(|mode| Fingers {
+            mode,
+            start: (x, y),
+        });
+        self.ghost = None;
+        match self.fingers {
+            Some(fingers) => self.input(
+                DeviceInput::Touches {
+                    phase: TouchPhase::Down,
+                    touches: fingers.at((x, y)).to_vec(),
+                },
+                cx,
+            ),
+            None => self.input(
+                DeviceInput::Touch {
+                    phase: TouchPhase::Down,
+                    x,
+                    y,
+                },
+                cx,
+            ),
+        }
+        cx.notify();
+    }
+
+    /// Option held over the screen (no button): show where two fingers
+    /// would go.
+    fn hover(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.touching {
+            return;
+        }
+        let m = &event.modifiers;
+        let ghost = TwoFingers::from_modifiers(m.alt, m.shift)
+            .filter(|_| self.is_running() && self.picture.is_some())
+            .and_then(|mode| {
+                let at = self.screen_point(event.position, false)?;
+                Some(Fingers { mode, start: at }.at(at))
+            });
+        if ghost != self.ghost {
+            self.ghost = ghost;
+            cx.notify();
+        }
+    }
+
+    /// Lift every finger (the device changes, or stops).
+    fn end_touches(&mut self, cx: &mut Context<Self>) {
+        if self.touching {
+            self.touch_up(None, cx);
+        }
+        self.touching = false;
+        self.fingers = None;
+        self.pinch = None;
+        self.ghost = None;
+    }
+
+    /// A trackpad pinch over the screen: two fingers that spread or close
+    /// around where it happens.
+    fn on_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::TouchPhase as Gesture;
+        if !self.is_running() || self.picture.is_none() || self.touching {
+            return;
+        }
+        let Some(centre) = self.screen_point(event.position, true) else {
+            return;
+        };
+        cx.stop_propagation();
+        match (event.phase, self.pinch.as_mut()) {
+            (Gesture::Ended | Gesture::Cancelled, Some(_)) => {
+                let pinch = self.pinch.take().expect("matched");
+                self.input(
+                    DeviceInput::Touches {
+                        phase: TouchPhase::Up,
+                        touches: pinch.fingers().to_vec(),
+                    },
+                    cx,
+                );
+            }
+            (Gesture::Ended | Gesture::Cancelled, None) => {}
+            (_, None) => {
+                let mut pinch = TrackpadPinch::new(centre);
+                pinch.zoom(event.delta);
+                self.pinch = Some(pinch);
+                self.last_move = Some(Instant::now());
+                self.input(
+                    DeviceInput::Touches {
+                        phase: TouchPhase::Down,
+                        touches: pinch.fingers().to_vec(),
+                    },
+                    cx,
+                );
+            }
+            (_, Some(pinch)) => {
+                pinch.zoom(event.delta);
+                let touches = pinch.fingers().to_vec();
+                let now = Instant::now();
+                if self
+                    .last_move
+                    .is_none_or(|at| now.duration_since(at) >= MOVE_EVERY)
+                {
+                    self.last_move = Some(now);
+                    self.input(
+                        DeviceInput::Touches {
+                            phase: TouchPhase::Move,
+                            touches,
+                        },
+                        cx,
+                    );
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -661,14 +868,26 @@ impl DeviceView {
         }
         self.last_move = Some(now);
         self.last_touch = (x, y);
-        self.input(
-            DeviceInput::Touch {
-                phase: TouchPhase::Move,
-                x,
-                y,
-            },
-            cx,
-        );
+        match self.fingers {
+            Some(fingers) => {
+                self.input(
+                    DeviceInput::Touches {
+                        phase: TouchPhase::Move,
+                        touches: fingers.at((x, y)).to_vec(),
+                    },
+                    cx,
+                );
+                cx.notify();
+            }
+            None => self.input(
+                DeviceInput::Touch {
+                    phase: TouchPhase::Move,
+                    x,
+                    y,
+                },
+                cx,
+            ),
+        }
     }
 
     /// The finger lifts (wherever the button was let go).
@@ -679,14 +898,23 @@ impl DeviceView {
         let (x, y) = position
             .and_then(|p| self.screen_point(p, true))
             .unwrap_or(self.last_touch);
-        self.input(
-            DeviceInput::Touch {
-                phase: TouchPhase::Up,
-                x,
-                y,
-            },
-            cx,
-        );
+        match self.fingers.take() {
+            Some(fingers) => self.input(
+                DeviceInput::Touches {
+                    phase: TouchPhase::Up,
+                    touches: fingers.at((x, y)).to_vec(),
+                },
+                cx,
+            ),
+            None => self.input(
+                DeviceInput::Touch {
+                    phase: TouchPhase::Up,
+                    x,
+                    y,
+                },
+                cx,
+            ),
+        }
         cx.notify();
     }
 
@@ -995,7 +1223,9 @@ impl DeviceView {
                 .disabled(!running)
                 .on_click(cx.listener(move |this, _, _, cx| this.press(b, cx)))
         };
-        let dark = self.dark;
+        let dark = self.dark(cx);
+        let physical = self.is_physical();
+        let tools_open = self.tools_open;
         h_flex()
             .h(px(TOOLBAR_HEIGHT))
             .flex_shrink_0()
@@ -1050,18 +1280,30 @@ impl DeviceView {
                     .disabled(!running)
                     .on_click(cx.listener(|this, _, _, cx| this.take_screenshot(cx))),
                 )
+                // What the device says it is, not what was last sent.
+                .when_some(dark, |bar, dark| {
+                    bar.child(
+                        tool(
+                            "device-appearance",
+                            if dark { IconName::Sun } else { IconName::Moon },
+                            if dark {
+                                "Light appearance"
+                            } else {
+                                "Dark appearance"
+                            },
+                        )
+                        .disabled(!running)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_dark(!dark, cx))),
+                    )
+                })
                 .child(
                     tool(
-                        "device-appearance",
-                        if dark { IconName::Sun } else { IconName::Moon },
-                        if dark {
-                            "Light appearance"
-                        } else {
-                            "Dark appearance"
-                        },
+                        "device-tools",
+                        IconName::SlidersHorizontal,
+                        "Settings, location, permissions and pushes",
                     )
-                    .disabled(!running)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_dark(!dark, cx))),
+                    .selected(tools_open)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_tools(cx))),
                 )
                 .child(
                     tool(
@@ -1071,13 +1313,18 @@ impl DeviceView {
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DeviceEvent::Float))),
                 )
-                .child(
-                    tool("device-power", IconName::Power, "Shut down")
-                        .disabled(!running)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.confirm_shutdown(window, cx)),
-                        ),
-                )
+                // A phone is turned off on the phone.
+                .when(!physical, |bar| {
+                    bar.child(
+                        tool("device-power", IconName::Power, "Shut down")
+                            .disabled(!running)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.confirm_shutdown(window, cx)
+                                }),
+                            ),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -1101,10 +1348,15 @@ impl DeviceView {
                 DeviceState::Running => format!("{} · {}", d.name, d.os),
                 state => format!("{} · {} · {}", d.name, d.os, state_label(state)),
             };
+            let icon = if d.physical {
+                IconName::Usb
+            } else {
+                IconName::Smartphone
+            };
             entries.push(
-                Entry::item(label, IconName::Smartphone, move |cx| {
+                Entry::item(label, icon, move |cx| {
                     let id = id.clone();
-                    let _ = view.update(cx, |v, cx| v.choose(Some(id), false, cx));
+                    let _ = view.update(cx, |v, cx| v.pick(id, false, cx));
                 })
                 .checked(self.chosen.as_ref() == Some(&d.id)),
             );
@@ -1126,7 +1378,7 @@ impl DeviceView {
     fn confirm_shutdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_kit::component::WindowExt as _;
         use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
-        let name = self.title();
+        let name = self.title(cx);
         let view = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
@@ -1210,6 +1462,15 @@ impl DeviceView {
         ] {
             let mine: Vec<&DeviceInfo> =
                 devices.iter().filter(|d| d.platform == platform).collect();
+            // Plugged-in phones are listed with the emulators.
+            let title = if mine.iter().any(|d| d.physical) {
+                match platform {
+                    DevicePlatform::Ios => "iOS",
+                    DevicePlatform::Android => "Android",
+                }
+            } else {
+                title
+            };
             let mut group = v_flex().gap_1().child(
                 div()
                     .px_2()
@@ -1246,6 +1507,16 @@ impl DeviceView {
     fn device_row(&self, d: &DeviceInfo, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (open_id, boot_id) = (d.id.clone(), d.id.clone());
         let state: AnyElement = match d.state {
+            // A phone isn't started from here: plugged in and unlocked, it
+            // runs.
+            DeviceState::Stopped if d.physical => h_flex()
+                .gap_1p5()
+                .items_center()
+                .text_xs()
+                .text_color(p.muted_foreground)
+                .child(div().size(px(7.)).rounded_full().bg(p.faint_foreground))
+                .child("Not available")
+                .into_any_element(),
             DeviceState::Stopped => {
                 Button::new(SharedString::from(format!("device-start-{}", d.id)))
                     .cursor_pointer()
@@ -1254,7 +1525,7 @@ impl DeviceView {
                     .label("Start")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.choose(Some(boot_id.clone()), true, cx);
+                        this.pick(boot_id.clone(), true, cx);
                     }))
                     .into_any_element()
             }
@@ -1285,20 +1556,44 @@ impl DeviceView {
             .cursor_pointer()
             .hover(|s| s.bg(p.hover))
             .child(
-                Icon::new(IconName::Smartphone)
-                    .small()
-                    .text_color(p.muted_foreground),
+                Icon::new(if d.physical {
+                    IconName::Usb
+                } else {
+                    IconName::Smartphone
+                })
+                .small()
+                .text_color(p.muted_foreground),
             )
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(p.foreground)
-                            .truncate()
-                            .child(d.name.clone()),
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(p.foreground)
+                                    .truncate()
+                                    .child(d.name.clone()),
+                            )
+                            // A real phone, not an emulator.
+                            .when(d.physical, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(p.border)
+                                        .text_xs()
+                                        .text_color(p.muted_foreground)
+                                        .child("Phone"),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -1313,9 +1608,7 @@ impl DeviceView {
             )
             .child(div().flex_none().child(state))
             .claims_press()
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.choose(Some(open_id.clone()), false, cx)),
-            )
+            .on_click(cx.listener(move |this, _, _, cx| this.pick(open_id.clone(), false, cx)))
             .into_any_element()
     }
 
@@ -1337,6 +1630,19 @@ impl DeviceView {
         );
         let id = entity.entity_id();
         let touching = self.touching;
+        // Two fingers: where they are while down, or would go with Option.
+        let marks = match (drawn, area) {
+            (Some(drawn), Some(area)) => {
+                let down = self.fingers.map(|f| f.at(self.last_touch));
+                let down = down.or_else(|| self.pinch.map(|p| p.fingers()));
+                match (down, self.ghost) {
+                    (Some(at), _) => finger_marks(&at, true, drawn, area, p),
+                    (None, Some(at)) => finger_marks(&at, false, drawn, area, p),
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
 
         // What shows over a screen with nothing on it yet.
         let muted = |text: &'static str| {
@@ -1385,6 +1691,23 @@ impl DeviceView {
                 None => Some(muted("Connecting…")),
                 Some(DeviceState::Booting) => Some(muted("Starting…")),
                 Some(DeviceState::ShuttingDown) => Some(muted("Shutting down…")),
+                // A phone that isn't available: unplugged, or locked out.
+                Some(DeviceState::Stopped) if self.is_physical() => Some(
+                    v_flex()
+                        .max_w(px(280.))
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(gpui_kit::white().opacity(0.75))
+                        .child(Icon::new(IconName::Usb))
+                        .child(format!("{} isn't available", self.title(cx)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .child("Plug it in, unlock it and allow USB debugging."),
+                        )
+                        .into_any_element(),
+                ),
                 Some(DeviceState::Stopped) => {
                     let name = device.as_ref().map_or_else(String::new, |d| d.name.clone());
                     Some(
@@ -1467,8 +1790,16 @@ impl DeviceView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::paste_clipboard))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| this.hover(e, cx)))
+            .on_hover(cx.listener(|this, over: &bool, _, cx| {
+                if !over && this.ghost.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_scroll(cx.listener(Self::on_scroll))
+            .on_pinch(cx.listener(Self::on_pinch))
             .children(phone)
+            .children(marks)
             .when_some(over, |d, over| {
                 d.child(
                     div()
@@ -1537,7 +1868,8 @@ impl DeviceView {
             info.error = None;
         }
         match self.device().map(|d| (d.id.clone(), d.state)) {
-            Some((id, DeviceState::Stopped)) => self.boot(id, cx),
+            // A phone isn't started from here: look again instead.
+            Some((id, DeviceState::Stopped)) if !self.is_physical() => self.boot(id, cx),
             _ => {
                 let entity = cx.entity_id();
                 self.store.update(cx, |s, _| {
@@ -1569,8 +1901,32 @@ impl Render for DeviceView {
         if self.chosen.is_some() && self.area.get().is_none() {
             window.request_animation_frame();
         }
+        self.ensure_tools(window, cx);
         let body = if self.chosen.is_some() {
-            self.render_screen(&p, cx)
+            let screen = self.render_screen(&p, cx);
+            // The tools drawer beside the screen (not in the floating card).
+            match self
+                .tools
+                .clone()
+                .filter(|_| self.tools_open && !self.floating)
+            {
+                Some(tools) => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(screen),
+                    )
+                    .child(tools)
+                    .into_any_element(),
+                None => screen,
+            }
         } else {
             // The list too keeps the panel watched while drawn.
             let seen = self.seen.clone();

@@ -334,9 +334,11 @@ pub struct AppStore {
     /// Device panels watching the list of simulators and emulators or one
     /// of them (ADR-0020), and their subscriptions (none while away).
     device_watch: Vec<DeviceWatch>,
-    /// The device each thread's Device panel showed last in this window
-    /// (kept in the session, so a restart shows it again).
-    pub device_choice: HashMap<ThreadId, loft_protocol::DeviceId>,
+    /// Each thread's Device tabs in this window: the device each shows and
+    /// its name (kept in the session, so a restart shows them again).
+    pub device_tabs: HashMap<ThreadId, Vec<crate::panel::device_tabs::DeviceTab>>,
+    /// Every device's name, as the daemon's list last said.
+    pub device_names: HashMap<loft_protocol::DeviceId, String>,
     /// Daemon pid of the current connection: a new pid means the daemon
     /// restarted and its PTYs are gone.
     daemon_pid: Option<u32>,
@@ -417,7 +419,8 @@ impl AppStore {
             pages: HashMap::new(),
             page_subs: HashMap::new(),
             device_watch: Vec::new(),
-            device_choice: HashMap::new(),
+            device_tabs: HashMap::new(),
+            device_names: HashMap::new(),
             daemon_pid: None,
         };
         this.reload_agent_prefs(cx);
@@ -863,6 +866,14 @@ impl AppStore {
         }
     }
 
+    /// Remember the devices' names (a Device tab out of sight, which
+    /// watches nothing, still names its device).
+    fn name_devices(&mut self, devices: &[loft_protocol::DeviceInfo]) {
+        for d in devices {
+            self.device_names.insert(d.id.clone(), d.name.clone());
+        }
+    }
+
     /// Watch a device topic (the list, or one device) for a Device panel.
     pub fn watch_device(
         &mut self,
@@ -968,6 +979,7 @@ impl AppStore {
                             pane.update(cx, |p, cx| p.on_replay(&replay.0, terminal.exited, cx));
                     }
                 } else if let Snapshot::Devices { devices, support } = snapshot {
+                    self.name_devices(&devices);
                     if let Some(view) = self.device_view(sub_id) {
                         let _ = view.update(cx, |v, cx| v.on_list(devices, support, cx));
                     }
@@ -1156,6 +1168,7 @@ impl AppStore {
                 devices,
                 support,
             } => {
+                self.name_devices(&devices);
                 if let Some(view) = self.device_view(sub_id) {
                     let _ = view.update(cx, |v, cx| v.on_list(devices, support, cx));
                 }

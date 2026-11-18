@@ -45,6 +45,9 @@ struct FakeState {
     /// A foldable's fold, as it is now.
     fold: Option<DeviceFold>,
     settings: DeviceSettings,
+    /// A fake physical phone: its adb serial, and why it can't be used
+    /// (unauthorized) when it can't.
+    phone: Option<(String, Option<String>)>,
 }
 
 impl FakeState {
@@ -119,6 +122,7 @@ impl FakeBackend {
                 running: false,
                 log: Vec::new(),
                 fold: None,
+                phone: None,
                 settings: DeviceSettings {
                     supported: FAKE_SETTINGS.iter().map(|s| s.to_string()).collect(),
                     dark: Some(false),
@@ -158,7 +162,28 @@ impl FakeBackend {
         fake
     }
 
+    /// A fake physical Android phone (`android:@<serial>`), plugged in and
+    /// running. `unauthorized`: it hasn't accepted this computer's USB
+    /// debugging key yet, so it can't be shown or driven.
+    pub fn phone(serial: &str, unauthorized: bool) -> Self {
+        let fake = Self::new(DevicePlatform::Android, Duration::ZERO);
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.running = !unauthorized;
+            state.phone = Some((
+                serial.to_owned(),
+                unauthorized.then(|| {
+                    "Unauthorized: accept \"Allow USB debugging\" on the phone.".to_owned()
+                }),
+            ));
+        }
+        fake
+    }
+
     pub fn id(&self) -> DeviceId {
+        if let Some((serial, _)) = &self.state.lock().unwrap().phone {
+            return DeviceId::android_phone(serial);
+        }
         match self.platform {
             DevicePlatform::Ios => DeviceId::ios("FAKE-PHONE"),
             DevicePlatform::Android if self.state.lock().unwrap().fold.is_some() => {
@@ -188,14 +213,21 @@ impl Backend for FakeBackend {
 
     fn list(&self) -> BoxFut<'_, Vec<DeviceInfo>> {
         Box::pin(async move {
-            let (running, fold, (width, height)) = {
+            let (running, fold, (width, height), phone) = {
                 let state = self.state.lock().unwrap();
-                (state.running, state.fold.clone(), state.screen())
+                (
+                    state.running,
+                    state.fold.clone(),
+                    state.screen(),
+                    state.phone.clone(),
+                )
             };
             Ok(vec![DeviceInfo {
                 id: self.id(),
                 platform: self.platform,
-                name: if fold.is_some() {
+                name: if let Some((serial, _)) = &phone {
+                    format!("Fake Pixel {serial}")
+                } else if fold.is_some() {
                     "Fake Fold".into()
                 } else {
                     "Fake Phone".into()
@@ -212,9 +244,9 @@ impl Backend for FakeBackend {
                 width,
                 height,
                 scale: 1.0,
-                error: None,
+                error: phone.as_ref().and_then(|(_, e)| e.clone()),
                 agent: None,
-                physical: false,
+                physical: phone.is_some(),
                 fold,
             }])
         })
@@ -222,6 +254,9 @@ impl Backend for FakeBackend {
 
     fn boot<'a>(&'a self, _native: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            if self.state.lock().unwrap().phone.is_some() {
+                anyhow::bail!("A phone can't be started from here.");
+            }
             self.record(FakeEvent::Boot);
             tokio::time::sleep(self.boot_time).await;
             self.state.lock().unwrap().running = true;
@@ -231,6 +266,9 @@ impl Backend for FakeBackend {
 
     fn shutdown<'a>(&'a self, _native: &'a str) -> BoxFut<'a, ()> {
         Box::pin(async move {
+            if self.state.lock().unwrap().phone.is_some() {
+                anyhow::bail!("A phone can't be shut down from here.");
+            }
             self.record(FakeEvent::Shutdown);
             self.state.lock().unwrap().running = false;
             Ok(())

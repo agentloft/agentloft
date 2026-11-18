@@ -5,6 +5,9 @@
 pub mod agent;
 pub mod changes;
 pub mod device;
+pub mod device_tabs;
+pub mod device_tools;
+pub mod device_touch;
 pub mod dock;
 pub mod docs;
 pub mod files;
@@ -102,6 +105,8 @@ struct ThreadPanel {
     seen_turn: Option<TurnId>,
     /// The thread's working directory; changes when its worktree is created.
     cwd: String,
+    /// The Device tab floating over the chat (or last floated).
+    floated: Option<gpui_kit::EntityId>,
     _subs: Vec<Subscription>,
 }
 
@@ -177,6 +182,13 @@ pub struct WorkbenchPanel {
     /// panel has its place (set by the workspace while laying out). There
     /// is no "back beside the conversation" to offer then.
     pub(crate) cramped: bool,
+    /// A tab being renamed in place: its thread, its view, and the field.
+    renaming: Option<(
+        ThreadId,
+        gpui_kit::EntityId,
+        Entity<gpui_kit::component::input::InputState>,
+        Subscription,
+    )>,
 }
 
 impl gpui_kit::EventEmitter<PanelEvent> for WorkbenchPanel {}
@@ -196,6 +208,7 @@ impl WorkbenchPanel {
             shown: None,
             maximized: false,
             cramped: false,
+            renaming: None,
         }
     }
 
@@ -284,16 +297,15 @@ impl WorkbenchPanel {
                     terminals_restored: false,
                     seen_turn,
                     cwd,
+                    floated: None,
                     _subs: subs,
                 },
             );
             // Its browser tabs live in the daemon: show the ones it has.
             self.fetch_tabs(thread_id, window, cx);
-            // The device it showed last time, behind the tab showing.
-            if self.store.read(cx).device_choice.contains_key(thread_id)
-                && self.store.read(cx).pages_allowed()
-            {
-                self.device_tab(thread_id, false, cx);
+            // The devices it showed last time, behind the tab showing.
+            if self.store.read(cx).pages_allowed() {
+                self.restore_device_tabs(thread_id, cx);
             }
         }
         self.threads.get_mut(thread_id).expect("inserted above")
@@ -715,124 +727,6 @@ impl WorkbenchPanel {
         .detach();
     }
 
-    // -- devices ---------------------------------------------------------------
-
-    /// `thread_id`'s Device tab, added (shown if `activate`) if it has none.
-    fn device_tab(
-        &mut self,
-        thread_id: &ThreadId,
-        activate: bool,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<device::DeviceView>> {
-        let panel = self.threads.get_mut(thread_id)?;
-        let at = panel
-            .tabs
-            .iter()
-            .position(|t| matches!(t, Open::Device { .. }));
-        let ix = match at {
-            Some(ix) => ix,
-            None => {
-                let store = self.store.clone();
-                let view = cx.new(|cx| device::DeviceView::new(store, thread_id.clone(), cx));
-                let id = thread_id.clone();
-                let subs = [
-                    // Its device's name and state show on the tab.
-                    cx.observe(&view, |_, _, cx| cx.notify()),
-                    cx.subscribe(&view, move |_, _, event: &device::DeviceEvent, cx| {
-                        cx.emit(match event {
-                            device::DeviceEvent::Screenshot(png) => {
-                                PanelEvent::Screenshot(id.clone(), png.clone())
-                            }
-                            device::DeviceEvent::Float => PanelEvent::FloatDevice(id.clone()),
-                        });
-                    }),
-                ];
-                panel._subs.extend(subs);
-                panel.tabs.push(Open::Device { view });
-                panel.tabs.len() - 1
-            }
-        };
-        if activate || panel.tabs.len() == 1 {
-            panel.active = ix;
-        }
-        cx.notify();
-        match &panel.tabs[ix] {
-            Open::Device { view } => Some(view.clone()),
-            _ => None,
-        }
-    }
-
-    /// Show `thread_id`'s Device tab, on device `id` if given (started if
-    /// `boot` and it is stopped).
-    pub fn show_device(
-        &mut self,
-        thread_id: &ThreadId,
-        id: Option<loft_protocol::DeviceId>,
-        boot: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.store.read(cx).pages_allowed() {
-            return;
-        }
-        if self.ensure_id(thread_id, window, cx).is_none() {
-            return;
-        }
-        let Some(view) = self.device_tab(thread_id, true, cx) else {
-            return;
-        };
-        if let Some(id) = id {
-            view.update(cx, |v, cx| v.choose(Some(id), boot, cx));
-        }
-    }
-
-    /// `thread_id`'s device for the card floating over the chat: its Device
-    /// tab (made if it has none), on `id` if given, and no longer the tab
-    /// the panel shows. `None` with no device to show; else whether the
-    /// panel still has other tabs to show.
-    pub fn float_device(
-        &mut self,
-        thread_id: &ThreadId,
-        id: Option<loft_protocol::DeviceId>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<(Entity<device::DeviceView>, bool)> {
-        if !self.store.read(cx).pages_allowed() {
-            return None;
-        }
-        self.ensure_id(thread_id, window, cx)?;
-        let view = self.device_tab(thread_id, false, cx)?;
-        if let Some(id) = id
-            && view.read(cx).chosen() != Some(&id)
-        {
-            view.update(cx, |v, cx| v.choose(Some(id), false, cx));
-        }
-        let panel = self.threads.get_mut(thread_id)?;
-        if matches!(panel.active_tab(), Some(Open::Device { .. })) {
-            let other = (0..panel.tabs.len())
-                .rev()
-                .find(|&ix| !matches!(panel.tabs[ix], Open::Device { .. }));
-            if let Some(ix) = other {
-                panel.active = ix;
-            }
-        }
-        let others = panel.tabs.iter().any(|t| !matches!(t, Open::Device { .. }));
-        cx.notify();
-        Some((view, others))
-    }
-
-    /// `thread_id`'s Device tab, if it has one.
-    pub fn existing_device(&self, thread_id: &ThreadId) -> Option<Entity<device::DeviceView>> {
-        self.threads
-            .get(thread_id)?
-            .tabs
-            .iter()
-            .find_map(|t| match t {
-                Open::Device { view } => Some(view.clone()),
-                _ => None,
-            })
-    }
-
     // -- terminals -------------------------------------------------------------
 
     /// A new shell for `thread_id`, in the side panel or the dock. The
@@ -1016,9 +910,7 @@ impl WorkbenchPanel {
                 // (or one already open elsewhere) shows where it is.
                 view.update(cx, |v, _| v.focus_address_if_blank());
             }
-            Tab::Device => {
-                self.show_device(thread_id, None, false, window, cx);
-            }
+            Tab::Device => self.add_device_tab(thread_id, cx),
             Tab::File(path) => self.open_file(thread_id, path, window, cx),
             Tab::Agent(id) => self.open_agent(thread_id, id, window, cx),
         }
@@ -1044,6 +936,14 @@ impl WorkbenchPanel {
         {
             view.update(cx, |b, cx| b.set_annotating(false, cx));
         }
+        // Only the Device tab showing streams.
+        let left = panel.active;
+        if ix != left {
+            self.rest_device(thread_id, left, cx);
+        }
+        let Some(panel) = self.threads.get_mut(thread_id) else {
+            return;
+        };
         panel.active = ix;
         if let Open::Terminal { pane, .. } = &panel.tabs[ix] {
             focus_terminal(pane, window, cx);
@@ -1065,12 +965,14 @@ impl WorkbenchPanel {
         if let Open::Page { view } = &tab {
             view.update(cx, |v, cx| v.close(cx));
         }
-        // Closing the panel leaves the device running; nor is it shown
+        // Closing the tab leaves the device running; nor is it shown
         // again next time.
         if let Open::Device { view } = &tab {
             view.update(cx, |v, cx| v.close(cx));
-            self.store
-                .update(cx, |s, _| s.device_choice.remove(thread_id));
+            if panel.floated == Some(view.entity_id()) {
+                panel.floated = None;
+            }
+            self.save_device_tabs(thread_id, cx);
         }
         let Some(panel) = self.threads.get_mut(thread_id) else {
             return;
@@ -1242,6 +1144,21 @@ impl WorkbenchPanel {
             );
             entries.insert(1, Entry::Separator);
         }
+        // A Device tab can be renamed.
+        if let Some(Open::Device { .. }) = self.threads.get(thread_id).and_then(|p| p.tabs.get(ix))
+        {
+            let (panel, id, handle) = (panel.clone(), thread_id.clone(), window.window_handle());
+            entries.insert(
+                0,
+                Entry::item("Rename…".to_owned(), IconName::Pencil, move |cx| {
+                    let (panel, id) = (panel.clone(), id.clone());
+                    let _ = handle.update(cx, move |_, window, cx| {
+                        _ = panel.update(cx, |p, cx| p.start_rename(&id, ix, window, cx));
+                    });
+                }),
+            );
+            entries.insert(1, Entry::Separator);
+        }
         // A page tab also offers a reload.
         if let Some(Open::Page { view }) = self.threads.get(thread_id).and_then(|p| p.tabs.get(ix))
         {
@@ -1365,7 +1282,7 @@ fn tab_face(tab: &Open, p: &Palette, cx: &gpui_kit::App) -> (AnyElement, String)
             } else {
                 icon(IconName::Smartphone)
             };
-            (face, v.title())
+            (face, v.title(cx))
         }
         Open::File { path, .. } => {
             let name = path.rsplit('/').next().unwrap_or(path).to_owned();
@@ -1400,7 +1317,16 @@ impl Render for WorkbenchPanel {
             return div().size_full().bg(p.background).into_any_element();
         }
         let tab_scroll = self.tab_scroll.clone();
-        let panel = self.ensure(&thread_id, &thread, window, cx);
+        self.ensure(&thread_id, &thread, window, cx);
+        let renaming: Vec<_> = self.threads[&thread_id]
+            .tabs
+            .iter()
+            .map(|t| match t {
+                Open::Device { view } => self.rename_field(&thread_id, view.entity_id()),
+                _ => None,
+            })
+            .collect();
+        let panel = &self.threads[&thread_id];
         let active = panel.active;
 
         let mut tabs = h_flex()
@@ -1415,6 +1341,30 @@ impl Render for WorkbenchPanel {
         for (ix, tab) in panel.tabs.iter().enumerate() {
             let is_active = ix == active;
             let (icon, label) = tab_face(tab, &p, cx);
+            let is_device = matches!(tab, Open::Device { .. });
+            let label: AnyElement = match renaming.get(ix).cloned().flatten() {
+                Some(field) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .on_key_down(cx.listener(|this, e: &gpui_kit::KeyDownEvent, _, cx| {
+                        if e.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            this.finish_rename(false, cx);
+                        }
+                    }))
+                    .child(
+                        gpui_kit::component::input::Input::new(&field)
+                            .xsmall()
+                            .appearance(false),
+                    )
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(label)
+                    .into_any_element(),
+            };
             let (tid, cid, mid) = (thread_id.clone(), thread_id.clone(), thread_id.clone());
             tabs = tabs.child(
                 h_flex()
@@ -1443,7 +1393,7 @@ impl Render for WorkbenchPanel {
                             .hover(|d| d.bg(p.hover).text_color(p.foreground))
                     })
                     .child(div().flex_none().child(icon))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(label)
                     .child(
                         div()
                             .id(SharedString::from(format!("panel-tab-x-{ix}")))
@@ -1463,7 +1413,14 @@ impl Render for WorkbenchPanel {
                             })),
                     )
                     .on_click(
-                        cx.listener(move |this, _, window, cx| this.activate(&tid, ix, window, cx)),
+                        cx.listener(move |this, e: &gpui_kit::ClickEvent, window, cx| {
+                            // A Device tab is renamed with a double-click.
+                            if is_device && e.click_count() == 2 {
+                                this.start_rename(&tid, ix, window, cx);
+                            } else {
+                                this.activate(&tid, ix, window, cx);
+                            }
+                        }),
                     )
                     .on_mouse_down(
                         gpui_kit::MouseButton::Right,
