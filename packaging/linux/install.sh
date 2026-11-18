@@ -2,7 +2,8 @@
 # Install Agentloft from this folder for the current user:
 #   ~/.local/share/agentloft (the binaries and the web client),
 #   ~/.local/bin/agentloft and agentloftd (links), the menu entry and icons.
-# PREFIX=/usr/local sudo ./install.sh installs for everyone instead.
+# sudo PREFIX=/usr/local ./install.sh installs for everyone instead (sudo drops
+# PREFIX from the environment when it comes first).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 prefix=${PREFIX:-$HOME/.local}

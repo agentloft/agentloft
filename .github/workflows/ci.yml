@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only unless a job says otherwise (only publishing writes).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # libghostty-vt's finished builds (vendor/ghostty-vt-sys), kept between
@@ -22,16 +26,16 @@ jobs:
     name: macOS (full workspace)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .ghostty-vt
           key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       # loft-terminal builds libghostty-vt, which needs Zig.
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -55,10 +59,10 @@ jobs:
     name: Linux (headless crates)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test headless crates
         run: >
           cargo test
@@ -72,7 +76,7 @@ jobs:
     name: Linux (app and daemon)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: System libraries (GPUI)
         run: |
           sudo apt-get update
@@ -82,12 +86,12 @@ jobs:
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .ghostty-vt
           key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -105,19 +109,19 @@ jobs:
     name: Windows (app and daemon)
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Windows builds are slow (no Linux-speed disk): keep what was
           # built even when a later step fails.
           cache-on-failure: true
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .ghostty-vt
           key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -140,17 +144,17 @@ jobs:
     name: Web client (wasm32)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .ghostty-vt
           key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       # The terminal in the browser is libghostty-vt built for wasm32, which
       # needs Zig like the native build does.
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -179,10 +183,10 @@ jobs:
     name: Dependency features (workspace-hack)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
         with:
           tool: cargo-hakari
       # crates/workspace-hack is what `cargo hakari generate` writes for the
@@ -194,5 +198,5 @@ jobs:
     name: Dependency policy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
