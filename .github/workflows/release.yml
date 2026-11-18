@@ -46,7 +46,9 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
-        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
+        # By git, not GitHub's archive: Zig keeps an archive with its top
+        # folder, and that copy hashes differently when a build reuses it.
+        run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
       - run: |
@@ -75,7 +77,9 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
-        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
+        # By git, not GitHub's archive: Zig keeps an archive with its top
+        # folder, and that copy hashes differently when a build reuses it.
+        run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # The stable bundle (the green icon, data in ~/.agentloft); the web
       # client goes in when it is packaged.
       # Building libghostty-vt (the terminal) downloads its Zig packages,
@@ -111,7 +115,9 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
-        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
+        # By git, not GitHub's archive: Zig keeps an archive with its top
+        # folder, and that copy hashes differently when a build reuses it.
+        run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
       - run: |
@@ -164,7 +170,9 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
-        run: zig fetch https://github.com/Vexu/arocc/archive/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b.tar.gz
+        # By git, not GitHub's archive: Zig keeps an archive with its top
+        # folder, and that copy hashes differently when a build reuses it.
+        run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
       - run: |
