@@ -1,0 +1,17 @@
+[package]
+name = "loft-raster"
+description = "A small software renderer: the Device panel's 3D device models (ADR-0020)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure Rust and nothing else, so it builds for the browser client too.
+[dependencies]
+
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+[target.'cfg(target_os = "macos")'.dependencies]
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

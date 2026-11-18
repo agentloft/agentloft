@@ -47,6 +47,12 @@
 - Two fingers as Simulator.app makes them: Option-drag pinches around the screen's centre, Option+Shift-drag moves both, and a trackpad pinch over the screen is a pinch (where the platform delivers it: macOS; not the web client).
 - A plugged-in phone is listed with its platform's emulators, marked as a phone: it has no Start and no power button, and one that is locked out shows why (accept the prompt on the phone).
 
+### 5. The 3D model and folding (added 2026-11-17)
+
+- The panel can show the device as a 3D model you turn: a phone, tablet, book-style foldable or flip phone, chosen from the platform, name, screen proportions and `DeviceInfo.fold`, with the live picture on its screen (the main one, split at the hinge, or the cover while `on_cover`). GPUI has no 3D, so `loft-raster` draws it in software, into a picture the panel's size at the window's scale, only when the picture, the view or the fold changes and at most about 30 times a second. Each screen pixel remembers the point of the device's picture it shows, so touches on the turned screen land exactly; a drag elsewhere turns the model, the wheel or a pinch off the device zooms, a pinch over a foldable folds it.
+- A foldable gets its postures and a hinge slider in 2D and 3D (`DeviceSetting::Posture`, `Hinge`); the model's hinge follows the device's. Turned so the cover faces you while it is open, a fold-in that can close is closed (the cover becomes the live screen) and the view turns so the cover stays facing you. The floating card stays 2D.
+- To review: the model's direction when the device turns on its side is assumed counter-clockwise (the panel doesn't read the device's orientation), so after Rotate Right the model's camera bump is on the wrong side (the picture is upright and touches are right either way).
+
 ## Consequences
 
 - iOS works only on macOS with Xcode and a runtime; Android wherever its SDK runs. Both report what's missing rather than failing quietly.

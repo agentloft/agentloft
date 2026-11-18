@@ -29,6 +29,7 @@ loft-view = { path = "crates/loft-view" }
 loft-page-script = { path = "crates/loft-page-script" }
 loft-page-exec = { path = "crates/loft-page-exec" }
 loft-sim = { path = "crates/loft-sim" }
+loft-raster = { path = "crates/loft-raster" }
 # One build of each dependency whatever the cargo command (.config/hakari.toml).
 workspace-hack = { path = "crates/workspace-hack" }
 
@@ -98,6 +99,12 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 1
 
+# The Device panel's 3D model is drawn by this crate, pixel by pixel, on the
+# UI's thread: unoptimized it takes ten times as long, and turning the model
+# in a debug build would stutter.
+[profile.dev.package.loft-raster]
+opt-level = 3
+
 # Build scripts, proc macros and the crates they are made of get the same
 # debug info as everything else. Left alone, Cargo gives them none, except
 # when the same crate is also an ordinary dependency somewhere in the build
@@ -135,6 +142,10 @@ codegen-units = 1
 debug = false
 strip = "debuginfo"
 panic = "abort"
+
+# Speed over size for the 3D device model's renderer (it is small).
+[profile.web-release.package.loft-raster]
+opt-level = 3
 
 # libghostty-vt's bindings with a wasm32 build added for the browser client
 # (vendor/ghostty-vt-sys/README.md says what differs from crates.io).

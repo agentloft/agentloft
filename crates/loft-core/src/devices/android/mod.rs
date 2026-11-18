@@ -623,21 +623,49 @@ impl Backend for AndroidBackend {
                     }
                 }
                 DeviceApp::Launch { app } => {
+                    // Its launcher activity, started as a tap on its icon
+                    // does. (`monkey` refuses to run on devices without
+                    // hardware keys, as Android 15 images are.)
+                    let found = self
+                        .shell(
+                            &running,
+                            &[
+                                "cmd",
+                                "package",
+                                "resolve-activity",
+                                "--brief",
+                                "-c",
+                                "android.intent.category.LAUNCHER",
+                                &app,
+                            ],
+                        )
+                        .await?;
+                    let Some(activity) = found
+                        .lines()
+                        .map(str::trim)
+                        .rfind(|l| l.contains('/') && !l.contains(' '))
+                    else {
+                        bail!("{app} isn't installed, or has nothing to open");
+                    };
                     let out = self
                         .shell(
                             &running,
                             &[
-                                "monkey",
-                                "-p",
-                                &app,
+                                "am",
+                                "start",
+                                "-n",
+                                activity,
+                                "-a",
+                                "android.intent.action.MAIN",
                                 "-c",
                                 "android.intent.category.LAUNCHER",
-                                "1",
+                                "-f",
+                                "0x10200000",
                             ],
                         )
                         .await?;
-                    if out.contains("No activities found") || out.contains("monkey aborted") {
-                        bail!("{app} isn't installed, or has nothing to open");
+                    if out.contains("Error:") {
+                        bail!("{app} couldn't be opened: {}", out.trim());
                     }
                 }
                 DeviceApp::Terminate { app } => {

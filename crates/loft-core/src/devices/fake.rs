@@ -35,8 +35,9 @@ pub struct FakeBackend {
     platform: DevicePlatform,
     state: Arc<Mutex<FakeState>>,
     boot_time: Duration,
-    /// The screen attached last: a fold redraws it at its new size.
-    screen: Mutex<std::sync::Weak<FakeScreen>>,
+    /// The screens attached and still in use: a fold redraws them all at
+    /// its new size (the daemon may still stream an earlier one).
+    screens: Mutex<Vec<std::sync::Weak<FakeScreen>>>,
 }
 
 struct FakeState {
@@ -132,7 +133,7 @@ impl FakeBackend {
                 },
             })),
             boot_time,
-            screen: Mutex::new(std::sync::Weak::new()),
+            screens: Mutex::new(Vec::new()),
         }
     }
 
@@ -281,7 +282,9 @@ impl Backend for FakeBackend {
                 anyhow::bail!("not running");
             }
             let screen = Arc::new(FakeScreen::new(self.state.clone()));
-            *self.screen.lock().unwrap() = Arc::downgrade(&screen);
+            let mut screens = self.screens.lock().unwrap();
+            screens.retain(|s| s.strong_count() > 0);
+            screens.push(Arc::downgrade(&screen));
             Ok(screen as Arc<dyn Screen>)
         })
     }
@@ -306,7 +309,14 @@ impl Backend for FakeBackend {
             state.apply(&setting);
             state.log.push(FakeEvent::Set(setting));
             drop(state);
-            if let Some(screen) = self.screen.lock().unwrap().upgrade() {
+            let screens: Vec<_> = self
+                .screens
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for screen in screens {
                 screen.draw();
             }
             Ok(())

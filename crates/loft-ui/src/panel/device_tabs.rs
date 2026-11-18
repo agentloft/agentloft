@@ -245,6 +245,25 @@ impl WorkbenchPanel {
         }
     }
 
+    /// The Device panel on device `id` as a 3D model turned `yaw` and
+    /// tipped `pitch` degrees, folded to `hinge` if given (the `device3d:`
+    /// dev hook). Started if stopped.
+    pub fn show_device_3d(
+        &mut self,
+        thread_id: &ThreadId,
+        id: DeviceId,
+        (yaw, pitch): (f32, f32),
+        hinge: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_device(thread_id, Some(id.clone()), true, window, cx);
+        let ix = self.device_tab_on(thread_id, &id, cx);
+        if let Some(view) = ix.and_then(|ix| self.device_at(thread_id, ix)) {
+            view.update(cx, |v, cx| v.show_3d(yaw, pitch, hinge, cx));
+        }
+    }
+
     /// A new Device tab showing the list, as the + menu opens one.
     pub(super) fn add_device_tab(&mut self, thread_id: &ThreadId, cx: &mut Context<Self>) {
         if self.store.read(cx).pages_allowed() {
