@@ -96,6 +96,8 @@ async function open(machine, button) {
   button.disabled = false;
   if (ok) {
     location.href = data.url;
+  } else if (status === 409 && data.error === "offline") {
+    $("machines-error").textContent = `${machine.name} is offline. Open it once it's back.`;
   } else if (status === 409) {
     $("machines-error").textContent =
       `${machine.name} hasn't said where to reach it. Turn on Public through Cloudflare in its Settings ▸ Web access.`;
@@ -185,6 +187,9 @@ async function openHere(id) {
   });
   if (status === 401) return signIn(location.pathname);
   if (status === 404) return openingFailed("This computer isn't in your account any more.");
+  if (status === 409 && data.error === "offline") {
+    return openingFailed("This computer is offline. Open it once it's back.");
+  }
   if (status === 409) {
     return openingFailed(
       "This computer hasn't said where to reach it. Turn on Public through Cloudflare in its Settings ▸ Web access.",
@@ -248,10 +253,16 @@ async function startLink(key) {
   }
   $("link-name").textContent = data.name;
   $("link-code").textContent = data.user_code;
+  // Started from another network than this browser's: likely a link someone
+  // sent, not one this person's own computer opened.
+  $("link-elsewhere").hidden = !data.elsewhere;
+  if (data.elsewhere) $("link-approve").textContent = "Link it anyway";
   show("link");
   const decide = async (action) => {
     $("link-approve").disabled = $("link-deny").disabled = true;
-    const reply = await api(`/api/link/${action}`, { body: { key } });
+    const reply = await api(`/api/link/${action}`, {
+      body: { key, elsewhere_ok: Boolean(data.elsewhere) },
+    });
     if (!reply.ok) {
       $("link-approve").disabled = $("link-deny").disabled = false;
       $("link-error").textContent = "That didn't work. Choose Link this computer in Agentloft again.";
@@ -269,9 +280,22 @@ async function startLink(key) {
 
 // -- start ----------------------------------------------------------------------
 
+/** What each sign-in failure (`?error=<code>`) says. Anything else in the
+ *  address is ignored: anyone can send a link with an `?error=` of theirs. */
+const SIGN_IN_ERRORS = {
+  expired: "Sign-in took too long or was started elsewhere. Try again.",
+  cancelled: "Google sign-in was cancelled.",
+  unfinished: "Google didn't finish signing you in. Try again.",
+  unchecked: "Google's answer couldn't be checked. Try again.",
+  unverified: "Your Google account's email address isn't verified.",
+  not_allowed: "This Google account can't sign in here.",
+};
+
 const params = new URLSearchParams(location.search);
-const error = params.get("error");
-if (error) history.replaceState(null, "", location.pathname + location.hash);
+const error = Object.hasOwn(SIGN_IN_ERRORS, params.get("error") ?? "")
+  ? SIGN_IN_ERRORS[params.get("error")]
+  : null;
+if (params.has("error")) history.replaceState(null, "", location.pathname + location.hash);
 
 const user = await me();
 const shown = /^\/m\/([A-Za-z0-9_-]+)$/.exec(location.pathname);

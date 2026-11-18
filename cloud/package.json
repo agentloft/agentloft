@@ -5,7 +5,7 @@
   "description": "Agentloft's website: sign in with Google, open your computers over your tailnet",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "dev": "npx wrangler@4 dev",
-    "deploy": "npx wrangler@4 deploy"
+    "dev": "npx wrangler@4.164.0 dev",
+    "deploy": "npx wrangler@4.164.0 deploy"
   }
 }

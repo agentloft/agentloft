@@ -209,6 +209,13 @@ export function cleanOrigin(value) {
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
   if (url.username || url.password || !url.hostname) return null;
   if ((url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) return null;
+  // It goes into the /m/ page's `frame-src` as it is: a plain host name or
+  // IP literal only. `new URL` also takes `*`, `;` and `,` in a host, which
+  // would widen or split that policy.
+  const host = url.hostname;
+  const plain =
+    /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host) || /^\[[0-9a-f:.]+\]$/.test(host);
+  if (!plain) return null;
   return url.origin;
 }
 
@@ -260,11 +267,14 @@ async function startGoogle(request, env, url) {
   });
 }
 
-function signInFailed(message) {
+/** Back to the app with what went wrong, as a code: the page shows its own
+ *  sentence for each, never text taken from its address (anyone can send a
+ *  link with `?error=` of their choosing). */
+function signInFailed(code) {
   return new Response(null, {
     status: 302,
     headers: {
-      Location: `${APP_PATH}?error=${encodeURIComponent(message)}`,
+      Location: `${APP_PATH}?error=${encodeURIComponent(code)}`,
       "Set-Cookie": setCookie(OAUTH_COOKIE, "", 0),
     },
   });
@@ -275,13 +285,13 @@ async function finishGoogle(request, env, url) {
   const next = rest.join(".");
   const given = url.searchParams.get("state") ?? "";
   if (!state || !verifier || !(await secretsMatch(state, given))) {
-    return signInFailed("Sign-in took too long or was started elsewhere. Try again.");
+    return signInFailed("expired");
   }
   if (url.searchParams.get("error")) {
-    return signInFailed("Google sign-in was cancelled.");
+    return signInFailed("cancelled");
   }
   const code = url.searchParams.get("code");
-  if (!code) return signInFailed("Google didn't finish signing you in. Try again.");
+  if (!code) return signInFailed("unfinished");
   const reply = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -296,7 +306,7 @@ async function finishGoogle(request, env, url) {
   });
   if (!reply.ok) {
     console.warn("google token exchange failed", reply.status, await reply.text());
-    return signInFailed("Google didn't finish signing you in. Try again.");
+    return signInFailed("unfinished");
   }
   const tokens = await reply.json();
   // Straight from Google's token endpoint over TLS: no signature to check,
@@ -305,18 +315,14 @@ async function finishGoogle(request, env, url) {
   const now = Date.now();
   const issuerOk = claims.iss === "https://accounts.google.com" || claims.iss === "accounts.google.com";
   if (claims.aud !== env.GOOGLE_CLIENT_ID || !issuerOk || !(claims.exp * 1000 > now) || !claims.sub) {
-    return signInFailed("Google's answer couldn't be checked. Try again.");
+    return signInFailed("unchecked");
   }
   if (claims.email_verified !== true || typeof claims.email !== "string") {
-    return signInFailed("Your Google account's email address isn't verified.");
+    return signInFailed("unverified");
   }
   const email = claims.email.toLowerCase();
-  const allowed = (env.ALLOWED_EMAILS ?? "")
-    .split(",")
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean);
-  if (allowed.length && !allowed.includes(email)) {
-    return signInFailed(`${email} can't sign in here.`);
+  if (!emailAllowed(env, email)) {
+    return signInFailed("not_allowed");
   }
   const userId = `g_${claims.sub}`;
   const secret = randomToken();
@@ -341,6 +347,15 @@ async function finishGoogle(request, env, url) {
   return new Response(null, { status: 302, headers });
 }
 
+/** Whether `email` may use the site (`ALLOWED_EMAILS`; empty: everyone). */
+function emailAllowed(env, email) {
+  const allowed = (env.ALLOWED_EMAILS ?? "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return !allowed.length || allowed.includes(String(email).toLowerCase());
+}
+
 async function signedIn(request, env) {
   const secret = cookie(request, SESSION_COOKIE);
   if (secret) {
@@ -350,7 +365,9 @@ async function signedIn(request, env) {
     )
       .bind(await sha256(secret), Date.now())
       .first();
-    if (user) return user;
+    // Taken off ALLOWED_EMAILS since signing in: signed out now, not
+    // when the session runs out.
+    if (user && emailAllowed(env, user.email)) return user;
   }
   throw fail(401, "signed_out");
 }
@@ -440,7 +457,7 @@ async function machinePage(request, env, id) {
   try {
     const user = await signedIn(request, env);
     const row = await ownMachine(env, user, id);
-    if (framed(row)) frame = `; frame-src ${new URL(row.url).origin}`;
+    if (framed(row) && Date.now() - row.last_seen_ms < ONLINE_MS) frame = `; frame-src ${new URL(row.url).origin}`;
   } catch {}
   return appPage(request, env, frame);
 }
@@ -464,6 +481,9 @@ async function openMachine(request, env, id) {
   const user = await signedIn(request, env);
   const row = await ownMachine(env, user, id);
   if (!row.url) throw fail(409, "no_address");
+  // Not heard from lately: its last address may be gone, or (a quick
+  // tunnel's random name) be someone else's by now. No ticket goes there.
+  if (!(Date.now() - row.last_seen_ms < ONLINE_MS)) throw fail(409, "offline");
   const secret = await unseal(env.SECRETS_KEY, row.secret, row.id);
   const ticket = await makeTicket(secret, {
     machineId: row.id,
@@ -536,10 +556,18 @@ async function pendingLink(env, key) {
 
 async function linkDecide(request, env, action) {
   const user = await signedIn(request, env);
-  const { key } = await body(request);
+  const { key, elsewhere_ok: elsewhereOk } = await body(request);
   const row = await pendingLink(env, key);
+  // Device-code phishing: someone starts a link on their own computer and
+  // sends the page to a victim. A link approved from another network than
+  // the one it was started from needs the page's warning to have been shown.
+  const here = request.headers.get("CF-Connecting-IP") ?? "";
+  const elsewhere = Boolean(row.ip && here && row.ip !== here);
   if (action === "info") {
-    return json({ name: row.name, platform: row.platform, user_code: row.user_code });
+    return json({ name: row.name, platform: row.platform, user_code: row.user_code, elsewhere });
+  }
+  if (action === "approve" && elsewhere && elsewhereOk !== true) {
+    throw fail(409, "confirm_elsewhere");
   }
   const state = action === "approve" ? "approved" : "denied";
   const { meta } = await env.DB.prepare(

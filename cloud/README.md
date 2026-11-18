@@ -16,8 +16,8 @@ The account is picked with `CLOUDFLARE_ACCOUNT_ID` (kept out of the repository):
 
 ```sh
 export CLOUDFLARE_ACCOUNT_ID=<account id>
-npx wrangler@4 d1 migrations apply agentloft-cloud --remote   # after adding a migration
-npx wrangler@4 deploy
+npx wrangler@4.164.0 d1 migrations apply agentloft-cloud --remote   # after adding a migration
+npx wrangler@4.164.0 deploy
 ```
 
 Secrets (set once; `wrangler secret put <NAME>` reads the value from stdin):
@@ -29,14 +29,14 @@ Secrets (set once; `wrangler secret put <NAME>` reads the value from stdin):
 
 Settings in `wrangler.toml`: `GOOGLE_CLIENT_ID` (public), and `ALLOWED_EMAILS` (comma-separated; empty lets any Google account sign in, each seeing only its own computers).
 
-The OAuth client's redirect URIs are `https://agentloft.promptanddone.com/auth/google/callback` and, for `npx wrangler@4 dev`, `http://localhost:8787/auth/google/callback`. The consent screen is in **Testing**: only its listed test users can sign in. Publishing it needs a homepage and a privacy-policy page.
+The OAuth client's redirect URIs are `https://agentloft.promptanddone.com/auth/google/callback` and, for `npx wrangler@4.164.0 dev`, `http://localhost:8787/auth/google/callback`. The consent screen is in **Testing**: only its listed test users can sign in. Publishing it needs a homepage and a privacy-policy page.
 
 ## Run it locally
 
 ```sh
-npx wrangler@4 d1 migrations apply agentloft-cloud --local
+npx wrangler@4.164.0 d1 migrations apply agentloft-cloud --local
 printf 'GOOGLE_CLIENT_SECRET=…\nSECRETS_KEY=…\n' > .dev.vars   # git-ignored
-npx wrangler@4 dev                                             # http://localhost:8787
+npx wrangler@4.164.0 dev                                             # http://localhost:8787
 ```
 
 Point a scratch daemon at it with `[web] website = "http://localhost:8787"`.
