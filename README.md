@@ -73,7 +73,7 @@ Shortcuts are shown with ⌘ here; on Windows and Linux they use Ctrl. <kbd>⌘K
 - Images by paste, drag-and-drop or the paperclip; `/` slash commands and `@` file mentions complete as you type.
 - Queue messages while a turn runs: the daemon sends each one when the turn before it ends, whether the app is open or not.
 - Mention another thread with `@` (or drag it from the sidebar onto the composer): the agent can read it.
-- Quote a selection from the conversation (<kbd>⌘'</kbd>), or send a terminal selection as a code block.
+- Quote a selection from the conversation (the Quote button that shows over it, <kbd>⌘'</kbd>, or the right-click menu), or send a terminal selection as a code block.
 - Usage limits: a thread that runs out of its plan's usage says when the limit resets, and can carry on by itself then.
 
 ### Workspaces you can trust

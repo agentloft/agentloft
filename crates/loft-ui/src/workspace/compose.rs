@@ -42,6 +42,17 @@ pub(super) struct Composing {
     /// The thread chips a recalled prompt brought back with it (as their
     /// lines in `pasted`): they go again when recall moves on.
     recalled_threads: HashMap<ThreadId, Vec<String>>,
+    /// The Quote button over text just selected in a conversation.
+    quote_button: Option<QuoteButton>,
+}
+
+/// Text selected in `thread`'s conversation, and where the mouse let go of
+/// it (window coordinates): the Quote button shows there. The text is kept
+/// because pressing anywhere, the button included, may end the selection.
+pub(super) struct QuoteButton {
+    thread: ThreadId,
+    at: gpui_kit::Point<gpui_kit::Pixels>,
+    text: String,
 }
 
 impl WorkspaceView {
@@ -376,6 +387,112 @@ impl WorkspaceView {
     pub(super) fn quote_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = TextSelection::selected_text(window, cx);
         self.quote_text(&text, window, cx);
+    }
+
+    /// The mouse let go in `thread_id`'s conversation at `at`: with text
+    /// selected there, the Quote button shows by it.
+    pub(super) fn selection_released(
+        &mut self,
+        thread_id: ThreadId,
+        at: gpui_kit::Point<gpui_kit::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Once every listener has had the release: a press on the same
+        // spot ends a selection there.
+        cx.defer_in(window, move |this, window, cx| {
+            // A control's press (a button in a message, the Quote button).
+            if crate::press::claimed(cx) {
+                return;
+            }
+            let text = TextSelection::selected_text(window, cx);
+            tracing::debug!(?at, chars = text.len(), "selection released");
+            if crate::quote::markdown_quote(&text).is_none() {
+                return;
+            }
+            this.composing.quote_button = Some(QuoteButton {
+                thread: thread_id,
+                at,
+                text,
+            });
+            cx.notify();
+        });
+    }
+
+    fn hide_quote_button(&mut self, cx: &mut Context<Self>) {
+        if self.composing.quote_button.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The Quote button over what was just selected in `thread_id`'s
+    /// conversation, if anything was. It goes on the next press elsewhere
+    /// or scroll, or when the selection does.
+    pub(super) fn quote_button(
+        &mut self,
+        thread_id: &ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let button = self.composing.quote_button.as_ref()?;
+        if &button.thread != thread_id {
+            return None;
+        }
+        if !TextSelection::has_selection(window, cx) {
+            self.composing.quote_button = None;
+            return None;
+        }
+        let (at, text, thread) = (button.at, button.text.clone(), button.thread.clone());
+        let view = cx.entity().downgrade();
+        // Scrolling moves the text away from it.
+        let on_scroll = gpui_kit::canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                window.on_mouse_event(move |_: &gpui_kit::ScrollEvent, phase, _, cx| {
+                    if phase == gpui_kit::DispatchPhase::Capture {
+                        let _ = view.update(cx, |v, cx| v.hide_quote_button(cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
+        let quote = gpui_kit::component::button::Button::new("quote-selection")
+            .small()
+            .icon(IconName::TextQuote)
+            .label("Quote")
+            .cursor_pointer()
+            .tooltip("Quote in your message")
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.composing.quote_button = None;
+                if let Some(quote) = crate::quote::markdown_quote(&text) {
+                    this.insert_block(&thread, &quote, "\n\n", window, cx);
+                }
+                TextSelection::clear(window, cx);
+            }));
+        Some(
+            gpui_kit::deferred(
+                gpui_kit::anchored()
+                    .anchor(gpui_kit::Anchor::BottomLeft)
+                    // Just above where the mouse let go, clear of the text
+                    // under the pointer.
+                    .position(gpui_kit::point(at.x - px(12.), at.y - px(18.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .occlude()
+                            .rounded_md()
+                            .shadow_lg()
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, _, cx| this.hide_quote_button(cx)),
+                            )
+                            .child(quote)
+                            .child(on_scroll),
+                    ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     /// `text` (selected in one of `thread_id`'s terminals) as a code block

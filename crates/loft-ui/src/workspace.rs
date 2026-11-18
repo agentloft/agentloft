@@ -4912,6 +4912,10 @@ impl WorkspaceView {
                     .update(cx, |s, cx| s.ensure_commands(&harness, &cwd, cx));
             }
         }
+        let quote_button = {
+            let id = thread.read(cx).id.clone();
+            self.quote_button(&id, window, cx)
+        };
         let tl_width = self
             .timeline_widths
             .entry(thread.read(cx).id.clone())
@@ -5255,9 +5259,19 @@ impl WorkspaceView {
             let thread = thread.clone();
             let store = self.store.clone();
             let palette = p.clone();
+            let released = thread_id.clone();
             v_flex()
                 .flex_1()
                 .min_h_0()
+                // Text selected in it: a Quote button where the mouse let go.
+                .capture_any_mouse_up(cx.listener(
+                    move |this, e: &gpui_kit::MouseUpEvent, window, cx| {
+                        if e.button == gpui_kit::MouseButton::Left {
+                            this.selection_released(released.clone(), e.position, window, cx);
+                        }
+                    },
+                ))
+                .children(quote_button)
                 .children(fork_bar)
                 .child(
                     MessageScroller::new("timeline", scroller_state, move |ix, window, cx| {
