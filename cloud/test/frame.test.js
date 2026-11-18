@@ -11,6 +11,9 @@ const script = await readFile(new URL("../public/app.js", import.meta.url), "utf
 function frameAllows() {
   const frames = page.match(/<iframe\b[^>]*>/g) ?? [];
   assert.equal(frames.length, 1, "one frame on the page");
+  // Every attribute set apart (a quote straight into the next name is a
+  // parse error browsers only recover from).
+  assert.doesNotMatch(frames[0], /"[A-Za-z-]+=/, frames[0]);
   const allow = /\sallow="([^"]*)"/.exec(frames[0]);
   assert.ok(allow, "the frame says what it allows");
   return allow[1]
