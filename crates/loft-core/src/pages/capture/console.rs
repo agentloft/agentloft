@@ -13,6 +13,7 @@ use super::super::cdp::Event;
 use super::super::lock;
 use super::cross_site::{self, Unfollow, Wanted};
 use super::network_model::cut;
+use super::redaction::{MIN_IN_TEXT, Redactor};
 use super::{PageCapture, now_iso, now_ms};
 use loft_page_script::{BrowserError, ConsoleReadOptions, SCRIPT_TIMEOUT};
 use serde::Serialize;
@@ -23,6 +24,9 @@ use std::collections::{HashSet, VecDeque};
 const KEPT: usize = 1000;
 /// The most of a message's text kept, in bytes.
 const TEXT_LIMIT: usize = 4000;
+/// The most of a message's text looked through for credentials, in bytes:
+/// more than is kept, so a token isn't judged cut in half.
+const SCANNED: usize = 4 * TEXT_LIMIT;
 /// Entries a read returns when not told.
 const DEFAULT_LIMIT: u32 = 200;
 
@@ -177,15 +181,23 @@ impl Console {
             self.entries.pop_front();
             self.dropped += 1;
         }
+        // Credentials out (as of a network capture's) before anything
+        // keeps the text, so a read's filter can't find them either. Cut
+        // after: a token cut in half no longer looks like one.
+        let mut redactor = Redactor::default();
+        let url = message.url.map(|url| redactor.url(&url));
+        let frame = frame.map(|frame| redactor.url(frame));
+        let text = redactor.text(&cut(&message.text, SCANNED));
+        let known = |s: String| redactor.known_in_text(&s, MIN_IN_TEXT);
         self.entries.push_back(Entry {
             seq: self.seq,
             time: now_iso(),
             kind: message.kind,
-            text: cut(&message.text, TEXT_LIMIT),
+            text: cut(&text, TEXT_LIMIT),
             source: message.source,
-            url: message.url,
+            url: url.map(known),
             line: message.line,
-            frame: frame.map(str::to_owned),
+            frame: frame.map(known),
         });
     }
 
@@ -530,6 +542,140 @@ mod tests {
         let rest = read(&state, json!({}));
         assert_eq!(rest["entries"].as_array().unwrap().len(), 1);
         assert_eq!(rest["entries"][0]["text"], "fine");
+    }
+
+    /// Credentials are taken out of what the console says as they are out
+    /// of a network capture, before the text is kept: a filter can't find
+    /// them either.
+    #[test]
+    fn credentials_are_redacted() {
+        const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let state = PageCapture::default();
+        begin(&state, 0.0);
+        observe(
+            &state,
+            &log(
+                &[
+                    json!("fetching"),
+                    json!("https://api.test/v1/me?access_token=hunter2hunter2&page=2"),
+                ],
+                1,
+                1.0,
+                None,
+            ),
+            None,
+        );
+        observe(
+            &state,
+            &log(&[json!(format!("session {JWT}"))], 1, 2.0, None),
+            None,
+        );
+        observe(
+            &state,
+            &log(
+                &[
+                    json!("headers"),
+                    json!({ "type": "object", "description": "Object" }),
+                ],
+                1,
+                3.0,
+                None,
+            ),
+            None,
+        );
+        observe(
+            &state,
+            &log(
+                &[json!(
+                    "Authorization: Bearer xyzzy-plugh, then {\"password\": \"open sesame\"} and Authorization: Basic dXNlcjpwYXNz"
+                )],
+                1,
+                4.0,
+                None,
+            ),
+            None,
+        );
+        observe(
+            &state,
+            &event(
+                "Runtime.exceptionThrown",
+                json!({ "timestamp": 5.0, "exceptionDetails": {
+                    "executionContextId": 1, "text": "Uncaught",
+                    "url": format!("https://x.test/app.js?sig=abc123def456"),
+                    "lineNumber": 4,
+                    "exception": { "description": format!(
+                        "Error: 401 for /api/{JWT}/items\n    at load (https://x.test/app.js?sig=abc123def456:5:3)"
+                    ) },
+                } }),
+                None,
+            ),
+            None,
+        );
+        observe(
+            &state,
+            &event(
+                "Log.entryAdded",
+                json!({ "entry": { "level": "error", "source": "network",
+                    "text": "Failed to load resource: https://x.test/reset?token=s3cr3t-reset-token",
+                    "url": "https://x.test/reset?token=s3cr3t-reset-token",
+                    "timestamp": 6.0 } }),
+                None,
+            ),
+            None,
+        );
+
+        // Nothing to find by filtering for it.
+        for secret in [
+            "hunter2",
+            "xyzzy",
+            "sesame",
+            "dXNlcjpwYXNz",
+            "s3cr3t",
+            "abc123",
+        ] {
+            let found = read(&state, json!({ "filter": secret, "clear": false }));
+            assert_eq!(found["entries"], json!([]), "{secret}: {found}");
+        }
+        let all = read(&state, json!({}));
+        let all_text = all.to_string();
+        for secret in [
+            "hunter2",
+            JWT,
+            "xyzzy-plugh",
+            "open sesame",
+            "dXNlcjpwYXNz",
+            "abc123def456",
+            "s3cr3t",
+        ] {
+            assert!(!all_text.contains(secret), "{secret} in {all}");
+        }
+        let texts: Vec<&str> = all["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "fetching https://api.test/v1/me?access_token=[redacted]&page=2",
+                "session [redacted]",
+                "headers Object",
+                "Authorization: Bearer [redacted], then {\"password\": \"[redacted]\"} and \
+                 Authorization: Basic [redacted]",
+                "Error: 401 for /api/[redacted]/items\n    at load \
+                 (https://x.test/app.js?sig=[redacted])",
+                "Failed to load resource: https://x.test/reset?token=[redacted]",
+            ]
+        );
+        assert_eq!(
+            all["entries"][4]["url"],
+            "https://x.test/app.js?sig=[redacted]"
+        );
+        assert_eq!(
+            all["entries"][5]["url"],
+            "https://x.test/reset?token=[redacted]"
+        );
     }
 
     #[test]

@@ -185,6 +185,147 @@ fn words(name: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Whether `c` belongs to a word of free text ([`Redactor::text`]): words
+/// stop at spaces, quotes, brackets and what separates a key from its
+/// value or fields from each other. `/`, `+`, `.`, `-`, `_`, `~` and `%`
+/// are in words: tokens are made of them.
+fn is_word_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | ','
+                | ';'
+                | ':'
+                | '='
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '?'
+                | '&'
+                | '#'
+                | '|'
+                | '\\'
+        )
+}
+
+/// Where the next address (`scheme://…`) in free text starts and ends: at
+/// a space, a quote or a bracket, without a sentence's punctuation after
+/// it.
+fn next_address(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(found) = text[from..].find("://") {
+        let at = from + found;
+        from = at + 3;
+        let mut start = at;
+        while start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[start - 1], b'+' | b'-' | b'.'))
+        {
+            start -= 1;
+        }
+        // A scheme starts with a letter.
+        while start < at && !bytes[start].is_ascii_alphabetic() {
+            start += 1;
+        }
+        if start == at {
+            continue;
+        }
+        let mut end = text[at..]
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '{' | '}' | '\\'
+                    )
+            })
+            .map_or(text.len(), |n| at + n);
+        while end > at + 3 && text[..end].ends_with(['.', ',', ';', ':', '!', '?']) {
+            end -= 1;
+        }
+        return Some((start, end));
+    }
+    None
+}
+
+/// The value given to a key that ends at `end` in free text: after a `:`
+/// or `=` (quotes and spaces around them allowed, JSON's escaped quotes
+/// too), up to its closing quote if quoted, else up to a space or the
+/// next field. `None` when nothing is given (`token expired`).
+fn value_after(text: &str, end: usize) -> Option<(usize, usize, bool)> {
+    let quote = |c: char| matches!(c, '"' | '\'' | '`');
+    let mut rest = &text[end..];
+    // The key's closing quote (`"token": …`, `\"token\": …`).
+    rest = rest.strip_prefix('\\').unwrap_or(rest);
+    rest = rest.strip_prefix(quote).unwrap_or(rest);
+    rest = rest.trim_start_matches([' ', '\t']);
+    rest = rest.strip_prefix([':', '='])?;
+    rest = rest.trim_start_matches([' ', '\t']);
+    let escaped = rest.starts_with('\\');
+    let unescaped = rest.strip_prefix('\\').unwrap_or(rest);
+    if let Some(q) = unescaped.chars().next().filter(|&c| quote(c)) {
+        let inner = &unescaped[1..];
+        let start = text.len() - inner.len();
+        let mut length = inner.find([q, '\n']).unwrap_or(inner.len());
+        if escaped && inner[..length].ends_with('\\') {
+            length -= 1;
+        }
+        return (length > 0).then_some((start, start + length, true));
+    }
+    let start = text.len() - rest.len();
+    let length = credential_length(rest);
+    (length > 0).then_some((start, start + length, false))
+}
+
+/// How long the credential `text` starts with is: up to a space, a quote,
+/// or what ends a field or a bracket.
+fn credential_length(text: &str) -> usize {
+    text.find(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '`' | ',' | ';' | '&' | '#' | ')' | '}' | ']' | '<' | '>' | '\\'
+            )
+    })
+    .unwrap_or(text.len())
+}
+
+/// An authorization's value (`start..stop` in `text`) without its scheme
+/// (`Basic …`, `Bearer …`), as an `Authorization` header is redacted: the
+/// scheme says what kind it is and is no secret. Unquoted, the credential
+/// is the word after the scheme.
+fn credential_after_scheme(text: &str, start: usize, stop: usize, quoted: bool) -> (usize, usize) {
+    let value = &text[start..stop];
+    let is_scheme = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic());
+    if quoted {
+        if let Some(space) = value.find([' ', '\t'])
+            && is_scheme(&value[..space])
+        {
+            let credential = value[space..].trim_start_matches([' ', '\t']);
+            if !credential.is_empty() {
+                return (stop - credential.len(), stop);
+            }
+        }
+        return (start, stop);
+    }
+    if is_scheme(value) {
+        let after = &text[stop..];
+        let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
+        let length = credential_length(&after[gap..]);
+        if gap > 0 && length > 0 {
+            return (stop + gap, stop + gap + length);
+        }
+    }
+    (start, stop)
+}
+
 /// Whether a path segment (decoded) looks like a token rather than a name:
 /// a JWT, a long hex string, or a long mix of letters and digits as base64
 /// is made of. UUIDs (identifiers, not secrets), slugs and template
@@ -600,6 +741,101 @@ impl Redactor {
         }
         out.push(pieces[pieces.len() - 1].to_owned());
         Some(out.join(&delimiter))
+    }
+
+    // -- free text: console messages -----------------------------------------
+
+    /// Free text (a console message, an uncaught error and its stack) with
+    /// what is secret in it taken out, by the rules a capture's requests
+    /// go through: addresses as [`Redactor::url`] takes them apart; the
+    /// value after a secret-named key ([`is_secret_name`]: `token=…`,
+    /// `"password": "…"`, `Authorization: Basic …`, the scheme kept); the
+    /// credential after `Bearer`; words that [`looks_like_token`] (judged
+    /// segment by segment when they have a `/`, as a path is); then every
+    /// value so taken out, wherever else in the text it shows up.
+    pub(super) fn text(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some((start, end)) = next_address(rest) {
+            out.push_str(&self.prose(&rest[..start]));
+            out.push_str(&self.url(&rest[start..end]));
+            rest = &rest[end..];
+        }
+        out.push_str(&self.prose(rest));
+        self.known_in_text(&out, MIN_IN_TEXT)
+    }
+
+    /// Text without addresses in it: see [`Redactor::text`].
+    fn prose(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while let Some(c) = text[i..].chars().next() {
+            if !is_word_char(c) {
+                out.push(c);
+                i += c.len_utf8();
+                continue;
+            }
+            let end = text[i..]
+                .find(|c| !is_word_char(c))
+                .map_or(text.len(), |n| i + n);
+            let word = &text[i..end];
+            let secret = if is_secret_name(word) {
+                value_after(text, end).map(|(start, stop, quoted)| {
+                    if mentions_auth(&word.to_ascii_lowercase()) {
+                        credential_after_scheme(text, start, stop, quoted)
+                    } else {
+                        (start, stop)
+                    }
+                })
+            } else if word.eq_ignore_ascii_case("bearer") {
+                let after = &text[end..];
+                let gap = after.len() - after.trim_start_matches([' ', '\t']).len();
+                let length = credential_length(&after[gap..]);
+                (gap > 0 && length > 0).then_some((end + gap, end + gap + length))
+            } else {
+                None
+            };
+            if let Some((start, stop)) = secret {
+                self.learn(&text[start..stop], Some(word));
+                out.push_str(&text[i..start]);
+                out.push_str(REDACTED);
+                i = stop;
+                continue;
+            }
+            // A sentence's full stop isn't part of a token.
+            let core = word.trim_end_matches('.');
+            if core.contains('/') {
+                out.push_str(&self.path(core));
+                out.push_str(&word[core.len()..]);
+                i = end;
+                continue;
+            }
+            let decoded = percent_decode_strict(core);
+            if looks_like_token(decoded.as_deref().unwrap_or(core)) {
+                // Base64's padding, which the words stop at.
+                let mut stop = end;
+                if core.len() == word.len() {
+                    let pad = text[end..].bytes().take_while(|&b| b == b'=').count();
+                    if pad <= 2
+                        && text[end + pad..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| !is_word_char(c))
+                    {
+                        stop += pad;
+                    }
+                }
+                let token_end = if stop > end { stop } else { i + core.len() };
+                self.learn(&text[i..token_end], None);
+                out.push_str(REDACTED);
+                out.push_str(&word[core.len()..]);
+                i = stop;
+                continue;
+            }
+            out.push_str(word);
+            i = end;
+        }
+        out
     }
 
     // -- the second pass: what was learned, wherever it shows up -------------
@@ -1021,6 +1257,54 @@ mod tests {
         assert!(!looks_like_token("has spaces in it 1234567890 AB"));
         // Lower case only and shorter than 32: an identifier more likely.
         assert!(!looks_like_token("abcdefghijklm1234567890x"));
+    }
+
+    #[test]
+    fn free_text() {
+        let text = |s: &str| Redactor::default().text(s);
+        // What a console says is kept when nothing in it is a credential.
+        for plain in [
+            "Loaded 3 items in 120ms",
+            "TypeError: Cannot read properties of undefined (reading 'map')",
+            "status_code: 404, error_code=E_GONE",
+            "user 123e4567-e89b-12d3-a456-426614174000 joined",
+            "at render (webpack-internal:///./src/components/HelloWorld.vue:12:5)",
+            "the token expired; ask for a new one",
+            "see https://example.test/docs/how-to-install-the-extension-now?page=2#top.",
+        ] {
+            assert_eq!(text(plain), plain);
+        }
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLXNpZ25hdHVyZQ";
+        assert_eq!(text(&format!("got {jwt}.")), "got [redacted].");
+        assert_eq!(
+            text("key aGVsbG8gd29ybGQgdGhpcyBpcyAx== ok"),
+            "key [redacted] ok"
+        );
+        assert_eq!(
+            text("token=\"abc def\" csrf: x1, apiKey = 'k'"),
+            "token=\"[redacted]\" csrf: [redacted], apiKey = '[redacted]'"
+        );
+        assert_eq!(
+            text(r#"body {\"password\":\"pw1234\",\"user\":\"ann\"}"#),
+            r#"body {\"password\":\"[redacted]\",\"user\":\"ann\"}"#
+        );
+        assert_eq!(
+            text("/api/login?access_token=abc&next=/home"),
+            "/api/login?access_token=[redacted]&next=/home"
+        );
+        assert_eq!(
+            text("\"authorization\": \"Basic dXNlcjpwYXNz\" bearer  tok_1"),
+            "\"authorization\": \"Basic [redacted]\" bearer  [redacted]"
+        );
+        // A value taken out once is taken out wherever it shows up again.
+        assert_eq!(
+            text("password=pw1234 then pw1234 again"),
+            "password=[redacted] then [redacted] again"
+        );
+        assert_eq!(
+            text("wss://u:pa55word@x.test/s?ticket=T-1 opened"),
+            "wss://u:[redacted]@x.test/s?ticket=[redacted] opened"
+        );
     }
 
     fn json_body(r: &mut Redactor, text: &str) -> Value {
