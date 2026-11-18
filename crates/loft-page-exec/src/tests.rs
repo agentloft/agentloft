@@ -39,6 +39,10 @@ impl Fake {
             "eval" => json!({"script": command["script"]}),
             "type" => json!({"element": command["ref_id"], "value": command["text"]}),
             "fill" => json!({"element": command["ref_id"], "value": command["value"]}),
+            "paste" => {
+                json!({"pasted": command["text"].as_str().unwrap_or_default().chars().count()})
+            }
+            "press" => json!({"key": command["key"]}),
             "click" => json!({"clicked": command["ref_id"], "navigated": false}),
             "screenshot" => json!({
                 "mime_type": "image/png", "width": 1, "height": 1, "scale": 1.0,
@@ -387,6 +391,51 @@ async fn page_locators_become_refs() {
         json!({"action": "eval", "script": "document.title"})
     );
     assert_eq!(calls[6], json!({"action": "snapshot"}));
+}
+
+/// Typing, inserting and pasting: `keyboard.insertText` is an input
+/// method's text (no keys), and a paste goes to the focused element, a
+/// locator's element or a selector's, with HTML when given.
+#[tokio::test]
+async fn keyboard_insert_and_paste() {
+    let (report, fake) = go("await page.keyboard.type('ab')\n\
+         await page.keyboard.insertText('one\\ntwo')\n\
+         await page.keyboard.paste('Long text\\nSecond line')\n\
+         await page.keyboard.paste({text: 'Bold', html: '<p><b>Bold</b></p>'})\n\
+         await page.locator('#body').paste('Here', {html: '<p>Here</p>'})\n\
+         await page.paste('#body', 'Again')\n\
+         return 'ok'")
+    .await;
+    assert!(!report.is_error, "{}", report.text);
+    let calls: Vec<Value> = fake.calls().into_iter().map(|(_, c)| c).collect();
+    assert_eq!(
+        calls[0],
+        json!({"action": "type", "text": "ab", "submit": false})
+    );
+    assert_eq!(
+        calls[1],
+        json!({"action": "type", "text": "one\ntwo", "submit": false, "insert": true})
+    );
+    assert_eq!(
+        calls[2],
+        json!({"action": "paste", "text": "Long text\nSecond line"})
+    );
+    assert_eq!(
+        calls[3],
+        json!({"action": "paste", "text": "Bold", "html": "<p><b>Bold</b></p>"})
+    );
+    assert_eq!(
+        calls[4],
+        json!({"action": "locate", "steps": [{"css": "#body"}], "limit": 5})
+    );
+    assert_eq!(
+        calls[5],
+        json!({"action": "paste", "ref_id": 7, "text": "Here", "html": "<p>Here</p>"})
+    );
+    assert_eq!(
+        calls[7],
+        json!({"action": "paste", "ref_id": 7, "text": "Again"})
+    );
 }
 
 #[tokio::test]

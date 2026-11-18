@@ -46,14 +46,32 @@ pub enum BrowserCommand {
         modifiers: Vec<String>,
     },
     /// Type text key by key (trusted key events) into the target, focused
-    /// first with the caret at its end, or into the focused element.
-    /// `submit` then presses Enter.
+    /// first with the caret at its end, or into the focused element; each
+    /// key waits for the page to have dealt with the one before. `submit`
+    /// then presses Enter. `insert`: no key events, the text put in as an
+    /// input method commits it, a line at a time with Enter between (a
+    /// script's `keyboard.insertText`).
     Type {
         #[serde(flatten)]
         target: Target,
         text: String,
         #[serde(default)]
         submit: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        insert: bool,
+    },
+    /// Paste text, and optionally HTML, into the target (focused first,
+    /// the caret at its end) or the focused element: a real paste, through
+    /// the browser's own clipboard (not this computer's) and paste
+    /// command, so the page gets one trusted `paste` event and a rich
+    /// editor makes its own paragraphs and formatting. `text` is the plain
+    /// form, also what is checked for afterwards.
+    Paste {
+        #[serde(flatten)]
+        target: Target,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        html: Option<String>,
     },
     /// Press a key or a shortcut on the focused element (or the target,
     /// focused first): `"Enter"`, `"Tab"`, `"Escape"`, `"ArrowDown"`,
@@ -435,6 +453,7 @@ impl BrowserCommand {
             Self::Snapshot { .. } => "snapshot",
             Self::Click { .. } => "click",
             Self::Type { .. } => "type",
+            Self::Paste { .. } => "paste",
             Self::Press { .. } => "press",
             Self::Scroll { .. } => "scroll",
             Self::Eval { .. } => "eval",
@@ -604,8 +623,34 @@ mod tests {
                     target: Target::by_ref(2),
                     text: "hi".into(),
                     submit: true,
+                    insert: false,
                 },
                 json!({"action": "type", "ref_id": 2, "text": "hi", "submit": true}),
+            ),
+            (
+                BrowserCommand::Type {
+                    target: Target::default(),
+                    text: "a\nb".into(),
+                    submit: false,
+                    insert: true,
+                },
+                json!({"action": "type", "text": "a\nb", "submit": false, "insert": true}),
+            ),
+            (
+                BrowserCommand::Paste {
+                    target: Target::by_selector("#body"),
+                    text: "One\nTwo".into(),
+                    html: None,
+                },
+                json!({"action": "paste", "selector": "#body", "text": "One\nTwo"}),
+            ),
+            (
+                BrowserCommand::Paste {
+                    target: Target::default(),
+                    text: "Bold".into(),
+                    html: Some("<p><b>Bold</b></p>".into()),
+                },
+                json!({"action": "paste", "text": "Bold", "html": "<p><b>Bold</b></p>"}),
             ),
             (
                 BrowserCommand::Press {
@@ -761,6 +806,10 @@ mod tests {
             .allowed_read_only()
         );
         assert!(!command(json!({"action": "press", "key": "Enter"})).allowed_read_only());
+        assert!(!command(json!({"action": "paste", "text": "x"})).allowed_read_only());
+        assert!(
+            !command(json!({"action": "type", "text": "x", "insert": true})).allowed_read_only()
+        );
     }
 
     #[test]
@@ -772,7 +821,8 @@ mod tests {
             BrowserCommand::Type {
                 target: Target::by_ref(1),
                 text: "x".into(),
-                submit: false
+                submit: false,
+                insert: false,
             }
         );
     }

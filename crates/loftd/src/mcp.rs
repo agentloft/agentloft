@@ -115,7 +115,8 @@ browser tab, which the user can watch and use in Agentloft. Work in a loop: insp
 Inspect with `browser_snapshot` before choosing what to do: it outlines the page, and its \
 interactive elements carry `[ref=N]`. Act with the narrowest tool that fits: `browser_navigate` \
 (a web address or a local HTML file), `browser_click`, `browser_fill` (set a field), \
-`browser_type` (keystrokes), `browser_press` (keys and shortcuts), `browser_select`, \
+`browser_type` (keystrokes, for short text), `browser_paste` (long or formatted text, as a \
+person pastes it), `browser_press` (keys and shortcuts), `browser_select`, \
 `browser_hover`, `browser_drag`, `browser_scroll`, `browser_upload`, `browser_wait_for`. Element \
 tools take a `ref` or a `selector`; pointer tools also take x/y. Use `browser_eval` only when \
 nothing else fits. Verify with a fresh snapshot or a screenshot: a click that returned proves \
@@ -221,10 +222,19 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "browser_type",
-            "Type text key by key (real key events) into an element (ref or selector; it is focused first, with the caret at the end) or, without one, into whatever has focus. Unlike browser_fill it adds to what is there; use it for search boxes with suggestions, editors and pages that react to keys. submit: press Enter afterwards.",
+            "Type text key by key (real key events) into an element (ref or selector; it is focused first, with the caret at the end) or, without one, into whatever has focus. Unlike browser_fill it adds to what is there; use it for short text where the keys matter: search boxes with suggestions, shortcuts, pages that react to each key. Each key waits for the page to have dealt with the one before (about a frame per character), so for more than a sentence or two, several paragraphs, or a rich editor, use browser_paste (adds) or browser_fill (replaces) instead. A warning in the result means the field doesn't hold all that was typed. submit: press Enter afterwards.",
             with_target(json!({
                 "text": { "type": "string" },
                 "submit": { "type": "boolean", "default": false }
+            })),
+            &["text"],
+        ),
+        tool(
+            "browser_paste",
+            "Paste text into an element (ref or selector; it is focused first, with the caret at the end) or, without one, into whatever has focus, as a person pastes: one real paste event, from the browser's own clipboard (never the user's). Rich editors (ProseMirror, Lexical, Draft and the like) make it their own paragraphs and formatting in one change, and plain fields take it at once: the way to put in long text, several paragraphs or formatted text. In the text each line break starts a new paragraph (one \\n between paragraphs; \\n\\n leaves an empty paragraph in most editors). html (optional): the same content as HTML (<p>, <b>, <a>, <ul>, …) for editors that keep formatting; text is still needed, as its plain form. It adds at the caret or replaces what is selected; to replace everything, use browser_fill. Returns pasted (characters), and a warning when the field doesn't hold the text afterwards (the page refused or changed the paste).",
+            with_target(json!({
+                "text": { "type": "string", "description": "What to paste, as plain text: one line per paragraph." },
+                "html": { "type": "string", "description": "The same content as HTML, for editors that keep formatting." }
             })),
             &["text"],
         ),
@@ -453,7 +463,7 @@ pub fn tools() -> Vec<Value> {
         // Page interaction (A)
         tool(
             "browser_fill",
-            "Set a form field as if it were typed (real text input), replacing what it holds: a text field, textarea or editor takes value; a checkbox, radio or switch takes checked; a <select> picks the option whose value or label is value. Passwords and one-time codes are reported back only as their length. submit: press Enter afterwards.",
+            "Set a form field as if it were typed (real text input), replacing what it holds: a text field, textarea or editor takes value; a checkbox, radio or switch takes checked; a <select> picks the option whose value or label is value. An editable area (a rich editor) given several lines gets them as a paste (browser_paste), so each line becomes one of the editor's own paragraphs. Passwords and one-time codes are reported back only as their length. submit: press Enter afterwards.",
             with_target(json!({
                 "value": { "type": "string" },
                 "checked": { "type": "boolean", "description": "For a checkbox, radio or switch." },
@@ -722,6 +732,11 @@ pub fn browser_command(name: &str, args: &Value) -> Option<Value> {
             typed["submit"] = json!(args.get("submit").and_then(Value::as_bool).unwrap_or(false));
             typed
         }
+        "browser_paste" => command(
+            "paste",
+            &target_args(args),
+            &["ref_id", "selector", "text", "html"],
+        ),
         "browser_press" => command(
             "press",
             &target_args(args),
@@ -1608,8 +1623,9 @@ const EXECUTE: &str = "Run a JavaScript program that drives this thread's browse
 
 /// The `script` parameter: what a script can call.
 const EXECUTE_SCRIPT: &str = "The body of an async function: await freely and `return` what you want back (a lone expression is returned by itself). In scope:
-- page: a Playwright-like page for the tab. goto, reload, goBack, goForward, url() (no await), title, content, evaluate(fn, arg) (runs in the page), locator(selector), getByRole/getByText/getByLabel/getByPlaceholder/getByAltText/getByTitle/getByTestId, element shortcuts that take a selector first (click, fill, type, press, check, uncheck, selectOption, hover, textContent, innerText, inputValue, getAttribute, isVisible, isChecked, …), $eval/$$eval, waitForSelector, waitForURL, waitForLoadState, waitForFunction, waitForTimeout, keyboard.press/type, mouse.click/move/wheel, screenshot, setViewportSize, emulateMedia, close. context.newPage() opens another tab.
-- Locators: click, dblclick, fill, clear, type, press, hover, check, uncheck, selectOption, setInputFiles, dragTo, textContent, innerText, innerHTML, inputValue, getAttribute, isVisible, isChecked, isEnabled, count, all, allTextContents, evaluate, evaluateAll, waitFor({state}), boundingBox, screenshot; narrow them with locator, getBy*, filter({hasText, visible}), first, last, nth. Selectors are CSS, text=…, role=button[name=\"Save\"] or quoted text, chained with >> (nth=0, visible=true). An action needs exactly one element and waits up to 10 s for it.
+- page: a Playwright-like page for the tab. goto, reload, goBack, goForward, url() (no await), title, content, evaluate(fn, arg) (runs in the page), locator(selector), getByRole/getByText/getByLabel/getByPlaceholder/getByAltText/getByTitle/getByTestId, element shortcuts that take a selector first (click, fill, type, press, check, uncheck, selectOption, hover, textContent, innerText, inputValue, getAttribute, isVisible, isChecked, …), $eval/$$eval, waitForSelector, waitForURL, waitForLoadState, waitForFunction, waitForTimeout, keyboard.press/type/insertText/paste, mouse.click/move/wheel, screenshot, setViewportSize, emulateMedia, close. context.newPage() opens another tab.
+- Typing: keyboard.type and locator.type send real keys, each after the page has dealt with the one before (about a frame per character), so keep them for short text. For long or formatted text paste: locator.paste(text, {html}), page.paste(selector, text, {html}) or keyboard.paste(text, {html}) into the focused element; a real paste that rich editors make their own paragraphs (one \\n per paragraph) and formatting. fill(value) replaces what a field holds (several lines into a rich editor are pasted). keyboard.insertText(text) puts text in as an input method does, without key events.
+- Locators: click, dblclick, fill, clear, type, paste, press, hover, check, uncheck, selectOption, setInputFiles, dragTo, textContent, innerText, innerHTML, inputValue, getAttribute, isVisible, isChecked, isEnabled, count, all, allTextContents, evaluate, evaluateAll, waitFor({state}), boundingBox, screenshot; narrow them with locator, getBy*, filter({hasText, visible}), first, last, nth. Selectors are CSS, text=…, role=button[name=\"Save\"] or quoted text, chained with >> (nth=0, visible=true). An action needs exactly one element and waits up to 10 s for it.
 - snapshot(): the page outline with [ref=N] handles, as browser_snapshot gives it; ref(N) is a locator for that element. Acting on refs from a fresh snapshot is usually surer than guessing selectors.
 - browse.<command>(args): any browser command with the browser_* tools' arguments (snapshot, click {ref}, type {ref, text}, press {key}, navigate {url}, wait_for, dialog, network_start, …); resolves to its JSON result or throws its error. `tab` in args runs it in another tab.
 - handoff(message): let the user do a step themselves (a sign-in, a captcha) and wait until they continue.
@@ -1735,6 +1751,14 @@ mod tests {
         );
         let typed = browser_command("browser_type", &json!({"ref": 1, "text": "hi"})).unwrap();
         assert_eq!(typed["submit"], false);
+        assert_eq!(
+            browser_command(
+                "browser_paste",
+                &json!({"selector": "#body", "text": "a", "html": "<p>a</p>"})
+            )
+            .unwrap(),
+            json!({"action": "paste", "selector": "#body", "text": "a", "html": "<p>a</p>"})
+        );
         assert!(browser_command("list_threads", &json!({})).is_none());
     }
 
@@ -1751,6 +1775,11 @@ mod tests {
             ),
             ("browser_click", json!({ "x": 10, "y": 20.5 })),
             ("browser_type", json!({ "text": "hi" })),
+            ("browser_paste", json!({ "text": "One\nTwo" })),
+            (
+                "browser_paste",
+                json!({ "ref": 2, "text": "Bold", "html": "<p><b>Bold</b></p>" }),
+            ),
             ("browser_press", json!({ "key": "Control+A", "count": 2 })),
             ("browser_scroll", json!({ "dy": 300 })),
             (

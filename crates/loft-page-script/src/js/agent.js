@@ -994,6 +994,34 @@ function loftFocus(args) {
   return { ok: true, element };
 }
 
+// The field that has focus, to check what typing or a paste left in it:
+// a fingerprint of its text (to tell whether it changed) and whether it
+// holds `args.want` (squashed). `{ok, element: null}` when the focus isn't
+// in a text field or an editable element; `shown: false` for one drawn
+// elsewhere (the hidden field code editors type into).
+function loftFocused(args) {
+  let el = deepActiveElement();
+  if (!el || el === el.ownerDocument.body || !(isTextField(el) || el.isContentEditable)) {
+    return { ok: true, element: null };
+  }
+  // The editing host: the whole editor, not the paragraph the caret is in.
+  while (el.isContentEditable && el.parentElement && el.parentElement.isContentEditable) el = el.parentElement;
+  const text = el.isContentEditable ? textOf(el) : squash(String(el.value || ''));
+  let print = 2166136261;
+  for (let i = 0; i < text.length; i++) print = Math.imul(print ^ text.charCodeAt(i), 16777619) >>> 0;
+  const r = el.getBoundingClientRect();
+  const style = styleOf(el);
+  const want = squash(String(args.want || ''));
+  return {
+    ok: true,
+    element: shortDescription(el),
+    print: print + ':' + text.length,
+    has: want ? text.includes(want) : null,
+    secret: isSecret(el),
+    shown: r.width > 4 && r.height > 4 && style.opacity !== '0' && style.visibility !== 'hidden',
+  };
+}
+
 // What `fill` has to do with the element: toggle it (`check`), pick an
 // option (`select`), or type over it (`text`, focused with its content
 // selected).
@@ -1021,7 +1049,7 @@ function loftFillKind(args) {
   }
   const focused = loftFocus({ target: { ref: refFor(el) }, select: true });
   if (!focused.ok) return focused;
-  return { ok: true, kind: 'text', element, ref: refFor(el), empty: !(el.value || textOf(el)) };
+  return { ok: true, kind: 'text', element, ref: refFor(el), empty: !(el.value || textOf(el)), editable: !!el.isContentEditable };
 }
 
 // What the field holds now, as a result may show it.

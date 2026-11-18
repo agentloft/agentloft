@@ -171,6 +171,9 @@ struct Browser {
     /// Mutes the tabs nobody here is listening to (`None`: the whole
     /// browser is muted).
     sound: Option<sound::Sound>,
+    /// Held while an agent's paste uses the browser's clipboard (its own,
+    /// not this computer's): one paste at a time (`input.rs`).
+    clipboard: tokio::sync::Mutex<()>,
 }
 
 struct Page {
@@ -726,6 +729,7 @@ impl Browser {
             drivers: automation::Drivers::default(),
             captures: capture::Captures::default(),
             sound,
+            clipboard: tokio::sync::Mutex::new(()),
         });
         tokio::spawn(browser.clone().run(events));
         // Hear about titles, and about windows pages open.

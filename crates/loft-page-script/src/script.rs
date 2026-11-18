@@ -62,6 +62,11 @@ pub enum Helper {
     FillKind,
     /// A field's value as a result may show it.
     FieldValue,
+    /// The field that has focus, to check what typing or a paste left
+    /// there: `{ok, element, print, has, secret, shown}` (`print` tells
+    /// whether its text changed, `has` whether it holds `want`), `element:
+    /// null` when no field has it.
+    Focused,
     Select,
     ScrollPoint,
     ScrollState,
@@ -87,6 +92,7 @@ impl Helper {
             Helper::Focus => "loftFocus",
             Helper::FillKind => "loftFillKind",
             Helper::FieldValue => "loftFieldValue",
+            Helper::Focused => "loftFocused",
             Helper::Select => "loftSelect",
             Helper::ScrollPoint => "loftScrollPoint",
             Helper::ScrollState => "loftScrollState",
@@ -100,7 +106,7 @@ impl Helper {
     }
 
     #[cfg(test)]
-    const ALL: [Helper; 15] = [
+    const ALL: [Helper; 16] = [
         Helper::FrameOffset,
         Helper::Snapshot,
         Helper::Click,
@@ -109,6 +115,7 @@ impl Helper {
         Helper::Focus,
         Helper::FillKind,
         Helper::FieldValue,
+        Helper::Focused,
         Helper::Select,
         Helper::ScrollPoint,
         Helper::ScrollState,

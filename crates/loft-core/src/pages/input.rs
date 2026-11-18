@@ -8,7 +8,7 @@
 //! page's `shaping` lock, so none lands while the page is pictured at
 //! another scale.
 
-use super::automation::Agent;
+use super::automation::{Agent, In};
 use super::human::{self, InputState, Point};
 use super::keys;
 use loft_page_script::{BrowserError, SCRIPT_TIMEOUT};
@@ -16,6 +16,11 @@ use loft_protocol::page_modifiers::{ALT, CONTROL, META, SHIFT};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::sync::MutexGuard;
+
+/// The longest [`Input::settle`] waits for a frame that doesn't come.
+const SETTLE_LATE: Duration = Duration::from_millis(100);
+/// How long [`Input::settle`] waits for the page to answer at all.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A key as the protocol wants it (US layout).
 #[derive(Debug, Clone, PartialEq)]
@@ -575,9 +580,12 @@ impl<'a> Input<'a> {
             params["text"] = json!(text);
             params["unmodifiedText"] = json!(text);
         }
-        if cfg!(target_os = "macos")
-            && let Some(command) = keys::mac_command(&key.key, self.modifiers)
-        {
+        let command = keys::clipboard_command(&key.key, self.modifiers).or_else(|| {
+            cfg!(target_os = "macos")
+                .then(|| keys::mac_command(&key.key, self.modifiers))
+                .flatten()
+        });
+        if let Some(command) = command {
             params["commands"] = json!([command]);
         }
         self.state.last_key = Some(Instant::now());
@@ -620,6 +628,104 @@ impl<'a> Input<'a> {
         .map(drop)
     }
 
+    /// Wait until the page has dealt with the input just sent: its next
+    /// frame, and the task after it (at most [`SETTLE_LATE`] when no frame
+    /// comes). Editors that draw what was typed a frame later, then update
+    /// their own state in a task of their own (React's effects, and most
+    /// rich editors built on a framework) lost keys that came in between:
+    /// the browser runs input before those tasks, and a later redraw put
+    /// back an older state. A person is never that quick; this keeps an
+    /// agent from being so. Errors don't count (a load in between), except
+    /// a dialog the key opened.
+    pub async fn settle(&self) -> Result<(), BrowserError> {
+        let body = format!(
+            "await new Promise((done) => {{\n  const late = setTimeout(done, {});\n  \
+             requestAnimationFrame(() => setTimeout(() => {{ clearTimeout(late); done(); }}));\n}});",
+            SETTLE_LATE.as_millis()
+        );
+        match self
+            .agent
+            .evaluate(&body, In::Helpers, SETTLE_TIMEOUT, "waiting for the page")
+            .await
+        {
+            Err(err @ (BrowserError::DialogOpen(_) | BrowserError::Closed)) => Err(err),
+            _ => Ok(()),
+        }
+    }
+
+    /// Put `text` (and `html`) on the browser's clipboard: the daemon's
+    /// headless browser has one of its own, in memory, so this computer's
+    /// clipboard is never touched. Written from the helpers' world, so the
+    /// page sees no script of ours (only, as with any copy, that the
+    /// clipboard changed). Hold [`Browser::clipboard`] around it and the
+    /// paste.
+    async fn put_on_clipboard(&self, text: &str, html: Option<&str>) -> Result<(), BrowserError> {
+        let text = serde_json::to_string(text).unwrap_or_default();
+        let html = serde_json::to_string(&html).unwrap_or_default();
+        let body = format!(
+            "const items = {{ 'text/plain': new Blob([{text}], {{ type: 'text/plain' }}) }};\n\
+             const html = {html};\n\
+             if (html !== null) items['text/html'] = new Blob([html], {{ type: 'text/html' }});\n\
+             await navigator.clipboard.write([new ClipboardItem(items)]);"
+        );
+        self.agent
+            .evaluate(
+                &body,
+                In::Helpers,
+                SCRIPT_TIMEOUT,
+                "putting the text on the browser's clipboard",
+            )
+            .await
+            .map(drop)
+    }
+
+    /// A real paste of `text` (and `html`, for editors that take
+    /// formatting) where the focus is: the text goes on the browser's
+    /// clipboard and the paste key (⌘V, Ctrl+V elsewhere) runs the
+    /// browser's own paste command. The page gets one trusted `paste`
+    /// event with both, and an editor (ProseMirror, Lexical, Draft, …)
+    /// handles it as a person's paste: its own paragraphs and formatting,
+    /// in one change. The clipboard is emptied again afterwards.
+    ///
+    /// `Ok(false)` when the browser's clipboard couldn't be written (the
+    /// caller then puts the text in as typed input).
+    pub async fn paste(&mut self, text: &str, html: Option<&str>) -> Result<bool, BrowserError> {
+        let browser = self.agent.browser.clone();
+        let _clipboard = browser.clipboard.lock().await;
+        match self.put_on_clipboard(text, html).await {
+            Ok(()) => {}
+            Err(err @ (BrowserError::DialogOpen(_) | BrowserError::Closed)) => return Err(err),
+            Err(err) => {
+                tracing::debug!(%err, "the browser's clipboard couldn't be written");
+                return Ok(false);
+            }
+        }
+        let pasted = self.press("ControlOrMeta+v").await;
+        // What was pasted isn't left for later pastes, nor for pages that
+        // may read the clipboard.
+        let _ = self.put_on_clipboard("", None).await;
+        pasted?;
+        Ok(true)
+    }
+
+    /// Text put in as an input method commits it (no key events), a line
+    /// at a time, Enter between lines: a raw line break put into an
+    /// editable element would stay a character in one paragraph instead
+    /// of making a new one.
+    pub async fn insert_lines(&mut self, text: &str) -> Result<(), BrowserError> {
+        let text = text.replace("\r\n", "\n");
+        for (n, line) in text.split(['\n', '\r']).enumerate() {
+            if n > 0 {
+                self.press("Enter").await?;
+            }
+            if !line.is_empty() {
+                self.insert_text(line).await?;
+                self.settle().await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Hold modifier keys down; what to give [`Input::release`].
     pub async fn hold(&mut self, names: &[String]) -> Result<Vec<KeyDef>, BrowserError> {
         let keys = names
@@ -654,7 +760,8 @@ impl<'a> Input<'a> {
             // A character no key types: put in as text.
             self.key_gap(None, None).await;
             self.state.last_key = Some(Instant::now());
-            return self.insert_text(&key).await;
+            self.insert_text(&key).await?;
+            return self.settle().await;
         };
         for modifier in &modifiers {
             self.key_gap(None, None).await;
@@ -674,12 +781,14 @@ impl<'a> Input<'a> {
         for modifier in modifiers.iter().rev() {
             self.key_up(modifier).await?;
         }
-        Ok(())
+        self.settle().await
     }
 
     /// Text typed key by key (Shift where needed); what no key types is
-    /// put in a character at a time. With human input, paced so that the
-    /// whole takes at most about 3 s.
+    /// put in a character at a time. Each key waits for the page to have
+    /// dealt with the one before ([`Input::settle`]); with human input,
+    /// the pauses of a person's typing come on top, shortened so that
+    /// they add at most about 3 s to the whole.
     pub async fn type_text(&mut self, text: &str) -> Result<(), BrowserError> {
         let count = text.chars().count().max(1);
         let cap = Duration::from_millis(3000) / count as u32;
@@ -711,6 +820,7 @@ impl<'a> Input<'a> {
                     self.insert_text(&c.to_string()).await?;
                 }
             }
+            self.settle().await?;
         }
         Ok(())
     }

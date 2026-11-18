@@ -160,7 +160,23 @@ mod tests {
             BrowserCommand::Type {
                 target: Target::by_ref(2),
                 text: "hi".into(),
-                submit: false
+                submit: false,
+                insert: false,
+            }
+        );
+
+        // Commands added later need no table: `paste` maps as it is.
+        let (_, cmd) = command(
+            "paste",
+            &json!({"selector": "#body", "text": "One", "html": "<p>One</p>"}),
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            BrowserCommand::Paste {
+                target: Target::by_selector("#body"),
+                text: "One".into(),
+                html: Some("<p>One</p>".into()),
             }
         );
 

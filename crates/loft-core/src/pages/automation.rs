@@ -492,9 +492,15 @@ impl Agent<'_> {
                 target,
                 text,
                 submit,
+                insert,
             } => {
                 let before = self.before_action().await;
-                let result = self.type_text(&target, &text, submit).await?;
+                let result = self.type_text(&target, &text, submit, insert).await?;
+                Ok(self.after_action(before, result).await)
+            }
+            BrowserCommand::Paste { target, text, html } => {
+                let before = self.before_action().await;
+                let result = self.paste(&target, &text, html.as_deref()).await?;
                 Ok(self.after_action(before, result).await)
             }
             BrowserCommand::Press { key, target, count } => {

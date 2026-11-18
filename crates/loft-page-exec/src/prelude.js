@@ -655,6 +655,12 @@
     pressSequentially(text, options = {}) {
       return this.type(text, options);
     }
+    // Not Playwright's: a real paste (the browser's own clipboard and paste
+    // command), the way to put long or formatted text into rich editors.
+    async paste(text, options = {}) {
+      const ref = await this._resolve(options && options.timeout);
+      return this._send('paste', { ref_id: ref, ...pasteArgs(text, options) });
+    }
     async press(key, options = {}) {
       const ref = await this._resolve(options && options.timeout);
       return this._send('press', { ref_id: ref, key: safeString(key) });
@@ -896,6 +902,16 @@
     }
   }
 
+  // `paste(text, {html})`, or `paste({text, html})`.
+  function pasteArgs(text, options) {
+    if (text !== null && typeof text === 'object' && options && !Object.keys(options).length) {
+      options = text;
+      text = text.text;
+    }
+    const html = options && options.html != null ? safeString(options.html) : undefined;
+    return { text: text == null ? '' : safeString(text), html };
+  }
+
   class Keyboard {
     constructor(page) {
       hide(this, { _page: page });
@@ -907,7 +923,11 @@
       return this._page._send('type', { text: safeString(text) });
     }
     insertText(text) {
-      return this._page._send('type', { text: safeString(text) });
+      return this._page._send('type', { text: safeString(text), insert: true });
+    }
+    // Not Playwright's: a real paste into the focused element.
+    paste(text, options = {}) {
+      return this._page._send('paste', pasteArgs(text, options));
     }
     down() {
       throw unsupported('keyboard.down()', 'press a combination instead, e.g. keyboard.press("Shift+Tab")');
@@ -1319,7 +1339,7 @@
 
   // Element shortcuts: page.<method>(selector, …) acts on the first match.
   for (const name of [
-    'click', 'dblclick', 'tap', 'fill', 'type', 'press', 'hover', 'focus', 'check', 'uncheck', 'setChecked',
+    'click', 'dblclick', 'tap', 'fill', 'type', 'paste', 'press', 'hover', 'focus', 'check', 'uncheck', 'setChecked',
     'selectOption', 'setInputFiles', 'textContent', 'innerText', 'innerHTML', 'inputValue', 'getAttribute',
     'isVisible', 'isHidden', 'isChecked', 'isEnabled', 'isDisabled', 'isEditable', 'dispatchEvent',
   ]) {

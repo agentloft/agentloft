@@ -69,6 +69,37 @@ fn needs(what: &str, target: &Target) -> Result<(), BrowserError> {
     }
 }
 
+/// What to tell the agent when the field that has focus doesn't hold what
+/// was typed or pasted (`loftFocused` before and after): the page dropped
+/// or changed some of it. Nothing for a secret field, one drawn elsewhere
+/// (a code editor's hidden field), or one that can't be read; and, unless
+/// `untouched_counts`, nothing for one whose text didn't change at all (a
+/// field that hands keys to an editor drawn elsewhere).
+fn not_kept(before: &Value, after: &Value, how: &str, untouched_counts: bool) -> Option<String> {
+    let element = after["element"].as_str()?;
+    if after["secret"] == true || after["shown"] != true || after["has"] != false {
+        return None;
+    }
+    let same_field = before["element"] == after["element"];
+    if same_field && before["print"] == after["print"] {
+        return untouched_counts.then(|| {
+            format!(
+                "{element} holds the same text as before: the page didn't take what was {how} \
+                 (it may refuse pastes; try browser_type)"
+            )
+        });
+    }
+    let instead = if how == "typed" {
+        "; for long text use browser_paste (or browser_fill to replace everything)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{element} doesn't hold all of what was {how}: the page changed or dropped some of it. \
+         Check with a snapshot{instead}"
+    ))
+}
+
 impl Agent<'_> {
     /// Run a helper where the target is: the top document, or the frame of
     /// another site its ref is in (`frames.rs`).
@@ -522,34 +553,102 @@ impl Agent<'_> {
         Ok(focused["element"].as_str().map(str::to_owned))
     }
 
+    /// The field that has focus (`loftFocused`): whether its text changed
+    /// and holds `want`. Null when that can't be read.
+    async fn focused(&self, want: Option<&str>) -> Value {
+        self.helper(Helper::Focused, json!({ "want": want }))
+            .await
+            .unwrap_or(Value::Null)
+    }
+
     /// Keystrokes into the target (or whatever has focus), adding to what
-    /// is there.
+    /// is there; `insert`: put in as an input method commits text, with
+    /// no key events.
     pub(super) async fn type_text(
         &self,
         target: &Target,
         text: &str,
         submit: bool,
+        insert: bool,
     ) -> Result<Value, BrowserError> {
         let mut input = Input::new(self).await;
         let element = self.focus_for_typing(&mut input, target).await?;
-        let done = async {
-            input.type_text(text).await?;
-            if submit {
-                input.press("Enter").await?;
+        let before = self.focused(None).await;
+        let typed = if insert {
+            input.insert_lines(text).await
+        } else {
+            input.type_text(text).await
+        };
+        if typed.is_err() {
+            input.reset().await;
+        }
+        typed?;
+        // Checked before Enter, which may send the field off and empty it.
+        let after = self.focused(Some(text)).await;
+        let mut result = json!({ "typed": text.chars().count() });
+        if let Some(element) = element {
+            result["element"] = json!(element);
+        }
+        if let Some(warning) = not_kept(&before, &after, "typed", false) {
+            result["warning"] = json!(warning);
+        }
+        if submit {
+            let pressed = input.press("Enter").await;
+            if pressed.is_err() {
+                input.reset().await;
             }
-            Ok::<(), BrowserError>(())
+            pressed?;
+            result["submitted"] = json!(true);
+        }
+        Ok(result)
+    }
+
+    /// A real paste into the target (or whatever has focus): `Input::paste`,
+    /// or the text put in as typed input when the browser's clipboard
+    /// can't be used. Checked against what the field holds afterwards.
+    pub(super) async fn paste(
+        &self,
+        target: &Target,
+        text: &str,
+        html: Option<&str>,
+    ) -> Result<Value, BrowserError> {
+        if text.is_empty() && html.is_none_or(str::is_empty) {
+            return Err(BrowserError::Action(
+                "nothing to paste: give text (and html for formatting)".into(),
+            ));
+        }
+        let mut input = Input::new(self).await;
+        let element = self.focus_for_typing(&mut input, target).await?;
+        let before = self.focused(None).await;
+        let done = async {
+            if input.paste(text, html).await? {
+                return Ok(true);
+            }
+            input.insert_lines(text).await.map(|()| false)
         }
         .await;
         if done.is_err() {
             input.reset().await;
         }
-        done?;
-        let mut result = json!({ "typed": text.chars().count() });
-        if let Some(element) = element {
+        let pasted = done?;
+        drop(input);
+        let after = self.focused(Some(text)).await;
+        let mut result = json!({ "pasted": text.chars().count() });
+        if let Some(element) = element.or_else(|| after["element"].as_str().map(str::to_owned)) {
             result["element"] = json!(element);
         }
-        if submit {
-            result["submitted"] = json!(true);
+        if pasted {
+            if html.is_some() {
+                result["html"] = json!(true);
+            }
+        } else {
+            result["note"] = json!(
+                "the browser's clipboard couldn't be used, so the text was put in as typed \
+                 input instead (no formatting)"
+            );
+        }
+        if let Some(warning) = not_kept(&before, &after, "pasted", pasted) {
+            result["warning"] = json!(warning);
         }
         Ok(result)
     }
@@ -656,13 +755,23 @@ impl Agent<'_> {
                 }
                 let text = value.unwrap_or_default();
                 // The field is focused with all it holds selected: what goes
-                // in replaces it, as a paste does.
+                // in replaces it, as a paste does. Lines for an editable
+                // element are pasted, so that its editor makes them its own
+                // paragraphs (a line break put in as text stays a character
+                // inside one).
                 let mut input = Input::new(self).await;
+                let lines = kind["editable"] == true && text.contains(['\n', '\r']);
                 let done = if text.is_empty() {
                     if kind["empty"] == true {
                         Ok(())
                     } else {
                         input.press("Delete").await
+                    }
+                } else if lines {
+                    match input.paste(&text, None).await {
+                        Ok(true) => Ok(()),
+                        Ok(false) => input.insert_lines(&text).await,
+                        Err(err) => Err(err),
                     }
                 } else {
                     input.insert_text(&text).await
@@ -1157,6 +1266,10 @@ mod tests {
 <button onclick="this.textContent = 'Clicked ' + event.isTrusted">Other button</button>
 <input aria-label="Other field">"#;
 
+    /// An editor that redraws itself after every change and handles
+    /// pastes itself (`testdata/editor.html`).
+    const EDITOR: &str = include_str!("testdata/editor.html");
+
     const CHALLENGE: &str = r#"<!doctype html><meta charset="utf-8"><title>Just a moment...</title>
 <div class="cf-turnstile" style="width: 300px; height: 65px"></div>
 <p>Verify you are human by completing the action below.</p>"#;
@@ -1176,6 +1289,8 @@ mod tests {
                     let head = String::from_utf8_lossy(&request[..n]);
                     let body = if head.starts_with("GET /challenge") {
                         CHALLENGE.to_owned()
+                    } else if head.starts_with("GET /editor") {
+                        EDITOR.to_owned()
                     } else if head.starts_with("GET /other") {
                         OTHER.to_owned()
                     } else {
@@ -1580,6 +1695,120 @@ mod tests {
         assert_eq!(
             eval("document.querySelector('#search').value").await,
             json!("abcde")
+        );
+
+        // Rich text: typing, pasting and filling an editor that redraws
+        // itself a frame and a task after every change.
+        drive(json!({ "action": "navigate", "url": format!("{base}/editor") }))
+            .await
+            .unwrap();
+        let paragraphs = async || eval("window.paragraphs()").await;
+        // Long text typed key by key: every character arrives, with no
+        // key landing between two of the editor's redraws.
+        let long: Vec<String> = (1..=3)
+            .map(|n| {
+                let words: Vec<String> = (0..25).map(|i| format!("w{n}x{i}")).collect();
+                format!("Paragraph {n}: {} isn't it, every turn.", words.join(" "))
+            })
+            .collect();
+        let started = Instant::now();
+        let typed = drive(json!({ "action": "type", "selector": "#ed", "text": long.join("\n") }))
+            .await
+            .unwrap();
+        let took = started.elapsed();
+        assert!(typed.get("warning").is_none(), "{typed}");
+        assert_eq!(paragraphs().await, json!(long), "typed in {took:?}");
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        // The same with a person's pauses.
+        drive(json!({ "action": "fill", "selector": "#ed", "value": "" }))
+            .await
+            .unwrap();
+        run(
+            json!({ "action": "type", "selector": "#ed", "text": long[0] }),
+            &human,
+        )
+        .await
+        .unwrap();
+        assert_eq!(paragraphs().await, json!([long[0]]));
+
+        // A paste: one trusted paste event, which the editor makes into
+        // its own paragraphs; then HTML, which it reads as such.
+        drive(json!({ "action": "fill", "selector": "#ed", "value": "" }))
+            .await
+            .unwrap();
+        let pasted = drive(json!({
+            "action": "paste",
+            "selector": "#ed",
+            "text": "First line\nSecond line",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(pasted["pasted"], 22, "{pasted}");
+        assert!(pasted.get("warning").is_none(), "{pasted}");
+        assert_eq!(paragraphs().await, json!(["First line", "Second line"]));
+        let pasted = drive(json!({
+            "action": "paste",
+            "text": "Bold. More",
+            "html": "<p><b>Bold</b>.</p><p>More</p>",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(pasted["html"], true, "{pasted}");
+        assert_eq!(
+            paragraphs().await,
+            json!(["First line", "Second lineBold.", "More"])
+        );
+        assert_eq!(
+            eval("window.pastes.map((p) => [p.trusted, p.html])").await,
+            json!([[true, false], [true, true]])
+        );
+        // Fill replaces it all; its lines become paragraphs too (pasted),
+        // not line breaks inside one.
+        let filled =
+            drive(json!({ "action": "fill", "selector": "#ed", "value": "One\nTwo\nThree" }))
+                .await
+                .unwrap();
+        assert!(filled.get("warning").is_none(), "{filled}");
+        assert_eq!(paragraphs().await, json!(["One", "Two", "Three"]));
+        // A field the browser pastes into itself.
+        drive(json!({ "action": "paste", "selector": "#notes", "text": "a\nb" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            eval("document.querySelector('#notes').value").await,
+            json!("a\nb")
+        );
+        // The clipboard was emptied after: pasting again adds nothing.
+        drive(json!({ "action": "press", "key": "ControlOrMeta+v" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            eval("document.querySelector('#notes').value").await,
+            json!("a\nb")
+        );
+        // A field that refuses pastes: said so.
+        let refused = drive(json!({ "action": "paste", "selector": "#nopaste", "text": "1234" }))
+            .await
+            .unwrap();
+        assert!(
+            refused["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("didn't take")),
+            "{refused}"
+        );
+        // `insert`: an input method's text, a line at a time.
+        drive(json!({ "action": "fill", "selector": "#ed", "value": "" }))
+            .await
+            .unwrap();
+        drive(
+            json!({ "action": "type", "selector": "#ed", "text": "Héllo\nwörld", "insert": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paragraphs().await, json!(["Héllo", "wörld"]));
+        assert_eq!(
+            eval("Object.keys(window).some((k) => /loft/i.test(k))").await,
+            json!(false)
         );
 
         // A bot check: said so, with what to do about it.

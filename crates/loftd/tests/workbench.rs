@@ -1825,6 +1825,100 @@ async fn live_a_script_drives_the_daemons_browser() {
     env.daemon.shutdown().await;
 }
 
+/// A script types, inserts and pastes into a rich editor that redraws
+/// itself after every change (`loft-core`'s `pages/testdata/editor.html`):
+/// paragraphs typed with `keyboard.type` and Enter all arrive whole, and
+/// pastes become the editor's own paragraphs. Needs Chrome:
+/// `cargo test -p loftd --test workbench live -- --ignored`.
+#[tokio::test]
+#[ignore = "starts a real browser"]
+async fn live_a_script_types_and_pastes_into_an_editor() {
+    use tokio::io::AsyncReadExt as _;
+    const EDITOR: &str = include_str!("../../loft-core/src/pages/testdata/editor.html");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{EDITOR}",
+                    EDITOR.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    let env = setup().await;
+    let thread = fake_thread(&env).await;
+    let mut bridge = Bridge::start(&env.paths, &thread.id).await;
+
+    let script = format!(
+        r#"
+        await page.goto({base:?})
+        await page.locator('#ed').click()
+        const paras = []
+        for (let n = 1; n <= 5; n++) {{
+          const words = Array.from({{ length: 20 }}, (_, i) => `w${{n}}x${{i}}`).join(' ')
+          paras.push(`Paragraph ${{n}}: ${{words}} isn’t it — every turn.`)
+        }}
+        for (const p of paras) {{
+          await page.keyboard.type(p)
+          await page.keyboard.press('Enter')
+        }}
+        const typed = await page.evaluate(() => window.paragraphs())
+        await page.fill('#ed', '')
+        await page.keyboard.insertText('Héllo\nwörld')
+        const inserted = await page.evaluate(() => window.paragraphs())
+        await page.fill('#ed', '')
+        const pasted = await page.locator('#ed').paste('One\nTwo')
+        await page.keyboard.paste({{ text: 'Three', html: '<p>Three</p><p>Four</p>' }})
+        await page.paste('#notes', 'a\nb')
+        return {{
+          paras, typed, inserted, pasted,
+          after: await page.evaluate(() => window.paragraphs()),
+          notes: await page.inputValue('#notes'),
+          events: await page.evaluate(() => window.pastes.map((p) => [p.trusted, p.html])),
+        }}
+        "#
+    );
+    let result = bridge
+        .tool(
+            "browser_execute",
+            serde_json::json!({ "script": script, "timeout_ms": 120000 }),
+        )
+        .await;
+    assert_eq!(result["isError"], false, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(text.split("\n\n").nth(1).unwrap()).unwrap();
+    // Every character of every paragraph, and the empty one Enter left.
+    let mut want = value["paras"].as_array().unwrap().clone();
+    want.push(serde_json::json!(""));
+    assert_eq!(value["typed"], serde_json::Value::Array(want), "{text}");
+    assert_eq!(
+        value["inserted"],
+        serde_json::json!(["Héllo", "wörld"]),
+        "{text}"
+    );
+    assert_eq!(value["pasted"]["pasted"], 7, "{text}");
+    assert_eq!(
+        value["after"],
+        serde_json::json!(["One", "TwoThree", "Four"]),
+        "{text}"
+    );
+    assert_eq!(value["notes"], "a\nb", "{text}");
+    assert_eq!(
+        value["events"],
+        serde_json::json!([[true, false], [true, true]]),
+        "{text}"
+    );
+
+    bridge.stop().await;
+    env.daemon.shutdown().await;
+}
+
 /// The last text of a tool's result: the tab it ran in.
 fn tab_line(result: &serde_json::Value) -> String {
     result["content"]

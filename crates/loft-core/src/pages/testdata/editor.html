@@ -1,0 +1,83 @@
+<!doctype html><meta charset="utf-8"><title>Editor</title>
+<style>#ed{min-height:120px;border:1px solid #888;padding:4px}#ed p{margin:0 0 4px}</style>
+<!-- A test page for agents' typing, pasting and filling (live tests in
+     loft-core's pages::interact and loftd's workbench). -->
+<div id="ed" contenteditable="true" role="textbox" aria-label="Body" aria-multiline="true"><p><br></p></div>
+<textarea id="notes" aria-label="Notes"></textarea>
+<input id="nopaste" aria-label="Code" onpaste="return false">
+<script>
+  // An editor that keeps its own model of the text and draws the field from
+  // it after every change: on the next frame, then in a task of its own (as
+  // editors built on a UI framework do, React's effects among them),
+  // putting the caret back where its model says. Keys that come in between
+  // two of those redraws are lost, as they would be on such a site; a
+  // person never types that fast. It handles pastes itself, as Lexical
+  // does: one paragraph per line of plain text, or the HTML's paragraphs.
+  (() => {
+    const ed = document.getElementById('ed');
+    window.pastes = [];
+    window.paragraphs = () => [...ed.children].map((p) => p.textContent);
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const paras = () => [...ed.children].map((p) => p.textContent);
+    // Where a boundary of the selection is: [paragraph, offset].
+    const point = (node, offset) => {
+      const blocks = [...ed.children];
+      const block = blocks.findIndex((p) => p === node || p.contains(node));
+      if (block < 0) return node === ed ? [Math.min(offset, blocks.length - 1), 0] : null;
+      const pre = document.createRange();
+      pre.selectNodeContents(blocks[block]);
+      pre.setEnd(node, offset);
+      return [block, pre.toString().length];
+    };
+    const span = () => {
+      const sel = getSelection();
+      if (!sel.rangeCount) return null;
+      const r = sel.getRangeAt(0);
+      const start = point(r.startContainer, r.startOffset);
+      const end = r.collapsed ? start : point(r.endContainer, r.endOffset);
+      if (r.endContainer === ed && r.endOffset === ed.children.length) {
+        const last = ed.children.length - 1;
+        return start && [start, [last, ed.children[last].textContent.length]];
+      }
+      return start && end && [start, end];
+    };
+    const caret = () => { const s = span(); return s && s[0]; };
+    const draw = (model) => {
+      ed.innerHTML = model.paras.map((p) => `<p>${esc(p) || '<br>'}</p>`).join('');
+      if (!model.caret) return;
+      const [b, offset] = model.caret;
+      const p = ed.children[Math.min(b, ed.children.length - 1)];
+      const node = p.firstChild && p.firstChild.nodeType === 3 ? p.firstChild : p;
+      getSelection().collapse(node, node === p ? 0 : Math.min(offset, node.length));
+    };
+    ed.addEventListener('input', () => {
+      const model = { paras: paras(), caret: caret() };
+      requestAnimationFrame(() => setTimeout(() => draw(model)));
+    });
+    ed.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const html = e.clipboardData.getData('text/html');
+      const text = e.clipboardData.getData('text/plain');
+      window.pastes.push({ trusted: e.isTrusted, html: !!html, text });
+      let lines;
+      if (html) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        lines = [...doc.body.querySelectorAll('p, li, h1, h2, h3')].map((p) => p.textContent);
+        if (!lines.length) lines = [doc.body.textContent];
+      } else {
+        lines = text.split(/\r?\n/);
+      }
+      const all = paras();
+      const [from, to] = span() || [[all.length - 1, Infinity], [all.length - 1, Infinity]];
+      const head = all[from[0]].slice(0, from[1]);
+      const tail = all[to[0]].slice(to[1]);
+      const added = lines.slice();
+      added[0] = head + added[0];
+      const last = added.length - 1;
+      const end = [from[0] + last, added[last].length];
+      added[last] += tail;
+      all.splice(from[0], to[0] - from[0] + 1, ...added);
+      draw({ paras: all, caret: end });
+    });
+  })();
+</script>

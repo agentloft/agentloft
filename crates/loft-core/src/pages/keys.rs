@@ -98,6 +98,30 @@ pub fn mac_command(key: &str, modifiers: u8) -> Option<&'static str> {
     })
 }
 
+/// The clipboard command an agent's key chord stands for: ⌘C, ⌘X, ⌘V on a
+/// Mac, Ctrl+C, Ctrl+X, Ctrl+V elsewhere. They act on the daemon's
+/// browser's own clipboard, so they are an agent's only: a viewer's copy
+/// and paste go through the viewer's clipboard instead ([`mac_command`]
+/// leaves them out).
+pub fn clipboard_command(key: &str, modifiers: u8) -> Option<&'static str> {
+    let primary = if cfg!(target_os = "macos") {
+        META
+    } else {
+        CONTROL
+    };
+    if modifiers & (ALT | CONTROL | META) != primary {
+        return None;
+    }
+    Some(
+        match (key.to_ascii_lowercase().as_str(), modifiers & SHIFT != 0) {
+            ("c", false) => "copy",
+            ("x", false) => "cut",
+            ("v", false) => "paste",
+            _ => return None,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +152,22 @@ mod tests {
         assert_eq!(mac_command("a", 0), None);
         assert_eq!(mac_command("c", META), None);
         assert_eq!(mac_command("v", META), None);
+    }
+
+    #[test]
+    fn clipboard_commands() {
+        let primary = if cfg!(target_os = "macos") {
+            META
+        } else {
+            CONTROL
+        };
+        assert_eq!(clipboard_command("v", primary), Some("paste"));
+        assert_eq!(clipboard_command("V", primary), Some("paste"));
+        assert_eq!(clipboard_command("c", primary), Some("copy"));
+        assert_eq!(clipboard_command("x", primary), Some("cut"));
+        assert_eq!(clipboard_command("v", 0), None);
+        assert_eq!(clipboard_command("v", primary | ALT), None);
+        assert_eq!(clipboard_command("v", primary | SHIFT), None);
+        assert_eq!(clipboard_command("a", primary), None);
     }
 }
