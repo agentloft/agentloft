@@ -4,10 +4,12 @@
 //! it or an agent uses it, numbering its pictures for viewers as the
 //! browser's pages do (`BusMsg::DeviceFrame`, newest picture only).
 //!
-//! Each platform is a [`Backend`] (`ios.rs`, `android.rs`); `fake.rs` is a
-//! phone that needs neither, for tests and for trying the panel.
+//! Each kind of device is a [`Backend`] (`ios.rs`, `android/` for emulators,
+//! `android_phone.rs` for phones over adb); `fake.rs` is a phone that needs
+//! none, for tests and for trying the panel.
 
 pub mod android;
+pub mod android_phone;
 pub mod backend;
 pub mod fake;
 pub mod ios;
@@ -39,7 +41,12 @@ type Result<T> = std::result::Result<T, ErrorBody>;
 /// The backends a real daemon uses on this computer.
 pub fn system_backends(env: &HashMap<String, String>) -> Vec<Arc<dyn Backend>> {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut backends: Vec<Arc<dyn Backend>> = vec![Arc::new(android::AndroidBackend::new(env))];
+    let mut backends: Vec<Arc<dyn Backend>> = vec![
+        // Phones first: when neither has anything to show, the emulators'
+        // advice (what to install) is the one the panel gives.
+        Arc::new(android_phone::PhoneBackend::new(env)),
+        Arc::new(android::AndroidBackend::new(env)),
+    ];
     // iOS simulators: their screens come through a helper process, the
     // daemon's own executable (`agentloftd simulator`).
     // `AGENTLOFT_SIMULATOR_SET`: another device set than the user's

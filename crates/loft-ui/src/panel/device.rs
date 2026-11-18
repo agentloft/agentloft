@@ -996,6 +996,8 @@ impl DeviceView {
                 .on_click(cx.listener(move |this, _, _, cx| this.press(b, cx)))
         };
         let dark = self.dark;
+        // A phone is turned off on the phone, not from here.
+        let physical = device.as_ref().is_some_and(|d| d.physical);
         h_flex()
             .h(px(TOOLBAR_HEIGHT))
             .flex_shrink_0()
@@ -1071,13 +1073,17 @@ impl DeviceView {
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DeviceEvent::Float))),
                 )
-                .child(
-                    tool("device-power", IconName::Power, "Shut down")
-                        .disabled(!running)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.confirm_shutdown(window, cx)),
-                        ),
-                )
+                .when(!physical, |bar| {
+                    bar.child(
+                        tool("device-power", IconName::Power, "Shut down")
+                            .disabled(!running)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.confirm_shutdown(window, cx)
+                                }),
+                            ),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -1251,7 +1257,9 @@ impl DeviceView {
                     .cursor_pointer()
                     .small()
                     .icon(IconName::Play)
-                    .label("Start")
+                    // A phone isn't started: it waits to be allowed (its
+                    // error says how), then is looked for again.
+                    .label(if d.physical { "Try again" } else { "Start" })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.choose(Some(boot_id.clone()), true, cx);
