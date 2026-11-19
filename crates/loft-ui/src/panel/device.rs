@@ -504,10 +504,7 @@ impl DeviceView {
             if let Some((old_sub, old_seq, _, _)) =
                 self.waiting.replace((sub_id, seq, jpeg, on_cover))
             {
-                cx.spawn(async move |this, cx| {
-                    let _ = this.update(cx, |this, cx| this.ack(old_sub, old_seq, cx));
-                })
-                .detach();
+                self.ack(old_sub, old_seq, cx);
             }
             return;
         }
@@ -534,10 +531,16 @@ impl DeviceView {
         .detach();
     }
 
+    /// Tell the daemon a picture is done with. `on_frame` runs inside the
+    /// store's update (it hands the picture in), where reading the store
+    /// aborts the app, so the store is read once that update is over.
     fn ack(&self, sub_id: u64, seq: u64, cx: &mut Context<Self>) {
-        if let Some(client) = self.store.read(cx).client() {
-            client.ack_page_frame(sub_id, seq);
-        }
+        let store = self.store.clone();
+        cx.defer(move |cx| {
+            if let Some(client) = store.read(cx).client() {
+                client.ack_page_frame(sub_id, seq);
+            }
+        });
     }
 
     /// Free the old picture's texture; each one is a new image to GPUI.
