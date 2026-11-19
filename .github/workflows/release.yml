@@ -258,15 +258,21 @@ jobs:
           $innoDir = Join-Path $env:RUNNER_TEMP 'InnoSetup'
           $install = Start-Process -FilePath $innoSetup -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$innoDir"
           if ($install.ExitCode -ne 0) { throw "Inno Setup's installer failed ($($install.ExitCode))" }
-          # Where it went (a copy already on the runner is updated in place),
-          # and that it is the version checked above.
-          $iscc = @("$innoDir\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $iscc) { throw "ISCC.exe isn't where Inno Setup was installed" }
-          $isccInfo = (Get-Item $iscc).VersionInfo
-          $isccVersion = [string]($isccInfo.ProductVersion ?? $isccInfo.FileVersion)
-          if (-not $isccVersion.StartsWith($innoVersion)) {
-            throw "$iscc is Inno Setup $isccVersion, expected $innoVersion"
+          # Where it went (a copy already on the runner is updated in place)
+          # and which version is there now, from the uninstall entry the
+          # installer writes. ISCC.exe has no version resource of its own
+          # (it reads 0.0.0.0).
+          $entry = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1'
+          ) | Where-Object { Test-Path $_ } | ForEach-Object { Get-ItemProperty $_ } | Select-Object -First 1
+          if (-not $entry) { throw "Inno Setup's installer left no uninstall entry" }
+          if (-not ([string]$entry.DisplayVersion).StartsWith($innoVersion)) {
+            throw "Inno Setup $($entry.DisplayVersion) is installed, expected $innoVersion"
           }
+          $iscc = Join-Path $entry.InstallLocation 'ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe isn't in $($entry.InstallLocation)" }
           # [workspace.package] version in Cargo.toml.
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           & $iscc "/DAppVersion=$version" "/DSourceDir=$PWD\dist\Agentloft" "/DOutputDir=$PWD\dist" packaging/windows/agentloft.iss
