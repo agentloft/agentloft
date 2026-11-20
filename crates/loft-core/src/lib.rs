@@ -2100,6 +2100,10 @@ impl Core {
                 before,
                 after,
             } => self.voice_cleanup(transcript, before, after).await,
+            Request::VoiceLiveStart { language } => self.voice_live_start(language).await,
+            Request::VoiceLiveFeed { id, audio } => self.voice_live_feed(id, audio.0).await,
+            Request::VoiceLiveFinish { id, audio } => self.voice_live_finish(id, audio.0).await,
+            Request::VoiceLiveCancel { id } => self.voice_live_cancel(id).await,
         }
     }
 

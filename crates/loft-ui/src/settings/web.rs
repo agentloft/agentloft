@@ -42,14 +42,14 @@ pub(super) fn heading(title: &str, detail: &str, p: &Palette) -> AnyElement {
             div()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(title.to_owned()),
+                .child(super::selectable(title.to_owned())),
         )
         .when(!detail.is_empty(), |d| {
             d.child(
                 div()
                     .text_xs()
                     .text_color(p.muted_foreground)
-                    .child(detail.to_owned()),
+                    .child(super::selectable(detail.to_owned())),
             )
         })
         .into_any_element()

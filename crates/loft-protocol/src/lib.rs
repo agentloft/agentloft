@@ -925,6 +925,27 @@ pub enum Request {
     },
     /// Unload every model now (`Response::Voice`).
     VoiceUnload,
+    /// Start transcribing while the person speaks, with `[voice] model`
+    /// (`Response::VoiceLive`; its `id` is `None` when the model doesn't
+    /// transcribe live: send the whole recording with `VoiceTranscribe`).
+    VoiceLiveStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
+    /// The recording since the last piece sent (16 kHz mono 16-bit
+    /// little-endian); answers the text so far (`Response::VoiceLive`).
+    VoiceLiveFeed {
+        id: u64,
+        audio: Bytes,
+    },
+    /// The rest of the recording; answers the final text (`Response::Text`).
+    VoiceLiveFinish {
+        id: u64,
+        audio: Bytes,
+    },
+    VoiceLiveCancel {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1219,6 +1240,16 @@ pub enum Response {
     },
     Voice {
         status: VoiceStatus,
+    },
+    /// A live transcription's text so far: `committed` stays, `tentative`
+    /// may still change.
+    VoiceLive {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        #[serde(default)]
+        committed: String,
+        #[serde(default)]
+        tentative: String,
     },
 }
 

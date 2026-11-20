@@ -24,6 +24,18 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(180);
 /// Five minutes of speech on a CPU, with room to spare.
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(600);
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(180);
+/// A piece of a live transcription (it is behind by at most a few).
+const LIVE_TIMEOUT: Duration = Duration::from_secs(60);
+/// While a live transcription runs, its model stays loaded at least this
+/// long after the last piece of audio, whatever `unload_after` says: the
+/// next piece is a fraction of a second away. A recording whose window
+/// went away is ended after it.
+const LIVE_GRACE: Duration = Duration::from_secs(60);
+
+fn live_grace(after: Option<Duration>) -> Option<Duration> {
+    after.map(|after| after.max(LIVE_GRACE))
+}
+
 /// Longest cleanup answer (a long transcript, tidied).
 const MAX_CLEANUP_TOKENS: usize = 4096;
 
@@ -46,6 +58,10 @@ struct Inner {
     store: Arc<Store>,
     speech: Arc<Slot>,
     text: Arc<Slot>,
+    /// The live transcription running in the speech engine: its id and
+    /// model.
+    live: std::sync::Mutex<Option<(u64, String)>>,
+    live_ids: AtomicU64,
 }
 
 /// One engine process, started on demand.
@@ -83,6 +99,8 @@ impl Voice {
             store,
             speech: slot("speech"),
             text: slot("cleanup"),
+            live: std::sync::Mutex::new(None),
+            live_ids: AtomicU64::new(0),
         }))
     }
 
@@ -198,23 +216,7 @@ impl Voice {
         words: Vec<String>,
         unload_after: Option<Duration>,
     ) -> Result<String> {
-        let load = if model == FAKE_MODEL && self.0.opts.fake {
-            EngineRequest::LoadSpeech {
-                path: PathBuf::new(),
-                fake: true,
-            }
-        } else {
-            let m = catalog::model(model)
-                .ok_or_else(|| anyhow!("no speech model is called `{model}`"))?;
-            let files = std::slice::from_ref(&m.file);
-            if !self.0.store.installed(m.id, files) {
-                bail!("{} isn't downloaded yet: Settings ▸ Voice", m.name);
-            }
-            EngineRequest::LoadSpeech {
-                path: self.0.store.model_dir(m.id).join(m.file.name),
-                fake: false,
-            }
-        };
+        let load = self.load_speech(model)?;
         let language = language.filter(|l| !l.is_empty() && l != "auto");
         let request = EngineRequest::Transcribe {
             pcm: Bytes(pcm),
@@ -232,6 +234,156 @@ impl Voice {
             )
             .await?;
         Ok(text.trim().to_owned())
+    }
+
+    fn load_speech(&self, model: &str) -> Result<EngineRequest> {
+        if model == FAKE_MODEL && self.0.opts.fake {
+            return Ok(EngineRequest::LoadSpeech {
+                path: PathBuf::new(),
+                fake: true,
+            });
+        }
+        let m =
+            catalog::model(model).ok_or_else(|| anyhow!("no speech model is called `{model}`"))?;
+        let files = std::slice::from_ref(&m.file);
+        if !self.0.store.installed(m.id, files) {
+            bail!("{} isn't downloaded yet: Settings ▸ Voice", m.name);
+        }
+        Ok(EngineRequest::LoadSpeech {
+            path: self.0.store.model_dir(m.id).join(m.file.name),
+            fake: false,
+        })
+    }
+
+    /// Whether `model` transcribes while the person speaks.
+    pub fn streams(&self, model: &str) -> bool {
+        (model == FAKE_MODEL && self.0.opts.fake)
+            || catalog::model(model).is_some_and(|m| m.streaming)
+    }
+
+    /// Start a live transcription with `model` (it must stream); answers
+    /// its id. One runs at a time: a new one replaces any other.
+    pub async fn live_start(
+        &self,
+        model: &str,
+        language: Option<String>,
+        words: Vec<String>,
+        unload_after: Option<Duration>,
+    ) -> Result<u64> {
+        if !self.streams(model) {
+            bail!("this model doesn't transcribe live");
+        }
+        let load = self.load_speech(model)?;
+        // One that was left running (its window went away) is dropped.
+        if self.0.live.lock().unwrap().take().is_some() {
+            let _ = self
+                .live_request(model, EngineRequest::StreamCancel, unload_after)
+                .await;
+        }
+        let language = language.filter(|l| !l.is_empty() && l != "auto");
+        let request = EngineRequest::StreamStart { language, words };
+        self.ask(
+            &self.0.speech,
+            model,
+            load,
+            request,
+            LOAD_TIMEOUT,
+            live_grace(unload_after),
+        )
+        .await?;
+        let id = self.0.live_ids.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.0.live.lock().unwrap() = Some((id, model.to_owned()));
+        Ok(id)
+    }
+
+    /// More of a live transcription's audio; answers the text so far
+    /// (committed, tentative).
+    pub async fn live_feed(
+        &self,
+        id: u64,
+        pcm: Vec<u8>,
+        unload_after: Option<Duration>,
+    ) -> Result<(String, String)> {
+        let model = self.live_model(id)?;
+        let reply = self
+            .live_request(
+                &model,
+                EngineRequest::StreamFeed { pcm: Bytes(pcm) },
+                live_grace(unload_after),
+            )
+            .await;
+        match reply {
+            Ok(EngineReply::Live {
+                committed,
+                tentative,
+            }) => Ok((committed, tentative)),
+            Ok(other) => Err(anyhow!("unexpected answer {other:?}")),
+            Err(err) => {
+                self.0.live.lock().unwrap().take();
+                Err(err)
+            }
+        }
+    }
+
+    /// The rest of a live transcription's audio; answers its final text.
+    pub async fn live_finish(
+        &self,
+        id: u64,
+        pcm: Vec<u8>,
+        unload_after: Option<Duration>,
+    ) -> Result<String> {
+        let model = self.live_model(id)?;
+        self.0.live.lock().unwrap().take();
+        match self
+            .live_request(
+                &model,
+                EngineRequest::StreamFinish { pcm: Bytes(pcm) },
+                unload_after,
+            )
+            .await?
+        {
+            EngineReply::Text { text } => Ok(text.trim().to_owned()),
+            other => Err(anyhow!("unexpected answer {other:?}")),
+        }
+    }
+
+    pub async fn live_cancel(&self, id: u64, unload_after: Option<Duration>) {
+        let Ok(model) = self.live_model(id) else {
+            return;
+        };
+        self.0.live.lock().unwrap().take();
+        let _ = self
+            .live_request(&model, EngineRequest::StreamCancel, unload_after)
+            .await;
+    }
+
+    fn live_model(&self, id: u64) -> Result<String> {
+        match &*self.0.live.lock().unwrap() {
+            Some((live, model)) if *live == id => Ok(model.clone()),
+            _ => bail!("this dictation was stopped (another one started, or the model unloaded)"),
+        }
+    }
+
+    async fn live_request(
+        &self,
+        model: &str,
+        request: EngineRequest,
+        unload_after: Option<Duration>,
+    ) -> Result<EngineReply> {
+        // The stream lives in the running engine: never start one for this.
+        if self.0.speech.loaded.lock().unwrap().as_deref() != Some(model) {
+            bail!("this dictation was stopped (the model unloaded)");
+        }
+        let load = self.load_speech(model)?;
+        self.ask(
+            &self.0.speech,
+            model,
+            load,
+            request,
+            LIVE_TIMEOUT,
+            unload_after,
+        )
+        .await
     }
 
     /// An answer from a local cleanup model.
@@ -281,6 +433,26 @@ impl Voice {
         timeout: Duration,
         unload_after: Option<Duration>,
     ) -> Result<String> {
+        match self
+            .ask(slot, model, load, request, timeout, unload_after)
+            .await?
+        {
+            EngineReply::Text { text } => Ok(text),
+            other => Err(anyhow!("unexpected answer {other:?}")),
+        }
+    }
+
+    /// Ask `slot`'s engine (started, with `load`, if it isn't running)
+    /// `request`. An error answer is an `Err`.
+    async fn ask(
+        &self,
+        slot: &Arc<Slot>,
+        model: &str,
+        load: EngineRequest,
+        request: EngineRequest,
+        timeout: Duration,
+        unload_after: Option<Duration>,
+    ) -> Result<EngineReply> {
         let (program, args) = self
             .0
             .opts
@@ -315,9 +487,8 @@ impl Voice {
                 }
                 let engine = proc.as_mut().expect("started above");
                 match tokio::time::timeout(timeout, engine.ask(&request)).await {
-                    Ok(Ok(EngineReply::Text { text })) => Ok(text),
                     Ok(Ok(EngineReply::Error { message })) => Err(anyhow!("{message}")),
-                    Ok(Ok(other)) => Err(anyhow!("unexpected answer {other:?}")),
+                    Ok(Ok(reply)) => Ok(reply),
                     Ok(Err(err)) => Err(err),
                     Err(_) => Err(anyhow!("the {} model took too long", slot.kind)),
                 }

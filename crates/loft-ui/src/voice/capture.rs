@@ -67,6 +67,13 @@ impl Recorder {
         self.lock().ended.clone()
     }
 
+    /// The samples recorded since the first `from` (for live
+    /// transcription, which sends them as they come).
+    pub fn samples_from(&self, from: usize) -> Vec<i16> {
+        let collector = self.lock();
+        collector.samples.get(from..).unwrap_or_default().to_vec()
+    }
+
     /// Stops and returns everything recorded: 16 kHz mono.
     pub fn finish(self) -> Vec<i16> {
         self.lock().finish()

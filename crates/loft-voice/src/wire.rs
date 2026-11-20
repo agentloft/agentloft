@@ -38,12 +38,41 @@ pub(crate) enum EngineRequest {
         user: String,
         max_tokens: usize,
     },
+    /// Start transcribing as audio comes (the speech model must stream).
+    /// Until `StreamFinish` or `StreamCancel`, only `StreamFeed` is taken.
+    StreamStart {
+        #[serde(default)]
+        language: Option<String>,
+        #[serde(default)]
+        words: Vec<String>,
+    },
+    /// More of the recording (16 kHz mono i16 little-endian).
+    StreamFeed {
+        pcm: Bytes,
+    },
+    /// The rest of the recording; answers the final text.
+    StreamFinish {
+        pcm: Bytes,
+    },
+    StreamCancel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub(crate) enum EngineReply {
-    Loaded { backend: String },
-    Text { text: String },
-    Error { message: String },
+    Loaded {
+        backend: String,
+    },
+    Text {
+        text: String,
+    },
+    /// The text so far while streaming: `committed` won't change,
+    /// `tentative` may.
+    Live {
+        committed: String,
+        tentative: String,
+    },
+    Error {
+        message: String,
+    },
 }

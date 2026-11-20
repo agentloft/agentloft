@@ -1175,7 +1175,7 @@ impl Render for SettingsView {
                                     .items_center()
                                     .text_base()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.section.label()),
+                                    .child(selectable(self.section.label())),
                             )
                             .children(crate::title_bar::controls(window, &p).map(|controls| {
                                 div().absolute().top_0().right_0().h_full().child(controls)
@@ -1223,6 +1223,17 @@ const PAGE_MAX: f32 = 800.;
 
 // -- building blocks --------------------------------------------------------
 
+/// Text that can be selected and copied, like any page's: plain text in a
+/// `div` takes no part in the window's selection. Its id comes from the
+/// text, so the same words keep their state from frame to frame.
+pub(crate) fn selectable(text: impl Into<SharedString>) -> gpui_kit::base::SelectableText {
+    use std::hash::{Hash as _, Hasher as _};
+    let text: SharedString = text.into();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hash);
+    gpui_kit::base::SelectableText::new(("selectable", hash.finish() as usize), text)
+}
+
 pub(super) fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> impl IntoElement {
     h_flex()
         .gap_6()
@@ -1239,13 +1250,13 @@ pub(super) fn row(label: &str, hint: &str, control: AnyElement, p: &Palette) -> 
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
-                        .child(label.to_owned()),
+                        .child(selectable(label.to_owned())),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(p.muted_foreground)
-                        .child(hint.to_owned()),
+                        .child(selectable(hint.to_owned())),
                 ),
         )
         .child(div().flex_shrink_0().child(control))

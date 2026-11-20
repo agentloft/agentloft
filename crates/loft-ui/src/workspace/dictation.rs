@@ -1,5 +1,7 @@
 //! Dictation into the composer: the microphone button (and ⇧⌘D) records,
-//! the daemon turns the recording into text (`Request::VoiceTranscribe`),
+//! the daemon turns the recording into text (as it comes with a model that
+//! transcribes live, `Request::VoiceLive*`, shown above the toolbar while
+//! recording; else all at once at the end, `Request::VoiceTranscribe`),
 //! optionally tidies it (`Request::VoiceCleanup`), and the text goes where
 //! the cursor was when recording began. Nothing is sent to the agent: the
 //! text waits in the draft like typed text.
@@ -30,6 +32,9 @@ actions!(
 const MIN_SECONDS: f32 = 0.3;
 /// How often the level meter and the clock are redrawn while recording.
 const TICK: Duration = Duration::from_millis(80);
+/// Live transcription is sent the recording in pieces at least this long
+/// (samples: a quarter of a second), one piece at a time.
+const LIVE_PIECE: usize = SAMPLE_RATE as usize / 4;
 
 pub(super) struct Dictation {
     pub(super) thread_id: ThreadId,
@@ -39,7 +44,24 @@ pub(super) struct Dictation {
     start: (String, Range<usize>),
     /// The level meter's recent readings, newest last.
     levels: Vec<f32>,
+    /// Transcription while recording, with a model that does it.
+    live: Live,
+    /// What live transcription has heard so far: text that stays, and text
+    /// that may still change.
+    heard: (String, String),
     _task: Task<()>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Live {
+    /// Asked the daemon whether the model transcribes live.
+    Asking,
+    /// It does: this transcription's id, how much of the recording was
+    /// sent, and whether a piece is on its way.
+    On { id: u64, sent: usize, sending: bool },
+    /// It doesn't (or live transcription failed): the whole recording is
+    /// sent at the end.
+    Off,
 }
 
 pub(super) enum Phase {
@@ -115,6 +137,7 @@ impl WorkspaceView {
                             d.phase = Phase::Recording(recorder);
                             d._task = task;
                         }
+                        this.ask_live(cx);
                         cx.notify();
                     }
                 }
@@ -131,6 +154,8 @@ impl WorkspaceView {
             phase: Phase::Starting,
             start,
             levels: Vec::new(),
+            live: Live::Asking,
+            heard: Default::default(),
             _task: task,
         });
         cx.notify();
@@ -159,6 +184,7 @@ impl WorkspaceView {
                         if d.levels.len() > LEVEL_BARS {
                             d.levels.remove(0);
                         }
+                        this.send_live_piece(cx);
                         cx.notify();
                         true
                     })
@@ -172,11 +198,145 @@ impl WorkspaceView {
 
     /// Esc, or the ✕ by the meter: the recording is thrown away.
     pub(super) fn cancel_dictation(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.dictation.take().is_some() {
-            cx.notify();
-            return true;
+        let Some(d) = self.dictation.take() else {
+            return false;
+        };
+        if let Live::On { id, .. } = d.live
+            && let Some(client) = self.store.read(cx).client()
+        {
+            let cancel = client.request(Request::VoiceLiveCancel { id });
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = cancel.await;
+                })
+                .detach();
         }
-        false
+        cx.notify();
+        true
+    }
+
+    /// Ask the daemon to transcribe as the recording comes, if its model
+    /// can.
+    fn ask_live(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.store.read(cx).client() else {
+            if let Some(d) = self.dictation.as_mut() {
+                d.live = Live::Off;
+            }
+            return;
+        };
+        let start = client.request(Request::VoiceLiveStart { language: None });
+        cx.spawn(async move |this, cx| {
+            let answer = start.await;
+            let id = match answer {
+                Ok(Response::VoiceLive { id: Some(id), .. }) => Some(id),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::info!("no live transcription: {}", err.message);
+                    None
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                let recording = this.dictation.as_ref().is_some_and(|d| {
+                    d.live == Live::Asking && matches!(d.phase, Phase::Recording(_))
+                });
+                if !recording {
+                    // Finished (or cancelled) meanwhile: it went all at once.
+                    if let Some(id) = id
+                        && let Some(client) = this.store.read(cx).client()
+                    {
+                        let cancel = client.request(Request::VoiceLiveCancel { id });
+                        cx.background_executor()
+                            .spawn(async move {
+                                let _ = cancel.await;
+                            })
+                            .detach();
+                    }
+                    return;
+                }
+                if let Some(d) = this.dictation.as_mut() {
+                    d.live = match id {
+                        Some(id) => Live::On {
+                            id,
+                            sent: 0,
+                            sending: false,
+                        },
+                        None => Live::Off,
+                    };
+                }
+                this.send_live_piece(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Send what was recorded since the last piece, when nothing is on its
+    /// way and there is enough of it.
+    fn send_live_piece(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.dictation.as_mut() else {
+            return;
+        };
+        let (Live::On { id, sent, sending }, Phase::Recording(recorder)) = (d.live, &d.phase)
+        else {
+            return;
+        };
+        if sending {
+            return;
+        }
+        let piece = recorder.samples_from(sent);
+        if piece.len() < LIVE_PIECE {
+            return;
+        }
+        let Some(client) = self.store.read(cx).client() else {
+            return;
+        };
+        d.live = Live::On {
+            id,
+            sent: sent + piece.len(),
+            sending: true,
+        };
+        let audio: Vec<u8> = piece.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let answer = client.request(Request::VoiceLiveFeed {
+            id,
+            audio: Bytes(audio),
+        });
+        cx.spawn(async move |this, cx| {
+            let answer = answer.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(d) = this.dictation.as_mut() else {
+                    return;
+                };
+                let Live::On { id: now, sent, .. } = d.live else {
+                    return;
+                };
+                if now != id {
+                    return;
+                }
+                match answer {
+                    Ok(Response::VoiceLive {
+                        committed,
+                        tentative,
+                        ..
+                    }) => {
+                        d.heard = (committed, tentative);
+                        d.live = Live::On {
+                            id,
+                            sent,
+                            sending: false,
+                        };
+                    }
+                    other => {
+                        // The whole recording goes at the end instead.
+                        if let Err(err) = other {
+                            tracing::warn!("live transcription stopped: {}", err.message);
+                        }
+                        d.live = Live::Off;
+                        d.heard = Default::default();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn finish_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -210,13 +370,54 @@ impl WorkspaceView {
             // answers the transcript as heard when cleanup is off there.
             self.store.read(cx).remote().is_some() || !matches!(voice.cleanup.trim(), "" | "off")
         };
-        let heard = client.request(Request::VoiceTranscribe {
-            audio: Bytes(audio),
-            language: None,
-            model: None,
-        });
+        let live = match d.live {
+            Live::On { id, .. } => Some(id),
+            _ => None,
+        };
         d._task = cx.spawn_in(window, async move |this, cx| {
-            let text = match heard.await {
+            let heard = match live {
+                Some(id) => {
+                    // The piece on its way goes first.
+                    let sent = loop {
+                        let state = this
+                            .read_with(cx, |this, _| this.dictation.as_ref().map(|d| d.live))
+                            .ok()
+                            .flatten();
+                        match state {
+                            Some(Live::On { sending: true, .. }) => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(20))
+                                    .await;
+                            }
+                            Some(Live::On { sent, .. }) => break Some(sent),
+                            Some(_) => break None,
+                            None => return,
+                        }
+                    };
+                    match sent {
+                        Some(sent) => {
+                            let rest = audio.get(sent * 2..).unwrap_or_default().to_vec();
+                            match client
+                                .request(Request::VoiceLiveFinish {
+                                    id,
+                                    audio: Bytes(rest),
+                                })
+                                .await
+                            {
+                                Ok(answer) => Ok(answer),
+                                Err(err) => {
+                                    tracing::warn!("live transcription failed: {}", err.message);
+                                    whole(client.clone(), audio).await
+                                }
+                            }
+                        }
+                        // It failed while recording.
+                        None => whole(client.clone(), audio).await,
+                    }
+                }
+                None => whole(client.clone(), audio).await,
+            };
+            let text = match heard {
                 Ok(Response::Text { text }) => text,
                 Ok(_) => String::new(),
                 Err(err) => {
@@ -473,6 +674,62 @@ impl WorkspaceView {
                 .into_any_element(),
         )
     }
+}
+
+impl WorkspaceView {
+    /// What live transcription has heard, while recording and until the
+    /// text goes into the draft: the part that stays in the text colour,
+    /// the part that may still change fainter.
+    pub(super) fn dictation_preview(
+        &self,
+        thread_id: &ThreadId,
+        p: &Palette,
+    ) -> Option<AnyElement> {
+        let d = self
+            .dictation
+            .as_ref()
+            .filter(|d| &d.thread_id == thread_id)?;
+        let (committed, tentative) = &d.heard;
+        if committed.trim().is_empty() && tentative.trim().is_empty() {
+            return None;
+        }
+        let text = format!("{committed}{tentative}");
+        let still = committed.len()..text.len();
+        Some(
+            div()
+                .px_2()
+                .text_sm()
+                .text_color(p.foreground)
+                .child(
+                    gpui_kit::StyledText::new(text).with_highlights((!still.is_empty()).then(
+                        || {
+                            (
+                                still,
+                                gpui_kit::HighlightStyle {
+                                    color: Some(p.muted_foreground),
+                                    ..Default::default()
+                                },
+                            )
+                        },
+                    )),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// The whole recording, transcribed at once.
+async fn whole(
+    client: loft_client::Client,
+    audio: Vec<u8>,
+) -> Result<Response, loft_protocol::ErrorBody> {
+    client
+        .request(Request::VoiceTranscribe {
+            audio: Bytes(audio),
+            language: None,
+            model: None,
+        })
+        .await
 }
 
 /// Bars in the level meter.

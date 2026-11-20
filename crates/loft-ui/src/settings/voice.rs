@@ -10,8 +10,9 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, Context, FontWeight, IntoElement as _, ParentElement as _, SharedString,
-    Styled as _, Task, div, prelude::FluentBuilder as _, px,
+    AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, div,
+    prelude::FluentBuilder as _, px,
 };
 use loft_config::{SettingValue, VoiceConfig};
 use loft_protocol::{HarnessId, Request, Response, VoiceModel, VoiceModelState, VoiceStatus};
@@ -22,6 +23,9 @@ pub(super) struct VoicePage {
     status: Option<VoiceStatus>,
     /// Asks the daemon for the models' state while the page shows.
     polling: Option<Task<()>>,
+    /// Where each model list is scrolled.
+    speech_scroll: gpui_kit::ScrollHandle,
+    cleanup_scroll: gpui_kit::ScrollHandle,
 }
 
 /// Languages offered for dictation, by ISO code (the models say which
@@ -121,10 +125,20 @@ impl SettingsView {
             "Downloaded once to this computer. Word errors are the share of English words the model got wrong in its benchmark; speed is the time it takes for 30 seconds of speech on this Mac's GPU.",
             p,
         ));
-        for model in &status.models {
-            let selected = model.id == voice.model;
-            page = page.child(self.model_row("speech", model, selected, true, p, cx));
-        }
+        let rows = status
+            .models
+            .iter()
+            .map(|model| {
+                let selected = model.id == voice.model;
+                self.model_row("speech", model, selected, true, p, cx)
+            })
+            .collect();
+        page = page.child(model_list(
+            "speech-models",
+            &self.voice.speech_scroll,
+            rows,
+            p,
+        ));
 
         let language_label = LANGUAGES
             .iter()
@@ -213,10 +227,20 @@ impl SettingsView {
                 p,
             ));
         if !status.cleanup_models.is_empty() {
-            for model in &status.cleanup_models {
-                let selected = voice.cleanup.trim() == format!("local:{}", model.id);
-                page = page.child(self.model_row("cleanup", model, selected, false, p, cx));
-            }
+            let rows = status
+                .cleanup_models
+                .iter()
+                .map(|model| {
+                    let selected = voice.cleanup.trim() == format!("local:{}", model.id);
+                    self.model_row("cleanup", model, selected, false, p, cx)
+                })
+                .collect();
+            page = page.child(div().pt_3().child(model_list(
+                "cleanup-models",
+                &self.voice.cleanup_scroll,
+                rows,
+                p,
+            )));
         }
         if voice.cleanup.trim() != "off" && !voice.cleanup.trim().is_empty() {
             page = page.child(row(
@@ -383,7 +407,7 @@ impl SettingsView {
                                     } else {
                                         FontWeight::NORMAL
                                     })
-                                    .child(model.name.clone()),
+                                    .child(super::selectable(model.name.clone())),
                             )
                             .when(model.recommended, |d| d.child(badge("Recommended", p)))
                             .when(loaded, |d| d.child(badge("In memory", p))),
@@ -392,18 +416,23 @@ impl SettingsView {
                         div()
                             .text_xs()
                             .text_color(p.muted_foreground)
-                            .child(model.description.clone()),
+                            .child(super::selectable(model.description.clone())),
                     )
                     .when(!facts.is_empty(), |d| {
                         d.child(
                             div()
                                 .text_xs()
                                 .text_color(p.faint_foreground)
-                                .child(facts.join(" · ")),
+                                .child(super::selectable(facts.join(" · "))),
                         )
                     })
                     .when_some(model.error.clone(), |d, err| {
-                        d.child(div().text_xs().text_color(p.danger).child(err))
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(p.danger)
+                                .child(super::selectable(err)),
+                        )
                     }),
             )
             .child(div().flex_none().child(control))
@@ -645,6 +674,47 @@ impl SettingsView {
             let _ = this.update(cx, |this, _| this.voice.polling = None);
         }));
     }
+}
+
+/// Models in a box of their own that scrolls once it holds more than
+/// about four, so the settings below stay in reach. The wheel over it
+/// scrolls the box, and the page only once the box can go no further that
+/// way (as a browser chains scrolling).
+fn model_list(
+    id: &'static str,
+    scroll: &gpui_kit::ScrollHandle,
+    rows: Vec<AnyElement>,
+    p: &Palette,
+) -> AnyElement {
+    let handle = scroll.clone();
+    div()
+        .id(SharedString::from(format!("{id}-box")))
+        .mt_2()
+        // The box has scrolled by now (its own listener comes first); the
+        // page has a turn only at the box's ends.
+        .on_scroll(move |event, window, cx| {
+            let dy = event.delta.pixel_delta(window.line_height()).y;
+            let (offset, max) = (handle.offset().y, handle.max_offset().y);
+            let at_top = offset >= px(0.);
+            let at_bottom = -offset >= max;
+            let goes_up = dy > px(0.);
+            if max > px(0.) && !(goes_up && at_top) && !(!goes_up && at_bottom) {
+                cx.stop_propagation();
+            }
+        })
+        .child(
+            div()
+                .id(id)
+                .max_h(px(300.))
+                .overflow_y_scroll()
+                .track_scroll(scroll)
+                .px_3()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(p.border)
+                .children(rows),
+        )
+        .into_any_element()
 }
 
 /// The id of the daemon's test model (`AGENTLOFT_FAKE_VOICE`).

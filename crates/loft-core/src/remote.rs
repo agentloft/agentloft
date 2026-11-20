@@ -344,7 +344,11 @@ impl Core {
             | Request::VoiceRemoveModel { .. }
             | Request::VoiceTranscribe { .. }
             | Request::VoiceCleanup { .. }
-            | Request::VoiceUnload => Ok(()),
+            | Request::VoiceUnload
+            | Request::VoiceLiveStart { .. }
+            | Request::VoiceLiveFeed { .. }
+            | Request::VoiceLiveFinish { .. }
+            | Request::VoiceLiveCancel { .. } => Ok(()),
 
             Request::ChangeSetting { key, .. } => {
                 if remote_may_set(key) {

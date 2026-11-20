@@ -4735,14 +4735,15 @@ impl WorkspaceView {
                             div()
                                 .flex_shrink_0()
                                 .text_color(p.muted_foreground)
-                                .child(project),
+                                .child(crate::settings::selectable(project)),
                         )
                         .child(div().text_color(p.faint_foreground).child("/"))
                         .child(
                             div()
+                                .min_w_0()
                                 .truncate()
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(title),
+                                .child(crate::settings::selectable(title)),
                         ),
                 )
                 .child(
@@ -5610,6 +5611,7 @@ impl WorkspaceView {
                                                 ))
                                             }),
                                     )
+                                    .children(self.dictation_preview(&thread_id, p))
                                     .child(
                                         h_flex()
                                             .items_center()
@@ -6969,7 +6971,9 @@ fn titlebar_double_click(
     window: &mut Window,
     cx: &mut gpui_kit::App,
 ) {
-    if event.click_count() == 2 && !crate::press::claimed(cx) {
+    // A double-click on the title's text selects a word, as in any text.
+    let on_text = gpui_kit::base::TextSelection::is_selectable_at(event.position(), window, cx);
+    if event.click_count() == 2 && !crate::press::claimed(cx) && !on_text {
         window.titlebar_double_click();
     }
 }
@@ -9287,13 +9291,27 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
         .filter_map(|v| v.trim().parse().ok())
         .collect();
     let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
-    let position = gpui_kit::point(px(at(0, 10.)), px(at(1, 10.)));
-    let after = std::time::Duration::from_millis(at(2, 2500.) as u64);
     // `x,y,after_ms,x2,y2`: a drag, pressed at the first place and let go
     // at the second.
     let released = gpui_kit::point(px(at(3, at(0, 10.))), px(at(4, at(1, 10.))));
     // `move x,y,after_ms`: the pointer only passes over, no button held.
     let only_moves = spec.trim_start().starts_with("move");
+    // `scroll x,y,after_ms,dy`: the wheel there (dy pixels; positive goes
+    // up the page).
+    let scroll = spec.trim_start().starts_with("scroll");
+    let n: Vec<f32> = if scroll {
+        spec.trim_start()
+            .trim_start_matches("scroll")
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect()
+    } else {
+        n
+    };
+    let at = |i: usize, or: f32| n.get(i).copied().unwrap_or(or);
+    let position = gpui_kit::point(px(at(0, 10.)), px(at(1, 10.)));
+    let after = std::time::Duration::from_millis(at(2, 2500.) as u64);
+    let wheel = at(3, -200.);
     cx.spawn_in(window, async move |_, cx| {
         use gpui_kit::{
             Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
@@ -9307,6 +9325,28 @@ fn dev_click(spec: String, window: &mut Window, cx: &mut Context<WorkspaceView>)
             return;
         };
         let (button, modifiers) = (MouseButton::Left, Modifiers::default());
+        if scroll {
+            for step in [
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers,
+                }),
+                PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                    position,
+                    delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(wheel))),
+                    ..Default::default()
+                }),
+            ] {
+                let _ = target.update(cx, |_, window, cx| {
+                    window.dispatch_event(step, cx);
+                });
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(40))
+                    .await;
+            }
+            return;
+        }
         for step in [
             PlatformInput::MouseMove(MouseMoveEvent {
                 position,

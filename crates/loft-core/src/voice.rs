@@ -90,19 +90,76 @@ impl Core {
             ));
         }
         let language = language.unwrap_or(voice.language.clone());
-        let words = voice
-            .words
-            .iter()
-            .map(|w| w.trim().to_owned())
-            .filter(|w| !w.is_empty())
-            .take(100)
-            .collect();
         let text = self
             .voice
-            .transcribe(&model, audio, Some(language), words, voice.unload_after())
+            .transcribe(
+                &model,
+                audio,
+                Some(language),
+                words(&voice),
+                voice.unload_after(),
+            )
             .await
             .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
         Ok(Response::Text { text })
+    }
+
+    pub(crate) async fn voice_live_start(&self, language: Option<String>) -> CoreResult<Response> {
+        let voice = self.config().voice;
+        let model = voice.model.trim().to_owned();
+        if model.is_empty() {
+            return Err(ErrorBody::new(
+                ErrorCode::BadRequest,
+                "Choose a speech model first: Settings ▸ Voice",
+            ));
+        }
+        if !self.voice.streams(&model) {
+            return Ok(Response::VoiceLive {
+                id: None,
+                committed: String::new(),
+                tentative: String::new(),
+            });
+        }
+        let language = language.unwrap_or(voice.language.clone());
+        let id = self
+            .voice
+            .live_start(&model, Some(language), words(&voice), voice.unload_after())
+            .await
+            .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
+        Ok(Response::VoiceLive {
+            id: Some(id),
+            committed: String::new(),
+            tentative: String::new(),
+        })
+    }
+
+    pub(crate) async fn voice_live_feed(&self, id: u64, audio: Vec<u8>) -> CoreResult<Response> {
+        let (committed, tentative) = self
+            .voice
+            .live_feed(id, audio, self.config().voice.unload_after())
+            .await
+            .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
+        Ok(Response::VoiceLive {
+            id: Some(id),
+            committed,
+            tentative,
+        })
+    }
+
+    pub(crate) async fn voice_live_finish(&self, id: u64, audio: Vec<u8>) -> CoreResult<Response> {
+        let text = self
+            .voice
+            .live_finish(id, audio, self.config().voice.unload_after())
+            .await
+            .map_err(|e| ErrorBody::new(ErrorCode::Internal, format!("{e:#}")))?;
+        Ok(Response::Text { text })
+    }
+
+    pub(crate) async fn voice_live_cancel(&self, id: u64) -> CoreResult<Response> {
+        self.voice
+            .live_cancel(id, self.config().voice.unload_after())
+            .await;
+        Ok(Response::Ok)
     }
 
     pub(crate) async fn voice_cleanup(
@@ -145,6 +202,17 @@ impl Core {
             .unwrap_or(transcript);
         Ok(Response::Text { text })
     }
+}
+
+/// The terms the speech model is asked to spell right.
+fn words(voice: &loft_config::VoiceConfig) -> Vec<String> {
+    voice
+        .words
+        .iter()
+        .map(|w| w.trim().to_owned())
+        .filter(|w| !w.is_empty())
+        .take(100)
+        .collect()
 }
 
 /// The agent's small model when none is named: Claude's Haiku; the others'
