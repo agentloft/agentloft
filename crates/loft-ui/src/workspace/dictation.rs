@@ -60,8 +60,29 @@ pub(super) struct Dictation {
 enum Held {
     /// The shortcut: its key and modifiers.
     Keys(gpui_kit::Keystroke),
+    /// The dictation key, a lone modifier.
+    Side,
     /// The microphone button, pressed.
     Pointer,
+}
+
+/// A press of the dictation key longer than this isn't a tap (toggle).
+const TAP: Duration = Duration::from_millis(600);
+
+/// Feeds the dictation key's presses to the window's workspace.
+pub(super) fn watch_side_keys(window: &mut Window, cx: &mut Context<WorkspaceView>) -> Task<()> {
+    use futures::StreamExt as _;
+    let mut events = crate::voice::keys::subscribe();
+    cx.spawn_in(window, async move |this, cx| {
+        while let Some(event) = events.next().await {
+            if this
+                .update_in(cx, |this, window, cx| this.side_key(event, window, cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -105,6 +126,75 @@ impl WorkspaceView {
         if let Some(d) = self.dictation.as_mut() {
             // A shortcut that can't be read back ends like a toggle's.
             d.held = keys.map(Held::Keys);
+        }
+    }
+
+    /// The dictation key (`[voice] key`, a lone modifier): with hold to
+    /// talk it records while held; else a tap toggles. Held with another
+    /// key it was a combination (⌥E types a letter), not for us.
+    fn side_key(
+        &mut self,
+        event: crate::voice::keys::KeyEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::voice::keys::{KeyEvent, SideKey};
+        let voice = self.store.read(cx).voice.clone();
+        let Some(key) = SideKey::parse(&voice.key) else {
+            self.side_press = None;
+            return;
+        };
+        tracing::debug!(
+            ?event,
+            ?key,
+            active = window.is_window_active(),
+            "dictation key"
+        );
+        // Every window hears the key; the one in front acts.
+        if !window.is_window_active() {
+            return;
+        }
+        let hold = voice.hold_to_talk();
+        match event {
+            KeyEvent::Down(k) if k == key => {
+                self.side_press = Some((web_time::Instant::now(), false));
+                if hold && self.dictation.is_none() {
+                    self.start_dictation(window, cx);
+                    if let Some(d) = self.dictation.as_mut() {
+                        d.held = Some(Held::Side);
+                    }
+                }
+            }
+            KeyEvent::Other => {
+                if let Some((_, chord)) = self.side_press.as_mut()
+                    && !*chord
+                {
+                    *chord = true;
+                    let ours = matches!(
+                        self.dictation.as_ref().and_then(|d| d.held.as_ref()),
+                        Some(Held::Side)
+                    );
+                    if ours {
+                        self.cancel_dictation(cx);
+                    }
+                }
+            }
+            KeyEvent::Up(k) if k == key => {
+                let Some((since, chord)) = self.side_press.take() else {
+                    return;
+                };
+                if hold {
+                    if matches!(
+                        self.dictation.as_ref().and_then(|d| d.held.as_ref()),
+                        Some(Held::Side)
+                    ) {
+                        self.let_go(window, cx);
+                    }
+                } else if !chord && since.elapsed() < TAP {
+                    self.toggle_dictation(window, cx);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -674,9 +764,11 @@ impl WorkspaceView {
         let Some(d) = active else {
             let hold = self.store.read(cx).voice.hold_to_talk();
             let what = if hold { "Hold to dictate" } else { "Dictate" };
-            let tip = match crate::keymap::keys_for("dictate", cx) {
-                Some(keys) => format!("{what} ({})", crate::keymap::display(&keys)),
-                None => what.to_owned(),
+            let side = crate::voice::keys::SideKey::parse(&self.store.read(cx).voice.key);
+            let tip = match (side, crate::keymap::keys_for("dictate", cx)) {
+                (Some(side), _) => format!("{what} ({})", side.label()),
+                (None, Some(keys)) => format!("{what} ({})", crate::keymap::display(&keys)),
+                (None, None) => what.to_owned(),
             };
             return Some(
                 div()

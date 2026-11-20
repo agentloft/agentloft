@@ -26,6 +26,17 @@ pub(super) struct VoicePage {
     /// Where each model list is scrolled.
     speech_scroll: gpui_kit::ScrollHandle,
     cleanup_scroll: gpui_kit::ScrollHandle,
+    /// The dictation key is being picked.
+    recording: bool,
+    /// The last key pressed while picking typed text alone (refused).
+    refused: bool,
+    /// A lone modifier down while picking, and whether another key joined
+    /// it.
+    side_down: Option<(crate::voice::keys::SideKey, bool)>,
+    /// Takes the next keystroke (before any shortcut can act on it).
+    _intercept: Option<gpui_kit::Subscription>,
+    /// Hears lone modifiers while picking.
+    _side: Option<Task<()>>,
 }
 
 /// Languages offered for dictation, by ISO code (the models say which
@@ -132,10 +143,7 @@ impl SettingsView {
                 .into_any_element(),
             p,
         ));
-        // The same keys as in Settings ▸ Shortcuts: click, then press.
-        if let Some(shortcut) = crate::keymap::SHORTCUTS.iter().find(|s| s.id == "dictate") {
-            page = page.child(self.editable_row(shortcut, p, cx));
-        }
+        page = page.child(self.dictate_key_row(&voice, p, cx));
         let Some(status) = self.voice.status.clone() else {
             return page
                 .child(
@@ -290,6 +298,183 @@ impl SettingsView {
             ));
         }
         page.into_any_element()
+    }
+
+    /// The dictation key: a combination (the `dictate` shortcut, as in
+    /// Settings ▸ Shortcuts) or one modifier key on its own, by side.
+    /// Click, then press it; for a lone modifier, press and let go.
+    fn dictate_key_row(
+        &self,
+        voice: &VoiceConfig,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::voice::keys::{self, SideKey};
+        let side = SideKey::parse(&voice.key);
+        let keys = crate::keymap::keys_for("dictate", cx);
+        let custom = side.is_some() || crate::keymap::is_custom("dictate", cx);
+        let recording = self.voice.recording;
+        let label = if recording {
+            if self.voice.refused {
+                "Add ⌘, ⌃ or ⌥".to_owned()
+            } else {
+                "Press keys…".to_owned()
+            }
+        } else if let Some(side) = side {
+            side.label().to_owned()
+        } else if let Some(k) = &keys {
+            crate::keymap::display(k)
+        } else {
+            "Not set".to_owned()
+        };
+        let cap = h_flex()
+            .id("dictate-keys")
+            .min_w(px(110.))
+            .h(px(28.))
+            .px_2()
+            .justify_center()
+            .items_center()
+            .rounded(px(7.))
+            .border_1()
+            .text_sm()
+            .cursor_pointer()
+            .map(|d| {
+                if recording {
+                    d.border_color(p.accent)
+                        .bg(p.accent.opacity(0.08))
+                        .text_color(p.accent)
+                } else {
+                    d.border_color(p.border)
+                        .bg(p.elevated)
+                        .font_weight(FontWeight::MEDIUM)
+                        .hover(|d| d.border_color(p.accent.opacity(0.6)))
+                }
+            })
+            .child(label)
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.voice.recording {
+                    this.stop_picking_key(cx);
+                } else {
+                    this.pick_dictate_key(cx);
+                }
+            }));
+        let reset = custom && !recording;
+        let hint = if keys::supported() {
+            "Click, then press the keys. A single modifier works too: press it and let go, like the right ⌥ key. With Toggle, tap it; with Hold to talk, hold it."
+        } else {
+            "Click, then press the keys."
+        };
+        row(
+            "Dictation key",
+            hint,
+            h_flex()
+                .gap_1()
+                .items_center()
+                .when(reset, |d| {
+                    d.child(
+                        Button::new("dictate-keys-reset")
+                            .cursor_pointer()
+                            .ghost()
+                            .small()
+                            .label("Default")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.write(&["voice", "key"], SettingValue::Unset, false, cx);
+                                this.set_keys("dictate", SettingValue::Unset, cx);
+                            })),
+                    )
+                })
+                .child(cap)
+                .into_any_element(),
+            p,
+        )
+        .into_any_element()
+    }
+
+    fn stop_picking_key(&mut self, cx: &mut Context<Self>) {
+        self.voice.recording = false;
+        self.voice.refused = false;
+        self.voice.side_down = None;
+        self.voice._side = None;
+        // Dropped after the callback that may be running returns.
+        let intercept = self.voice._intercept.take();
+        cx.defer(move |_| drop(intercept));
+        cx.notify();
+    }
+
+    fn pick_dictate_key(&mut self, cx: &mut Context<Self>) {
+        use crate::voice::keys::KeyEvent;
+        use futures::StreamExt as _;
+        let view = cx.entity().downgrade();
+        // A combination with a key: it becomes the `dictate` shortcut.
+        let intercept = cx.intercept_keystrokes(move |event, _, cx: &mut gpui_kit::App| {
+            let k = &event.keystroke;
+            let escape = !k.modifiers.modified() && k.key == "escape";
+            let keys = crate::keymap::from_keystroke(k, cx);
+            // A lone modifier: the side-key watcher decides.
+            if keys.is_none() && !escape {
+                return;
+            }
+            cx.stop_propagation();
+            let refused = !escape && crate::keymap::types_text(k);
+            let _ = view.update(cx, |this, cx| {
+                if !this.voice.recording {
+                    return;
+                }
+                if refused {
+                    this.voice.refused = true;
+                    cx.notify();
+                    return;
+                }
+                if let Some(keys) = keys.filter(|_| !escape) {
+                    this.set_keys("dictate", SettingValue::Str(keys), cx);
+                    this.write(&["voice", "key"], SettingValue::Unset, false, cx);
+                }
+                this.stop_picking_key(cx);
+            });
+        });
+        // A lone modifier pressed and let go: it becomes `[voice] key`, and
+        // the combination is turned off so only one key dictates.
+        let mut events = crate::voice::keys::subscribe();
+        let side = cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                let done = this
+                    .update(cx, |this, cx| {
+                        match event {
+                            KeyEvent::Down(k) => this.voice.side_down = Some((k, false)),
+                            KeyEvent::Other => {
+                                if let Some((_, chord)) = this.voice.side_down.as_mut() {
+                                    *chord = true;
+                                }
+                            }
+                            KeyEvent::Up(k) => {
+                                if this.voice.side_down == Some((k, false)) {
+                                    this.write(
+                                        &["voice", "key"],
+                                        SettingValue::Str(k.id().to_owned()),
+                                        false,
+                                        cx,
+                                    );
+                                    this.set_keys("dictate", SettingValue::Str(String::new()), cx);
+                                    this.stop_picking_key(cx);
+                                    return true;
+                                }
+                                this.voice.side_down = None;
+                            }
+                        }
+                        false
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        });
+        self.voice.recording = true;
+        self.voice.refused = false;
+        self.voice.side_down = None;
+        self.voice._intercept = Some(intercept);
+        self.voice._side = Some(side);
+        cx.notify();
     }
 
     /// One model: what it is, and download / use / remove.

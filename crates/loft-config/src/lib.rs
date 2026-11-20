@@ -278,6 +278,10 @@ pub struct VoiceConfig {
     /// How the microphone button and the shortcut record: `toggle` (press
     /// to start, press again to finish) or `hold` (records while held).
     pub mode: String,
+    /// One modifier key on its own as the dictation key, by side
+    /// (`right_option`, `left_command`, `fn`, …); empty: the `dictate`
+    /// shortcut of `[ui.keys]` instead.
+    pub key: String,
     /// The speech model (an id from the daemon's catalog); empty = none
     /// chosen yet.
     pub model: String,
@@ -302,6 +306,7 @@ impl Default for VoiceConfig {
         Self {
             enabled: true,
             mode: "toggle".into(),
+            key: String::new(),
             model: String::new(),
             language: "auto".into(),
             unload_after: "5m".into(),

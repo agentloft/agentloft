@@ -139,6 +139,11 @@ pub struct WorkspaceView {
     composers: HashMap<ThreadId, Entity<TextareaState>>,
     /// Dictation into a composer, while it records or is transcribed.
     dictation: Option<dictation::Dictation>,
+    /// The dictation key (a lone modifier) is down: since when, and
+    /// whether another key went down with it (a combination, not a press).
+    side_press: Option<(web_time::Instant, bool)>,
+    /// Watches the dictation key.
+    _side_keys: gpui_kit::Task<()>,
     /// Threads whose composer has something typed in it right now (a
     /// draft is saved a moment later).
     typed: std::collections::HashSet<ThreadId>,
@@ -368,6 +373,8 @@ impl WorkspaceView {
             automations_page: None,
             composers: HashMap::new(),
             dictation: None,
+            side_press: None,
+            _side_keys: dictation::watch_side_keys(window, cx),
             typed: Default::default(),
             attachments: HashMap::new(),
             pasted: HashMap::new(),
@@ -662,6 +669,15 @@ impl WorkspaceView {
                 let t = thread_id.clone();
                 self.panel
                     .update(cx, |p, cx| p.show_device(&t, Some(id), true, window, cx));
+            }
+            // `sidekey:<id>:down|up`: a lone modifier pressed or let go
+            // (`right_option`…), through AppKit like the keyboard's.
+            Some(("sidekey", rest)) => {
+                if let Some((id, how)) = rest.split_once(':')
+                    && let Some(key) = crate::voice::keys::SideKey::parse(id)
+                {
+                    crate::voice::keys::dev_press(key, how == "down");
+                }
             }
             // `dictate`: the microphone button (start, or finish); with
             // `AGENTLOFT_FAKE_MIC` the recording is that file. Combine with

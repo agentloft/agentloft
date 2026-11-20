@@ -216,6 +216,21 @@ const KEYS: &[Key] = &[
         about: "How the microphone button and the dictation shortcut record: \"toggle\" (press to start, press again to finish; default) or \"hold\" (records only while held)",
     },
     Key {
+        key: "voice.key",
+        kind: Kind::OneOf(&[
+            "right_option",
+            "left_option",
+            "right_command",
+            "left_command",
+            "right_control",
+            "left_control",
+            "right_shift",
+            "left_shift",
+            "fn",
+        ]),
+        about: "One modifier key on its own as the dictation key (on a Mac and in a browser); null = the dictate shortcut in ui.keys",
+    },
+    Key {
         key: "voice.model",
         kind: Kind::Text,
         about: "Speech model for dictation, an id from Settings ▸ Voice (e.g. parakeet-en, whisper-large-v3-turbo); it must be downloaded there",

@@ -472,6 +472,14 @@ pub fn apply(cx: &mut App) {
     cx.set_menus(crate::workspace::app_menus());
 }
 
+/// A key that types something (a letter, a digit, space), pressed without
+/// ⌘, ⌃, ⌥ or Fn: as an app-wide shortcut it would fire while typing.
+pub fn types_text(k: &gpui_kit::Keystroke) -> bool {
+    let m = k.modifiers;
+    !(m.platform || m.control || m.alt || m.function)
+        && (k.key.chars().count() == 1 || k.key == "space")
+}
+
 /// A pressed key as config text (`cmd-shift-k`), or `None` for a lone
 /// modifier.
 pub fn from_keystroke(k: &gpui_kit::Keystroke, cx: &App) -> Option<String> {
@@ -487,6 +495,21 @@ pub fn from_keystroke(k: &gpui_kit::Keystroke, cx: &App) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_letter_alone_types_text() {
+        fn key(s: &'static str) -> gpui_kit::Keystroke {
+            gpui_kit::Keystroke::parse(s).unwrap()
+        }
+        assert!(types_text(&key("e")));
+        assert!(types_text(&key("shift-e")));
+        assert!(types_text(&key("space")));
+        assert!(!types_text(&key("cmd-e")));
+        assert!(!types_text(&key("alt-e")));
+        assert!(!types_text(&key("ctrl-shift-d")));
+        assert!(!types_text(&key("f5")));
+        assert!(!types_text(&key("escape")));
+    }
 
     #[test]
     fn shows_keys_the_platform_way() {

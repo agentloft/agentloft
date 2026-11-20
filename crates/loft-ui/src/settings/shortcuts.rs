@@ -18,6 +18,8 @@ use loft_config::SettingValue;
 pub(super) struct ShortcutsPage {
     /// The shortcut waiting for its new keys.
     recording: Option<&'static str>,
+    /// The last key pressed while recording typed text alone (refused).
+    refused: bool,
     /// Takes the next keystroke (before any shortcut can act on it).
     _listening: Option<Subscription>,
 }
@@ -32,6 +34,15 @@ impl SettingsView {
                 None
             } else {
                 match keymap::from_keystroke(k, cx) {
+                    // A letter alone would fire while typing: ask for more.
+                    Some(_) if keymap::types_text(k) => {
+                        cx.stop_propagation();
+                        let _ = view.update(cx, |this, cx| {
+                            this.shortcuts.refused = true;
+                            cx.notify();
+                        });
+                        return;
+                    }
                     Some(keys) => Some(keys),
                     // A modifier on its own: wait for the rest.
                     None => return,
@@ -52,11 +63,12 @@ impl SettingsView {
             });
         });
         self.shortcuts.recording = Some(id);
+        self.shortcuts.refused = false;
         self.shortcuts._listening = Some(listening);
         cx.notify();
     }
 
-    fn set_keys(&mut self, id: &str, value: SettingValue, cx: &mut Context<Self>) {
+    pub(super) fn set_keys(&mut self, id: &str, value: SettingValue, cx: &mut Context<Self>) {
         // Back to the default: no entry at all.
         let default = SHORTCUTS
             .iter()
@@ -163,7 +175,11 @@ impl SettingsView {
                     d.border_color(p.accent)
                         .bg(p.accent.opacity(0.08))
                         .text_color(p.accent)
-                        .child("Press keys…")
+                        .child(if self.shortcuts.refused {
+                            "Add ⌘, ⌃ or ⌥"
+                        } else {
+                            "Press keys…"
+                        })
                 } else {
                     match &keys {
                         Some(k) => d
