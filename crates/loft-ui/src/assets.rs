@@ -143,6 +143,7 @@ gpui_kit::assets::icon_assets!(
         SquareCheck,
         Volume2,
         VolumeX,
+        Music,
         // Project actions (`actions.rs`): the icons guessed for them, and
         // a few more a project may name.
         FlaskConical,

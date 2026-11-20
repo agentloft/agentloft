@@ -184,9 +184,9 @@ pub(crate) fn reply_text_view(
                 "reply-image-{}",
                 node.source_range().map(|r| r.start).unwrap_or_default()
             ));
-            // A video plays where it stands.
+            // A video or a sound plays where it stands.
             if let Some(path) = local_image_path(&image.src, &render_cwd)
-                && crate::video::is_video(&path)
+                && crate::video::plays(&path)
                 && !crate::windows::store_of(window, cx)
                     .is_some_and(|s| s.read(cx).remote().is_some())
             {

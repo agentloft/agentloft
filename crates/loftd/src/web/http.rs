@@ -638,7 +638,8 @@ fn logout(request: Request<Incoming>, ctx: &Ctx, host: &str) -> Response<Body> {
     response
 }
 
-/// What a browser is told a file is (for `<video>`, which needs to know).
+/// What a browser is told a file is (for `<video>`, which needs to know;
+/// it plays sound files too).
 fn media_type(path: &std::path::Path) -> &'static str {
     match path
         .extension()
@@ -649,6 +650,13 @@ fn media_type(path: &std::path::Path) -> &'static str {
         Some("mp4" | "m4v") => "video/mp4",
         Some("mov") => "video/quicktime",
         Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("flac") => "audio/flac",
+        Some("aif" | "aiff") => "audio/aiff",
+        Some("caf") => "audio/x-caf",
         _ => "application/octet-stream",
     }
 }

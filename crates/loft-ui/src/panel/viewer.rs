@@ -31,8 +31,9 @@ enum Content {
         text: Arc<str>,
     },
     Image(Arc<Image>),
-    /// A video, played from where it is on this machine.
-    Video(std::path::PathBuf),
+    /// A video or a sound, played (streamed) from where it is on this
+    /// machine, however big.
+    Media(std::path::PathBuf),
     Doc(Entity<DocPreview>),
     External(String),
     Error(String),
@@ -97,11 +98,11 @@ impl FileViewer {
         }
     }
 
-    /// Where the file is, if it is a video that plays here.
-    fn video(&self, cx: &Context<Self>) -> Option<std::path::PathBuf> {
+    /// Where the file is, if it is a video or a sound that plays here.
+    fn media(&self, cx: &Context<Self>) -> Option<std::path::PathBuf> {
         // Played from its file: here, or streamed by the daemon to the web
         // client. (A window on an SSH host has neither, yet.)
-        if !crate::video::is_video(std::path::Path::new(&self.rel_path))
+        if !crate::video::plays(std::path::Path::new(&self.rel_path))
             || self.store.read(cx).remote().is_some()
         {
             return None;
@@ -118,12 +119,14 @@ impl FileViewer {
     }
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A video is played from its file: nothing of it is read here.
-        if let Some(path) = self.video(cx) {
+        // A video or a sound is played from its file: nothing of it is
+        // read here (so it has no size limit).
+        if let Some(path) = self.media(cx) {
             self.size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             self.abs_path = Some(path.to_string_lossy().into_owned());
-            if !matches!(&self.content, Content::Video(showing) if *showing == path) {
-                self.content = Content::Video(path);
+            self.truncated = false;
+            if !matches!(&self.content, Content::Media(showing) if *showing == path) {
+                self.content = Content::Media(path);
                 self.shown = None;
                 cx.notify();
             }
@@ -790,7 +793,7 @@ impl Render for FileViewer {
                 .relative()
                 .child(div().absolute().inset_0().child(doc.clone()))
                 .into_any_element(),
-            Content::Video(path) => div()
+            Content::Media(path) => div()
                 .flex_1()
                 .min_h_0()
                 .p_4()
@@ -839,17 +842,22 @@ impl Render for FileViewer {
             .min_h_0()
             .overflow_hidden()
             .child(header)
-            .when(self.truncated, |d| {
-                d.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .text_xs()
-                        .bg(p.warning_soft)
-                        .text_color(p.warning)
-                        .child("Large file — showing the first 10 MB."),
-                )
-            })
+            // (Nothing of a binary file is shown: how much was read is no
+            // matter.)
+            .when(
+                self.truncated && !matches!(self.content, Content::External(_)),
+                |d| {
+                    d.child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .bg(p.warning_soft)
+                            .text_color(p.warning)
+                            .child("Large file — showing the first 10 MB."),
+                    )
+                },
+            )
             .child(body)
             .font_weight(FontWeight::NORMAL)
     }

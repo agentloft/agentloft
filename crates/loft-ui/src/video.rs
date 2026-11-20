@@ -1,5 +1,7 @@
-//! A video file, played where it is shown: in a reply or a message (a
-//! Markdown image whose target is a video), and in the file viewer.
+//! A video or audio file, played where it is shown: in a reply or a
+//! message (a Markdown image whose target is one), and in the file viewer.
+//! Either is streamed from its file, whatever its size; audio gets a bar of
+//! controls instead of a picture.
 //!
 //! The platform plays it and the app draws it, so the video scrolls, clips
 //! and sits under menus like everything else, and the controls over it are
@@ -20,23 +22,28 @@ use crate::press::ClaimsPress as _;
 use gpui_kit::{AnyElement, App, SharedString, Window};
 use std::path::{Path, PathBuf};
 
-/// Whether the file at `path` is a video this build can play in place.
-pub(crate) fn is_video(path: &Path) -> bool {
-    PLAYS
-        && path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                ["mp4", "mov", "m4v"]
-                    .iter()
-                    .any(|video| ext.eq_ignore_ascii_case(video))
-            })
+/// Whether the file at `path` is a video or a sound this build can play in
+/// place.
+pub(crate) fn plays(path: &Path) -> bool {
+    PLAYS && (has_extension(path, VIDEO) || has_extension(path, AUDIO))
+}
+
+/// Played in place as videos.
+const VIDEO: &[&str] = &["mp4", "mov", "m4v"];
+/// Played in place as sound alone: what AVFoundation and the browsers'
+/// `<video>` both play.
+const AUDIO: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "aif", "aiff", "caf"];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| list.iter().any(|known| ext.eq_ignore_ascii_case(known)))
 }
 
 /// Whether this build plays videos in place.
 const PLAYS: bool = cfg!(any(target_os = "macos", target_arch = "wasm32"));
 
-/// The video at `path` as a player as wide as what holds it. `key` tells it
+/// The video or sound at `path` as a player as wide as what holds it. `key` tells it
 /// from the other players beside it (the same file may be shown twice).
 pub(crate) fn player(
     key: SharedString,
@@ -99,11 +106,11 @@ mod imp {
     use crate::theme::Palette;
     use backend::Native;
     use gpui_kit::assets::IconName;
-    use gpui_kit::component::{Icon, Sizable as _, h_flex};
+    use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
     use gpui_kit::prelude::FluentBuilder as _;
     use gpui_kit::{
         AppContext as _, Bounds, Context, DispatchPhase, Div, Element, ElementId, Entity, Global,
-        GlobalElementId, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
+        GlobalElementId, Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
         MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels,
         Render, Stateful, StatefulInteractiveElement as _, Styled as _, Task, black, canvas, div,
         linear_color_stop, linear_gradient, px, relative, white,
@@ -649,6 +656,8 @@ mod imp {
         path: PathBuf,
         /// Fills what holds it (the file viewer), or is a box in the chat.
         fill: bool,
+        /// Sound alone: no picture, a bar of controls.
+        audio: bool,
         /// The system's player, while the video plays or was just touched.
         native: Option<Native>,
         /// The frame showing: the video's latest, or its last before the
@@ -692,9 +701,11 @@ mod imp {
 
     impl Player {
         fn new(path: PathBuf, fill: bool, cx: &mut Context<Self>) -> Self {
+            let audio = !has_extension(&path, VIDEO);
             let mut this = Self {
                 path,
                 fill,
+                audio,
                 native: None,
                 frame: None,
                 ratio: BOX_RATIO,
@@ -783,6 +794,10 @@ mod imp {
             {
                 self.duration = duration;
                 changed = true;
+                // Sound has no picture to wait for: its length was all.
+                if self.audio {
+                    self.awaiting = None;
+                }
             }
             if let Some(frame) = native.new_frame() {
                 let (w, h) = backend::frame_size(&frame);
@@ -965,6 +980,7 @@ mod imp {
         fn button(
             id: &'static str,
             icon: IconName,
+            ink: Hsla,
             on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
             cx: &mut Context<Self>,
         ) -> Stateful<Div> {
@@ -977,8 +993,8 @@ mod imp {
                 .size(px(28.))
                 .rounded_full()
                 .cursor_pointer()
-                .text_color(white())
-                .hover(|d| d.bg(white().opacity(0.16)))
+                .text_color(ink)
+                .hover(move |d| d.bg(ink.opacity(0.16)))
                 .child(Icon::new(icon).small())
                 // A press here is the button's, not the start of a selection
                 // in the text around the video.
@@ -994,7 +1010,15 @@ mod imp {
     impl Render for Player {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let p = Palette::of(cx);
-            let entity = cx.entity();
+            let audio = self.audio;
+            // Over a picture the controls are white; on a bar of sound,
+            // the theme's own.
+            let ink = if audio { p.foreground } else { white() };
+            let name = self
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let seen = self.seen.clone();
             let track = self.track.clone();
             let volume_track = self.volume_track.clone();
@@ -1004,43 +1028,53 @@ mod imp {
             } else {
                 0.
             };
-            let frame = div().id("video").group("video").relative().bg(black());
-            let frame = if self.fill {
-                frame.size_full()
-            } else {
-                frame
+            // Sound: a bar the controls are in (on its own in the chat; in
+            // the middle of the file viewer, under the file's name).
+            let bar = || {
+                div()
+                    .relative()
                     .w_full()
+                    .h(px(CONTROLS_HEIGHT))
                     .rounded(px(10.))
                     .border_1()
                     .border_color(p.border)
-                    // A video that can't be shown doesn't need its room.
-                    .map(|d| match self.failed {
-                        true => d.h(px(64.)),
-                        false => d
-                            .max_h(px(MAX_HEIGHT))
-                            .aspect_ratio(self.ratio.max(BOX_RATIO)),
-                    })
+                    .bg(p.muted)
             };
             if self.failed {
-                let name = self
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                return frame
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(white().opacity(0.7))
-                    .child(format!("{name} can't be played here"));
+                let failed = format!("{name} can't be played here");
+                return if audio {
+                    bar()
+                        .id("video")
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .text_sm()
+                        .text_color(p.muted_foreground)
+                        .child(failed)
+                } else {
+                    div()
+                        .id("video")
+                        .relative()
+                        .bg(black())
+                        .map(|d| match self.fill {
+                            true => d.size_full(),
+                            false => d
+                                .w_full()
+                                .h(px(64.))
+                                .rounded(px(10.))
+                                .border_1()
+                                .border_color(p.border),
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(white().opacity(0.7))
+                        .child(failed)
+                };
             }
             let controls = h_flex()
                 .id("controls")
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_0()
                 .h(px(CONTROLS_HEIGHT))
                 .px_2()
                 .gap_1p5()
@@ -1048,20 +1082,28 @@ mod imp {
                 // A small player (in a message) squeezes its tracks, never
                 // past its edge.
                 .overflow_hidden()
-                // Over a bright picture the controls still read.
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(black().opacity(0.), 0.),
-                    linear_color_stop(black().opacity(0.7), 1.),
-                ))
                 // A press here is the controls' own, not the start of a
-                // selection in the text around the video. (They don't hide
+                // selection in the text around the player. (They don't hide
                 // what is under them from the pointer: the video would stop
                 // counting as pointed at, and take them away.)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                // A playing video shows them under the pointer only.
-                .when(self.playing && !self.scrubbing && !self.adjusting, |d| {
-                    d.invisible().group_hover("video", |d| d.visible())
+                .map(|d| match audio {
+                    true => d.size_full(),
+                    false => d
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        // Over a bright picture the controls still read.
+                        .bg(linear_gradient(
+                            180.,
+                            linear_color_stop(black().opacity(0.), 0.),
+                            linear_color_stop(black().opacity(0.7), 1.),
+                        ))
+                        // A playing video shows them under the pointer only.
+                        .when(self.playing && !self.scrubbing && !self.adjusting, |d| {
+                            d.invisible().group_hover("video", |d| d.visible())
+                        }),
                 })
                 .child(Self::button(
                     "play",
@@ -1070,14 +1112,29 @@ mod imp {
                     } else {
                         IconName::Play
                     },
+                    ink,
                     |this, cx| this.toggle(cx),
                     cx,
                 ))
+                // In the chat, which sound this is (the file viewer says it
+                // above the bar).
+                .when(audio && !self.fill, |d| {
+                    d.child(
+                        div()
+                            .flex_shrink(1.)
+                            .min_w(px(24.))
+                            .max_w(px(220.))
+                            .truncate()
+                            .text_sm()
+                            .text_color(ink)
+                            .child(name.clone()),
+                    )
+                })
                 .child(
                     div()
                         .flex_none()
                         .text_xs()
-                        .text_color(white())
+                        .text_color(if audio { p.muted_foreground } else { ink })
                         .child(format!(
                             "{} / {}",
                             clock(self.position),
@@ -1100,7 +1157,7 @@ mod imp {
                             MouseButton::Left,
                             cx.listener(|this, event: &MouseDownEvent, _, cx| {
                                 // The drag is the scrubber's, not a selection
-                                // in the text around the video.
+                                // in the text around the player.
                                 cx.stop_propagation();
                                 this.scrub_start(event.position.x, cx);
                             }),
@@ -1119,7 +1176,7 @@ mod imp {
                                 .w_full()
                                 .h(px(4.))
                                 .rounded_full()
-                                .bg(white().opacity(0.3))
+                                .bg(ink.opacity(0.3))
                                 .child(
                                     canvas(
                                         move |bounds, _, _| track.set(Some(bounds)),
@@ -1128,9 +1185,7 @@ mod imp {
                                     .absolute()
                                     .size_full(),
                                 )
-                                .child(
-                                    div().h_full().w(relative(along)).rounded_full().bg(white()),
-                                ),
+                                .child(div().h_full().w(relative(along)).rounded_full().bg(ink)),
                         ),
                 )
                 .child(Self::button(
@@ -1140,6 +1195,7 @@ mod imp {
                     } else {
                         IconName::Volume2
                     },
+                    ink,
                     |this, cx| this.toggle_muted(cx),
                     cx,
                 ))
@@ -1176,7 +1232,7 @@ mod imp {
                                 .w_full()
                                 .h(px(4.))
                                 .rounded_full()
-                                .bg(white().opacity(0.3))
+                                .bg(ink.opacity(0.3))
                                 .child(
                                     canvas(
                                         move |bounds, _, _| volume_track.set(Some(bounds)),
@@ -1185,70 +1241,106 @@ mod imp {
                                     .absolute()
                                     .size_full(),
                                 )
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .w(relative(loudness))
-                                        .rounded_full()
-                                        .bg(white()),
-                                ),
+                                .child(div().h_full().w(relative(loudness)).rounded_full().bg(ink)),
                         ),
                 );
+            // Says where the player was drawn (so a sound or video out of
+            // sight is paused), and follows a drag of the scrubber or the
+            // volume past their edges.
             let scrubbing = self.scrubbing;
             let adjusting = self.adjusting;
+            let entity = cx.entity();
+            let watcher = canvas(
+                move |_, window, _| seen.set(Some(Seen::now(window))),
+                move |_, _, window, _| {
+                    if !scrubbing && !adjusting {
+                        return;
+                    }
+                    // The pointer leaves the scrubber while it is dragged:
+                    // the drag goes on.
+                    let moved = entity.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            moved.update(cx, |this, cx| {
+                                let x = event.position.x;
+                                match (event.dragging(), this.adjusting) {
+                                    (true, true) => this.volume_to(x, cx),
+                                    (true, false) => this.scrub_to(x, false, cx),
+                                    // Let go where nothing of ours heard it.
+                                    (false, true) => this.volume_end(x, cx),
+                                    (false, false) => this.scrub_end(x, cx),
+                                }
+                            });
+                        }
+                    });
+                    let released = entity.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                            released.update(cx, |this, cx| {
+                                this.volume_end(event.position.x, cx);
+                                this.scrub_end(event.position.x, cx);
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full();
+            if audio {
+                let bar = bar().child(watcher).child(controls);
+                return if self.fill {
+                    v_flex()
+                        .id("video")
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_4()
+                        .px_4()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(88.))
+                                .rounded(px(20.))
+                                .bg(p.muted)
+                                .text_color(p.muted_foreground)
+                                .child(Icon::new(IconName::Music).size(px(36.))),
+                        )
+                        .child(
+                            div()
+                                .max_w_full()
+                                .truncate()
+                                .text_sm()
+                                .text_color(p.foreground)
+                                .child(name),
+                        )
+                        .child(div().w_full().max_w(px(560.)).child(bar))
+                } else {
+                    // Its own width, not its content's: a message bubble
+                    // takes its width from what is in it.
+                    div().id("video").w(px(480.)).max_w_full().child(bar)
+                };
+            }
+            let frame = div().id("video").group("video").relative().bg(black());
+            let frame = if self.fill {
+                frame.size_full()
+            } else {
+                frame
+                    .w_full()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(p.border)
+                    .max_h(px(MAX_HEIGHT))
+                    .aspect_ratio(self.ratio.max(BOX_RATIO))
+            };
             frame
                 .child(
                     div()
                         .absolute()
                         .inset_0()
                         .children(self.frame.clone().map(backend::frame_element))
-                        .child(
-                            canvas(
-                                move |_, window, _| seen.set(Some(Seen::now(window))),
-                                move |_, _, window, _| {
-                                    if !scrubbing && !adjusting {
-                                        return;
-                                    }
-                                    // The pointer leaves the scrubber while
-                                    // it is dragged: the drag goes on.
-                                    let moved = entity.clone();
-                                    window.on_mouse_event(
-                                        move |event: &MouseMoveEvent, phase, _, cx| {
-                                            if phase == DispatchPhase::Capture {
-                                                moved.update(cx, |this, cx| {
-                                                    let x = event.position.x;
-                                                    match (event.dragging(), this.adjusting) {
-                                                        (true, true) => this.volume_to(x, cx),
-                                                        (true, false) => {
-                                                            this.scrub_to(x, false, cx)
-                                                        }
-                                                        // Let go where nothing
-                                                        // of ours heard it.
-                                                        (false, true) => this.volume_end(x, cx),
-                                                        (false, false) => this.scrub_end(x, cx),
-                                                    }
-                                                });
-                                            }
-                                        },
-                                    );
-                                    let released = entity.clone();
-                                    window.on_mouse_event(
-                                        move |event: &MouseUpEvent, phase, _, cx| {
-                                            if phase == DispatchPhase::Capture
-                                                && event.button == MouseButton::Left
-                                            {
-                                                released.update(cx, |this, cx| {
-                                                    this.volume_end(event.position.x, cx);
-                                                    this.scrub_end(event.position.x, cx);
-                                                });
-                                            }
-                                        },
-                                    );
-                                },
-                            )
-                            .absolute()
-                            .size_full(),
-                        ),
+                        .child(watcher),
                 )
                 // A click on the picture plays and pauses: everywhere but
                 // where the controls are.
@@ -1285,9 +1377,18 @@ mod tests {
     #[test]
     fn videos_are_told_by_their_extension() {
         let playable = cfg!(target_os = "macos") && !crate::host::IS_WEB;
-        assert_eq!(is_video(Path::new("/a/reel.MP4")), playable);
-        assert_eq!(is_video(Path::new("clip.mov")), playable);
-        assert!(!is_video(Path::new("/a/picture.png")));
-        assert!(!is_video(Path::new("/a/mp4")));
+        assert_eq!(plays(Path::new("/a/reel.MP4")), playable);
+        assert_eq!(plays(Path::new("clip.mov")), playable);
+        assert!(!plays(Path::new("/a/picture.png")));
+        assert!(!plays(Path::new("/a/mp4")));
+        assert!(!has_extension(Path::new("/a/demo.wav"), VIDEO));
+    }
+
+    #[test]
+    fn sounds_play_too() {
+        let playable = cfg!(target_os = "macos") && !crate::host::IS_WEB;
+        assert_eq!(plays(Path::new("/a/demo.WAV")), playable);
+        assert_eq!(plays(Path::new("final-mix.mp3")), playable);
+        assert!(!plays(Path::new("/a/notes.txt")));
     }
 }
