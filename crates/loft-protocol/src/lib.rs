@@ -10,6 +10,7 @@ pub mod ids;
 pub mod model;
 pub mod pages;
 pub mod thread_ref;
+pub mod voice;
 pub mod workbench;
 
 pub use automation::*;
@@ -17,6 +18,7 @@ pub use devices::*;
 pub use ids::*;
 pub use model::*;
 pub use pages::*;
+pub use voice::*;
 pub use workbench::*;
 
 use serde::{Deserialize, Serialize};
@@ -884,6 +886,45 @@ pub enum Request {
     RunAutomation {
         id: AutomationId,
     },
+    /// The speech and cleanup models and their state (`Response::Voice`).
+    VoiceStatus,
+    /// Start downloading a model (`Response::Voice`); `VoiceStatus` then
+    /// shows its progress.
+    VoiceDownload {
+        model: String,
+    },
+    /// Stop a download (`Response::Voice`).
+    VoiceCancelDownload {
+        model: String,
+    },
+    /// Delete a downloaded model (`Response::Voice`).
+    VoiceRemoveModel {
+        model: String,
+    },
+    /// Turn a recording into text with `[voice] model` (`Response::Text`).
+    /// `audio` is 16 kHz mono 16-bit little-endian PCM, at most
+    /// [`VOICE_MAX_SECONDS`] long.
+    VoiceTranscribe {
+        audio: Bytes,
+        /// Overrides `[voice] language` (an ISO code, or `auto`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+        /// Overrides `[voice] model` (Settings' "Try it").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    /// Tidy a transcript with `[voice] cleanup` (`Response::Text`; the
+    /// transcript itself when cleanup is off). `before` and `after` are
+    /// the draft's text around where it goes, so the result fits in.
+    VoiceCleanup {
+        transcript: String,
+        #[serde(default)]
+        before: String,
+        #[serde(default)]
+        after: String,
+    },
+    /// Unload every model now (`Response::Voice`).
+    VoiceUnload,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1175,6 +1216,9 @@ pub enum Response {
     },
     Automation {
         automation: Automation,
+    },
+    Voice {
+        status: VoiceStatus,
     },
 }
 

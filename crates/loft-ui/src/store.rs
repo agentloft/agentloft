@@ -319,6 +319,8 @@ pub struct AppStore {
     /// `[worktrees]` in the settings (cleaning up merged worktrees), kept
     /// current.
     pub worktrees_config: loft_config::WorktreeConfig,
+    /// `[voice]` in the settings (dictation), kept current.
+    pub voice: loft_config::VoiceConfig,
     /// `[pricing]` in the settings: API prices over the built-in ones.
     pub pricing: std::collections::BTreeMap<String, loft_config::ModelPrice>,
     /// The model prices the daemon fetched (models.dev), as it last saved them.
@@ -411,6 +413,7 @@ impl AppStore {
             browser: Default::default(),
             threads_config: Default::default(),
             worktrees_config: Default::default(),
+            voice: Default::default(),
             pricing: Default::default(),
             price_catalog: None,
             hidden_models: HashMap::new(),
@@ -672,6 +675,7 @@ impl AppStore {
         self.browser = config.browser.clone();
         self.threads_config = config.threads.clone();
         self.worktrees_config = config.worktrees.clone();
+        self.voice = config.voice.clone();
         self.pricing = config.pricing.clone();
         let file = loft_config::pricing::catalog_file(&self.paths);
         let fetched = self.price_catalog.as_ref().map(|c| c.fetched_at_ms);
@@ -1996,6 +2000,14 @@ impl AppStore {
             let _ = this.update(cx, |store, cx| then(store, result, cx));
         })
         .detach();
+    }
+
+    /// An error toast in this store's windows.
+    pub fn toast_error(&mut self, message: String, cx: &mut Context<Self>) {
+        cx.emit(StoreEvent::Notify {
+            message,
+            error: true,
+        });
     }
 
     fn notify_result(&mut self, result: Result<String, ErrorBody>, cx: &mut Context<Self>) {

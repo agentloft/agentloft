@@ -1,0 +1,43 @@
+[package]
+name = "loft-llm"
+description = "A small local language model (GGUF, on candle) that cleans up dictated text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# candle runs the model; never anything that bundles ggml (llama.cpp and its
+# bindings): transcribe-cpp, in the same binary, links a copy of its own.
+[dependencies]
+anyhow.workspace = true
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+# Anonymous mappings to read the model through (decoder.rs says why); the
+# version candle-core already uses.
+memmap2 = "0.9"
+# Pure Rust (fancy-regex rather than onig's C library); the version candle-core
+# itself uses, so there is one copy.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+# The GPU on a Mac; the CPU everywhere else (and on a Mac whose Metal device
+# can't be opened).
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11.1", features = ["metal"] }
+candle-nn = { version = "0.11.1", features = ["metal"] }
+# One build of each dependency whatever the cargo command (.config/hakari.toml).
+workspace-hack.workspace = true
+
+[dev-dependencies]
+loft-config.workspace = true
+sha2 = "0.10"
+
+# The live test downloads models: the OS's TLS stack on macOS and Windows,
+# rustls elsewhere (as loftd does).
+[target.'cfg(any(target_os = "macos", windows))'.dev-dependencies]
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(not(any(target_os = "macos", windows)))'.dev-dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[lints]
+workspace = true

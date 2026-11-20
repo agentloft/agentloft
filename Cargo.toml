@@ -30,6 +30,8 @@ loft-page-script = { path = "crates/loft-page-script" }
 loft-page-exec = { path = "crates/loft-page-exec" }
 loft-sim = { path = "crates/loft-sim" }
 loft-raster = { path = "crates/loft-raster" }
+loft-llm = { path = "crates/loft-llm" }
+loft-voice = { path = "crates/loft-voice" }
 # One build of each dependency whatever the cargo command (.config/hakari.toml).
 workspace-hack = { path = "crates/workspace-hack" }
 

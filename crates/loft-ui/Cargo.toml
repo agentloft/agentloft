@@ -43,6 +43,8 @@ web-time = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 gpui-kit = { workspace = true, features = ["tree-sitter-languages"] }
 tokio.workspace = true
+# The microphone, for dictation (voice/capture.rs).
+cpal = "0.18"
 
 # The browser build (crates/loft-web, ADR-0016): only tokio's channels.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -55,8 +57,15 @@ web-sys = { version = "0.3", features = [
   # Videos (video.rs): a hidden <video>, its frames copied through a canvas.
   "Document", "Element", "HtmlElement", "HtmlMediaElement", "HtmlVideoElement",
   "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "MediaError", "Node",
+  # Dictation (voice/capture/web.rs): the microphone through Web Audio.
+  "Navigator", "MediaDevices", "MediaStream", "MediaStreamConstraints", "MediaStreamTrack",
+  "AudioContext", "AudioContextOptions", "BaseAudioContext", "AudioNode", "AudioDestinationNode",
+  "MediaStreamAudioSourceNode", "ScriptProcessorNode", "AudioProcessingEvent", "AudioBuffer",
+  "DomException",
 ] }
 wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-macos-shots = { package = "gpui-pre-macos", version = "=0.3.11", features = ["test-support"], optional = true }
@@ -67,7 +76,8 @@ objc2-foundation = { workspace = true, features = ["NSBundle"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger"] }
 block2 = "0.6"
 # Video in the chat (video.rs): AVPlayer's frames, drawn by GPUI.
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
+# Dictation (voice/capture/native.rs): the microphone permission.
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "objc2-core-foundation", "objc2-core-media", "objc2-core-video"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CMTime"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CVBuffer", "CVImageBuffer", "CVPixelBuffer"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CFString"] }

@@ -58,6 +58,10 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Hold a voice model and answer the daemon's requests for it, over
+    /// stdin and stdout (spawned by the daemon; ends when stdin closes).
+    #[command(hide = true)]
+    VoiceEngine,
     /// Show web access as the running daemon has it: where it listens, the
     /// pairing link, and the browsers signed in.
     Web {
@@ -88,6 +92,10 @@ fn main() -> Result<()> {
     {
         // stdout carries pictures; nothing else may write to it.
         return simulator(udid, developer_dir, set, screens);
+    }
+    if let Some(Cmd::VoiceEngine) = cli.cmd {
+        // stdout carries the answers.
+        return loft_voice::engine::run();
     }
     let paths = match cli.home {
         Some(home) => Paths::new(home),

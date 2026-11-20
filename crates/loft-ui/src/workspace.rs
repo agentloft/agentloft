@@ -58,8 +58,10 @@ actions!(
 // The composer's recall, thread context and quoting (`workspace/compose.rs`).
 mod compose;
 mod device_card;
+mod dictation;
 mod handoff;
 pub use compose::QuoteSelection;
+pub use dictation::Dictate;
 
 const CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 272.;
@@ -135,6 +137,8 @@ pub struct WorkspaceView {
     /// The Automations page, made the first time it is opened.
     automations_page: Option<Entity<crate::automations::AutomationsPage>>,
     composers: HashMap<ThreadId, Entity<TextareaState>>,
+    /// Dictation into a composer, while it records or is transcribed.
+    dictation: Option<dictation::Dictation>,
     /// Threads whose composer has something typed in it right now (a
     /// draft is saved a moment later).
     typed: std::collections::HashSet<ThreadId>,
@@ -363,6 +367,7 @@ impl WorkspaceView {
             store,
             automations_page: None,
             composers: HashMap::new(),
+            dictation: None,
             typed: Default::default(),
             attachments: HashMap::new(),
             pasted: HashMap::new(),
@@ -657,6 +662,13 @@ impl WorkspaceView {
                 let t = thread_id.clone();
                 self.panel
                     .update(cx, |p, cx| p.show_device(&t, Some(id), true, window, cx));
+            }
+            // `dictate`: the microphone button (start, or finish); with
+            // `AGENTLOFT_FAKE_MIC` the recording is that file. Combine with
+            // `later:` to finish: `all:dictate++later:8000:dictate`.
+            Some(("dictate", _)) | None if dev == "dictate" || dev.starts_with("dictate:") => {
+                self.panel_open = false;
+                self.toggle_dictation(window, cx);
             }
             // `later:<ms>:<hook>`: a hook, that long after launch.
             Some(("later", rest)) => {
@@ -5522,7 +5534,9 @@ impl WorkspaceView {
                                     })
                                     .capture_action(cx.listener(
                                         |this, _: &gpui_kit::component::input::Escape, _, cx| {
-                                            if this.completion.take().is_some() {
+                                            if this.completion.take().is_some()
+                                                || this.cancel_dictation(cx)
+                                            {
                                                 cx.stop_propagation();
                                                 cx.notify();
                                             }
@@ -5663,6 +5677,9 @@ impl WorkspaceView {
                                                                 )),
                                                         )
                                                     })
+                                                    .children(
+                                                        self.dictation_controls(&thread_id, p, cx),
+                                                    )
                                                     .child(action),
                                             ),
                                     ),
@@ -6639,6 +6656,9 @@ impl Render for WorkspaceView {
                 cx.listener(|this, _: &QuoteSelection, window, cx| {
                     this.quote_selection(window, cx)
                 }),
+            )
+            .on_action(
+                cx.listener(|this, _: &Dictate, window, cx| this.toggle_dictation(window, cx)),
             )
             .on_action(
                 cx.listener(|_, _: &ConnectToComputer, window, cx| crate::remote::open(window, cx)),

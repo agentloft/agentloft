@@ -80,7 +80,8 @@ fn main() -> Result<()> {
 /// `cfg(unix)` and `cfg(target_os = …)` that the native build never sees.
 ///
 /// - linux: needs `zig` (it is the C compiler); fontconfig is looked up at
-///   run time, so no Linux system libraries are needed.
+///   run time and ALSA is only named to the linker (which clippy never
+///   runs), so no Linux system libraries are needed.
 /// - windows: needs `cargo install cargo-xwin` (it downloads Microsoft's
 ///   SDK headers on first use, accepting their license) and LLVM's `llvm-rc`
 ///   on PATH or in Homebrew's llvm. libghostty-vt can't be built for
@@ -106,6 +107,18 @@ fn cross_check(target: Option<&str>) -> Result<()> {
                 )?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
             }
+            // alsa-sys (cpal's, for dictation) asks pkg-config how to link
+            // ALSA; clippy never links, so a stand-in answers.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let path = cross.join("pkg-config-linux");
+                std::fs::write(
+                    &path,
+                    "#!/bin/sh\ncase \"$*\" in *--modversion*) echo 1.2.11;; *) echo -lasound;; esac\n",
+                )?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
             let ar = Command::new("xcrun")
                 .args(["-f", "ar"])
                 .output()
@@ -120,6 +133,10 @@ fn cross_check(target: Option<&str>) -> Result<()> {
                 .env("CXX_x86_64_unknown_linux_gnu", cross.join("cxx-linux"))
                 .env("AR_x86_64_unknown_linux_gnu", ar)
                 .env("RUST_FONTCONFIG_DLOPEN", "on")
+                .env(
+                    "PKG_CONFIG_x86_64_unknown_linux_gnu",
+                    cross.join("pkg-config-linux"),
+                )
                 .env("PKG_CONFIG_ALLOW_CROSS", "1"))
         }
         Some("windows") => {
@@ -161,6 +178,14 @@ fn cross_check(target: Option<&str>) -> Result<()> {
                 .args(["xwin", "clippy", "--target", "x86_64-pc-windows-msvc"])
                 .args(lint)
                 .env("GHOSTTY_VT_CACHE_DIR", cross.join("ghostty"))
+                // transcribe.cpp's CMake checks its compiler by linking a
+                // test program, and cargo-xwin's lld-link (rust-lld) can't
+                // always run here; clippy links nothing, so check by
+                // compiling only.
+                .env(
+                    "TRANSCRIBE_CMAKE_ARGS",
+                    "-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY",
+                )
                 .env("PATH", path))
         }
         _ => bail!("usage: cargo xtask cross-check <linux|windows>"),
@@ -534,6 +559,7 @@ fn info_plist(version: &str) -> String {
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Agentloft listens only while you dictate a message, to turn your voice into text.</string>
   <key>NSHumanReadableCopyright</key><string>Apache-2.0 — github.com/agentloft/agentloft</string>
 </dict>
 </plist>

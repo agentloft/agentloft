@@ -45,6 +45,8 @@ mod thread_ref;
 mod title_bar;
 mod video;
 mod view;
+/// Dictation's microphone.
+mod voice;
 pub mod windows;
 pub mod workspace;
 

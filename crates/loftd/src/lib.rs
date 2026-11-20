@@ -99,13 +99,19 @@ impl Daemon {
             CoreOptions {
                 env,
                 config,
-                mcp_bridge: opts.mcp_bridge,
+                mcp_bridge: opts.mcp_bridge.clone(),
                 worktrees_dir: paths.worktrees_dir(),
                 chats_dir: paths.chats_dir(),
                 projects_dir: paths.projects_dir(),
                 config_file: Some(paths.config_file()),
                 attachments_dir: paths.attachments_dir(),
                 device_backends,
+                models_dir: paths.models_dir(),
+                // The same program as the MCP bridge: this daemon's own.
+                voice_engine: opts
+                    .mcp_bridge
+                    .as_ref()
+                    .map(|b| (b.exe.clone(), vec!["voice-engine".to_owned()])),
                 fetch: opts.check_agent_updates.then(|| {
                     std::sync::Arc::new(|url: &str| http::get_text(url, 1 << 20))
                         as loft_core::Fetcher

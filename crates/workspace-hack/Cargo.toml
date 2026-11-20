@@ -17,17 +17,18 @@ publish.workspace = true
 
 ### BEGIN HAKARI SECTION
 [dependencies]
+aho-corasick = { version = "1" }
 anstyle = { version = "1" }
 arrayvec = { version = "0.7", default-features = false, features = ["std"] }
 base64 = { version = "0.23" }
 brotli = { version = "8" }
-bytemuck = { version = "1", default-features = false, features = ["aarch64_simd", "derive", "extern_crate_alloc", "min_const_generics"] }
+bytemuck = { version = "1", default-features = false, features = ["aarch64_simd", "derive", "extern_crate_alloc", "min_const_generics", "wasm_simd"] }
 byteorder = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 digest = { version = "0.10", features = ["mac", "std"] }
-either = { version = "1", default-features = false, features = ["use_std"] }
+either = { version = "1", features = ["use_std"] }
 euclid = { version = "0.22", features = ["libm"] }
 fallible-iterator = { version = "0.3", features = ["std"] }
 fastrand = { version = "2" }
@@ -37,8 +38,9 @@ form_urlencoded = { version = "1" }
 futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+half = { version = "2", features = ["bytemuck", "num-traits", "rand_distr", "use-intrinsics", "zerocopy"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
+hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", features = ["serde"] }
 icu_locale_core = { version = "2", default-features = false, features = ["alloc", "zerovec"] }
 icu_provider = { version = "2", default-features = false, features = ["alloc", "baked"] }
 image = { version = "0.25", default-features = false, features = ["dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "pnm", "qoi", "rayon", "tga", "tiff", "webp"] }
@@ -47,11 +49,13 @@ libc = { version = "0.2", features = ["extra_traits"] }
 litemap = { version = "0.8", default-features = false, features = ["alloc"] }
 log = { version = "0.4", default-features = false, features = ["serde", "std"] }
 memchr = { version = "2" }
+memmap2 = { version = "0.9", default-features = false, features = ["stable_deref_trait"] }
 moxcms = { version = "0.8", features = ["in_place"] }
-num-traits = { version = "0.2", features = ["libm"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 potential_utf = { version = "0.1", default-features = false, features = ["alloc", "zerovec"] }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
+rand_distr = { version = "0.5" }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 rust-i18n-support = { version = "4", default-features = false, features = ["codegen"] }
 semver = { version = "1" }
@@ -61,7 +65,7 @@ serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 simd-adler32 = { version = "0.3" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
-stable_deref_trait = { version = "1", default-features = false, features = ["std"] }
+stable_deref_trait = { version = "1" }
 subtle = { version = "2" }
 thiserror = { version = "2" }
 tinystr = { version = "0.8", default-features = false, features = ["alloc", "zerovec"] }
@@ -75,18 +79,19 @@ winnow = { version = "0.7" }
 writeable = { version = "0.6", default-features = false, features = ["alloc"] }
 yoke = { version = "0.8", features = ["derive"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
-zeroize = { version = "1", features = ["derive"] }
 zerotrie = { version = "0.2", default-features = false, features = ["alloc", "yoke", "zerofrom"] }
 zerovec = { version = "0.11", default-features = false, features = ["alloc", "derive", "yoke"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 zune-jpeg = { version = "0.5" }
 
 [build-dependencies]
+aho-corasick = { version = "1" }
 anstyle = { version = "1" }
 base64 = { version = "0.23" }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 digest = { version = "0.10", features = ["mac", "std"] }
-either = { version = "1", default-features = false, features = ["use_std"] }
+either = { version = "1", features = ["use_std"] }
 fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
@@ -94,10 +99,10 @@ hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 indexmap = { version = "2", features = ["serde"] }
 log = { version = "0.4", default-features = false, features = ["serde", "std"] }
 memchr = { version = "2" }
-num-traits = { version = "0.2", features = ["libm"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 rust-i18n-support = { version = "4", default-features = false, features = ["codegen"] }
 semver = { version = "1" }
@@ -106,7 +111,7 @@ serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
-stable_deref_trait = { version = "1", default-features = false, features = ["std"] }
+stable_deref_trait = { version = "1" }
 subtle = { version = "2" }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
@@ -119,20 +124,21 @@ winnow = { version = "0.7" }
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 block2 = { version = "0.6" }
+dispatch2 = { version = "0.3", default-features = false, features = ["block2", "objc2", "std"] }
 errno = { version = "0.3" }
-getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gpui-component = { version = "0.9", default-features = false, features = ["tree-sitter-languages"] }
 gpui-kit = { version = "0.9", features = ["tree-sitter-languages"] }
 gpui-pre-apple = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
 gpui-pre-macos = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", default-features = false, features = ["default-hasher", "serde"] }
 http = { version = "1" }
 httparse = { version = "1" }
 nix = { version = "0.31", features = ["fs"] }
 objc2 = { version = "0.6", features = ["disable-encoding-assertions", "exception"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFNumber", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
+objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVBuffer", "CVHostTime", "CVImageBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn", "objc2", "objc2-metal", "std"] }
 objc2-foundation = { version = "0.3" }
+objc2-metal = { version = "0.3" }
 percent-encoding = { version = "2" }
 raw-window-handle = { version = "0.6", default-features = false, features = ["std"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
@@ -142,17 +148,19 @@ time = { version = "0.3", default-features = false, features = ["formatting", "m
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 ureq = { version = "3", default-features = false, features = ["gzip", "native-tls"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 block2 = { version = "0.6" }
+dispatch2 = { version = "0.3", default-features = false, features = ["block2", "objc2", "std"] }
 errno = { version = "0.3" }
-getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 http = { version = "1" }
 httparse = { version = "1" }
 libc = { version = "0.2", features = ["extra_traits"] }
 objc2 = { version = "0.6", features = ["disable-encoding-assertions", "exception"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFNumber", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
+objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3" }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
@@ -165,20 +173,21 @@ zeroize = { version = "1", features = ["derive"] }
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 block2 = { version = "0.6" }
+dispatch2 = { version = "0.3", default-features = false, features = ["block2", "objc2", "std"] }
 errno = { version = "0.3" }
-getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 gpui-component = { version = "0.9", default-features = false, features = ["tree-sitter-languages"] }
 gpui-kit = { version = "0.9", features = ["tree-sitter-languages"] }
 gpui-pre-apple = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
 gpui-pre-macos = { version = "0.3", features = ["font-kit", "runtime_shaders", "test-support"] }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", default-features = false, features = ["default-hasher", "serde"] }
 http = { version = "1" }
 httparse = { version = "1" }
 nix = { version = "0.31", features = ["fs"] }
 objc2 = { version = "0.6", features = ["disable-encoding-assertions", "exception"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFNumber", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
+objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVBuffer", "CVHostTime", "CVImageBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBuffer", "CVPixelBufferPool", "CVReturn", "objc2", "objc2-metal", "std"] }
 objc2-foundation = { version = "0.3" }
+objc2-metal = { version = "0.3" }
 percent-encoding = { version = "2" }
 raw-window-handle = { version = "0.6", default-features = false, features = ["std"] }
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "time"] }
@@ -188,17 +197,19 @@ time = { version = "0.3", default-features = false, features = ["formatting", "m
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 ureq = { version = "3", default-features = false, features = ["gzip", "native-tls"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 block2 = { version = "0.6" }
+dispatch2 = { version = "0.3", default-features = false, features = ["block2", "objc2", "std"] }
 errno = { version = "0.3" }
-getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
+getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 http = { version = "1" }
 httparse = { version = "1" }
 libc = { version = "0.2", features = ["extra_traits"] }
 objc2 = { version = "0.6", features = ["disable-encoding-assertions", "exception"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFAttributedString", "CFBase", "CFCGTypes", "CFCalendar", "CFCharacterSet", "CFData", "CFDate", "CFDictionary", "CFError", "CFFileSecurity", "CFLocale", "CFMachPort", "CFMessagePort", "CFNumber", "CFRunLoop", "CFSet", "CFStream", "CFString", "CFURL", "CFUUID", "objc2", "std"] }
+objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3" }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }

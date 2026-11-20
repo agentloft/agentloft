@@ -26,6 +26,7 @@ mod projects;
 mod shortcuts;
 mod threads;
 mod usage;
+mod voice;
 mod web;
 mod worktrees;
 
@@ -217,6 +218,16 @@ pub struct Findable {
 /// Every setting, by the name its row shows (for the command palette).
 pub const FINDABLE: &[Findable] = &[
     Findable {
+        label: "Voice input and speech models",
+        keywords: "voice dictation dictate microphone mic speech transcribe transcription whisper parakeet model",
+        section: Section::Voice,
+    },
+    Findable {
+        label: "Transcript cleanup",
+        keywords: "voice dictation cleanup tidy punctuation local model haiku",
+        section: Section::Voice,
+    },
+    Findable {
         label: "Light, dark or system mode",
         keywords: "appearance theme mode light dark system",
         section: Section::Appearance,
@@ -359,6 +370,8 @@ pub enum Section {
     Agents,
     /// How threads are named.
     Threads,
+    /// Dictation: speech models, cleanup.
+    Voice,
     Projects,
     Worktrees,
     /// The browser panel: search engine, home page, which browser.
@@ -381,10 +394,11 @@ impl Section {
             .find(|sec| sec.label().eq_ignore_ascii_case(s) || sec.slug() == s)
     }
 
-    const ALL: [Section; 11] = [
+    const ALL: [Section; 12] = [
         Section::Appearance,
         Section::Agents,
         Section::Threads,
+        Section::Voice,
         Section::Projects,
         Section::Worktrees,
         Section::Browser,
@@ -411,6 +425,7 @@ impl Section {
             Section::Appearance => "appearance",
             Section::Agents => "agents",
             Section::Threads => "threads",
+            Section::Voice => "voice",
             Section::Projects => "projects",
             Section::Worktrees => "worktrees",
             Section::Browser => "browser",
@@ -427,6 +442,7 @@ impl Section {
             Section::Appearance => "Appearance",
             Section::Agents => "Agents",
             Section::Threads => "Threads",
+            Section::Voice => "Voice",
             Section::Projects => "Projects",
             Section::Worktrees => "Worktrees",
             Section::Browser => "Browser",
@@ -443,6 +459,7 @@ impl Section {
             Section::Appearance => IconName::Sun,
             Section::Agents => IconName::Bot,
             Section::Threads => IconName::MessageSquare,
+            Section::Voice => IconName::Mic,
             Section::Projects => IconName::FolderOpen,
             Section::Worktrees => IconName::GitBranch,
             Section::Browser => IconName::Globe,
@@ -478,6 +495,10 @@ pub(super) enum Field {
     TitleInstructions,
     /// Custom days before archived threads are deleted.
     ArchiveDays,
+    /// Terms dictation should spell right, comma-separated.
+    VoiceWords,
+    /// Added to the transcript cleanup's instructions.
+    VoiceInstructions,
 }
 
 impl Field {
@@ -500,6 +521,8 @@ impl Field {
             Field::TitleModel => &["titles", "model"],
             Field::TitleInstructions => &["titles", "instructions"],
             Field::ArchiveDays => &["threads", "delete_archived_after_days"],
+            Field::VoiceWords => &["voice", "words"],
+            Field::VoiceInstructions => &["voice", "cleanup_instructions"],
         }
     }
 
@@ -532,6 +555,8 @@ impl Field {
             Field::BrowserApp => c.browser.executable.clone().unwrap_or_default(),
             Field::TitleModel => c.titles.model.clone(),
             Field::TitleInstructions => c.titles.instructions.clone(),
+            Field::VoiceWords => c.voice.words.join(", "),
+            Field::VoiceInstructions => c.voice.cleanup_instructions.clone(),
             Field::ArchiveDays => c.threads.delete_archived_after_days.to_string(),
         }
     }
@@ -555,6 +580,8 @@ impl Field {
             Field::TitleModel => "Automatic",
             Field::TitleInstructions => "None",
             Field::ArchiveDays => "Days",
+            Field::VoiceWords => "Agentloft, GPUI, Tokio",
+            Field::VoiceInstructions => "None",
         }
     }
 
@@ -590,7 +617,22 @@ impl Field {
             (Field::BrowserSearch | Field::BrowserHome | Field::BrowserApp, true) => {
                 SettingValue::Unset
             }
-            (Field::TitleModel | Field::TitleInstructions, true) => SettingValue::Unset,
+            (Field::TitleModel | Field::TitleInstructions | Field::VoiceInstructions, true) => {
+                SettingValue::Unset
+            }
+            (Field::VoiceWords, _) => {
+                let words: Vec<String> = text
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if words.is_empty() {
+                    SettingValue::Unset
+                } else {
+                    SettingValue::List(words)
+                }
+            }
             // Empty or 0: never. Not a number: checked in `save_field`.
             (Field::ArchiveDays, _) => match text.parse::<u32>() {
                 Ok(days) if days > 0 => SettingValue::Int(i64::from(days)),
@@ -647,6 +689,7 @@ pub struct SettingsView {
     computers: computers::ComputersPage,
     browser: browser::BrowserPage,
     usage: usage::UsagePage,
+    voice: voice::VoicePage,
     /// "Custom" is picked for deleting archived threads (its days field
     /// shows even while the value is a preset or never).
     archive_custom: bool,
@@ -695,6 +738,8 @@ impl SettingsView {
             Field::TitleModel,
             Field::TitleInstructions,
             Field::ArchiveDays,
+            Field::VoiceWords,
+            Field::VoiceInstructions,
         ] {
             let current = field.current(&config);
             let input = cx.new(|cx| {
@@ -731,6 +776,7 @@ impl SettingsView {
             computers: Default::default(),
             browser: browser::BrowserPage::default(),
             usage: usage::UsagePage::default(),
+            voice: voice::VoicePage::default(),
             archive_custom: false,
             leftovers_asked: false,
             scroll: gpui_kit::ScrollHandle::new(),
@@ -1011,6 +1057,7 @@ impl Render for SettingsView {
             Section::Appearance => self.appearance(&p, window, cx),
             Section::Agents => self.agents_page(&p, window, cx),
             Section::Threads => self.threads_page(&p, cx),
+            Section::Voice => self.voice_page(&p, cx),
             Section::Projects => self.projects_page(&p, window, cx),
             Section::Worktrees => self.worktrees(&p, cx),
             Section::Browser => self.browser_page(&p, cx),

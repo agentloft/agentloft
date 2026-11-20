@@ -141,6 +141,14 @@ pub const SHORTCUTS: &[Shortcut] = &[
         crate::workspace::QuoteSelection
     ),
     shortcut!(
+        "dictate",
+        "Dictate (start, then finish)",
+        "Conversation",
+        "secondary-shift-d",
+        WORKSPACE,
+        crate::workspace::Dictate
+    ),
+    shortcut!(
         "stop",
         "Stop the turn",
         "Conversation",

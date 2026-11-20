@@ -17,6 +17,7 @@ url.workspace = true
 loft-store.workspace = true
 loft-harness.workspace = true
 loft-config.workspace = true
+loft-voice.workspace = true
 loft-git.workspace = true
 ignore.workspace = true
 portable-pty.workspace = true

@@ -206,6 +206,41 @@ const KEYS: &[Key] = &[
         about: "After each turn, offer the agent's guess at your next message in the empty composer (Tab takes it); the agent is asked once per turn, Claude on Haiku (default on)",
     },
     Key {
+        key: "voice.enabled",
+        kind: Kind::Bool,
+        about: "Show the microphone button in the composer for dictation (default on)",
+    },
+    Key {
+        key: "voice.model",
+        kind: Kind::Text,
+        about: "Speech model for dictation, an id from Settings ▸ Voice (e.g. parakeet-en, whisper-large-v3-turbo); it must be downloaded there",
+    },
+    Key {
+        key: "voice.language",
+        kind: Kind::Text,
+        about: "Language spoken when dictating, an ISO code such as en or de; \"auto\" = the model works it out",
+    },
+    Key {
+        key: "voice.unload_after",
+        kind: Kind::OneOf(&["immediately", "2m", "5m", "10m", "15m", "1h", "never"]),
+        about: "How long a voice model stays in memory after it was last used (default 5m)",
+    },
+    Key {
+        key: "voice.cleanup",
+        kind: Kind::Text,
+        about: "What tidies dictated text: \"off\", \"local:<model>\" (a small model on this computer, from Settings ▸ Voice), or an agent and model such as \"claude:haiku\" or \"codex:<model>\"",
+    },
+    Key {
+        key: "voice.cleanup_instructions",
+        kind: Kind::Text,
+        about: "Extra instructions for tidying dictated text",
+    },
+    Key {
+        key: "voice.words",
+        kind: Kind::TextList,
+        about: "Names and terms the speech model should spell right",
+    },
+    Key {
         key: "usage.price_catalog",
         kind: Kind::Text,
         about: "Where model prices for cost estimates come from each day (models.dev's format); empty = only the built-in prices and [pricing]",

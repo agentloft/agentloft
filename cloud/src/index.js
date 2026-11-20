@@ -459,24 +459,31 @@ const PAGE_CSP =
  *  page then sends the browser to sign in, or to the computer). */
 async function machinePage(request, env, id) {
   let frame = "";
+  let origin = "";
   try {
     const user = await signedIn(request, env);
     const row = await ownMachine(env, user, id);
-    if (framed(row) && Date.now() - row.last_seen_ms < ONLINE_MS) frame = `; frame-src ${new URL(row.url).origin}`;
+    if (framed(row) && Date.now() - row.last_seen_ms < ONLINE_MS) {
+      origin = new URL(row.url).origin;
+      frame = `; frame-src ${origin}`;
+    }
   } catch {}
-  return appPage(request, env, frame);
+  return appPage(request, env, frame, origin);
 }
 
 /** The app page under another path (/m/<id>, /link), with the page's
  *  headers set here (public/_headers matches the path asked for). */
-async function appPage(request, env, frame = "") {
+async function appPage(request, env, frame = "", framedOrigin = "") {
   const page = await env.ASSETS.fetch(new URL(APP_PATH, request.url));
   const out = new Response(page.body, page);
   out.headers.set("Content-Security-Policy", PAGE_CSP + frame);
   out.headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  // The framed computer may use the microphone (dictation into its
+  // composer); this page itself never does.
+  const microphone = framedOrigin ? `microphone=("${framedOrigin}")` : "microphone=()";
   out.headers.set(
     "Permissions-Policy",
-    "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    `camera=(), ${microphone}, geolocation=(), payment=(), usb=()`,
   );
   out.headers.set("Cache-Control", "no-store");
   return out;

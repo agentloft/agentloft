@@ -60,7 +60,7 @@ fn browser_off() -> ErrorBody {
 fn remote_may_set(key: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
     match parts.as_slice() {
-        ["ui", ..] | ["worktrees", _] | ["titles", _] | ["threads", _] => true,
+        ["ui", ..] | ["worktrees", _] | ["titles", _] | ["threads", _] | ["voice", _] => true,
         // How the browser tab behaves; not which program is run for it.
         ["browser", "search" | "home"] => true,
         ["harness", _, field] => matches!(
@@ -335,7 +335,16 @@ impl Core {
             | Request::SaveTheme { .. }
             | Request::ReloadConfig
             | Request::ProbeHarness { .. }
-            | Request::ListModels { .. } => Ok(()),
+            | Request::ListModels { .. }
+            // Dictation from a browser is transcribed here, by models
+            // fetched here, as on this computer.
+            | Request::VoiceStatus
+            | Request::VoiceDownload { .. }
+            | Request::VoiceCancelDownload { .. }
+            | Request::VoiceRemoveModel { .. }
+            | Request::VoiceTranscribe { .. }
+            | Request::VoiceCleanup { .. }
+            | Request::VoiceUnload => Ok(()),
 
             Request::ChangeSetting { key, .. } => {
                 if remote_may_set(key) {

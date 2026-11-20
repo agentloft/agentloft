@@ -317,7 +317,9 @@ fn harden(response: &mut Response<Body>, host: Option<&str>, tls: bool, framer: 
         ),
         (
             header::HeaderName::from_static("permissions-policy"),
-            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+            // The microphone is for dictation into the composer, by this
+            // page itself (and by it framed on the linked website).
+            "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
         ),
     ] {
         headers.insert(name, HeaderValue::from_static(value));

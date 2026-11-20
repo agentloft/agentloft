@@ -15,6 +15,7 @@ loft-protocol.workspace = true
 loft-config.workspace = true
 loft-store.workspace = true
 loft-core.workspace = true
+loft-voice.workspace = true
 loft-harness.workspace = true
 loft-harness-claude.workspace = true
 loft-harness-codex.workspace = true

@@ -22,6 +22,7 @@ mod terminals;
 mod thread;
 mod titles;
 mod usage;
+mod voice;
 mod workbench;
 mod worktrees;
 
@@ -205,6 +206,11 @@ pub struct CoreOptions {
     /// Simulators and emulators (ADR-0020): `devices::system_backends` in
     /// the daemon, none (or fakes) in tests.
     pub device_backends: Vec<Arc<dyn devices::Backend>>,
+    /// Where downloaded models go (`~/.agentloft/models`).
+    pub models_dir: PathBuf,
+    /// The program that runs voice models and its arguments
+    /// (`agentloftd voice-engine`); `None`: no voice input (tests).
+    pub voice_engine: Option<(PathBuf, Vec<String>)>,
 }
 
 pub use agent_updates::Fetcher;
@@ -223,6 +229,8 @@ impl Default for CoreOptions {
             attachments_dir: std::env::temp_dir().join("agentloft-attachments"),
             fetch: None,
             device_backends: Vec::new(),
+            models_dir: std::env::temp_dir().join("agentloft-models"),
+            voice_engine: None,
         }
     }
 }
@@ -284,6 +292,8 @@ pub struct Core {
     latest_releases: agent_updates::Latest,
     /// Harnesses whose CLI is being updated now.
     updating: Mutex<std::collections::HashSet<String>>,
+    /// Voice input's models and the processes that run them.
+    voice: loft_voice::Voice,
     opts: CoreOptions,
     // Scripts (D)
     /// Agents' browser scripts: each tab's `state`, and how many run.
@@ -312,8 +322,18 @@ impl Core {
             opts.device_backends.clone(),
             bus.clone(),
         ));
+        let voice = loft_voice::Voice::new(loft_voice::VoiceOptions {
+            models_dir: opts.models_dir.clone(),
+            engine: opts.voice_engine.clone(),
+            fake: opts
+                .env
+                .get("AGENTLOFT_FAKE_VOICE")
+                .or(std::env::var("AGENTLOFT_FAKE_VOICE").ok().as_ref())
+                .is_some_and(|v| v == "1"),
+        });
         Arc::new(Self {
             devices,
+            voice,
             store: Mutex::new(store),
             bus,
             harnesses: harnesses.into_iter().map(|h| (h.id().0, h)).collect(),
@@ -852,6 +872,7 @@ impl Core {
         };
         let config = loft_config::Config::load_file(file)
             .map_err(|e| ErrorBody::new(ErrorCode::BadRequest, format!("{e:#}")))?;
+        self.voice.unload_after_changed(config.voice.unload_after());
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
         self.config_rev.send_modify(|rev| *rev += 1);
         // Binary paths may have changed.
@@ -2064,6 +2085,21 @@ impl Core {
             }
             Request::DeleteAutomation { id } => self.delete_automation(&id),
             Request::RunAutomation { id } => self.run_automation_now(&id).await,
+            Request::VoiceStatus => self.voice_status(),
+            Request::VoiceDownload { model } => self.voice_download(&model),
+            Request::VoiceCancelDownload { model } => self.voice_cancel_download(&model),
+            Request::VoiceRemoveModel { model } => self.voice_remove(&model).await,
+            Request::VoiceUnload => self.voice_unload().await,
+            Request::VoiceTranscribe {
+                audio,
+                language,
+                model,
+            } => self.voice_transcribe(audio.0, language, model).await,
+            Request::VoiceCleanup {
+                transcript,
+                before,
+                after,
+            } => self.voice_cleanup(transcript, before, after).await,
         }
     }
 

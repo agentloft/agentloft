@@ -108,6 +108,10 @@ impl Paths {
     pub fn logs_dir(&self) -> PathBuf {
         self.home.join("logs")
     }
+    /// Downloaded models (speech, transcript cleanup).
+    pub fn models_dir(&self) -> PathBuf {
+        self.home.join("models")
+    }
     pub fn worktrees_dir(&self) -> PathBuf {
         self.home.join("worktrees")
     }
@@ -260,6 +264,76 @@ pub struct Config {
     /// million tokens, over the built-in ones (a model id or its prefix).
     pub pricing: std::collections::BTreeMap<String, ModelPrice>,
     pub usage: UsageConfig,
+    pub voice: VoiceConfig,
+}
+
+/// `[voice]` in config.toml: dictation into the composer. Speech is turned
+/// into text on the daemon's computer by a model downloaded there; nothing
+/// is sent anywhere else unless `cleanup` names an agent.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// The composer shows a microphone button.
+    pub enabled: bool,
+    /// The speech model (an id from the daemon's catalog); empty = none
+    /// chosen yet.
+    pub model: String,
+    /// What is spoken, as an ISO code (`en`, `de`, …); `auto` = the model
+    /// works it out (or its only language).
+    pub language: String,
+    /// How long a model stays in memory after it was last used:
+    /// `immediately`, `2m`, `5m`, `10m`, `15m`, `1h` or `never`.
+    pub unload_after: String,
+    /// What tidies a transcript before it lands in the composer: `off`,
+    /// `local:<model>` (a small model on this computer), or an agent and
+    /// model (`claude:haiku`, `codex:<model>`, `gemini:<model>`, …).
+    pub cleanup: String,
+    /// Added to the cleanup instructions.
+    pub cleanup_instructions: String,
+    /// Names and terms the speech model should spell right.
+    pub words: Vec<String>,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: String::new(),
+            language: "auto".into(),
+            unload_after: "5m".into(),
+            cleanup: "off".into(),
+            cleanup_instructions: String::new(),
+            words: Vec::new(),
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// The picks for `unload_after`, with their labels.
+    pub const UNLOAD_CHOICES: [(&'static str, &'static str); 7] = [
+        ("immediately", "Right after each use"),
+        ("2m", "After 2 minutes"),
+        ("5m", "After 5 minutes"),
+        ("10m", "After 10 minutes"),
+        ("15m", "After 15 minutes"),
+        ("1h", "After an hour"),
+        ("never", "Keep it loaded"),
+    ];
+
+    /// How long an unused model stays loaded; `None` = until the daemon
+    /// stops. Anything unknown is the default, five minutes.
+    pub fn unload_after(&self) -> Option<std::time::Duration> {
+        let mins = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        match self.unload_after.trim() {
+            "immediately" => Some(std::time::Duration::ZERO),
+            "2m" => mins(2),
+            "10m" => mins(10),
+            "15m" => mins(15),
+            "1h" => mins(60),
+            "never" => None,
+            _ => mins(5),
+        }
+    }
 }
 
 /// `[usage]` in config.toml: the Usage page's cost estimates.
