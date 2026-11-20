@@ -142,7 +142,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     ),
     shortcut!(
         "dictate",
-        "Dictate (start, then finish)",
+        "Dictate",
         "Conversation",
         "secondary-shift-d",
         WORKSPACE,

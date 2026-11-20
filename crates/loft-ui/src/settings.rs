@@ -223,6 +223,11 @@ pub const FINDABLE: &[Findable] = &[
         section: Section::Voice,
     },
     Findable {
+        label: "Dictation: toggle or hold to talk",
+        keywords: "voice dictation push to talk hold toggle microphone shortcut",
+        section: Section::Voice,
+    },
+    Findable {
         label: "Transcript cleanup",
         keywords: "voice dictation cleanup tidy punctuation local model haiku",
         section: Section::Voice,

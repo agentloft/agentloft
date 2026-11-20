@@ -592,6 +592,23 @@ impl WorkspaceView {
                 };
                 let left = MouseButton::Left;
                 let events: Vec<PlatformInput> = match name {
+                    // `keydown=cmd-shift-d` … `keyup=cmd-shift-d`: a key
+                    // held for as long as the steps between take (hold to
+                    // talk).
+                    "keydown" | "keyup" => {
+                        let Ok(keystroke) = Keystroke::parse_with_os(arg, os) else {
+                            continue;
+                        };
+                        vec![if name == "keydown" {
+                            PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                                keystroke,
+                                is_held: false,
+                                prefer_character_input: false,
+                            })
+                        } else {
+                            PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke })
+                        }]
+                    }
                     "wait" => {
                         pause(n.first().copied().unwrap_or(500.) as u64).await;
                         continue;

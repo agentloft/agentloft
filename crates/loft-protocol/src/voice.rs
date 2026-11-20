@@ -44,6 +44,9 @@ pub struct VoiceModel {
     pub languages: Vec<String>,
     #[serde(default)]
     pub recommended: bool,
+    /// Transcribes while the person speaks (the text shows as they go).
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub live: bool,
     /// Measured share of English words it gets wrong (percent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub english_error: Option<f32>,

@@ -12,6 +12,7 @@ use crate::theme::Palette;
 use crate::voice::capture::{Recorder, SAMPLE_RATE};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, ElementId, InteractiveElement as _, IntoElement as _, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Task, Window, actions, div, px,
@@ -49,7 +50,18 @@ pub(super) struct Dictation {
     /// What live transcription has heard so far: text that stays, and text
     /// that may still change.
     heard: (String, String),
+    /// Hold to talk: what is being held; letting go finishes.
+    held: Option<Held>,
     _task: Task<()>,
+}
+
+/// What a hold-to-talk recording lasts as long as.
+#[derive(Clone)]
+enum Held {
+    /// The shortcut: its key and modifiers.
+    Keys(gpui_kit::Keystroke),
+    /// The microphone button, pressed.
+    Pointer,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +86,101 @@ pub(super) enum Phase {
 }
 
 impl WorkspaceView {
+    /// The shortcut, pressed: toggles, or with hold to talk starts (the
+    /// key's repeats while it is held change nothing).
+    pub(super) fn dictate_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.store.read(cx).voice.hold_to_talk() {
+            self.toggle_dictation(window, cx);
+            return;
+        }
+        if self.dictation.is_some() {
+            return;
+        }
+        let os = cx.platform_info().os;
+        let keys = crate::keymap::keys_for("dictate", cx).and_then(|keys| {
+            let first = keys.split_whitespace().next()?.to_owned();
+            gpui_kit::Keystroke::parse_with_os(&first, os).ok()
+        });
+        self.start_dictation(window, cx);
+        if let Some(d) = self.dictation.as_mut() {
+            // A shortcut that can't be read back ends like a toggle's.
+            d.held = keys.map(Held::Keys);
+        }
+    }
+
+    /// The microphone button pressed, with hold to talk.
+    fn hold_button(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dictation.is_some() {
+            return;
+        }
+        self.start_dictation(window, cx);
+        if let Some(d) = self.dictation.as_mut() {
+            d.held = Some(Held::Pointer);
+        }
+    }
+
+    /// A key let go: the end of a hold-to-talk shortcut.
+    pub(super) fn dictation_key_up(
+        &mut self,
+        key: &gpui_kit::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Held::Keys(keys)) = self.dictation.as_ref().and_then(|d| d.held.clone())
+            && key.key.eq_ignore_ascii_case(&keys.key)
+        {
+            self.let_go(window, cx);
+        }
+    }
+
+    /// Modifiers changed: a hold-to-talk shortcut ends when one of its own
+    /// is let go.
+    pub(super) fn dictation_modifiers(
+        &mut self,
+        now: &gpui_kit::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Held::Keys(keys)) = self.dictation.as_ref().and_then(|d| d.held.clone()) {
+            let wanted = keys.modifiers;
+            let lost = (wanted.platform && !now.platform)
+                || (wanted.control && !now.control)
+                || (wanted.alt && !now.alt)
+                || (wanted.shift && !now.shift)
+                || (wanted.function && !now.function);
+            if lost {
+                self.let_go(window, cx);
+            }
+        }
+    }
+
+    /// The mouse let go anywhere in the window: the end of a hold on the
+    /// microphone button.
+    pub(super) fn dictation_mouse_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.dictation.as_ref().and_then(|d| d.held.as_ref()),
+            Some(Held::Pointer)
+        ) {
+            self.let_go(window, cx);
+        }
+    }
+
+    /// What was held is let go: the recording finishes (or, if the
+    /// microphone hadn't started yet, is dropped).
+    fn let_go(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.dictation.as_mut() else {
+            return;
+        };
+        d.held = None;
+        match d.phase {
+            Phase::Recording(_) => self.finish_dictation(window, cx),
+            Phase::Starting => {
+                self.cancel_dictation(cx);
+            }
+            _ => {}
+        }
+    }
+
     /// The microphone button or the shortcut.
     pub(super) fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.dictation.as_ref().map(|d| &d.phase) {
@@ -156,6 +263,7 @@ impl WorkspaceView {
             levels: Vec::new(),
             live: Live::Asking,
             heard: Default::default(),
+            held: None,
             _task: task,
         });
         cx.notify();
@@ -564,9 +672,11 @@ impl WorkspaceView {
             .as_ref()
             .filter(|d| &d.thread_id == thread_id);
         let Some(d) = active else {
+            let hold = self.store.read(cx).voice.hold_to_talk();
+            let what = if hold { "Hold to dictate" } else { "Dictate" };
             let tip = match crate::keymap::keys_for("dictate", cx) {
-                Some(keys) => format!("Dictate ({})", crate::keymap::display(&keys)),
-                None => "Dictate".to_owned(),
+                Some(keys) => format!("{what} ({})", crate::keymap::display(&keys)),
+                None => what.to_owned(),
             };
             return Some(
                 div()
@@ -584,10 +694,21 @@ impl WorkspaceView {
                         gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                     })
                     .claims_press()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_dictation(window, cx);
-                        cx.stop_propagation();
-                    }))
+                    .when(hold, |d| {
+                        d.on_mouse_down(
+                            gpui_kit::MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.hold_button(window, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                    })
+                    .when(!hold, |d| {
+                        d.on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_dictation(window, cx);
+                            cx.stop_propagation();
+                        }))
+                    })
                     .into_any_element(),
             );
         };

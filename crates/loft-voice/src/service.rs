@@ -115,6 +115,7 @@ impl Voice {
                 size: m.file.size,
                 languages: m.languages.iter().map(|l| (*l).to_owned()).collect(),
                 recommended: m.recommended,
+                live: m.streaming,
                 english_error: m.english_error,
                 seconds_per_30s: m.seconds_per_30s,
                 state: store.state(m.id, std::slice::from_ref(&m.file)),
@@ -143,6 +144,7 @@ impl Voice {
             };
             models.push(VoiceModel {
                 languages: vec!["en".into()],
+                live: true,
                 ..fake.clone()
             });
             cleanup_models.push(fake);

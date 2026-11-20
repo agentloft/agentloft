@@ -211,6 +211,11 @@ const KEYS: &[Key] = &[
         about: "Show the microphone button in the composer for dictation (default on)",
     },
     Key {
+        key: "voice.mode",
+        kind: Kind::OneOf(&["toggle", "hold"]),
+        about: "How the microphone button and the dictation shortcut record: \"toggle\" (press to start, press again to finish; default) or \"hold\" (records only while held)",
+    },
+    Key {
         key: "voice.model",
         kind: Kind::Text,
         about: "Speech model for dictation, an id from Settings ▸ Voice (e.g. parakeet-en, whisper-large-v3-turbo); it must be downloaded there",

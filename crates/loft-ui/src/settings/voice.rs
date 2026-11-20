@@ -77,7 +77,7 @@ impl SettingsView {
         let voice = self.config.voice.clone();
         let mut page = v_flex().child(heading(
             "Dictation",
-            "Press the microphone in the composer (or its shortcut), speak, and press it again: the text goes into your message to edit or send. Speech is turned into text on this computer by the model below; recordings aren't kept.",
+            "Press the microphone in the composer (or its shortcut), speak, and press it again, or hold it while you speak with Hold to talk: the text goes into your message to edit or send. Speech is turned into text on this computer by the model below; recordings aren't kept.",
             p,
         ));
         page = page.child(row(
@@ -97,6 +97,45 @@ impl SettingsView {
                 .into_any_element(),
             p,
         ));
+        let hold = voice.hold_to_talk();
+        let view = cx.entity();
+        page = page.child(row(
+            "Recording",
+            "How the microphone and its shortcut record. Toggle: press to start, press again to finish. Hold to talk: records while you hold them, and finishes when you let go.",
+            Button::new("voice-mode")
+                .cursor_pointer()
+                .outline()
+                .small()
+                .label(if hold { "Hold to talk" } else { "Toggle" })
+                .dropdown_menu(move |menu, _, _| {
+                    let (toggle, held) = (view.clone(), view.clone());
+                    menu.item(PopupMenuItem::new("Toggle").checked(!hold).on_click(
+                        move |_, _, cx| {
+                            toggle.update(cx, |this, cx| {
+                                this.write(&["voice", "mode"], SettingValue::Unset, false, cx)
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new("Hold to talk").checked(hold).on_click(
+                        move |_, _, cx| {
+                            held.update(cx, |this, cx| {
+                                this.write(
+                                    &["voice", "mode"],
+                                    SettingValue::Str("hold".into()),
+                                    false,
+                                    cx,
+                                )
+                            });
+                        },
+                    ))
+                })
+                .into_any_element(),
+            p,
+        ));
+        // The same keys as in Settings ▸ Shortcuts: click, then press.
+        if let Some(shortcut) = crate::keymap::SHORTCUTS.iter().find(|s| s.id == "dictate") {
+            page = page.child(self.editable_row(shortcut, p, cx));
+        }
         let Some(status) = self.voice.status.clone() else {
             return page
                 .child(
@@ -122,7 +161,7 @@ impl SettingsView {
 
         page = page.child(heading(
             "Speech model",
-            "Downloaded once to this computer. Word errors are the share of English words the model got wrong in its benchmark; speed is the time it takes for 30 seconds of speech on this Mac's GPU.",
+            "Downloaded once to this computer. Live preview models show the text while you speak; the others when you stop. Word errors are the share of English words the model got wrong in its benchmark; speed is the time it takes for 30 seconds of speech on this Mac's GPU.",
             p,
         ));
         let rows = status
@@ -410,6 +449,7 @@ impl SettingsView {
                                     .child(super::selectable(model.name.clone())),
                             )
                             .when(model.recommended, |d| d.child(badge("Recommended", p)))
+                            .when(model.live, |d| d.child(badge("Live preview", p)))
                             .when(loaded, |d| d.child(badge("In memory", p))),
                     )
                     .child(

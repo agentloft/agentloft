@@ -6659,9 +6659,19 @@ impl Render for WorkspaceView {
                     this.quote_selection(window, cx)
                 }),
             )
-            .on_action(
-                cx.listener(|this, _: &Dictate, window, cx| this.toggle_dictation(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &Dictate, window, cx| this.dictate_action(window, cx)))
+            // Hold to talk ends when what was held is let go.
+            .on_key_up(cx.listener(|this, e: &gpui_kit::KeyUpEvent, window, cx| {
+                this.dictation_key_up(&e.keystroke, window, cx)
+            }))
+            .on_modifiers_changed(cx.listener(
+                |this, e: &gpui_kit::ModifiersChangedEvent, window, cx| {
+                    this.dictation_modifiers(&e.modifiers, window, cx)
+                },
+            ))
+            .capture_any_mouse_up(cx.listener(|this, _: &gpui_kit::MouseUpEvent, window, cx| {
+                this.dictation_mouse_up(window, cx)
+            }))
             .on_action(
                 cx.listener(|_, _: &ConnectToComputer, window, cx| crate::remote::open(window, cx)),
             )

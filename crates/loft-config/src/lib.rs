@@ -275,6 +275,9 @@ pub struct Config {
 pub struct VoiceConfig {
     /// The composer shows a microphone button.
     pub enabled: bool,
+    /// How the microphone button and the shortcut record: `toggle` (press
+    /// to start, press again to finish) or `hold` (records while held).
+    pub mode: String,
     /// The speech model (an id from the daemon's catalog); empty = none
     /// chosen yet.
     pub model: String,
@@ -298,6 +301,7 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: "toggle".into(),
             model: String::new(),
             language: "auto".into(),
             unload_after: "5m".into(),
@@ -319,6 +323,11 @@ impl VoiceConfig {
         ("1h", "After an hour"),
         ("never", "Keep it loaded"),
     ];
+
+    /// Recording lasts only while the button or the shortcut is held.
+    pub fn hold_to_talk(&self) -> bool {
+        self.mode.trim() == "hold"
+    }
 
     /// How long an unused model stays loaded; `None` = until the daemon
     /// stops. Anything unknown is the default, five minutes.

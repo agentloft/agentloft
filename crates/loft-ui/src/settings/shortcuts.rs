@@ -131,7 +131,7 @@ impl SettingsView {
         page.into_any_element()
     }
 
-    fn editable_row(
+    pub(super) fn editable_row(
         &self,
         s: &'static keymap::Shortcut,
         p: &Palette,
