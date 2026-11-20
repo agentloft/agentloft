@@ -17,7 +17,9 @@ env:
   CARGO_TERM_COLOR: always
   # libghostty-vt's finished builds (vendor/ghostty-vt-sys), kept between
   # runs by the cache step before each Zig build: building it downloads its
-  # Zig packages, and that download failing has failed releases.
+  # Zig packages, and that download failing has failed releases. When it is
+  # cached nothing else needs Zig: installing it and fetching aro (one to one
+  # and a half minutes a job) are skipped.
   GHOSTTY_VT_CACHE_DIR: ${{ github.workspace }}/.ghostty-vt
   RUSTFLAGS: -D warnings
 
@@ -27,15 +29,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
         with:
           path: .ghostty-vt
-          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+          # Release builds read this one too (.github/workflows/release.yml).
+          key: ghostty-vt-macos-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       # loft-terminal builds libghostty-vt, which needs Zig.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -43,6 +47,7 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
@@ -60,8 +65,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test headless crates
         run: >
@@ -84,14 +88,16 @@ jobs:
             pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libfontconfig1-dev libfreetype-dev libx11-xcb-dev libxcb1-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
         with:
           path: .ghostty-vt
-          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+          # Release builds read this one too (.github/workflows/release.yml).
+          key: ghostty-vt-linux-app-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -99,6 +105,7 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
@@ -110,18 +117,20 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # Windows builds are slow (no Linux-speed disk): keep what was
           # built even when a later step fails.
           cache-on-failure: true
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
         with:
           path: .ghostty-vt
-          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+          # Release builds read this one too (.github/workflows/release.yml).
+          key: ghostty-vt-windows-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -129,6 +138,7 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
@@ -145,16 +155,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
         with:
           path: .ghostty-vt
-          key: ghostty-vt-${{ github.job }}-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+          # Release builds read this one too (.github/workflows/release.yml).
+          key: ghostty-vt-web-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
       # The terminal in the browser is libghostty-vt built for wasm32, which
       # needs Zig like the native build does.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -162,6 +174,7 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"

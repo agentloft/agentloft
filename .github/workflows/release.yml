@@ -5,6 +5,7 @@ name: Release
 #   like v0.1.0-rc1, as a pre-release).
 # - A push to the `release-test` branch, or running it by hand, builds
 #   everything without publishing: the files are the run's artifacts.
+# - Every night it builds on main, only to keep the build caches warm.
 #
 # What it publishes (the website's download buttons link to these names):
 #   Agentloft-macos-arm64.dmg
@@ -13,11 +14,23 @@ name: Release
 #
 # The browser client (the same on every platform) and each platform's
 # binaries are built at the same time; packaging, which needs both, is quick.
+# macOS is packaged in the job that builds it: a job of its own waited for a
+# second macOS runner (5 minutes for 0.0.10, after 10 for the first).
+#
+# Build caches: GitHub lets a run read only the caches of its own ref and of
+# main. A tag's run can never read another tag's, so every release used to
+# compile every dependency from nothing (13-20 minutes a platform). So the
+# caches are saved on main only: by the nightly run, which builds whenever
+# the dependencies changed since its last cache, and by running this by hand
+# on main. A tag's run reads them and saves nothing (a cache saved under a
+# tag is never read again, and uploading it took one to two minutes).
 
 on:
   push:
     tags: ["v*"]
     branches: [release-test]
+  schedule:
+    - cron: "23 3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -30,6 +43,14 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # libghostty-vt's finished build (vendor/ghostty-vt-sys), restored by the
+  # cache step before each Rust build, under the same keys as CI's: a tag's
+  # run reads the library CI built on main (same Zig, target and flags, so
+  # the same library) instead of building it with Zig (one to four minutes).
+  GHOSTTY_VT_CACHE_DIR: ${{ github.workspace }}/.ghostty-vt
+  # The nightly run only warms the caches: when its dependencies are cached
+  # exactly as they are now, it has nothing to add and skips the build.
+  WARM_ONLY: ${{ github.event_name == 'schedule' }}
 
 jobs:
   web:
@@ -37,12 +58,21 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        id: rust-cache
         with:
           key: release-web
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
+        with:
+          path: .ghostty-vt
+          # CI's `web` job's key (.github/workflows/ci.yml).
+          key: ghostty-vt-web-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+      # Zig builds libghostty-vt, when it isn't cached.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -50,30 +80,46 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
-      - run: |
+      - if: env.WARM_ONLY != 'true' || steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
           for try in 1 2 3; do cargo xtask web --release && exit 0; sleep 30; done; exit 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'schedule'
         with:
           name: web
           path: target/web
           if-no-files-found: error
 
   build-macos:
-    name: Build macOS (Apple silicon)
+    name: Build and package macOS (Apple silicon)
     runs-on: macos-15
+    permissions:
+      contents: read
+      # Reading this run's artifacts (the web client) while it runs.
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        id: rust-cache
         with:
           key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
+        with:
+          path: .ghostty-vt
+          # CI's `macos` job's key (.github/workflows/ci.yml).
+          key: ghostty-vt-macos-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+      # Zig builds libghostty-vt, when it isn't cached.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -81,6 +127,7 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
@@ -88,13 +135,46 @@ jobs:
       # client goes in when it is packaged.
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
-      - run: |
+      - if: env.WARM_ONLY != 'true' || steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
           for try in 1 2 3; do cargo xtask bundle --stable --no-web && exit 0; sleep 30; done; exit 1
-      - run: tar -C target/bundle/stable -cf Agentloft.app.tar Agentloft.app
+      # The web job builds the browser client meanwhile and is nearly always
+      # done by now (5 minutes from nothing, against 13 or more here). Taken
+      # from this run's artifacts as soon as it is there.
+      - name: Web client (from the web job)
+        if: github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for try in $(seq 1 60); do
+            rm -rf web
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name web --dir web && exit 0
+            ended=$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+              --jq '.jobs[] | select(.name == "Web client") | .conclusion')
+            if [ -n "$ended" ] && [ "$ended" != success ]; then
+              echo "::error::the web client's job ended: $ended"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::no web client after 20 minutes"
+          exit 1
+      - name: Disk image
+        if: github.event_name != 'schedule'
+        run: |
+          mkdir -p dmg
+          ditto target/bundle/stable/Agentloft.app dmg/Agentloft.app
+          ditto web dmg/Agentloft.app/Contents/Resources/web
+          # Signed again (ad-hoc) now that the web client is inside.
+          codesign --force --deep --sign - dmg/Agentloft.app
+          ln -s /Applications dmg/Applications
+          mkdir -p dist
+          hdiutil create -volname Agentloft -srcfolder dmg -ov -format UDZO dist/Agentloft-macos-arm64.dmg
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'schedule'
         with:
-          name: build-macos
-          path: Agentloft.app.tar
+          name: macos
+          path: dist/Agentloft-macos-arm64.dmg
           if-no-files-found: error
 
   build-windows:
@@ -102,16 +182,25 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        id: rust-cache
         with:
-          key: release
+          # Shared with test-windows, which reads it.
+          shared-key: release-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           # Windows builds are slow (no Linux-speed disk): keep what was
           # built even when a later step fails.
           cache-on-failure: true
-      # libghostty-vt (the terminal) is built with Zig.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
+        with:
+          path: .ghostty-vt
+          # CI's `windows` job's key (.github/workflows/ci.yml).
+          key: ghostty-vt-windows-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+      # Zig builds libghostty-vt, when it isn't cached.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -119,12 +208,14 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
-      - run: |
+      - if: env.WARM_ONLY != 'true' || steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
           foreach ($try in 1..3) {
             cargo build --release -p loft-app -p loftd
             if ($LASTEXITCODE -eq 0) { exit 0 }
@@ -132,16 +223,42 @@ jobs:
           }
           exit 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'schedule'
         with:
           name: build-windows
           path: |
             target/release/agentloft.exe
             target/release/agentloftd.exe
           if-no-files-found: error
-      # The daemon end to end on Windows (its named pipe, PATH lookups),
-      # reported without holding the release back.
+
+  # The daemon end to end on Windows (its named pipe, PATH lookups), in a
+  # release build. Reported without holding the release back: nothing waits
+  # for this job (it was in build-windows, and packaging waited 4-8 minutes
+  # for it). CI runs the same tests on every push to main.
+  test-windows:
+    name: Test Windows (config, client, daemon end to end)
+    if: github.event_name != 'schedule'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/rust-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-windows
+          save-if: false
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-windows-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
+        with:
+          version: 0.17.1
+      - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
+        run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       - name: Test (config, client, daemon end to end)
-        continue-on-error: true
         run: |
           cargo test --release -p loft-config -p loft-client --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -161,12 +278,23 @@ jobs:
             pkg-config clang libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libfontconfig1-dev libfreetype-dev libx11-xcb-dev libxcb1-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
-      - name: Install toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        id: rust-cache
         with:
           key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ghostty
+        with:
+          path: .ghostty-vt
+          # CI's `linux-app` job's key (.github/workflows/ci.yml). It builds
+          # on a newer Ubuntu, but Zig builds for its own `x86_64-linux-gnu`
+          # whatever the runner, so the library is the same.
+          key: ghostty-vt-linux-app-${{ runner.os }}-${{ hashFiles('vendor/ghostty-vt-sys/GHOSTTY.lock', 'vendor/ghostty-vt-sys/build.rs') }}
+      # Zig builds libghostty-vt, when it isn't cached.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: steps.ghostty.outputs.cache-hit != 'true'
         with:
           version: 0.17.1
       # libghostty-vt's build needs the aro C front end, which its Zig
@@ -174,14 +302,17 @@ jobs:
       # GitHub's runners (it failed 0.0.7 and 0.0.8). The same commit from
       # GitHub has the same package hash, so it goes in Zig's cache first.
       - name: aro from GitHub
+        if: steps.ghostty.outputs.cache-hit != 'true'
         # By git, not GitHub's archive: Zig keeps an archive with its top
         # folder, and that copy hashes differently when a build reuses it.
         run: zig fetch "git+https://github.com/Vexu/arocc#d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b"
       # Building libghostty-vt (the terminal) downloads its Zig packages,
       # and a dropped download has failed releases: tried up to three times.
-      - run: |
+      - if: env.WARM_ONLY != 'true' || steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
           for try in 1 2 3; do cargo build --release -p loft-app -p loftd && exit 0; sleep 30; done; exit 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name != 'schedule'
         with:
           name: build-linux
           path: |
@@ -189,37 +320,10 @@ jobs:
             target/release/agentloftd
           if-no-files-found: error
 
-  package-macos:
-    name: Package macOS
-    needs: [web, build-macos]
-    runs-on: macos-15
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: build-macos
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: web
-          path: web
-      - name: Disk image
-        run: |
-          mkdir -p dmg
-          tar -C dmg -xf Agentloft.app.tar
-          ditto web dmg/Agentloft.app/Contents/Resources/web
-          # Signed again (ad-hoc) now that the web client is inside.
-          codesign --force --deep --sign - dmg/Agentloft.app
-          ln -s /Applications dmg/Applications
-          mkdir -p dist
-          hdiutil create -volname Agentloft -srcfolder dmg -ov -format UDZO dist/Agentloft-macos-arm64.dmg
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: macos
-          path: dist/Agentloft-macos-arm64.dmg
-          if-no-files-found: error
-
   package-windows:
     name: Package Windows
     needs: [web, build-windows]
+    if: github.event_name != 'schedule'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -288,6 +392,7 @@ jobs:
   package-linux:
     name: Package Linux
     needs: [web, build-linux]
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -319,7 +424,7 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [package-macos, package-windows, package-linux]
+    needs: [build-macos, package-windows, package-linux]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

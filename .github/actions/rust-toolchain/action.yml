@@ -1,0 +1,26 @@
+name: Rust toolchain
+description: >
+  Installs the toolchain rust-toolchain.toml pins and removes the runner's
+  others, before Swatinem/rust-cache.
+
+# rust-cache puts every installed toolchain's version in its cache key
+# (`rustup toolchain list`), the runner image's own `stable` included. GitHub
+# updates that every week or so, and runners on the old and new images serve
+# jobs side by side for days: the key changed from one run to the next (v0.0.9
+# re-run, 30 minutes later: "No cache found"), and caches were never found.
+# With only the pinned toolchain left, the key changes when we change it.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        rustup show active-toolchain || rustup toolchain install
+        pinned=$(rustup show active-toolchain | cut -d' ' -f1)
+        rustup default "$pinned"
+        for toolchain in $(rustup toolchain list --quiet); do
+          if [ "$toolchain" != "$pinned" ]; then
+            rustup toolchain uninstall "$toolchain"
+          fi
+        done
+        rustup toolchain list
