@@ -1,6 +1,6 @@
 //! The sidebar footer's usage button: each agent's plan limits in a card on
 //! hover (asked directly of each installed agent without opening a thread
-//! session, and kept for a minute), the busiest limit's percent beside the
+//! session, and kept for a minute), the lowest remaining percent beside the
 //! icon once known, and a click opens Settings ▸ Usage.
 
 use crate::spinner::Spinner;
@@ -106,13 +106,13 @@ impl PlanLimits {
         cx.notify();
     }
 
-    /// The most used limit across the agents, in percent.
-    pub(crate) fn peak(&self) -> Option<f32> {
+    /// The lowest remaining quota across the agents, in percent.
+    pub(crate) fn lowest_remaining(&self) -> Option<f32> {
         self.limits
             .iter()
             .filter_map(|(_, l)| l.as_ref()?.as_ref().ok())
-            .filter_map(crate::info_cards::peak_percent)
-            .reduce(f32::max)
+            .filter_map(crate::info_cards::min_remaining_percent)
+            .reduce(f32::min)
     }
 }
 

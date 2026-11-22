@@ -4577,12 +4577,12 @@ impl WorkspaceView {
     }
 
     /// The footer's usage button: plan limits in a card on hover (and the
-    /// busiest one's percent beside the icon once known); a click opens
+    /// lowest remaining percent beside the icon once known); a click opens
     /// Settings ▸ Usage.
     fn usage_button(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let limits = self.plan_limits.clone();
         // Redrawn when the answers arrive (the percent beside the icon).
-        let peak = limits.read(cx).peak();
+        let remaining = limits.read(cx).lowest_remaining();
         let card = limits.clone();
         h_flex()
             .id("sidebar-usage")
@@ -4591,14 +4591,14 @@ impl WorkspaceView {
             .gap_1()
             .items_center()
             .rounded(px(7.))
-            .text_color(match peak {
-                Some(pct) if pct >= 80. => p.warning,
+            .text_color(match remaining {
+                Some(pct) if pct <= 20. => p.warning,
                 _ => p.muted_foreground,
             })
             .cursor_pointer()
             .hover(|d| d.bg(p.hover).text_color(p.foreground))
             .child(Icon::new(IconName::Gauge).small())
-            .children(peak.map(|pct| format!("{}%", pct.round() as i64)))
+            .children(remaining.map(|pct| format!("{}%", pct.round() as i64)))
             // Asked as the pointer arrives, so the card opens with answers.
             .on_hover(move |hovered, _, cx| {
                 if *hovered {

@@ -170,7 +170,12 @@ fn stat_row(name: String, value: String, extra: Option<String>, p: &Palette) -> 
         .into_any_element()
 }
 
-/// A limit: label, reset time, percent and its bar.
+/// Convert a 0..100 "used" percentage to a 100..0 "remaining" percentage.
+fn remaining_from_used(used: f64) -> f32 {
+    (100. - used).clamp(0., 100.) as f32
+}
+
+/// A limit: label, reset time, remaining percent and its bar.
 fn limit_row(
     label: String,
     reset: Option<String>,
@@ -688,11 +693,12 @@ fn usage_body(
         );
     }
     for limit in limits {
+        let left = remaining_from_used(num(limit, "percent"));
         body.push(limit_row(
             limit_label(limit),
             text(limit, "resets_at").and_then(reset_time),
-            num(limit, "percent") as f32,
-            text(limit, "severity") != Some("normal"),
+            left,
+            text(limit, "severity") != Some("normal") || left <= 20.,
             p,
         ));
     }
@@ -1081,13 +1087,14 @@ fn status_body(info: &Value, p: &Palette) -> (String, Vec<AnyElement>) {
     if !windows.is_empty() {
         body.push(section_title("Limits", p).into_any_element());
         for w in windows {
+            let left = remaining_from_used(num(w, "usedPercent"));
             body.push(limit_row(
                 window_label(num(w, "windowDurationMins")),
                 w.get("resetsAt")
                     .and_then(Value::as_i64)
                     .and_then(reset_unix),
-                num(w, "usedPercent") as f32,
-                num(w, "usedPercent") >= 80.,
+                left,
+                left <= 20.,
                 p,
             ));
         }
@@ -1175,16 +1182,16 @@ fn card_text(kind: AgentInfoKind, info: &Value) -> String {
         AgentInfoKind::Usage => {
             for l in arr(info, "/rate_limits/limits") {
                 out.push_str(&format!(
-                    "{}: {}%\n",
+                    "{}: {}% left\n",
                     limit_label(l),
-                    num(l, "percent") as i64
+                    remaining_from_used(num(l, "percent")).round() as i64
                 ));
             }
             for b in antigravity_buckets(info) {
                 out.push_str(&format!(
-                    "{}: {}% used\n",
+                    "{}: {}% left\n",
                     b.label,
-                    b.used_pct.round() as i64
+                    b.remaining_pct.round() as i64
                 ));
             }
             if let Some(s) = info.get("session") {
@@ -1198,9 +1205,9 @@ fn card_text(kind: AgentInfoKind, info: &Value) -> String {
             for k in ["primary", "secondary"] {
                 if let Some(w) = limits.get(k).filter(|w| !w.is_null()) {
                     out.push_str(&format!(
-                        "{}: {}% used\n",
+                        "{}: {}% left\n",
                         window_label(num(w, "windowDurationMins")),
-                        num(w, "usedPercent") as i64
+                        remaining_from_used(num(w, "usedPercent")).round() as i64
                     ));
                 }
             }
@@ -1422,7 +1429,7 @@ pub(crate) fn render(
 struct AntigravityBucket {
     label: String,
     reset: Option<String>,
-    used_pct: f32,
+    remaining_pct: f32,
     warn: bool,
 }
 
@@ -1470,7 +1477,7 @@ fn antigravity_group_buckets(
         } else {
             format!("{family} · {span}")
         };
-        let used_pct = ((1. - remaining.clamp(0., 1.)) * 100.) as f32;
+        let remaining_pct = (remaining.clamp(0., 1.) * 100.) as f32;
         // Untouched buckets report a rolling placeholder reset `now + window`
         // with no description; hide it until some quota is used.
         let untouched = remaining >= 1. && text(b, "description").is_none();
@@ -1480,8 +1487,8 @@ fn antigravity_group_buckets(
         out.push(AntigravityBucket {
             label,
             reset,
-            used_pct,
-            warn: used_pct >= 80.,
+            remaining_pct,
+            warn: remaining_pct <= 20.,
         });
     }
     out
@@ -1522,7 +1529,7 @@ fn antigravity_usage_body(info: &Value, p: &Palette) -> (String, Vec<AnyElement>
             );
         }
         for b in buckets {
-            body.push(limit_row(b.label, b.reset, b.used_pct, b.warn, p));
+            body.push(limit_row(b.label, b.reset, b.remaining_pct, b.warn, p));
         }
     }
     if !any_bucket {
@@ -1553,18 +1560,19 @@ fn antigravity_usage_body(info: &Value, p: &Palette) -> (String, Vec<AnyElement>
 
 /// An agent's plan and its limits, from its `/usage` report (Claude Code,
 /// Antigravity) or its `/status` report (Codex): the plan's name, then a row
-/// per limit.
+/// per limit (shown as remaining quota, decreasing from 100% to 0%).
 pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<AnyElement>) {
     let capital = |s: &str| s[..1].to_uppercase() + &s[1..];
     let mut rows = Vec::new();
     // Claude Code.
     let claude = arr(info, "/rate_limits/limits");
     for limit in &claude {
+        let left = remaining_from_used(num(limit, "percent"));
         rows.push(limit_row(
             limit_label(limit),
             text(limit, "resets_at").and_then(reset_time),
-            num(limit, "percent") as f32,
-            text(limit, "severity") != Some("normal"),
+            left,
+            text(limit, "severity") != Some("normal") || left <= 20.,
             p,
         ));
     }
@@ -1576,13 +1584,14 @@ pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<Any
         .iter()
         .filter_map(|k| limits.get(*k).filter(|w| !w.is_null()))
     {
+        let left = remaining_from_used(num(w, "usedPercent"));
         rows.push(limit_row(
             window_label(num(w, "windowDurationMins")),
             w.get("resetsAt")
                 .and_then(Value::as_i64)
                 .and_then(reset_unix),
-            num(w, "usedPercent") as f32,
-            num(w, "usedPercent") >= 80.,
+            left,
+            left <= 20.,
             p,
         ));
     }
@@ -1599,7 +1608,7 @@ pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<Any
     }
     // Antigravity.
     for b in antigravity_buckets(info) {
-        rows.push(limit_row(b.label, b.reset, b.used_pct, b.warn, p));
+        rows.push(limit_row(b.label, b.reset, b.remaining_pct, b.warn, p));
     }
     let plan = text(info, "subscription_type")
         .or_else(|| {
@@ -1611,23 +1620,24 @@ pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<Any
     (plan, rows)
 }
 
-/// The most used of an agent's plan limits, in percent (the same reports
-/// as [`plan_limits`]).
-pub(crate) fn peak_percent(info: &Value) -> Option<f32> {
+/// The lowest remaining quota among an agent's plan limits, in percent
+/// (the same reports as [`plan_limits`]).
+pub(crate) fn min_remaining_percent(info: &Value) -> Option<f32> {
     let claude = arr(info, "/rate_limits/limits")
         .into_iter()
-        .map(|l| num(l, "percent"));
+        .map(|l| f64::from(remaining_from_used(num(l, "percent"))));
     let codex = ["primary", "secondary"].into_iter().filter_map(|k| {
         info.pointer(&format!("/rateLimits/rateLimits/{k}/usedPercent"))
             .and_then(Value::as_f64)
+            .map(|used| f64::from(remaining_from_used(used)))
     });
     let antigravity = antigravity_buckets(info)
         .into_iter()
-        .map(|b| f64::from(b.used_pct));
+        .map(|b| f64::from(b.remaining_pct));
     claude
         .chain(codex)
         .chain(antigravity)
-        .reduce(f64::max)
+        .reduce(f64::min)
         .map(|v| v as f32)
 }
 
@@ -1636,22 +1646,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peak_percent_is_the_busiest_limit() {
+    fn min_remaining_percent_is_the_tightest_limit() {
         let claude: Value = serde_json::json!({"rate_limits": {"limits": [
             {"percent": 12.0}, {"percent": 61.5}]}});
-        assert_eq!(peak_percent(&claude), Some(61.5));
+        assert_eq!(min_remaining_percent(&claude), Some(38.5));
         let codex: Value = serde_json::json!({"rateLimits": {"rateLimits": {
             "primary": {"usedPercent": 40.0}, "secondary": null}}});
-        assert_eq!(peak_percent(&codex), Some(40.0));
+        assert_eq!(min_remaining_percent(&codex), Some(60.0));
         let agy: Value = serde_json::json!({"command": {"data": {"groups": [
             {"name": "Gemini Models", "buckets": [
                 {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.92},
                 {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.74}
             ]}
         ]}}});
-        let agy_peak = peak_percent(&agy).unwrap();
-        assert!((agy_peak - 26.0).abs() < 0.01, "{agy_peak}");
-        assert_eq!(peak_percent(&serde_json::json!({})), None);
+        let agy_left = min_remaining_percent(&agy).unwrap();
+        assert!((agy_left - 74.0).abs() < 0.01, "{agy_left}");
+        assert_eq!(min_remaining_percent(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -1682,17 +1692,17 @@ mod tests {
                 "Gemini 4 Argon · Weekly",
             ]
         );
-        assert!((buckets[0].used_pct - 25.0).abs() < 0.01);
+        assert!((buckets[0].remaining_pct - 75.0).abs() < 0.01);
         assert!(buckets[0].reset.is_some());
-        assert!((buckets[1].used_pct - 8.0).abs() < 0.01);
+        assert!((buckets[1].remaining_pct - 92.0).abs() < 0.01);
         assert!(buckets[1].reset.is_some());
         // Untouched buckets suppress placeholder rolling reset times.
-        assert_eq!(buckets[2].used_pct, 0.0);
+        assert_eq!(buckets[2].remaining_pct, 100.0);
         assert!(buckets[2].reset.is_none());
         assert!(buckets[3].reset.is_none());
         assert!(buckets[4].reset.is_none());
         let text = card_text(AgentInfoKind::Usage, &info);
-        assert!(text.contains("Gemini · 5-hour: 25% used"), "{text}");
+        assert!(text.contains("Gemini · 5-hour: 75% left"), "{text}");
     }
 
     #[test]
