@@ -1,10 +1,9 @@
 //! Settings ▸ Usage: what the agents have used across every thread, in
 //! tokens or cost (by day, agent, model, project and thread, from the
-//! daemon's `UsageReport`), and each agent's plan limits (asked of the agent itself,
-//! through the most recent thread on it, as `/usage` and `/status` do).
+//! daemon's `UsageReport`), and each installed agent's plan limits.
 
 use super::{SettingsView, web::heading};
-use crate::plan_limits::LIMIT_AGENTS;
+use crate::plan_limits::{LIMIT_AGENTS, limit_agent_available};
 use crate::spinner::Spinner;
 use crate::theme::Palette;
 use chrono::Datelike as _;
@@ -41,7 +40,7 @@ pub(super) struct UsagePage {
 }
 
 enum Limits<'a> {
-    NoThread,
+    Unavailable,
     Asking,
     Ready(&'a Value),
     Failed(&'a str),
@@ -49,7 +48,7 @@ enum Limits<'a> {
 
 impl SettingsView {
     /// Ask the daemon for the report and the agents for their limits.
-    pub(super) fn refresh_usage(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_usage(&mut self, force_limits: bool, cx: &mut Context<Self>) {
         let Some(client) = self.store.read(cx).client() else {
             return;
         };
@@ -73,14 +72,17 @@ impl SettingsView {
             });
         })
         .detach();
-        // Limits: the agent's own report, through its most recent thread.
-        for (agent, _, kind) in LIMIT_AGENTS {
-            let Some(thread_id) = self.latest_thread(agent, cx) else {
+        // Limits: asked directly of each installed agent (no thread session).
+        for (agent, _) in LIMIT_AGENTS {
+            if !limit_agent_available(self.store.read(cx), agent) {
                 self.usage.limits.remove(agent);
                 continue;
-            };
+            }
             self.usage.limits.insert(agent, None);
-            let ask = client.request(Request::AgentInfo { thread_id, kind });
+            let ask = client.request(Request::PlanLimits {
+                harness: HarnessId(agent.into()),
+                refresh: force_limits,
+            });
             cx.spawn(async move |this, cx| {
                 let result = ask.await;
                 let _ = this.update(cx, |this, cx| {
@@ -96,11 +98,6 @@ impl SettingsView {
             .detach();
         }
         cx.notify();
-    }
-
-    /// The most recently used thread on `agent` that isn't archived.
-    fn latest_thread(&self, agent: &str, cx: &Context<Self>) -> Option<loft_protocol::ThreadId> {
-        crate::plan_limits::latest_thread(self.store.read(cx), agent)
     }
 
     /// The range picker, made once: the last 30 days to start with.
@@ -135,7 +132,7 @@ impl SettingsView {
             }
             this.usage.from = from.map(epoch_day);
             this.usage.to = to.map(epoch_day);
-            this.refresh_usage(cx);
+            this.refresh_usage(false, cx);
         });
         self.usage.picker = Some(picker.clone());
         self.usage._picker_sub = Some(sub);
@@ -150,7 +147,7 @@ impl SettingsView {
     ) -> AnyElement {
         let picker = self.usage_picker(window, cx);
         if self.usage.report.is_none() && !self.usage.loading {
-            self.refresh_usage(cx);
+            self.refresh_usage(false, cx);
         }
         let metric = self.usage.metric;
         let mut page = v_flex().gap_1().child(self.usage_toolbar(&picker, p, cx));
@@ -190,12 +187,12 @@ impl SettingsView {
         }
         page = page.child(heading(
             "Plan limits",
-            "Asked of each agent through your most recent thread on it (this starts the agent if it isn't running; it uses no tokens).",
+            "Asked directly of each installed agent (uses no tokens).",
             p,
         ));
-        for (agent, name, _) in LIMIT_AGENTS {
+        for (agent, name) in LIMIT_AGENTS {
             let state = match self.usage.limits.get(agent) {
-                None => Limits::NoThread,
+                None => Limits::Unavailable,
                 Some(None) => Limits::Asking,
                 Some(Some(Ok(v))) => Limits::Ready(v),
                 Some(Some(Err(e))) => Limits::Failed(e),
@@ -267,7 +264,7 @@ impl SettingsView {
                     .icon(IconName::RotateCcw)
                     .tooltip("Refresh")
                     .loading(self.usage.loading)
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_usage(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_usage(true, cx))),
             )
             .into_any_element()
     }
@@ -463,6 +460,7 @@ fn agent_name(id: &str) -> String {
         HarnessId::CODEX => "Codex".into(),
         HarnessId::OPENCODE => "OpenCode".into(),
         HarnessId::GEMINI => "Gemini CLI".into(),
+        HarnessId::ANTIGRAVITY => "Antigravity".into(),
         other => other.to_owned(),
     }
 }
@@ -475,6 +473,7 @@ fn agent_color(id: &str, p: &Palette) -> Hsla {
         HarnessId::CODEX => p.foreground.opacity(0.85),
         HarnessId::OPENCODE => hex(0x5B9BD5),
         HarnessId::GEMINI => hex(0x4FAE8B),
+        HarnessId::ANTIGRAVITY => hex(0x4285F4),
         _ => p.muted_foreground,
     }
 }
@@ -986,15 +985,13 @@ fn table(r: &Value, by: By, metric: Metric, p: &Palette) -> AnyElement {
 
 fn limits_card(agent: &str, name: &str, state: Limits<'_>, p: &Palette) -> AnyElement {
     let (plan, body): (Option<String>, Vec<AnyElement>) = match state {
-        Limits::NoThread => (
+        Limits::Unavailable => (
             None,
             vec![
                 div()
                     .text_sm()
                     .text_color(p.muted_foreground)
-                    .child(format!(
-                        "No {name} thread yet: start one to see its limits."
-                    ))
+                    .child(format!("{name} isn't installed or is turned off."))
                     .into_any_element(),
             ],
         ),

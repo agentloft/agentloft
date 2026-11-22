@@ -31,6 +31,19 @@ pub fn agent_logo(harness: &str, size: Pixels, p: &Palette) -> AnyElement {
         HarnessId::CODEX => ("brand/openai.svg", p.foreground),
         HarnessId::GEMINI => ("brand/gemini.svg", rgb(0x8E75B2).into()),
         HarnessId::OPENCODE => ("brand/opencode.svg", p.foreground),
+        HarnessId::ANTIGRAVITY => {
+            static LOGO: OnceLock<Arc<Image>> = OnceLock::new();
+            let logo = LOGO.get_or_init(|| {
+                Arc::new(Image::from_bytes(
+                    ImageFormat::Png,
+                    include_bytes!("../assets/brand/antigravity.png").to_vec(),
+                ))
+            });
+            return img(logo.clone())
+                .size(size)
+                .flex_shrink_0()
+                .into_any_element();
+        }
         _ => {
             return Icon::new(IconName::Bot)
                 .with_size(size)

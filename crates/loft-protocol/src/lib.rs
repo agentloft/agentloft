@@ -272,6 +272,14 @@ pub enum Request {
         thread_id: ThreadId,
         kind: AgentInfoKind,
     },
+    /// Ask an agent directly for its plan limits (`Response::AgentInfo`),
+    /// without starting or resuming a thread session.
+    PlanLimits {
+        harness: HarnessId,
+        /// Skip the daemon's short cache and ask the agent again.
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Stop one running subagent (its Agent tool call item), leaving the
     /// rest of the turn alone.
     StopSubagent {

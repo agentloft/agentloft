@@ -60,6 +60,7 @@ impl HarnessId {
     pub const CODEX: &'static str = "codex";
     pub const OPENCODE: &'static str = "opencode";
     pub const GEMINI: &'static str = "gemini";
+    pub const ANTIGRAVITY: &'static str = "antigravity";
     pub const FAKE: &'static str = "fake";
 
     pub fn claude() -> Self {

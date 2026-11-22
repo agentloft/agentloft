@@ -570,6 +570,7 @@ impl AppStore {
             HarnessId::CODEX,
             HarnessId::OPENCODE,
             HarnessId::GEMINI,
+            HarnessId::ANTIGRAVITY,
         ] {
             self.fetch_models(HarnessId(harness.into()), cx);
         }
@@ -665,8 +666,6 @@ impl AppStore {
         }
     }
 
-    /// Agents to offer: Claude Code and Codex always, ACP agents (OpenCode,
-    /// Gemini) once their CLI is found.
     /// Re-read the per-agent picker settings (on/off, hidden models).
     pub fn reload_agent_prefs(&mut self, cx: &mut Context<Self>) {
         let Ok(config) = crate::host::load_config(&self.paths) else {
@@ -693,6 +692,7 @@ impl AppStore {
             (HarnessId::CODEX, &config.harness.codex),
             (HarnessId::OPENCODE, &config.harness.opencode),
             (HarnessId::GEMINI, &config.harness.gemini),
+            (HarnessId::ANTIGRAVITY, &config.harness.antigravity),
         ] {
             if !h.enabled {
                 self.disabled_agents.insert(id.to_owned());
@@ -705,6 +705,7 @@ impl AppStore {
         cx.notify();
     }
 
+    /// Offer optional ACP agents once their CLI is found.
     pub fn available_harnesses(&self) -> Vec<(&'static str, &'static str)> {
         let mut out = vec![
             (HarnessId::CLAUDE, "Claude Code"),
@@ -713,6 +714,7 @@ impl AppStore {
         for (id, name) in [
             (HarnessId::OPENCODE, "OpenCode"),
             (HarnessId::GEMINI, "Gemini"),
+            (HarnessId::ANTIGRAVITY, "Antigravity"),
         ] {
             if self
                 .harness_status
@@ -733,6 +735,7 @@ impl AppStore {
             HarnessId::CODEX,
             HarnessId::OPENCODE,
             HarnessId::GEMINI,
+            HarnessId::ANTIGRAVITY,
         ]
         .map(|h| HarnessId(h.into()))
         {

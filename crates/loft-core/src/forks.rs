@@ -20,6 +20,7 @@ pub(crate) fn harness_display(h: &HarnessId) -> String {
         HarnessId::CODEX => "Codex".into(),
         HarnessId::OPENCODE => "OpenCode".into(),
         HarnessId::GEMINI => "Gemini".into(),
+        HarnessId::ANTIGRAVITY => "Antigravity".into(),
         other => {
             let mut c = other.chars();
             c.next()

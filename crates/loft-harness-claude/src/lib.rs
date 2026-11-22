@@ -76,6 +76,19 @@ impl Harness for ClaudeHarness {
         Ok(translate::commands(&v))
     }
 
+    fn plan_limits(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        binary: Option<PathBuf>,
+    ) -> Result<Option<serde_json::Value>> {
+        let binary = match binary {
+            Some(b) => b,
+            None => loft_config::which("claude", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .context("`claude` not found on PATH")?,
+        };
+        probe_plan_limits(&binary, env).map(Some)
+    }
+
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
         let binary = resolve_binary(&cfg)?;
         let mut cmd = Command::new(&binary);
@@ -370,6 +383,158 @@ fn probe_models(
     Ok(models)
 }
 
+/// Whether an administrator's `managed-mcp.json` exists: Claude exits before
+/// initializing when `--strict-mcp-config` is passed alongside it.
+fn has_managed_mcp_config(env: &std::collections::HashMap<String, String>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = env;
+        std::path::Path::new("/Library/Application Support/ClaudeCode/managed-mcp.json").exists()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = env;
+        std::path::Path::new("/etc/claude-code/managed-mcp.json").exists()
+    }
+    #[cfg(windows)]
+    {
+        env.get("ProgramData")
+            .or_else(|| env.get("PROGRAMDATA"))
+            .is_some_and(|dir| {
+                std::path::Path::new(dir)
+                    .join("ClaudeCode")
+                    .join("managed-mcp.json")
+                    .exists()
+            })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = env;
+        false
+    }
+}
+
+/// Spawn a lightweight, short-lived `claude` in `cwd` with hooks, session
+/// persistence, IDE auto-connect and MCP servers turned off.
+fn spawn_probe(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+    cwd: &std::path::Path,
+    extra_args: &[&str],
+) -> Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--settings",
+        r#"{"disableAllHooks":true}"#,
+    ])
+    .args(extra_args);
+    if !has_managed_mcp_config(env) {
+        cmd.args([
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+        ]);
+    }
+    cmd.current_dir(cwd)
+        .env_clear()
+        .envs(
+            env.iter()
+                .filter(|(k, _)| !SCRUBBED_ENV.contains(&k.as_str())),
+        )
+        .env("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
+        .env("CLAUDE_CODE_AUTO_CONNECT_IDE", "0")
+        .env("CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd.spawn()
+        .with_context(|| format!("spawn {}", binary.display()))
+}
+
+fn kill_probe(mut child: std::process::Child) {
+    let pid = child.id();
+    loft_harness::process::signal_group(pid, loft_harness::process::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Ask a short-lived `claude` for its account plan limits (`get_usage` with
+/// `skip_behaviors: true`, so it skips scanning local transcripts, never
+/// starts MCP servers or hooks, and never resumes a session).
+fn probe_plan_limits(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<serde_json::Value> {
+    use std::io::{BufRead as _, Write as _};
+    let cwd = loft_config::private_temp_dir("agentloft-ask")?;
+    let mut child = spawn_probe(binary, env, &cwd, &["--disable-slash-commands"])?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let stdout = child.stdout.take().context("stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let result = (|| {
+        let mut t = Translator::new();
+        let init = t.initialize();
+        let usage_id = "loft_usage";
+        let usage = serde_json::json!({
+            "type": "control_request",
+            "request_id": usage_id,
+            "request": {"subtype": "get_usage", "skip_behaviors": true},
+        });
+        writeln!(stdin, "{init}")?;
+        writeln!(stdin, "{usage}")?;
+        stdin.flush()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx.recv_timeout(left).context("claude didn't answer")?;
+            if v["type"] == "control_response"
+                && v.pointer("/response/request_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(usage_id)
+            {
+                if v.pointer("/response/subtype")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("error")
+                {
+                    let msg = v
+                        .pointer("/response/error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Claude couldn't report plan limits");
+                    anyhow::bail!("{msg}");
+                }
+                return Ok(v
+                    .pointer("/response/response")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
+            }
+        }
+    })();
+    drop(stdin);
+    kill_probe(child);
+    result
+}
+
 /// Claude's answer to `initialize` (models, commands, …), from a
 /// short-lived CLI started in `cwd`.
 fn probe_initialize(
@@ -378,28 +543,7 @@ fn probe_initialize(
     cwd: &std::path::Path,
 ) -> Result<serde_json::Value> {
     use std::io::{BufRead as _, Write as _};
-    let mut child = std::process::Command::new(binary)
-        .args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--settings",
-            r#"{"disableAllHooks":true}"#,
-        ])
-        .current_dir(cwd)
-        .env_clear()
-        .envs(
-            env.iter()
-                .filter(|(k, _)| !SCRUBBED_ENV.contains(&k.as_str())),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn {}", binary.display()))?;
+    let mut child = spawn_probe(binary, env, cwd, &[])?;
     let mut stdin = child.stdin.take().context("stdin")?;
     let stdout = child.stdout.take().context("stdout")?;
     let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
@@ -429,8 +573,7 @@ fn probe_initialize(
         }
     })();
     drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_probe(child);
     result
 }
 
@@ -551,5 +694,45 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["--permission-mode", "acceptEdits"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_limits_probe_skips_behaviors_and_reads_rate_limits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = loft_config::private_temp_dir(&format!(
+            "agentloft-claude-limits-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let req_log = dir.join("requests.jsonl");
+        let fake = dir.join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+read -r init
+printf '%s\n' "$init" >> '{}'
+printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"loft_1","response":{{}}}}}}'
+read -r usage
+printf '%s\n' "$usage" >> '{}'
+printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"loft_usage","response":{{"subscription_type":"max","rate_limits":{{"limits":[{{"kind":"five_hour","group":"five_hour","percent":42.0}}]}}}}}}}}'
+"#,
+                req_log.display(),
+                req_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: HashMap<String, String> = [("PATH".into(), "/usr/bin:/bin".into())].into();
+        let info = ClaudeHarness
+            .plan_limits(&env, Some(fake))
+            .unwrap()
+            .expect("claude reports limits");
+        assert_eq!(info["subscription_type"], "max");
+        assert_eq!(info["rate_limits"]["limits"][0]["percent"], 42.0);
+        let sent = std::fs::read_to_string(&req_log).unwrap();
+        assert!(sent.contains(r#""skip_behaviors":true"#), "{sent}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

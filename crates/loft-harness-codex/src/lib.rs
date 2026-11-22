@@ -70,6 +70,19 @@ impl Harness for CodexHarness {
         Ok(translate::codex_commands(&translate::skills_from(&reply)))
     }
 
+    fn plan_limits(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        binary: Option<PathBuf>,
+    ) -> Result<Option<serde_json::Value>> {
+        let binary = match binary {
+            Some(b) => b,
+            None => loft_config::which("codex", env.get("PATH").map(String::as_str).unwrap_or(""))
+                .context("`codex` not found on PATH")?,
+        };
+        probe_plan_limits(&binary, env).map(Some)
+    }
+
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
         let binary = resolve_binary(&cfg)?;
         let mut cmd = Command::new(&binary);
@@ -379,6 +392,96 @@ fn app_server_call(
     result
 }
 
+/// Ask a short-lived `codex app-server` for account and plan rate limits,
+/// without opening a thread session or reading lifetime usage history.
+fn probe_plan_limits(
+    binary: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<serde_json::Value> {
+    use std::io::{BufRead as _, Write as _};
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("app-server")
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let stdout = child.stdout.take().context("stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let recv = || -> Result<serde_json::Value> {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        rx.recv_timeout(left)
+            .context("codex app-server didn't answer")
+    };
+    let mut send = |v: serde_json::Value| -> Result<()> {
+        writeln!(stdin, "{v}")?;
+        Ok(stdin.flush()?)
+    };
+    let result = (|| {
+        send(
+            serde_json::json!({"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "agentloft", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"experimentalApi": true}
+            }}),
+        )?;
+        loop {
+            let v = recv()?;
+            if v["id"] == 1 {
+                if let Some(err) = v.get("error") {
+                    anyhow::bail!("initialize: {err}");
+                }
+                break;
+            }
+        }
+        send(serde_json::json!({"method": "initialized"}))?;
+        send(serde_json::json!({"id": 2, "method": "account/read", "params": {}}))?;
+        send(serde_json::json!({"id": 3, "method": "account/rateLimits/read", "params": {}}))?;
+        let mut account = None;
+        let mut rate_limits = None;
+        while account.is_none() || rate_limits.is_none() {
+            let v = recv()?;
+            match v["id"].as_u64() {
+                Some(2) => {
+                    account = Some(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                }
+                Some(3) => {
+                    rate_limits = Some(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                }
+                _ => {}
+            }
+        }
+        Ok(serde_json::json!({
+            "account": account.unwrap_or(serde_json::Value::Null),
+            "rateLimits": rate_limits.unwrap_or(serde_json::Value::Null),
+        }))
+    })();
+    drop(stdin);
+    let pid = child.id();
+    loft_harness::process::signal_group(pid, loft_harness::process::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 /// How long Codex waits on one of our MCP tools (its own default is 60 s).
 const MCP_TOOL_TIMEOUT_SECS: u32 = 3600;
 
@@ -451,5 +554,43 @@ mod tests {
         ));
         assert!(args.contains(&r#"mcp_servers.agentloft.args=["mcp","--thread","T"]"#.to_owned()));
         assert!(args.contains(&"mcp_servers.agentloft.tool_timeout_sec=3600".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_limits_reads_account_and_rate_limits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = loft_config::private_temp_dir(&format!(
+            "agentloft-codex-limits-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let fake = dir.join("codex");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+[ "$1" = app-server ] || exit 1
+read -r init
+echo '{"id":1,"result":{}}'
+read -r initialized
+read -r req2
+echo '{"id":2,"result":{"account":{"planType":"plus"}}}'
+read -r req3
+echo '{"id":3,"result":{"rateLimits":{"primary":{"usedPercent":35,"windowDurationMins":300}}}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: HashMap<String, String> = [("PATH".into(), "/usr/bin:/bin".into())].into();
+        let info = CodexHarness
+            .plan_limits(&env, Some(fake))
+            .unwrap()
+            .expect("codex reports limits");
+        assert_eq!(info["account"]["account"]["planType"], "plus");
+        assert_eq!(
+            info["rateLimits"]["rateLimits"]["primary"]["usedPercent"],
+            35
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -670,6 +670,9 @@ fn usage_body(
     ix: usize,
     p: &Palette,
 ) -> (String, Vec<AnyElement>) {
+    if info.pointer("/command/data/groups").is_some() {
+        return antigravity_usage_body(info, p);
+    }
     let mut body = Vec::new();
     let plan = text(info, "subscription_type")
         .map(|s| s[..1].to_uppercase() + &s[1..])
@@ -1177,6 +1180,13 @@ fn card_text(kind: AgentInfoKind, info: &Value) -> String {
                     num(l, "percent") as i64
                 ));
             }
+            for b in antigravity_buckets(info) {
+                out.push_str(&format!(
+                    "{}: {}% used\n",
+                    b.label,
+                    b.used_pct.round() as i64
+                ));
+            }
             if let Some(s) = info.get("session") {
                 out.push_str(&format!("Session cost: ${:.2}\n", num(s, "total_cost_usd")));
             }
@@ -1273,7 +1283,11 @@ pub(crate) fn render(
     let thread_id = state.id.clone();
     let (t_fold, t_reload, t_close) = (thread.clone(), thread.clone(), thread.clone());
     let store_reload = store.clone();
-    let compact = (kind == AgentInfoKind::Usage).then(|| {
+    let compact = (kind == AgentInfoKind::Usage
+        && ready
+            .as_ref()
+            .is_some_and(|info| info.pointer("/command/data/groups").is_none()))
+    .then(|| {
         let (store, id) = (store.clone(), thread_id.clone());
         h_flex().pt_3().gap_2().child(
             div()
@@ -1403,8 +1417,143 @@ pub(crate) fn render(
         .into_any_element()
 }
 
-/// An agent's plan and its limits, from its `/usage` report (Claude Code)
-/// or its `/status` report (Codex): the plan's name, then a row per limit.
+// -- Antigravity /usage --------------------------------------------------------
+
+struct AntigravityBucket {
+    label: String,
+    reset: Option<String>,
+    used_pct: f32,
+    warn: bool,
+}
+
+fn antigravity_group_buckets(
+    group_name: Option<&str>,
+    buckets: &[&Value],
+) -> Vec<AntigravityBucket> {
+    // Show 5-hour limits before weekly limits (matching Claude and Codex).
+    let mut ordered: Vec<&Value> = buckets.to_vec();
+    ordered.sort_by_key(|b| match text(b, "window") {
+        Some("5h") => 0,
+        Some("weekly") => 1,
+        _ => 2,
+    });
+    let mut out = Vec::new();
+    for b in ordered {
+        if b.get("disabled").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(remaining) = b.get("remaining_fraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        if !remaining.is_finite() {
+            continue;
+        }
+        let id = text(b, "id").unwrap_or("");
+        let family = if id.starts_with("gemini-argon-") {
+            group_name.unwrap_or("Gemini Argon")
+        } else if id.starts_with("gemini-carbon-") {
+            group_name.unwrap_or("Gemini Carbon")
+        } else if id.starts_with("gemini-") {
+            "Gemini"
+        } else if id.starts_with("3p-") {
+            "Claude & GPT"
+        } else {
+            group_name.unwrap_or(id)
+        };
+        let span = match text(b, "window") {
+            Some("5h") => "5-hour",
+            Some("weekly") => "Weekly",
+            _ => text(b, "name").unwrap_or("Quota"),
+        };
+        let label = if family.is_empty() {
+            span.to_owned()
+        } else {
+            format!("{family} · {span}")
+        };
+        let used_pct = ((1. - remaining.clamp(0., 1.)) * 100.) as f32;
+        // Untouched buckets report a rolling placeholder reset `now + window`
+        // with no description; hide it until some quota is used.
+        let untouched = remaining >= 1. && text(b, "description").is_none();
+        let reset = (!untouched)
+            .then(|| text(b, "reset_time").and_then(reset_time))
+            .flatten();
+        out.push(AntigravityBucket {
+            label,
+            reset,
+            used_pct,
+            warn: used_pct >= 80.,
+        });
+    }
+    out
+}
+
+fn antigravity_buckets(info: &Value) -> Vec<AntigravityBucket> {
+    let mut out = Vec::new();
+    for group in arr(info, "/command/data/groups") {
+        let name = text(group, "name").map(str::trim).filter(|s| !s.is_empty());
+        let buckets = arr(group, "/buckets");
+        out.extend(antigravity_group_buckets(name, &buckets));
+    }
+    out
+}
+
+fn antigravity_usage_body(info: &Value, p: &Palette) -> (String, Vec<AnyElement>) {
+    let mut body = Vec::new();
+    let groups = arr(info, "/command/data/groups");
+    let mut any_bucket = false;
+    for group in groups {
+        let name = text(group, "name").map(str::trim).filter(|s| !s.is_empty());
+        let buckets = antigravity_group_buckets(name, &arr(group, "/buckets"));
+        if buckets.is_empty() {
+            continue;
+        }
+        any_bucket = true;
+        if let Some(name) = name {
+            body.push(section_title(name.to_owned(), p).into_any_element());
+        }
+        if let Some(desc) = text(group, "description") {
+            body.push(
+                div()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(p.faint_foreground)
+                    .child(desc.to_owned())
+                    .into_any_element(),
+            );
+        }
+        for b in buckets {
+            body.push(limit_row(b.label, b.reset, b.used_pct, b.warn, p));
+        }
+    }
+    if !any_bucket {
+        body.push(
+            div()
+                .text_sm()
+                .text_color(p.muted_foreground)
+                .child("Plan limits aren't available for this sign-in.")
+                .into_any_element(),
+        );
+    }
+    if let Some(desc) = info
+        .pointer("/command/data/description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        body.push(
+            div()
+                .pt_2()
+                .text_xs()
+                .text_color(p.faint_foreground)
+                .child(desc.to_owned())
+                .into_any_element(),
+        );
+    }
+    (String::new(), body)
+}
+
+/// An agent's plan and its limits, from its `/usage` report (Claude Code,
+/// Antigravity) or its `/status` report (Codex): the plan's name, then a row
+/// per limit.
 pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<AnyElement>) {
     let capital = |s: &str| s[..1].to_uppercase() + &s[1..];
     let mut rows = Vec::new();
@@ -1448,6 +1597,10 @@ pub(crate) fn plan_limits(info: &Value, p: &Palette) -> (Option<String>, Vec<Any
         };
         rows.push(stat_row("Credits".into(), v, None, p));
     }
+    // Antigravity.
+    for b in antigravity_buckets(info) {
+        rows.push(limit_row(b.label, b.reset, b.used_pct, b.warn, p));
+    }
     let plan = text(info, "subscription_type")
         .or_else(|| {
             info.pointer("/account/account/planType")
@@ -1468,7 +1621,14 @@ pub(crate) fn peak_percent(info: &Value) -> Option<f32> {
         info.pointer(&format!("/rateLimits/rateLimits/{k}/usedPercent"))
             .and_then(Value::as_f64)
     });
-    claude.chain(codex).reduce(f64::max).map(|v| v as f32)
+    let antigravity = antigravity_buckets(info)
+        .into_iter()
+        .map(|b| f64::from(b.used_pct));
+    claude
+        .chain(codex)
+        .chain(antigravity)
+        .reduce(f64::max)
+        .map(|v| v as f32)
 }
 
 #[cfg(test)]
@@ -1483,7 +1643,56 @@ mod tests {
         let codex: Value = serde_json::json!({"rateLimits": {"rateLimits": {
             "primary": {"usedPercent": 40.0}, "secondary": null}}});
         assert_eq!(peak_percent(&codex), Some(40.0));
+        let agy: Value = serde_json::json!({"command": {"data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.92},
+                {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.74}
+            ]}
+        ]}}});
+        let agy_peak = peak_percent(&agy).unwrap();
+        assert!((agy_peak - 26.0).abs() < 0.01, "{agy_peak}");
         assert_eq!(peak_percent(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn antigravity_buckets_order_labels_and_untouched_resets() {
+        let info: Value = serde_json::json!({"command": {"data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+                {"id": "gemini-weekly", "window": "weekly", "description": "used", "remaining_fraction": 0.92, "reset_time": "2026-11-29T19:40:27Z"},
+                {"id": "gemini-5h", "window": "5h", "description": "used", "remaining_fraction": 0.75, "reset_time": "2026-11-23T00:40:27Z"},
+                {"id": "gemini-disabled", "window": "5h", "disabled": true, "remaining_fraction": 0.1}
+            ]},
+            {"name": "Claude and GPT models", "buckets": [
+                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": "2026-11-29T20:13:49Z"},
+                {"id": "3p-5h", "window": "5h", "remaining_fraction": 1.0, "reset_time": "2026-11-23T01:13:49Z"}
+            ]},
+            {"name": "Gemini 4 Argon", "buckets": [
+                {"id": "gemini-argon-wtu-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": "2026-11-29T20:13:49Z"}
+            ]}
+        ]}}});
+        let buckets = antigravity_buckets(&info);
+        let labels: Vec<&str> = buckets.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Gemini · 5-hour",
+                "Gemini · Weekly",
+                "Claude & GPT · 5-hour",
+                "Claude & GPT · Weekly",
+                "Gemini 4 Argon · Weekly",
+            ]
+        );
+        assert!((buckets[0].used_pct - 25.0).abs() < 0.01);
+        assert!(buckets[0].reset.is_some());
+        assert!((buckets[1].used_pct - 8.0).abs() < 0.01);
+        assert!(buckets[1].reset.is_some());
+        // Untouched buckets suppress placeholder rolling reset times.
+        assert_eq!(buckets[2].used_pct, 0.0);
+        assert!(buckets[2].reset.is_none());
+        assert!(buckets[3].reset.is_none());
+        assert!(buckets[4].reset.is_none());
+        let text = card_text(AgentInfoKind::Usage, &info);
+        assert!(text.contains("Gemini · 5-hour: 25% used"), "{text}");
     }
 
     #[test]

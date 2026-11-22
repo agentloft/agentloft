@@ -5,7 +5,7 @@
 
 use crate::{Core, CoreResult};
 use loft_config::{Paths, SettingValue};
-use loft_protocol::{ErrorBody, ErrorCode, Response};
+use loft_protocol::{ErrorBody, ErrorCode, HarnessId, Response};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -23,7 +23,13 @@ pub(crate) const BUILTIN_THEMES: &[&str] = &[
     "nightshade",
 ];
 
-const AGENTS: &[&str] = &["claude", "codex", "opencode", "gemini"];
+const AGENTS: &[&str] = &[
+    HarnessId::CLAUDE,
+    HarnessId::CODEX,
+    HarnessId::OPENCODE,
+    HarnessId::GEMINI,
+    HarnessId::ANTIGRAVITY,
+];
 
 /// What a setting holds.
 #[derive(Clone, Copy)]

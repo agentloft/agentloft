@@ -1,8 +1,8 @@
 //! ACP harnesses (PLAN §2.6, M6): agents that speak the Agent Client Protocol
 //! (JSON-RPC 2.0 over newline-delimited stdio) — OpenCode (`opencode acp`),
-//! Gemini CLI (`gemini --acp`) and the long tail. One agent process per active
-//! thread. The Agentloft MCP server is attached through `session/new`'s
-//! `mcpServers`.
+//! Gemini CLI (`gemini --acp`) and Antigravity (`agy acp`). One agent process
+//! per active thread. The Agentloft MCP server is attached through
+//! `session/new`'s `mcpServers`.
 //!
 //! The client advertises no `fs/*` or `terminal/*` capabilities, so agents use
 //! their own file and shell tools; Agentloft only renders and approves them.
@@ -14,7 +14,7 @@ use loft_harness::process::{StderrTail, configure_group, stop_child};
 use loft_harness::{
     Capabilities, Harness, HarnessEvent, SessionCommand, SessionConfig, SessionEnds, SessionHandle,
 };
-use loft_protocol::HarnessId;
+use loft_protocol::{HarnessId, PermissionMode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -38,6 +38,7 @@ pub struct AcpHarness {
     /// Used instead of `args` when `<binary> --help` doesn't mention
     /// `args[0]` (older CLIs that only know an experimental flag).
     pub legacy_args: Option<Vec<String>>,
+    auth_hint: Option<&'static str>,
     resolved_args: OnceLock<Vec<String>>,
 }
 
@@ -54,6 +55,7 @@ impl AcpHarness {
             binary_name: binary_name.into(),
             args,
             legacy_args: None,
+            auth_hint: None,
             resolved_args: OnceLock::new(),
         }
     }
@@ -74,6 +76,19 @@ impl AcpHarness {
         Self {
             legacy_args: Some(vec!["--experimental-acp".into()]),
             ..Self::new(HarnessId::GEMINI, "Gemini", "gemini", vec!["--acp".into()])
+        }
+    }
+
+    /// Google Antigravity CLI 1.5 and newer.
+    pub fn antigravity() -> Self {
+        Self {
+            auth_hint: Some("Run `agy acp --login` in a terminal on the machine running Agentloft"),
+            ..Self::new(
+                HarnessId::ANTIGRAVITY,
+                "Antigravity",
+                "agy",
+                vec!["acp".into()],
+            )
         }
     }
 
@@ -116,6 +131,11 @@ impl AcpHarness {
     pub fn build_args(&self, binary: &Path, cfg: &SessionConfig) -> Vec<String> {
         let mut args = self.agent_args(binary, &cfg.env);
         args.extend(cfg.extra_args.iter().cloned());
+        if self.id == HarnessId::ANTIGRAVITY
+            && cfg.permission_mode == Some(PermissionMode::FullAccess)
+        {
+            args.push("--dangerously-skip-permissions".into());
+        }
         args
     }
 }
@@ -149,6 +169,7 @@ fn probe_session(
     binary: &Path,
     args: &[String],
     env: &HashMap<String, String>,
+    auth_hint: Option<&str>,
 ) -> Result<Vec<loft_protocol::ModelInfo>> {
     use std::io::{BufRead as _, Write as _};
     // An empty folder of the user's own, not the shared `/tmp` (on Linux)
@@ -199,6 +220,15 @@ fn probe_session(
                 .with_context(|| format!("the agent didn't answer `{method}`"))?;
             if v.get("id") == Some(&serde_json::json!(id)) && v.get("method").is_none() {
                 if let Some(err) = v.get("error") {
+                    if err.get("code").and_then(serde_json::Value::as_i64) == Some(-32000)
+                        && let Some(hint) = auth_hint
+                    {
+                        let msg = err
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Authentication required");
+                        anyhow::bail!("{msg} — {hint}");
+                    }
                     anyhow::bail!("{method}: {err}");
                 }
                 return Ok(v.get("result").cloned().unwrap_or_default());
@@ -288,8 +318,8 @@ impl Harness for AcpHarness {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             client_session_id: false,
-            // ACP has no steering; `session/fork` is still unstable.
-            steer: false,
+            // Antigravity handles a second ACP prompt while one is running.
+            steer: self.id == HarnessId::ANTIGRAVITY,
             native_fork: false,
             // Effort is a session config option (`thought_level`) where the
             // agent offers one, set on the live session.
@@ -301,6 +331,15 @@ impl Harness for AcpHarness {
             live_mode_switch: false,
             compact: false,
         }
+    }
+
+    fn permission_mode_requires_restart(
+        &self,
+        previous: Option<PermissionMode>,
+        next: Option<PermissionMode>,
+    ) -> bool {
+        let full = Some(PermissionMode::FullAccess);
+        self.id == HarnessId::ANTIGRAVITY && (previous == full) != (next == full)
     }
 
     /// ACP has no call for this: open a session in the temp folder, read
@@ -316,7 +355,22 @@ impl Harness for AcpHarness {
             Some(b) => b,
             None => self.which(env)?,
         };
-        probe_session(&binary, &self.agent_args(&binary, env), env)
+        probe_session(&binary, &self.agent_args(&binary, env), env, self.auth_hint)
+    }
+
+    fn plan_limits(
+        &self,
+        env: &HashMap<String, String>,
+        binary: Option<PathBuf>,
+    ) -> Result<Option<serde_json::Value>> {
+        if self.id != HarnessId::ANTIGRAVITY {
+            return Ok(None);
+        }
+        let binary = match binary {
+            Some(b) => b,
+            None => self.which(env)?,
+        };
+        probe_antigravity_usage(&binary, env, self.auth_hint).map(Some)
     }
 
     fn open_session(&self, cfg: SessionConfig) -> Result<SessionHandle> {
@@ -348,6 +402,7 @@ impl Harness for AcpHarness {
             cfg.resume.clone(),
             cfg.mcp_servers.clone(),
         );
+        translator.auth_hint = self.auth_hint.map(str::to_owned);
         translator.effort = cfg.effort.clone();
         // `mcp__agentloft` in allowed_tools → auto-approve that server's tools.
         translator.auto_allow_mcp = cfg
@@ -359,12 +414,15 @@ impl Harness for AcpHarness {
         let (mut handle, ends) = SessionHandle::pair();
         handle.pid = child.id();
         let agent = self.id.clone();
+        let usage_probe = (self.id == HarnessId::ANTIGRAVITY)
+            .then(|| (binary.clone(), cfg.env.clone(), self.auth_hint));
         tokio::spawn(async move {
             let events = ends.events.clone();
-            match run(ends, translator, stdin, stdout).await {
+            match run(ends, translator, stdin, stdout, usage_probe).await {
                 RunEnd::Shutdown(stdin) => {
                     drop(stdin);
                     stop_child(&mut child, Duration::from_secs(2), Duration::from_secs(5)).await;
+                    drop(events);
                     tracing::info!(%agent, "ACP agent stopped");
                 }
                 RunEnd::Eof => {
@@ -380,6 +438,149 @@ impl Harness for AcpHarness {
     }
 }
 
+/// Ask Antigravity's CLI for its quota buckets via `agy --print /usage
+/// --output-format json` (uses zero tokens and refreshes its own OAuth
+/// sign-in). Sets `ANTIGRAVITY_REMOTE_OOB_AUTH=1` and aborts immediately if
+/// the CLI asks to sign in, so it never opens a browser window on its own.
+#[allow(clippy::disallowed_methods)]
+fn probe_antigravity_usage(
+    binary: &Path,
+    env: &HashMap<String, String>,
+    auth_hint: Option<&str>,
+) -> Result<serde_json::Value> {
+    use std::io::BufRead as _;
+    let cwd = loft_config::private_temp_dir("agentloft-ask")?;
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(["--print", "/usage", "--output-format", "json"])
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(env.iter())
+        .env("ANTIGRAVITY_REMOTE_OOB_AUTH", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let stdout = child.stdout.take().context("agy stdout")?;
+    let stderr = child.stderr.take().context("agy stderr")?;
+
+    enum Line {
+        Out(String),
+        Err(String),
+        Done,
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Line>();
+    let spawn_reader =
+        |stream: Box<dyn std::io::Read + Send>, is_err: bool, tx: std::sync::mpsc::Sender<Line>| {
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stream)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    let msg = if is_err {
+                        Line::Err(line)
+                    } else {
+                        Line::Out(line)
+                    };
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                let _ = tx.send(Line::Done);
+            });
+        };
+    spawn_reader(Box::new(stdout), false, tx.clone());
+    spawn_reader(Box::new(stderr), true, tx);
+
+    let kill = |child: &mut std::process::Child| {
+        let pid = child.id();
+        loft_harness::process::signal_group(pid, loft_harness::process::SIGKILL);
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut out_lines = Vec::new();
+    let mut err_lines = Vec::new();
+    let mut closed = 0;
+    while closed < 2 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Line::Done) => closed += 1,
+            Ok(Line::Out(line)) => {
+                if looks_like_auth_prompt(&line) {
+                    kill(&mut child);
+                    anyhow::bail!("{}", auth_error(auth_hint));
+                }
+                out_lines.push(line);
+            }
+            Ok(Line::Err(line)) => {
+                if looks_like_auth_prompt(&line) {
+                    kill(&mut child);
+                    anyhow::bail!("{}", auth_error(auth_hint));
+                }
+                err_lines.push(line);
+            }
+            Err(_) => {
+                kill(&mut child);
+                anyhow::bail!("Antigravity didn't answer `/usage`");
+            }
+        }
+    }
+    let status = child.wait().ok();
+    let joined = out_lines.join("\n");
+    let parsed = serde_json::from_str::<serde_json::Value>(&joined)
+        .ok()
+        .or_else(|| {
+            out_lines
+                .iter()
+                .rev()
+                .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        });
+    if let Some(v) = parsed
+        && v.pointer("/command/data/groups")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+    {
+        return Ok(v);
+    }
+    // `agy` exits with code 2 when connected with GEMINI_API_KEY (no plan quota).
+    if status.and_then(|s| s.code()) == Some(2) {
+        return Ok(serde_json::json!({
+            "command": { "name": "usage", "data": { "groups": [] } }
+        }));
+    }
+    let detail = err_lines
+        .iter()
+        .chain(out_lines.iter())
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "Antigravity returned no usage report".into());
+    anyhow::bail!("{detail}");
+}
+
+fn looks_like_auth_prompt(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("authentication required") || lower.contains("waiting for authentication")
+}
+
+fn auth_error(hint: Option<&str>) -> String {
+    match hint {
+        Some(h) => format!("Authentication required — {h}"),
+        None => "Authentication required".to_owned(),
+    }
+}
+
+type AntigravityUsageProbe = (
+    PathBuf,
+    std::sync::Arc<HashMap<String, String>>,
+    Option<&'static str>,
+);
+
 enum RunEnd {
     Shutdown(ChildStdin),
     Eof,
@@ -390,6 +591,7 @@ async fn run(
     mut t: Translator,
     mut stdin: ChildStdin,
     stdout: tokio::process::ChildStdout,
+    usage_probe: Option<AntigravityUsageProbe>,
 ) -> RunEnd {
     let events = ends.events.clone();
     let mut lines = BufReader::new(stdout).lines();
@@ -398,7 +600,7 @@ async fn run(
         return RunEnd::Eof;
     }
     loop {
-        tokio::select! {
+        let outs = tokio::select! {
             line = lines.next_line() => {
                 let line = match line {
                     Ok(Some(line)) => line,
@@ -408,21 +610,32 @@ async fn run(
                     continue;
                 }
                 tracing::trace!(target: "harness.acp", "<< {line}");
-                if dispatch(&events, &mut stdin, t.on_line(&line)).await.is_err() {
-                    return RunEnd::Eof;
-                }
+                t.on_line(&line)
             }
             cmd = ends.commands.recv() => {
-                let outs = match cmd {
+                match cmd {
                     Some(SessionCommand::StartTurn(input)) => {
                         let images = read_images(&input.images).await;
                         t.start_turn_with(&input.text, images)
                     }
-                    // ACP can't steer: the core doesn't send this.
-                    Some(SessionCommand::Steer(_)) => vec![],
+                    Some(SessionCommand::Steer(input)) => {
+                        let images = read_images(&input.images).await;
+                        t.steer_with(&input.text, images)
+                    }
                     Some(SessionCommand::Interrupt) => t.interrupt(),
                     Some(SessionCommand::StopSubagent(_)) => vec![],
-                    Some(SessionCommand::Query { .. }) => vec![],
+                    Some(SessionCommand::Query { kind, reply }) => {
+                        if kind == loft_protocol::AgentInfoKind::Usage
+                            && let Some((bin, env, hint)) = usage_probe.clone()
+                        {
+                            tokio::task::spawn_blocking(move || {
+                                let res = probe_antigravity_usage(&bin, &env, hint)
+                                    .map_err(|e| e.to_string());
+                                let _ = reply.send(res);
+                            });
+                        }
+                        vec![]
+                    }
                     Some(SessionCommand::Respond { native_request_id, decision, .. }) => {
                         t.respond(&native_request_id, decision)
                     }
@@ -430,11 +643,20 @@ async fn run(
                     Some(SessionCommand::SetEffort(effort)) => t.set_effort(effort),
                     Some(SessionCommand::SetPermissionMode(mode)) => t.set_permission_mode(mode),
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
-                };
-                if dispatch(&events, &mut stdin, outs).await.is_err() {
-                    return RunEnd::Eof;
                 }
             }
+        };
+        // Deliver a startup error to the first turn before dropping the
+        // failed session. A retry may need a new process to pick up sign-in.
+        let failed_start = t.startup_failed()
+            && outs
+                .iter()
+                .any(|out| matches!(out, Out::Event(HarnessEvent::TurnCompleted { .. })));
+        if dispatch(&events, &mut stdin, outs).await.is_err() {
+            return RunEnd::Eof;
+        }
+        if failed_start {
+            return RunEnd::Shutdown(stdin);
         }
     }
 }
@@ -515,6 +737,80 @@ mod tests {
         // No runnable binary to probe: the current flag spelling is used.
         let args = gem.build_args(Path::new("/nonexistent/gemini"), &cfg(vec![]));
         assert_eq!(args, vec!["--acp"]);
+        let agy = AcpHarness::antigravity();
+        assert_eq!(agy.id().as_str(), "antigravity");
+        assert_eq!(agy.binary_name, "agy");
+        assert!(agy.capabilities().steer);
+        assert_eq!(
+            agy.build_args(
+                Path::new("/nonexistent/agy"),
+                &cfg(vec!["--sandbox".into()])
+            ),
+            ["acp", "--sandbox"]
+        );
+        let mut full = cfg(vec![]);
+        full.permission_mode = Some(PermissionMode::FullAccess);
+        assert_eq!(
+            agy.build_args(Path::new("/nonexistent/agy"), &full),
+            ["acp", "--dangerously-skip-permissions"]
+        );
+        assert!(agy.permission_mode_requires_restart(None, full.permission_mode));
+        assert!(agy.permission_mode_requires_restart(full.permission_mode, None));
+        assert!(!agy.permission_mode_requires_restart(full.permission_mode, full.permission_mode));
+        assert!(!agy.permission_mode_requires_restart(None, Some(PermissionMode::AcceptEdits)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_sign_in_error_ends_the_failed_session() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = loft_config::private_temp_dir(&format!(
+            "agentloft-acp-auth-test-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let binary = dir.join("agy");
+        let fixture = include_str!("../fixtures/antigravity-1.5.14-auth-required.jsonl");
+        let mut script = String::from("#!/bin/sh\n[ \"$1\" = acp ] || exit 1\n");
+        for response in fixture.lines() {
+            script.push_str(&format!(
+                "read -r request || exit 1\nprintf '%s\\n' '{response}'\n"
+            ));
+        }
+        script.push_str("read -r request\n");
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = cfg(Vec::new());
+        config.cwd = dir.clone();
+        config.binary = Some(binary);
+        let mut session = AcpHarness::antigravity().open_session(config).unwrap();
+        session
+            .commands
+            .send(SessionCommand::StartTurn(loft_harness::TurnInput {
+                text: "Hello".into(),
+                images: Vec::new(),
+            }))
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut error = None;
+            while let Some(event) = session.events.recv().await {
+                if let HarnessEvent::TurnCompleted {
+                    status: loft_protocol::TurnStatus::Failed,
+                    error: failure,
+                    ..
+                } = event
+                {
+                    error = failure;
+                }
+            }
+            error.unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(error.contains("Authentication required"), "{error}");
+        assert!(error.contains("agy acp --login"), "{error}");
+        assert!(session.commands.is_closed());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A stand-in ACP agent: answers `initialize` and `session/new` with
@@ -570,5 +866,97 @@ read l
         assert!(!mentions_flag(old, "--acp"));
         assert!(mentions_flag(old, "--experimental-acp"));
         assert!(!mentions_flag("--acpx", "--acp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_plan_limits_parses_usage_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            loft_config::private_temp_dir(&format!("agentloft-agy-limits-{}", std::process::id()))
+                .unwrap();
+        let fake = dir.join("agy");
+        let fixture = include_str!("../fixtures/antigravity-1.5.14-usage.json").trim();
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n[ \"$ANTIGRAVITY_REMOTE_OOB_AUTH\" = 1 ] || exit 9\n[ \"$1\" = --print ] && [ \"$2\" = /usage ] || exit 1\nprintf '%s\\n' '{}'\n",
+                fixture.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: HashMap<String, String> = [("PATH".into(), "/usr/bin:/bin".into())].into();
+        let info = AcpHarness::antigravity()
+            .plan_limits(&env, Some(fake))
+            .unwrap()
+            .expect("antigravity reports limits");
+        assert_eq!(
+            info.pointer("/command/data/groups/0/buckets/0/id")
+                .and_then(serde_json::Value::as_str),
+            Some("gemini-weekly")
+        );
+        // Non-Antigravity ACP agents return None.
+        assert!(
+            AcpHarness::opencode()
+                .plan_limits(&env, None)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_plan_limits_aborts_on_auth_prompt() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = loft_config::private_temp_dir(&format!(
+            "agentloft-agy-auth-limits-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let fake = dir.join("agy");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'Authentication required. Please visit the URL to log in:'\nsleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: HashMap<String, String> = [("PATH".into(), "/usr/bin:/bin".into())].into();
+        let err = AcpHarness::antigravity()
+            .plan_limits(&env, Some(fake))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Authentication required"), "{err}");
+        assert!(err.contains("agy acp --login"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_plan_limits_api_key_exit_code_2_has_no_limits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            loft_config::private_temp_dir(&format!("agentloft-agy-apikey-{}", std::process::id()))
+                .unwrap();
+        let fake = dir.join("agy");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'No account quota when using GEMINI_API_KEY' >&2\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env: HashMap<String, String> = [("PATH".into(), "/usr/bin:/bin".into())].into();
+        let info = AcpHarness::antigravity()
+            .plan_limits(&env, Some(fake))
+            .unwrap()
+            .expect("empty groups");
+        assert_eq!(
+            info.pointer("/command/data/groups")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

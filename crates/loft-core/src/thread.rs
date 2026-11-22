@@ -497,11 +497,27 @@ impl ThreadActor {
                 let _ = reply.send(self.respond(request_id, decision, answer));
             }
             ThreadCmd::SetPermissionMode { mode, reply } => {
+                let restart = self.session.is_some()
+                    && self.core.harness(&self.thread.harness).is_some_and(|h| {
+                        h.permission_mode_requires_restart(self.thread.permission_mode, mode)
+                    });
+                if restart && (self.turn.is_some() || !self.thread.waiting_on.is_empty()) {
+                    let _ = reply.send(Err(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        "Stop the turn and any background work before switching Full Access.",
+                    )));
+                    return;
+                }
+                let previous = self.thread.permission_mode;
                 self.thread.permission_mode = mode;
-                if let Some(s) = &self.session {
+                let res = self.save_thread().map(|_| Response::Ok);
+                if res.is_err() {
+                    self.thread.permission_mode = previous;
+                } else if restart {
+                    self.restart_session = true;
+                } else if let Some(s) = &self.session {
                     let _ = s.commands.send(SessionCommand::SetPermissionMode(mode));
                 }
-                let res = self.save_thread().map(|_| Response::Ok);
                 let _ = reply.send(res);
             }
             ThreadCmd::SetModel { model, reply } => {

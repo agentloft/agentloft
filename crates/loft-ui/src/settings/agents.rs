@@ -18,11 +18,12 @@ use gpui_kit::{
 use loft_config::{HarnessConfig, SettingValue};
 use loft_protocol::{HarnessId, ModelInfo, PermissionMode};
 
-pub(super) const AGENTS: [(&str, &str); 4] = [
+pub(super) const AGENTS: [(&str, &str); 5] = [
     (HarnessId::CLAUDE, "Claude Code"),
     (HarnessId::CODEX, "Codex"),
     (HarnessId::OPENCODE, "OpenCode"),
     (HarnessId::GEMINI, "Gemini CLI"),
+    (HarnessId::ANTIGRAVITY, "Antigravity"),
 ];
 
 /// Per-agent text fields, rebuilt when another agent is selected.
@@ -86,6 +87,7 @@ fn agent_config(config: &loft_config::Config, id: &str) -> HarnessConfig {
         HarnessId::CODEX => config.harness.codex.clone(),
         HarnessId::OPENCODE => config.harness.opencode.clone(),
         HarnessId::GEMINI => config.harness.gemini.clone(),
+        HarnessId::ANTIGRAVITY => config.harness.antigravity.clone(),
         _ => config.harness.claude.clone(),
     }
 }

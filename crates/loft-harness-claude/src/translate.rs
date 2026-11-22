@@ -162,11 +162,16 @@ impl Translator {
     }
 
     /// Ask what the session has cost so far. Sent once, before the first
-    /// prompt: Claude answers it before it runs anything.
+    /// prompt: Claude answers it before it runs anything. `skip_behaviors`
+    /// skips the local transcript scan (we only need `session.total_cost_usd`).
     pub fn ask_cost_so_far(&mut self) -> Value {
         let id = self.next_request_id();
         self.cost_query = Some(id.clone());
-        json!({"type": "control_request", "request_id": id, "request": {"subtype": "get_usage"}})
+        json!({
+            "type": "control_request",
+            "request_id": id,
+            "request": {"subtype": "get_usage", "skip_behaviors": true}
+        })
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {

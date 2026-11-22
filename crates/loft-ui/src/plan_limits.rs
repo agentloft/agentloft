@@ -1,7 +1,7 @@
 //! The sidebar footer's usage button: each agent's plan limits in a card on
-//! hover (asked of the agent itself through its most recent thread, as
-//! Settings ▸ Usage does, and kept for a minute), the busiest limit's
-//! percent beside the icon once known, and a click opens Settings ▸ Usage.
+//! hover (asked directly of each installed agent without opening a thread
+//! session, and kept for a minute), the busiest limit's percent beside the
+//! icon once known, and a click opens Settings ▸ Usage.
 
 use crate::spinner::Spinner;
 use crate::store::AppStore;
@@ -11,33 +11,40 @@ use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, Styled as _,
     Window, div, prelude::FluentBuilder as _, px,
 };
-use loft_protocol::{AgentInfoKind, HarnessId, Request, Response, ThreadId, ThreadStatus};
+use loft_protocol::{HarnessId, Request, Response, ThreadStatus};
 use serde_json::Value;
 use std::time::Duration;
 use web_time::Instant;
 
-/// The agents whose plan limits can be asked for, and how.
-pub(crate) const LIMIT_AGENTS: [(&str, &str, AgentInfoKind); 2] = [
-    (HarnessId::CLAUDE, "Claude Code", AgentInfoKind::Usage),
-    (HarnessId::CODEX, "Codex", AgentInfoKind::Status),
+/// The agents whose plan limits can be asked for.
+pub(crate) const LIMIT_AGENTS: [(&str, &str); 3] = [
+    (HarnessId::CLAUDE, "Claude Code"),
+    (HarnessId::CODEX, "Codex"),
+    (HarnessId::ANTIGRAVITY, "Antigravity"),
 ];
 
 /// How long an answer is shown before hovering asks again.
 const FRESH_FOR: Duration = Duration::from_secs(60);
 
-/// The most recently used thread on `agent` that isn't archived.
-pub(crate) fn latest_thread(store: &AppStore, agent: &str) -> Option<ThreadId> {
+/// Whether `agent` is enabled and installed (or has an active thread if the
+/// initial CLI probe hasn't answered yet).
+pub(crate) fn limit_agent_available(store: &AppStore, agent: &str) -> bool {
+    if store.disabled_agents.contains(agent) {
+        return false;
+    }
+    if let Some(status) = store.harness_status.get(&HarnessId(agent.into())) {
+        return status.installed;
+    }
     store
         .workspace
         .threads
         .iter()
-        .find(|t| t.harness.as_str() == agent && t.status != ThreadStatus::Archived)
-        .map(|t| t.id.clone())
+        .any(|t| t.harness.as_str() == agent && t.status != ThreadStatus::Archived)
 }
 
 pub(crate) struct PlanLimits {
     store: Entity<AppStore>,
-    /// Per agent with a thread: `None` asking, `Some(Ok)` its report,
+    /// Per available agent: `None` asking, `Some(Ok)` its report,
     /// `Some(Err)` why not.
     limits: Vec<(&'static str, Option<Result<Value, String>>)>,
     asked_at: Option<Instant>,
@@ -60,12 +67,11 @@ impl PlanLimits {
         let Some(client) = self.store.read(cx).client() else {
             return;
         };
-        self.asked_at = Some(Instant::now());
         let mut limits = Vec::new();
-        for (agent, _, kind) in LIMIT_AGENTS {
-            let Some(thread_id) = latest_thread(self.store.read(cx), agent) else {
+        for (agent, _) in LIMIT_AGENTS {
+            if !limit_agent_available(self.store.read(cx), agent) {
                 continue;
-            };
+            }
             // Keep the last answer on screen while asking again.
             let last = self
                 .limits
@@ -73,7 +79,10 @@ impl PlanLimits {
                 .find(|(a, _)| *a == agent)
                 .and_then(|(_, l)| l.clone());
             limits.push((agent, last));
-            let ask = client.request(Request::AgentInfo { thread_id, kind });
+            let ask = client.request(Request::PlanLimits {
+                harness: HarnessId(agent.into()),
+                refresh: false,
+            });
             cx.spawn(async move |this, cx| {
                 let result = ask.await;
                 let _ = this.update(cx, |this, cx| {
@@ -89,6 +98,9 @@ impl PlanLimits {
                 });
             })
             .detach();
+        }
+        if !limits.is_empty() {
+            self.asked_at = Some(Instant::now());
         }
         self.limits = limits;
         cx.notify();
@@ -118,15 +130,15 @@ impl Render for PlanLimits {
         let mut card = v_flex().gap_3();
         if self.limits.is_empty() {
             card = card.child(note(
-                "Start a Claude Code or Codex thread to see its plan limits.",
+                "Install Claude Code, Codex, or Antigravity to see plan limits.",
                 &p,
             ));
         }
         for (agent, state) in &self.limits {
             let name = LIMIT_AGENTS
                 .iter()
-                .find(|(a, ..)| a == agent)
-                .map_or(*agent, |(_, n, _)| *n);
+                .find(|(a, _)| a == agent)
+                .map_or(*agent, |(_, n)| *n);
             let (plan, body) = match state {
                 None => (
                     None,
@@ -179,7 +191,7 @@ impl Render for PlanLimits {
         div().child(
             v_flex()
                 .m_3()
-                .w(px(300.))
+                .w(px(320.))
                 .p_3()
                 .gap_3()
                 .font_family(cx.theme().font_family.clone())

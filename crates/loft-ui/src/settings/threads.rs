@@ -14,9 +14,17 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Sizable as _, v_flex};
 use gpui_kit::{AnyElement, Context, IntoElement as _, ParentElement as _, Styled as _};
 use loft_config::SettingValue;
+use loft_protocol::HarnessId;
 
 /// `titles.agent` for "the thread's own agent".
 const SAME_AGENT: &str = "thread";
+
+/// Antigravity's ACP sessions are for interactive turns, not one-off requests.
+fn title_agents() -> impl Iterator<Item = (&'static str, &'static str)> {
+    AGENTS
+        .into_iter()
+        .filter(|(id, _)| *id != HarnessId::ANTIGRAVITY)
+}
 
 /// Picks for deleting archived threads: days (0 = never) and their label.
 const ARCHIVE_PRESETS: [(u32, &str); 4] = [
@@ -38,10 +46,9 @@ impl SettingsView {
         let titles = &self.config.titles;
         let generate = titles.generate;
         let current = titles.agent.trim().to_owned();
-        let label = AGENTS
-            .iter()
+        let label = title_agents()
             .find(|(id, _)| *id == current)
-            .map(|(_, name)| *name)
+            .map(|(_, name)| name)
             .unwrap_or("Same as the thread");
         let view = cx.entity();
         let picker = Button::new("titles-agent")
@@ -50,12 +57,9 @@ impl SettingsView {
             .small()
             .label(label)
             .dropdown_menu(move |mut menu, _, _| {
-                let same = !AGENTS.iter().any(|(id, _)| *id == current);
-                let options = std::iter::once((SAME_AGENT, "Same as the thread", same)).chain(
-                    AGENTS
-                        .iter()
-                        .map(|(id, name)| (*id, *name, *id == current.as_str())),
-                );
+                let same = !title_agents().any(|(id, _)| id == current);
+                let options = std::iter::once((SAME_AGENT, "Same as the thread", same))
+                    .chain(title_agents().map(|(id, name)| (id, name, id == current.as_str())));
                 for (i, (id, name, checked)) in options.enumerate() {
                     let view = view.clone();
                     if i == 1 {

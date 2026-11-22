@@ -265,6 +265,14 @@ pub struct Capabilities {
 pub trait Harness: Send + Sync + 'static {
     fn id(&self) -> HarnessId;
     fn capabilities(&self) -> Capabilities;
+    /// Whether this change needs a new process for the same conversation.
+    fn permission_mode_requires_restart(
+        &self,
+        _previous: Option<PermissionMode>,
+        _next: Option<PermissionMode>,
+    ) -> bool {
+        false
+    }
     /// Spawn the session. Must be called within a tokio runtime.
     fn open_session(&self, cfg: SessionConfig) -> anyhow::Result<SessionHandle>;
     /// Models to offer in the picker. Blocking (may start the CLI briefly);
@@ -285,5 +293,15 @@ pub trait Harness: Send + Sync + 'static {
         _cwd: &str,
     ) -> anyhow::Result<Vec<loft_protocol::SlashCommandInfo>> {
         Ok(Vec::new())
+    }
+    /// Account plan limits, without starting or resuming a thread session.
+    /// Blocking (may run the CLI briefly; uses no tokens). `Ok(None)` when
+    /// this agent doesn't report plan limits.
+    fn plan_limits(
+        &self,
+        _env: &HashMap<String, String>,
+        _binary: Option<PathBuf>,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(None)
     }
 }

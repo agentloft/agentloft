@@ -275,6 +275,7 @@ impl Core {
             | Request::ResumeAtReset { .. }
             | Request::Interrupt { .. }
             | Request::AgentInfo { .. }
+            | Request::PlanLimits { .. }
             | Request::StopSubagent { .. }
             | Request::RespondRequest { .. }
             | Request::SetPermissionMode { .. }

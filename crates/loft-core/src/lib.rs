@@ -260,6 +260,9 @@ pub struct Core {
     models_listed: Mutex<std::collections::HashSet<String>>,
     /// Slash commands per (harness, folder), with when they were asked.
     commands: Mutex<CommandCache>,
+    /// Recent plan-limits reports per harness (short TTL; `refresh: true`
+    /// bypasses it).
+    plan_limits: Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>,
     /// Worktree setup commands to run before a thread's first prompt.
     pending_setup: Mutex<HashMap<ThreadId, String>>,
     /// The worktree setup command the user allowed per project (by id),
@@ -347,6 +350,7 @@ impl Core {
             models: Mutex::new(HashMap::new()),
             models_listed: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
+            plan_limits: Mutex::new(HashMap::new()),
             pending_setup: Mutex::new(HashMap::new()),
             setup_approved: Mutex::new(HashMap::new()),
             pending_notes: Mutex::new(HashMap::new()),
@@ -620,8 +624,7 @@ impl Core {
     /// shell's PATH. `Err` names the binary that wasn't found.
     fn harness_bin(&self, harness: &HarnessId) -> Result<PathBuf, String> {
         let bin = match harness.as_str() {
-            HarnessId::CLAUDE => "claude",
-            HarnessId::CODEX => "codex",
+            HarnessId::ANTIGRAVITY => "agy",
             other => other,
         };
         let hcfg = harness_config(&self.config(), harness);
@@ -790,6 +793,43 @@ impl Core {
             }
         }
         all.insert(harness.as_str().to_owned(), models);
+    }
+
+    /// Ask `harness` directly for its account plan limits (no thread session),
+    /// with a brief cache so hovering the footer and opening Settings ▸ Usage
+    /// share the same answer.
+    async fn plan_limits(&self, harness: &HarnessId, refresh: bool) -> CoreResult<Response> {
+        const FRESH: Duration = Duration::from_secs(30);
+        if !refresh
+            && let Some((at, info)) = lock(&self.plan_limits).get(harness.as_str()).cloned()
+            && at.elapsed() < FRESH
+        {
+            return Ok(Response::AgentInfo { info });
+        }
+        let h = self.harness(harness).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::BadRequest,
+                format!("unknown harness `{harness}`"),
+            )
+        })?;
+        let hcfg = harness_config(&self.config(), harness);
+        let binary = (hcfg.path != "auto").then(|| PathBuf::from(&hcfg.path));
+        let env = agent_env(&self.opts.env, &hcfg);
+        let got = tokio::task::spawn_blocking(move || h.plan_limits(&env, binary))
+            .await
+            .map_err(internal)?
+            .map_err(|err| ErrorBody::new(ErrorCode::Harness, format!("{err:#}")))?;
+        let Some(info) = got else {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                "this agent doesn't report plan limits",
+            ));
+        };
+        lock(&self.plan_limits).insert(
+            harness.as_str().to_owned(),
+            (std::time::Instant::now(), info.clone()),
+        );
+        Ok(Response::AgentInfo { info })
     }
 
     async fn list_models(&self, harness: &HarnessId) -> CoreResult<Response> {
@@ -1548,6 +1588,7 @@ impl Core {
                 self.thread_call(&thread_id, |reply| ThreadCmd::AgentInfo { kind, reply })
                     .await
             }
+            Request::PlanLimits { harness, refresh } => self.plan_limits(&harness, refresh).await,
             Request::StopSubagent { thread_id, item_id } => {
                 self.thread_call(&thread_id, |reply| ThreadCmd::StopSubagent {
                     item_id,
@@ -2663,6 +2704,7 @@ pub(crate) fn harness_config(
         HarnessId::CLAUDE => config.harness.claude.clone(),
         HarnessId::OPENCODE => config.harness.opencode.clone(),
         HarnessId::GEMINI => config.harness.gemini.clone(),
+        HarnessId::ANTIGRAVITY => config.harness.antigravity.clone(),
         _ => loft_config::HarnessConfig::default(),
     }
 }

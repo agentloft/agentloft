@@ -3878,3 +3878,74 @@ async fn one_off_prompts_go_on_stdin_never_the_command_line() {
         assert_eq!(stdin, prompt, "{name}'s stdin");
     }
 }
+
+#[tokio::test]
+async fn plan_limits_caches_until_refreshed() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountingHarness {
+        calls: Arc<AtomicU32>,
+    }
+
+    impl Harness for CountingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId("counting".into())
+        }
+        fn capabilities(&self) -> loft_harness::Capabilities {
+            Default::default()
+        }
+        fn open_session(
+            &self,
+            _cfg: loft_harness::SessionConfig,
+        ) -> anyhow::Result<loft_harness::SessionHandle> {
+            anyhow::bail!("unused")
+        }
+        fn plan_limits(
+            &self,
+            _env: &HashMap<String, String>,
+            _binary: Option<PathBuf>,
+        ) -> anyhow::Result<Option<serde_json::Value>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Some(serde_json::json!({ "call": n })))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicU32::new(0));
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![
+            Arc::new(FakeHarness),
+            Arc::new(CountingHarness {
+                calls: calls.clone(),
+            }),
+        ],
+        CoreOptions::default(),
+    );
+    let ask = |refresh| Request::PlanLimits {
+        harness: HarnessId("counting".into()),
+        refresh,
+    };
+    let Response::AgentInfo { info: first } = core.handle(ask(false)).await.unwrap() else {
+        panic!()
+    };
+    let Response::AgentInfo { info: second } = core.handle(ask(false)).await.unwrap() else {
+        panic!()
+    };
+    let Response::AgentInfo { info: third } = core.handle(ask(true)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(first["call"], 1);
+    assert_eq!(second["call"], 1, "cached answer reused");
+    assert_eq!(third["call"], 2, "refresh bypasses cache");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // Harnesses without plan limits return Unsupported.
+    let err = core
+        .handle(Request::PlanLimits {
+            harness: HarnessId(HarnessId::FAKE.into()),
+            refresh: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unsupported);
+}

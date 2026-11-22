@@ -176,7 +176,7 @@ pub struct Translator {
     // -- agent capabilities (from `initialize`) --
     load_session: bool,
     resume_session: bool,
-    auth_hint: Option<String>,
+    pub(crate) auth_hint: Option<String>,
     /// The session could not be opened; every turn fails with this.
     fatal: Option<String>,
 
@@ -197,7 +197,10 @@ pub struct Translator {
     images_ok: bool,
 
     // -- turn --
-    prompting: bool,
+    /// The latest prompt owns completion. Antigravity ends superseded RPCs
+    /// as it takes steering messages, before the final assistant reply.
+    active_prompt: Option<u64>,
+    turn_usage: Option<Usage>,
     interrupted: bool,
     /// Cumulative session cost when the turn started (`usage_update.cost`).
     cost_at_start: Option<f64>,
@@ -308,20 +311,39 @@ impl Translator {
         }
     }
 
-    fn prompt(&mut self, text: &str, images: &[(String, String)], session: &str) -> Value {
-        self.prompting = true;
-        self.cost_at_start = self.cost_now;
+    fn send_prompt(
+        &mut self,
+        text: &str,
+        images: Vec<(String, String)>,
+        session: &str,
+    ) -> Vec<Out> {
+        let mut out = Vec::new();
+        let images = if images.is_empty() || self.images_ok {
+            images
+        } else {
+            out.push(Self::notice(
+                NoticeLevel::Warning,
+                "This agent doesn't accept images; they weren't sent.",
+            ));
+            Vec::new()
+        };
         let mut prompt = vec![json!({ "type": "text", "text": text })];
         prompt.extend(
             images
                 .iter()
                 .map(|(mime, data)| json!({ "type": "image", "mimeType": mime, "data": data })),
         );
-        self.request(
+        if self.active_prompt.is_none() {
+            self.cost_at_start = self.cost_now;
+        }
+        let request = self.request(
             Pending::Prompt,
             "session/prompt",
             json!({ "sessionId": session, "prompt": prompt }),
-        )
+        );
+        self.active_prompt = Some(self.next_id);
+        out.push(Out::Send(request));
+        out
     }
 
     fn ready_for_prompts(&self) -> Option<String> {
@@ -331,7 +353,7 @@ impl Translator {
     }
 
     fn flush_queue(&mut self) -> Vec<Out> {
-        if self.prompting {
+        if self.active_prompt.is_some() {
             return vec![];
         }
         let Some(session) = self.ready_for_prompts() else {
@@ -339,26 +361,17 @@ impl Translator {
         };
         // One prompt at a time; the core never queues more than one.
         match self.queued.pop_front() {
-            Some((text, images)) => {
-                let mut out = Vec::new();
-                let images = if images.is_empty() || self.images_ok {
-                    images
-                } else {
-                    out.push(Out::Event(HarnessEvent::Notice {
-                        level: NoticeLevel::Warning,
-                        text: "This agent doesn't accept images; they weren't sent.".into(),
-                    }));
-                    Vec::new()
-                };
-                out.push(Out::Send(self.prompt(&text, &images, &session)));
-                out
-            }
+            Some((text, images)) => self.send_prompt(&text, images, &session),
             None => vec![],
         }
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {
         self.start_turn_with(text, Vec::new())
+    }
+
+    pub(crate) fn startup_failed(&self) -> bool {
+        self.fatal.is_some()
     }
 
     /// A prompt with images as `(mime, base64)`.
@@ -378,8 +391,25 @@ impl Translator {
         out
     }
 
+    pub(crate) fn steer_with(&mut self, text: &str, images: Vec<(String, String)>) -> Vec<Out> {
+        if self.active_prompt.is_some()
+            && let Some(session) = self.session_id.clone()
+        {
+            return self.send_prompt(text, images, &session);
+        }
+        // The first prompt may still be waiting for initialization or a setting.
+        if let Some((prompt, attachments)) = self.queued.back_mut() {
+            prompt.push_str("\n\n");
+            prompt.push_str(text);
+            attachments.extend(images);
+            return vec![];
+        }
+        // The reply can arrive as the client sends the steering message.
+        self.start_turn_with(text, images)
+    }
+
     pub fn interrupt(&mut self) -> Vec<Out> {
-        if !self.prompting {
+        if self.active_prompt.is_none() {
             // Not sent yet (session still opening): drop it.
             if self.queued.pop_front().is_some() {
                 return vec![Out::Event(HarnessEvent::TurnCompleted {
@@ -610,9 +640,20 @@ impl Translator {
     }
 
     fn on_response(&mut self, id: &Value, v: &Value) -> Vec<Out> {
-        let Some(kind) = id.as_u64().and_then(|id| self.pending.remove(&id)) else {
+        let Some(id) = id.as_u64() else {
             return vec![];
         };
+        let Some(kind) = self.pending.remove(&id) else {
+            return vec![];
+        };
+        if kind == Pending::Prompt {
+            if let Some(usage) = v.pointer("/result/usage").filter(|u| u.is_object()) {
+                self.record_prompt_usage(usage);
+            }
+            if self.active_prompt != Some(id) {
+                return vec![];
+            }
+        }
         if let Some(err) = v.get("error") {
             return self.on_error(kind, err);
         }
@@ -631,11 +672,13 @@ impl Translator {
                 self.resume_session = caps
                     .pointer("/sessionCapabilities/resume")
                     .is_some_and(|v| !v.is_null());
-                self.auth_hint = result
-                    .pointer("/authMethods/0/description")
-                    .or_else(|| result.pointer("/authMethods/0/name"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                if self.auth_hint.is_none() {
+                    self.auth_hint = result
+                        .pointer("/authMethods/0/description")
+                        .or_else(|| result.pointer("/authMethods/0/name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
                 let name = result
                     .pointer("/agentInfo/name")
                     .and_then(Value::as_str)
@@ -752,12 +795,26 @@ impl Translator {
                 out
             }
             Pending::Prompt => {
+                if !self.interrupted
+                    && let Some(previous) = self
+                        .pending
+                        .iter()
+                        .filter(|&(_, kind)| *kind == Pending::Prompt)
+                        .map(|(&id, _)| id)
+                        .max()
+                {
+                    self.active_prompt = Some(previous);
+                    return vec![Self::notice(
+                        NoticeLevel::Warning,
+                        format!("{} couldn't steer the turn: {msg}", self.agent),
+                    )];
+                }
                 let (status, error) = if self.interrupted {
                     (TurnStatus::Interrupted, None)
                 } else {
                     (TurnStatus::Failed, Some(format!("{}: {msg}", self.agent)))
                 };
-                self.end_turn(status, None, error)
+                self.end_turn(status, error)
             }
             Pending::Setting => {
                 self.settings_in_flight = self.settings_in_flight.saturating_sub(1);
@@ -844,22 +901,28 @@ impl Translator {
             // end_turn, and anything newer than us.
             _ => (TurnStatus::Completed, None),
         };
-        let usage = result.get("usage").filter(|u| u.is_object()).map(|u| {
-            let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-            Usage {
-                input_tokens: n("inputTokens"),
-                output_tokens: n("outputTokens"),
-                cache_read_tokens: n("cachedReadTokens"),
-                cache_write_tokens: n("cachedWriteTokens"),
-                cost_usd: None,
-                duration_ms: None,
-            }
-        });
+        self.end_turn(status, error)
+    }
+
+    fn record_prompt_usage(&mut self, usage: &Value) {
+        let tokens = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let total = self.turn_usage.get_or_insert_with(Usage::default);
+        total.input_tokens = total.input_tokens.saturating_add(tokens("inputTokens"));
+        total.output_tokens = total.output_tokens.saturating_add(tokens("outputTokens"));
+        total.cache_read_tokens = total
+            .cache_read_tokens
+            .saturating_add(tokens("cachedReadTokens"));
+        total.cache_write_tokens = total
+            .cache_write_tokens
+            .saturating_add(tokens("cachedWriteTokens"));
+    }
+
+    fn end_turn(&mut self, status: TurnStatus, error: Option<String>) -> Vec<Out> {
         let cost = match (self.cost_at_start, self.cost_now) {
             (Some(a), Some(b)) if b >= a => Some(b - a),
             _ => None,
         };
-        let usage = match (usage, cost) {
+        let usage = match (self.turn_usage.take(), cost) {
             (Some(mut u), cost) => {
                 u.cost_usd = cost;
                 Some(u)
@@ -870,15 +933,6 @@ impl Translator {
             }),
             (None, None) => None,
         };
-        self.end_turn(status, usage, error)
-    }
-
-    fn end_turn(
-        &mut self,
-        status: TurnStatus,
-        usage: Option<Usage>,
-        error: Option<String>,
-    ) -> Vec<Out> {
         let mut out = self.close_stream();
         // Tool calls the agent never ran (still pending) or never finished.
         let item_status = match status {
@@ -910,7 +964,8 @@ impl Translator {
             self.approvals.remove(&id);
             out.push(Out::Event(HarnessEvent::RequestResolved { native_id: id }));
         }
-        self.prompting = false;
+        self.active_prompt = None;
+        self.pending.retain(|_, kind| *kind != Pending::Prompt);
         self.interrupted = false;
         out.push(Out::Event(HarnessEvent::TurnCompleted {
             status,
@@ -1879,6 +1934,54 @@ mod tests {
         json!({ "jsonrpc": "2.0", "method": "session/update",
                 "params": { "sessionId": "S", "update": u } })
         .to_string()
+    }
+
+    #[test]
+    fn antigravity_steering_finishes_with_the_latest_prompt() {
+        let mut t = ready();
+        t.start_turn("original");
+        for (id, text) in [(4, "steered"), (5, "steered twice")] {
+            let out = t.steer_with(text, Vec::new());
+            assert!(events(&out).is_empty());
+            assert_eq!(
+                sends(&out)[0],
+                &json!({
+                    "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                    "params": {"sessionId":"S", "prompt":[{"type":"text","text":text}]}
+                })
+            );
+        }
+        let fixture = include_str!("../fixtures/antigravity-1.5.14-steering.jsonl");
+        let mut lines = fixture.lines();
+        assert!(t.on_line(lines.next().unwrap()).is_empty());
+        assert!(t.on_line(lines.next().unwrap()).is_empty());
+        let out: Vec<_> = lines.flat_map(|line| t.on_line(line)).collect();
+        assert!(events(&out).iter().any(|event| matches!(
+                event, HarnessEvent::ItemDelta { text, .. } if text.contains("STEERED_TWICE")
+        )));
+        let done: Vec<_> = events(&out)
+            .into_iter()
+            .filter(|event| matches!(event, HarnessEvent::TurnCompleted { .. }))
+            .collect();
+        assert!(matches!(done.as_slice(), [HarnessEvent::TurnCompleted {
+            status: TurnStatus::Completed, usage: Some(usage), ..
+        }] if usage.input_tokens == 13_570 && usage.output_tokens == 1_667));
+    }
+
+    #[test]
+    fn steering_joins_a_prompt_that_has_not_been_sent() {
+        let mut t = Translator::new("Antigravity", "/tmp/probe".into(), None, None, None, vec![]);
+        t.initialize();
+        t.start_turn("first message");
+        assert!(t.steer_with("second message", Vec::new()).is_empty());
+        t.on_line(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#,
+        );
+        let out = t.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"S"}}"#);
+        assert_eq!(
+            sends(&out)[0]["params"]["prompt"][0]["text"],
+            "first message\n\nsecond message"
+        );
     }
 
     fn permission(id: u64, tool_call: Value) -> String {

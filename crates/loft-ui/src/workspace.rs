@@ -2405,6 +2405,7 @@ impl WorkspaceView {
                 (HarnessId::CLAUDE, "/context") => Some(AgentInfoKind::Context),
                 (HarnessId::CLAUDE, "/usage" | "/cost") => Some(AgentInfoKind::Usage),
                 (HarnessId::CODEX, "/status" | "/usage") => Some(AgentInfoKind::Status),
+                (HarnessId::ANTIGRAVITY, "/usage") => Some(AgentInfoKind::Usage),
                 _ => None,
             }
         };
@@ -5095,6 +5096,7 @@ impl WorkspaceView {
                         &self.store,
                         p,
                         &model.thread.cwd,
+                        &model.thread.harness,
                     ))
                     .into_any_element()
             })
@@ -6389,6 +6391,7 @@ impl WorkspaceView {
             (HarnessId::CODEX, "Codex", "npm i -g @openai/codex"),
             (HarnessId::OPENCODE, "OpenCode", ""),
             (HarnessId::GEMINI, "Gemini CLI", ""),
+            (HarnessId::ANTIGRAVITY, "Antigravity", ""),
         ] {
             let Some(status) = statuses.get(&HarnessId(id.into())) else {
                 continue;
@@ -8009,6 +8012,7 @@ pub fn harness_name(h: &HarnessId) -> &'static str {
         HarnessId::CODEX => "Codex",
         HarnessId::OPENCODE => "OpenCode",
         HarnessId::GEMINI => "Gemini",
+        HarnessId::ANTIGRAVITY => "Antigravity",
         HarnessId::FAKE => "Echo",
         _ => "Agent",
     }

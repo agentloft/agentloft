@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","result":{"stopReason":"end_turn","usage":{"inputTokens":8689,"outputTokens":222,"cachedReadTokens":0,"cachedWriteTokens":0,"thoughtTokens":178,"totalTokens":8911}},"id":3}
+{"jsonrpc":"2.0","result":{"stopReason":"end_turn"},"id":4}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"STEERED_TWICE"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\n\nSTEERED_TWICE"}}}}
+{"jsonrpc":"2.0","result":{"stopReason":"end_turn","usage":{"inputTokens":4881,"outputTokens":1445,"cachedReadTokens":15145,"cachedWriteTokens":0,"thoughtTokens":1431,"totalTokens":21471}},"id":5}

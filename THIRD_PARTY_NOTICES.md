@@ -37,6 +37,14 @@ The font files are unmodified.
   `gemini.svg`), shown to identify each agent. The marks are trademarks of
   their owners (Anthropic, OpenAI, Google). `opencode.svg` is our own glyph.
 
+## Google Antigravity
+
+- Source: [Google Antigravity Press Assets](https://antigravity.google/press)
+  (Icon - Full Color).
+- Used in: `crates/loft-ui/assets/brand/antigravity.png`. The transparent
+  margins were cropped and the image resized for the agent picker. The mark
+  is a trademark of Google.
+
 ## Material Icon Theme
 
 - Project: Material Icon Theme, https://github.com/material-extensions/vscode-material-icon-theme (`material-icon-theme` 5.40.0)

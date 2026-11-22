@@ -92,7 +92,19 @@ fn process_matches(pid: u32, kind: &str) -> bool {
         return false;
     };
     let cmd = String::from_utf8_lossy(&out.stdout);
-    out.status.success() && !cmd.trim().is_empty() && cmd.contains(kind)
+    out.status.success() && matches_command(cmd.trim(), kind)
+}
+
+fn matches_command(cmd: &str, kind: &str) -> bool {
+    if kind == loft_protocol::HarnessId::ANTIGRAVITY {
+        // Processes are recorded by harness id, but the CLI is named `agy`.
+        return cmd.split_once(" acp").is_some_and(|(binary, _)| {
+            std::path::Path::new(binary)
+                .file_name()
+                .is_some_and(|name| name == "agy" || name == "antigravity")
+        });
+    }
+    !cmd.is_empty() && cmd.contains(kind)
 }
 
 // `ps`, `sleep` and process groups.
@@ -100,6 +112,14 @@ fn process_matches(pid: u32, kind: &str) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt as _;
+
+    #[test]
+    fn recognizes_an_antigravity_acp_process() {
+        let kind = loft_protocol::HarnessId::ANTIGRAVITY;
+        assert!(matches_command("/path with spaces/agy acp --sandbox", kind));
+        assert!(!matches_command("/bin/agy --version", kind));
+        assert!(!matches_command("/bin/sleep agy acp", kind));
+    }
 
     #[test]
     fn reaps_recorded_orphans_but_not_reused_pids() {

@@ -1451,7 +1451,7 @@ pub(crate) fn render_tool_group(
         }
     }
     for request in open_requests {
-        col = col.child(approval_card(request, store, p, cwd));
+        col = col.child(approval_card(request, store, p, cwd, &model.thread.harness));
     }
     col.into_any_element()
 }
@@ -2238,19 +2238,24 @@ pub(crate) fn approval_card(
     store: &Entity<AppStore>,
     p: &Palette,
     cwd: &str,
+    harness: &loft_protocol::HarnessId,
 ) -> AnyElement {
+    let agent = crate::workspace::harness_name(harness);
     let input = req.detail.get("input");
     let pick = |k: &str| input.and_then(|i| i.get(k)).and_then(|v| v.as_str());
     let (headline, body) = match req.kind {
         RequestKind::FileChangeApproval => (
-            "Allow Claude to edit this file?",
+            format!("Allow {agent} to edit this file?"),
             pick("file_path").map(|f| relative_to(f, cwd)),
         ),
-        RequestKind::Question => ("Claude has a question", None),
-        RequestKind::Plan => ("Claude has a plan", None),
+        RequestKind::Question => (format!("{agent} has a question"), None),
+        RequestKind::Plan => (format!("{agent} has a plan"), None),
         RequestKind::ToolApproval => match pick("command") {
-            Some(cmd) => ("Allow Claude to run this command?", Some(cmd.to_owned())),
-            None => ("Allow Claude to use this tool?", None),
+            Some(cmd) => (
+                format!("Allow {agent} to run this command?"),
+                Some(cmd.to_owned()),
+            ),
+            None => (format!("Allow {agent} to use this tool?"), None),
         },
     };
     let summary = req
