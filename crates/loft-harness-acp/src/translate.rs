@@ -1331,24 +1331,30 @@ impl Translator {
         let request_title = match tool_kind {
             ToolKind::Command => format!(
                 "Shell: {}",
-                input
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&title)
+                one_line(
+                    input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&title),
+                    200,
+                )
             ),
             ToolKind::FileChange => format!(
                 "{name}: {}",
-                input
-                    .get("file_path")
-                    .and_then(Value::as_str)
-                    .map(|f| relative(f, &self.cwd))
-                    .unwrap_or_else(|| title.clone())
+                one_line(
+                    &input
+                        .get("file_path")
+                        .and_then(Value::as_str)
+                        .map(|f| relative(f, &self.cwd))
+                        .unwrap_or_else(|| title.clone()),
+                    200,
+                )
             ),
             ToolKind::Mcp => {
                 let rest = name.strip_prefix("mcp__").unwrap_or(&name);
                 format!("MCP: {}", rest.replacen("__", " · ", 1))
             }
-            _ => format!("{name}: {title}"),
+            _ => format!("{name}: {}", one_line(&title, 200)),
         };
         let mut detail = json!({ "tool": name, "input": input, "decision_reason": Value::Null });
         let diff = diff_text(call.get("content"), &self.cwd);
@@ -1706,22 +1712,30 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
     };
     match tool_kind {
         ToolKind::Command => {
-            let command = raw_str(&["command", "cmd"]).or_else(|| {
-                raw.get("command").and_then(Value::as_array).map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-            });
+            let command =
+                raw_str(&["command", "cmd", "CommandLine", "command_line"]).or_else(|| {
+                    raw.get("command").and_then(Value::as_array).map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                });
             if let Some(c) = command {
                 input.insert("command".into(), json!(c));
             }
         }
         ToolKind::FileChange | ToolKind::FileRead => {
-            let path = location
-                .clone()
-                .or_else(|| raw_str(&["file_path", "filePath", "path", "absolute_path"]));
+            let path = location.clone().or_else(|| {
+                raw_str(&[
+                    "file_path",
+                    "filePath",
+                    "path",
+                    "absolute_path",
+                    "Path",
+                    "TargetFile",
+                ])
+            });
             if let Some(p) = path {
                 input.insert("file_path".into(), json!(p));
             }
@@ -1733,6 +1747,12 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
         || tool.title.eq_ignore_ascii_case(name)
         || tool.title.eq_ignore_ascii_case(&tool_name)
         || tool.title.eq_ignore_ascii_case(kind);
+    // Keep the full command in `input["command"]` when the agent only put it
+    // in `title`, so collapsing `title` to one line still lets the user open
+    // and inspect the whole command.
+    if tool_kind == ToolKind::Command && !generic && !input.contains_key("command") {
+        input.insert("command".into(), json!(tool.title.clone()));
+    }
     let title = if generic {
         match tool_kind {
             ToolKind::Command => input
@@ -1765,6 +1785,7 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
     } else {
         tool.title.clone()
     };
+    let title = one_line(&title, 200);
     ItemBody::ToolCall {
         tool: tool_name,
         tool_kind,
@@ -1773,6 +1794,33 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
         output: None,
         is_error: false,
     }
+}
+
+/// Collapse line breaks and excess whitespace into a single-line title.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !out.is_empty() {
+                space = true;
+            }
+            continue;
+        }
+        if count + usize::from(space) >= max_chars {
+            out.push('…');
+            break;
+        }
+        if space {
+            out.push(' ');
+            count += 1;
+            space = false;
+        }
+        out.push(c);
+        count += 1;
+    }
+    out
 }
 
 /// The effort levels a session's current model offers (its `thought_level`
@@ -2728,5 +2776,63 @@ mod tests {
             unified_diff("f", "", "x\n"),
             "--- a/f\n+++ b/f\n@@ -0,0 +1,1 @@\n+x\n"
         );
+    }
+
+    #[test]
+    fn multiline_shell_commands_collapse_title_and_keep_full_command() {
+        let script = ".venv/bin/python - <<'PY'\nfrom PIL import Image\nprint('ok')\nPY";
+        // Command only in `title` (empty `rawInput`): title collapses to one
+        // line while `input["command"]` preserves the full multiline script.
+        let mut t = translator(None);
+        let out = t.on_line(&update(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "kind": "execute",
+            "title": script,
+            "status": "in_progress",
+            "rawInput": {}
+        })));
+        let HarnessEvent::ItemStarted {
+            body:
+                ItemBody::ToolCall {
+                    tool,
+                    tool_kind,
+                    title,
+                    input,
+                    ..
+                },
+            ..
+        } = &events(&out)[0]
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(tool, "Shell");
+        assert_eq!(*tool_kind, ToolKind::Command);
+        assert!(!title.contains('\n'), "title must be one line: {title:?}");
+        assert_eq!(
+            title,
+            ".venv/bin/python - <<'PY' from PIL import Image print('ok') PY"
+        );
+        assert_eq!(input["command"], script);
+
+        // `CommandLine` in `rawInput` (Antigravity `run_command`) is normalized
+        // to `input["command"]`.
+        let out = t.on_line(&update(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c2",
+            "kind": "execute",
+            "title": "Shell",
+            "status": "in_progress",
+            "rawInput": { "CommandLine": script }
+        })));
+        let HarnessEvent::ItemStarted {
+            body: ItemBody::ToolCall { title, input, .. },
+            ..
+        } = &events(&out)[0]
+        else {
+            panic!("{out:?}")
+        };
+        assert!(!title.contains('\n'), "title must be one line: {title:?}");
+        assert_eq!(input["command"], script);
     }
 }

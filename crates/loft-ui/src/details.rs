@@ -1079,7 +1079,9 @@ impl Render for DetailsCard {
                     crate::items::subagent_status(model, &agent)
                 };
                 let title = match &agent.body {
-                    loft_protocol::ItemBody::ToolCall { title, .. } => title.clone(),
+                    loft_protocol::ItemBody::ToolCall { title, .. } => {
+                        crate::items::single_line(title, 160)
+                    }
                     _ => String::new(),
                 };
                 let dot = if status.running {

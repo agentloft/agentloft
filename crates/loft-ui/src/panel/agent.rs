@@ -183,7 +183,7 @@ impl Render for AgentView {
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
-                            .child(title.clone()),
+                            .child(crate::items::single_line(title, 160)),
                     )
                     .child(
                         div()

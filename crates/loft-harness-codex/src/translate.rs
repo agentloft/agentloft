@@ -1576,6 +1576,33 @@ fn change_paths(item: &Value, cwd: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Collapse line breaks and excess whitespace into a single-line title.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !out.is_empty() {
+                space = true;
+            }
+            continue;
+        }
+        if count + usize::from(space) >= max_chars {
+            out.push('…');
+            break;
+        }
+        if space {
+            out.push(' ');
+            count += 1;
+            space = false;
+        }
+        out.push(c);
+        count += 1;
+    }
+    out
+}
+
 fn tool_body(item: &Value, cwd: &str) -> Option<ItemBody> {
     let tool = |tool: &str, kind: ToolKind, title: String, input: Value| ItemBody::ToolCall {
         tool: tool.to_owned(),
@@ -1591,7 +1618,7 @@ fn tool_body(item: &Value, cwd: &str) -> Option<ItemBody> {
             tool(
                 "Shell",
                 ToolKind::Command,
-                cmd.clone(),
+                one_line(&cmd, 200),
                 json!({ "command": cmd }),
             )
         }
@@ -2733,5 +2760,24 @@ mod tests {
         let Out::Send(v) = &out[0] else { panic!() };
         assert_eq!(v["id"], 7);
         assert!(v.get("error").is_some());
+    }
+
+    #[test]
+    fn multiline_command_execution_uses_one_line_title() {
+        let script = "python3 - <<'PY'\nprint(1)\nprint(2)\nPY";
+        let body = tool_body(
+            &serde_json::json!({
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": script,
+            }),
+            "/w",
+        )
+        .unwrap();
+        let ItemBody::ToolCall { title, input, .. } = body else {
+            panic!("{body:?}")
+        };
+        assert_eq!(title, "python3 - <<'PY' print(1) print(2) PY");
+        assert_eq!(input["command"], script);
     }
 }

@@ -1670,16 +1670,24 @@ pub(crate) fn tool_line(
         .filter(|f| !f.starts_with('/'));
     // A shell command: coloured, and shown whole when opened.
     let command = (*tool_kind == ToolKind::Command)
-        .then(|| match input.get("command") {
-            Some(serde_json::Value::String(c)) => Some(c.clone()),
-            Some(serde_json::Value::Array(parts)) => Some(
-                parts
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
-            _ => None,
+        .then(|| {
+            ["command", "cmd", "CommandLine", "command_line"]
+                .iter()
+                .find_map(|k| match input.get(*k) {
+                    Some(serde_json::Value::String(c)) => Some(c.clone()),
+                    Some(serde_json::Value::Array(parts)) => Some(
+                        parts
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    _ => None,
+                })
+                .or_else(|| {
+                    let t = title.strip_prefix(&format!("{tool} ")).unwrap_or(title);
+                    (!t.trim().is_empty() && t != tool).then(|| t.to_owned())
+                })
         })
         .flatten()
         .filter(|c| !c.trim().is_empty());
@@ -1691,18 +1699,22 @@ pub(crate) fn tool_line(
         cwd,
     );
     if detail == *tool {
-        // MCP tools have no natural title: show their arguments instead.
-        detail = match input {
-            serde_json::Value::Object(map) if !map.is_empty() => map
-                .iter()
-                .map(|(k, v)| match v {
-                    serde_json::Value::String(s) => format!("{k}: {s}"),
-                    other => format!("{k}: {other}"),
-                })
-                .collect::<Vec<_>>()
-                .join("  "),
-            _ => String::new(),
-        };
+        if let Some(cmd) = &command {
+            detail = relative_to(cmd, cwd);
+        } else {
+            // MCP tools have no natural title: show their arguments instead.
+            detail = match input {
+                serde_json::Value::Object(map) if !map.is_empty() => map
+                    .iter()
+                    .map(|(k, v)| match v {
+                        serde_json::Value::String(s) => format!("{k}: {s}"),
+                        other => format!("{k}: {other}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  "),
+                _ => String::new(),
+            };
+        }
     }
     // Orchestration tools name the threads they touch, not their ids.
     let mut label = tool_label(tool);
@@ -1756,6 +1768,7 @@ pub(crate) fn tool_line(
             plain = true;
         }
     }
+    let detail = single_line(&detail, 240);
     let clickable = file.is_some() || output.is_some() || command.is_some();
     let detail_text = if command.is_some() && !plain {
         let highlights = crate::shell_highlight::highlights(&detail, cx);
@@ -1962,7 +1975,7 @@ pub(crate) fn subagent_status(model: &ThreadModel, item: &Item) -> SubagentStatu
         || matches!(&item.body, ItemBody::ToolCall { is_error: true, .. });
     // Under the title: what it is doing now, else what it answered.
     let latest = children.iter().rev().find_map(|i| match &i.body {
-        ItemBody::ToolCall { title, .. } => Some(title.clone()),
+        ItemBody::ToolCall { title, .. } => Some(single_line(title, 160)),
         _ => None,
     });
     let answer = if background {
@@ -2063,7 +2076,7 @@ fn agent_card(
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(p.foreground)
                         .truncate()
-                        .child(title.to_owned()),
+                        .child(single_line(title, 160)),
                 )
                 .child(
                     div()
@@ -2187,7 +2200,7 @@ fn spawned_card(
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(p.foreground)
                         .truncate()
-                        .child(title),
+                        .child(single_line(&title, 160)),
                 )
                 .child(
                     div()
@@ -2220,6 +2233,34 @@ fn spawned_card(
             })
         })
         .into_any_element()
+}
+
+/// Collapse line breaks and excess whitespace into one line for compact rows.
+/// GPUI's `.truncate()` elides each line horizontally but still honours `\n`.
+pub(crate) fn single_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !out.is_empty() {
+                space = true;
+            }
+            continue;
+        }
+        if count + usize::from(space) >= max_chars {
+            out.push('…');
+            break;
+        }
+        if space {
+            out.push(' ');
+            count += 1;
+            space = false;
+        }
+        out.push(c);
+        count += 1;
+    }
+    out
 }
 
 /// The first line of `text` with its Markdown marks dropped, if any.
@@ -2258,11 +2299,13 @@ pub(crate) fn approval_card(
             None => (format!("Allow {agent} to use this tool?"), None),
         },
     };
-    let summary = req
-        .title
-        .split_once(": ")
-        .map(|(_, rest)| rest.to_owned())
-        .unwrap_or_else(|| req.title.clone());
+    let summary = single_line(
+        req.title
+            .split_once(": ")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&req.title),
+        160,
+    );
     let reason = req
         .detail
         .get("decision_reason")
@@ -2946,5 +2989,19 @@ mod tests {
         );
         assert_eq!(relative_to("cat /tmp/repo/x", "/private/tmp/repo"), "cat x");
         assert_eq!(compact_count(12_345), "12.3k");
+    }
+
+    #[test]
+    fn single_line_collapses_heredocs_and_caps_length() {
+        let cmd = ".venv/bin/python - <<'PY'\nfrom PIL import Image\n\n    for y in range(h):\n        print(y)\nPY\n";
+        assert_eq!(
+            single_line(cmd, 240),
+            ".venv/bin/python - <<'PY' from PIL import Image for y in range(h): print(y) PY"
+        );
+        assert_eq!(single_line("  \r\n\t ", 40), "");
+        assert_eq!(single_line("hello   ", 5), "hello");
+        assert_eq!(single_line("hello!", 5), "hello…");
+        assert_eq!(single_line("hello world", 6), "hello…");
+        assert_eq!(single_line("hello world", 7), "hello w…");
     }
 }
