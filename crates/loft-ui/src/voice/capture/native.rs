@@ -265,8 +265,9 @@ mod tests {
     fn the_fake_microphone_plays_a_file_in_real_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tone.wav");
-        // 0.2 s of a loud 440 Hz tone, stereo at 48 kHz.
-        let tone: Vec<i16> = (0..9_600)
+        // 0.4 s of a loud 440 Hz tone, stereo at 48 kHz (wide enough that a
+        // busy CI runner oversleeping 120 ms still lands inside the tone).
+        let tone: Vec<i16> = (0..19_200)
             .flat_map(|i| {
                 let s =
                     (16_000. * (std::f32::consts::TAU * 440. * i as f32 / 48_000.).sin()) as i16;
@@ -280,14 +281,14 @@ mod tests {
         {
             let c = lock(&collector);
             let seconds = c.seconds();
-            assert!((0.06..0.2).contains(&seconds), "{seconds}");
+            assert!((0.06..0.38).contains(&seconds), "{seconds}");
             assert!(c.level() > 0.8, "{}", c.level());
         }
         // After the file: silence, still counting.
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(500));
         {
             let c = lock(&collector);
-            assert!(c.seconds() > 0.4, "{}", c.seconds());
+            assert!(c.seconds() > 0.55, "{}", c.seconds());
             assert!(c.level() < 0.1, "{}", c.level());
         }
         let samples = lock(&collector).finish();
