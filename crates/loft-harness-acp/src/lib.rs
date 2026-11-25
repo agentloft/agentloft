@@ -276,7 +276,11 @@ fn probe_session(
         }
         let mut models = translate::offered_models(&session);
         let mut next = 2;
-        if translate::offered_efforts(&session).is_some() {
+        // Kiro publishes each model's efforts and default in its model list,
+        // even if the current model (e.g. Auto) has no effort selector.
+        if models.iter().all(|m| m.efforts.is_empty())
+            && translate::offered_efforts(&session).is_some()
+        {
             let current = models.iter().position(|m| m.is_default);
             for m in &mut models {
                 let reply = call(
@@ -378,7 +382,10 @@ impl Harness for AcpHarness {
         next: Option<PermissionMode>,
     ) -> bool {
         let full = Some(PermissionMode::FullAccess);
-        self.id == HarnessId::ANTIGRAVITY && (previous == full) != (next == full)
+        // Antigravity's flag is process-wide. Kiro's preset is set on session
+        // new/load and is dropped when that process exits.
+        matches!(self.id.as_str(), HarnessId::ANTIGRAVITY | HarnessId::KIRO)
+            && (previous == full) != (next == full)
     }
 
     /// ACP has no call for this: open a session in the temp folder, read
@@ -447,7 +454,7 @@ impl Harness for AcpHarness {
             cfg.resume.clone(),
             cfg.mcp_servers.clone(),
         );
-        translator.wait_for_models = self.id == HarnessId::KIRO;
+        translator.is_kiro = self.id == HarnessId::KIRO;
         translator.auth_hint = self.auth_hint.map(str::to_owned);
         translator.effort = cfg.effort.clone();
         // `mcp__agentloft` in allowed_tools → auto-approve that server's tools.
@@ -822,6 +829,9 @@ mod tests {
         let kiro = AcpHarness::kiro();
         assert_eq!(kiro.id().as_str(), "kiro");
         assert_eq!(kiro.binary_name, "kiro-cli");
+        assert!(kiro.permission_mode_requires_restart(None, full.permission_mode));
+        assert!(kiro.permission_mode_requires_restart(full.permission_mode, None));
+        assert!(!kiro.permission_mode_requires_restart(full.permission_mode, full.permission_mode));
         assert_eq!(
             kiro.build_args(
                 Path::new("/nonexistent/kiro-cli"),

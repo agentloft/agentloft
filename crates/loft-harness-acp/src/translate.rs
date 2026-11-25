@@ -30,7 +30,8 @@ enum Pending {
     LoadSession,
     ResumeSession,
     Prompt,
-    /// `session/set_config_option`, `session/set_mode`, `session/set_model`.
+    /// A model switch can replace the advertised effort options.
+    SetModel,
     Setting,
 }
 
@@ -176,7 +177,7 @@ pub struct Translator {
     // -- agent capabilities (from `initialize`) --
     load_session: bool,
     resume_session: bool,
-    pub(crate) wait_for_models: bool,
+    pub(crate) is_kiro: bool,
     pub(crate) auth_hint: Option<String>,
     /// The session could not be opened; every turn fails with this.
     fatal: Option<String>,
@@ -191,6 +192,8 @@ pub struct Translator {
     /// The `thought_level` option (OpenCode's `effort`). Its values depend
     /// on the model, and switching models resets it.
     effort_setting: Option<Setting>,
+    /// Kiro accepts concrete effort levels, including the model's default.
+    default_effort: Option<String>,
     /// Setting changes in flight; prompts wait for them.
     settings_in_flight: usize,
     /// Prompts queued until the session exists, with `(mime, base64)` images.
@@ -272,22 +275,28 @@ impl Translator {
     }
 
     fn open_session(&mut self) -> Vec<Out> {
-        let mcp = self.mcp_servers_json();
-        let cwd = self.cwd.clone();
+        let mut params = json!({ "cwd": self.cwd, "mcpServers": self.mcp_servers_json() });
+        if self.is_kiro && self.mode == Some(PermissionMode::FullAccess) {
+            params["_meta"] = json!({ "kiro": { "policyPreset": ["allow-all"] } });
+        }
         match self.resume.clone() {
             Some(id) if self.load_session => {
                 self.replaying = true;
+                params["sessionId"] = json!(id);
                 vec![Out::Send(self.request(
                     Pending::LoadSession,
                     "session/load",
-                    json!({ "sessionId": id, "cwd": cwd, "mcpServers": mcp }),
+                    params,
                 ))]
             }
-            Some(id) if self.resume_session => vec![Out::Send(self.request(
-                Pending::ResumeSession,
-                "session/resume",
-                json!({ "sessionId": id, "cwd": cwd, "mcpServers": mcp }),
-            ))],
+            Some(id) if self.resume_session => {
+                params["sessionId"] = json!(id);
+                vec![Out::Send(self.request(
+                    Pending::ResumeSession,
+                    "session/resume",
+                    params,
+                ))]
+            }
             Some(_) => {
                 self.resume = None;
                 vec![
@@ -298,17 +307,13 @@ impl Translator {
                             self.agent
                         ),
                     ),
-                    Out::Send(self.request(
-                        Pending::NewSession,
-                        "session/new",
-                        json!({ "cwd": cwd, "mcpServers": mcp }),
-                    )),
+                    Out::Send(self.request(Pending::NewSession, "session/new", params)),
                 ]
             }
             None => vec![Out::Send(self.request(
                 Pending::NewSession,
                 "session/new",
-                json!({ "cwd": cwd, "mcpServers": mcp }),
+                params,
             ))],
         }
     }
@@ -384,7 +389,7 @@ impl Translator {
                 .filter(|m| !m.is_empty()),
             slash_commands: vec![],
         })];
-        let model = self.apply_model(self.wait_for_models);
+        let model = self.apply_model(self.is_kiro);
         // A model switch resets effort. Reapply it when the switch is answered.
         let switching = model.iter().any(|o| matches!(o, Out::Send(_)));
         out.extend(model);
@@ -489,7 +494,10 @@ impl Translator {
 
     pub fn set_effort(&mut self, effort: Option<String>) -> Vec<Out> {
         self.effort = effort;
-        if self.session_id.is_none() {
+        if self.session_id.is_none()
+            || self.awaiting_models
+            || self.pending.values().any(|p| *p == Pending::SetModel)
+        {
             return vec![];
         }
         self.apply_effort(true)
@@ -503,22 +511,22 @@ impl Translator {
         self.apply_mode(true)
     }
 
-    fn setting_request(&mut self, setting: &Setting, value: &str) -> Value {
+    fn setting_request(&mut self, setting: &Setting, value: &str, kind: Pending) -> Value {
         let session = self.session_id.clone().unwrap_or_default();
         self.settings_in_flight += 1;
         match setting {
             Setting::ConfigOption { id, .. } => self.request(
-                Pending::Setting,
+                kind,
                 "session/set_config_option",
                 json!({ "sessionId": session, "configId": id, "value": value }),
             ),
             Setting::LegacyMode { .. } => self.request(
-                Pending::Setting,
+                kind,
                 "session/set_mode",
                 json!({ "sessionId": session, "modeId": value }),
             ),
             Setting::LegacyModel { .. } => self.request(
-                Pending::Setting,
+                kind,
                 "session/set_model",
                 json!({ "sessionId": session, "modelId": value }),
             ),
@@ -549,7 +557,7 @@ impl Translator {
         if setting.current() == value {
             return vec![];
         }
-        let req = self.setting_request(&setting, &value);
+        let req = self.setting_request(&setting, &value, Pending::SetModel);
         setting.set_current(&value);
         self.model_setting = Some(setting);
         vec![Out::Send(req)]
@@ -583,12 +591,16 @@ impl Translator {
             None if explicit && setting.values().iter().any(|v| v == "default") => {
                 "default".to_owned()
             }
+            None if explicit => match self.default_effort.as_ref() {
+                Some(default) if setting.values().contains(default) => default.clone(),
+                _ => return vec![],
+            },
             None => return vec![],
         };
         if setting.current() == value {
             return vec![];
         }
-        let req = self.setting_request(&setting, &value);
+        let req = self.setting_request(&setting, &value, Pending::Setting);
         setting.set_current(&value);
         self.effort_setting = Some(setting);
         vec![Out::Send(req)]
@@ -599,6 +611,9 @@ impl Translator {
         let Some(mode) = self.mode else {
             return vec![]; // harness default: leave the agent's mode alone
         };
+        if self.is_kiro && mode == PermissionMode::FullAccess {
+            return vec![]; // applied by the session's policy preset
+        }
         let Some(mut setting) = self.mode_setting.clone() else {
             return if explicit {
                 vec![Self::notice(
@@ -618,7 +633,7 @@ impl Translator {
         if setting.current() == value {
             return vec![];
         }
-        let req = self.setting_request(&setting, &value);
+        let req = self.setting_request(&setting, &value, Pending::Setting);
         setting.set_current(&value);
         self.mode_setting = Some(setting);
         vec![Out::Send(req)]
@@ -741,21 +756,23 @@ impl Translator {
                 // one's is unknown until the first update.
                 self.cost_now = (kind == Pending::NewSession).then_some(0.0);
                 self.read_settings(result);
-                if self.wait_for_models && self.model_setting.is_none() {
+                if self.is_kiro && self.model_setting.is_none() {
                     self.awaiting_models = true;
                     return vec![];
                 }
                 self.session_ready(offered_models(result))
             }
             Pending::Prompt => self.finish_prompt(result),
-            Pending::Setting => {
+            Pending::SetModel | Pending::Setting => {
                 self.settings_in_flight = self.settings_in_flight.saturating_sub(1);
                 let mut out = Vec::new();
                 if result.get("configOptions").is_some() {
                     self.read_settings(result);
                     // After a model switch the effort is back at the
                     // model's default.
-                    out.extend(self.apply_effort(false));
+                    if !self.pending.values().any(|p| *p == Pending::SetModel) {
+                        out.extend(self.apply_effort(false));
+                    }
                 }
                 out.extend(self.flush_queue());
                 out
@@ -830,7 +847,7 @@ impl Translator {
                 };
                 self.end_turn(status, error)
             }
-            Pending::Setting => {
+            Pending::SetModel | Pending::Setting => {
                 self.settings_in_flight = self.settings_in_flight.saturating_sub(1);
                 let mut out = vec![Self::notice(
                     NoticeLevel::Warning,
@@ -846,6 +863,14 @@ impl Translator {
     /// `modes` / `models` states).
     fn read_settings(&mut self, result: &Value) {
         if let Some(options) = result.get("configOptions").and_then(Value::as_array) {
+            if self.is_kiro {
+                // Switching to a model like Auto removes the effort selector.
+                self.effort_setting = None;
+                self.default_effort = offered_models(result)
+                    .into_iter()
+                    .find(|m| m.is_default)
+                    .and_then(|m| m.default_effort);
+            }
             for opt in options {
                 let category = opt
                     .get("category")
@@ -1918,7 +1943,23 @@ pub fn offered_models(result: &Value) -> Vec<loft_protocol::ModelInfo> {
                 .unwrap_or_else(|| vec![opt])
             {
                 if let Some(id) = o.get("value").and_then(Value::as_str) {
-                    out.push(info(id, o.get("name").and_then(Value::as_str), current));
+                    let mut model = info(id, o.get("name").and_then(Value::as_str), current);
+                    if let Some(kiro) = o.pointer("/_meta/kiro")
+                        && kiro["hasEffort"].as_bool() == Some(true)
+                        && let Some(levels) = kiro["effortLevels"].as_array()
+                    {
+                        model.efforts = levels
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter(|level| *level != "default")
+                            .map(str::to_owned)
+                            .collect();
+                        model.default_effort = kiro["defaultEffortLevel"]
+                            .as_str()
+                            .filter(|level| model.efforts.iter().any(|e| e == *level))
+                            .map(str::to_owned);
+                    }
+                    out.push(model);
                 }
             }
         }
@@ -2368,7 +2409,7 @@ mod tests {
             None,
             vec![],
         );
-        t.wait_for_models = true;
+        t.is_kiro = true;
         t.initialize();
         t.start_turn("Hello");
         let fixture = include_str!("../fixtures/kiro-3.6.0-turn.jsonl");
@@ -2689,6 +2730,104 @@ mod tests {
         assert!(t.set_permission_mode(None).is_empty());
         // An unknown model is reported, not sent.
         let out = t.set_model(Some("gpt-nope".into()));
+        assert!(sends(&out).is_empty());
+        assert!(matches!(events(&out)[0], HarnessEvent::Notice { .. }));
+    }
+
+    #[test]
+    fn kiro_full_access_is_attached_to_new_and_loaded_sessions() {
+        for (resume, method) in [(None, "session/new"), (Some("S"), "session/load")] {
+            for mode in [PermissionMode::AskAll, PermissionMode::FullAccess] {
+                let mut t = Translator::new(
+                    "Kiro",
+                    "/tmp/probe".into(),
+                    None,
+                    Some(mode),
+                    resume.map(str::to_owned),
+                    vec![],
+                );
+                t.is_kiro = true;
+                t.initialize();
+                let out = t.on_line(
+                    include_str!("../fixtures/kiro-3.6.0-turn.jsonl")
+                        .lines()
+                        .next()
+                        .unwrap(),
+                );
+                let req = sends(&out)[0];
+                assert_eq!(req["method"], method);
+                assert_eq!(req["params"]["sessionId"].as_str(), resume);
+                let preset = req.pointer("/params/_meta/kiro/policyPreset");
+                if mode == PermissionMode::FullAccess {
+                    assert_eq!(preset, Some(&json!(["allow-all"])));
+                } else {
+                    assert!(preset.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kiro_discovers_effort_from_auto_and_applies_it_after_a_model_switch() {
+        let mut t = Translator::new("Kiro", "/tmp/probe".into(), None, None, None, vec![]);
+        t.is_kiro = true;
+        t.initialize();
+        t.on_line(
+            include_str!("../fixtures/kiro-3.6.0-turn.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        );
+        // Like Kiro V3, the model list names all available levels while the
+        // `thought_level` option only appears on a model that supports them.
+        let model = |current: &str| {
+            json!({
+                "type": "select", "id": "model", "category": "model", "currentValue": current,
+                "options": [{"value": "auto", "name": "Auto", "_meta": {"kiro": {"hasEffort": false}}},
+                            {"value": "claude-opus-4.8", "name": "Opus", "_meta": {"kiro": {
+                                "hasEffort": true, "effortLevels": ["low", "medium", "high", "max"],
+                                "defaultEffortLevel": "medium"
+                            }}}]
+            })
+        };
+        let effort = |current: &str| {
+            json!({
+                "type": "select", "id": "effortLevel", "category": "thought_level", "currentValue": current,
+                "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}, {"value": "max"}]
+            })
+        };
+        let reply = |id, result| json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+        let out = t.on_line(&reply(
+            2,
+            json!({"sessionId": "S", "configOptions": [model("auto")]}),
+        ));
+        let HarnessEvent::SessionReady { models, .. } = events(&out)[0] else {
+            panic!("{out:?}");
+        };
+        assert!(models[0].efforts.is_empty());
+        assert_eq!(models[1].efforts, ["low", "medium", "high", "max"]);
+        assert_eq!(models[1].default_effort.as_deref(), Some("medium"));
+
+        assert_eq!(
+            sends(&t.set_model(Some("claude-opus-4.8".into())))[0]["params"]["configId"],
+            "model"
+        );
+        assert!(t.set_effort(Some("max".into())).is_empty());
+        assert!(t.start_turn("go").is_empty());
+        let opus = |current| json!({"configOptions": [model("claude-opus-4.8"), effort(current)]});
+        let out = t.on_line(&reply(3, opus("medium")));
+        assert_eq!(
+            sends(&out)[0]["params"],
+            json!({"sessionId": "S", "configId": "effortLevel", "value": "max"})
+        );
+        let out = t.on_line(&reply(4, opus("max")));
+        assert_eq!(sends(&out)[0]["method"], "session/prompt");
+        let out = t.set_effort(None);
+        assert_eq!(sends(&out)[0]["params"]["value"], "medium");
+        t.on_line(&reply(6, opus("medium")));
+        t.set_model(Some("auto".into()));
+        t.on_line(&reply(7, json!({"configOptions": [model("auto")]})));
+        let out = t.set_effort(Some("max".into()));
         assert!(sends(&out).is_empty());
         assert!(matches!(events(&out)[0], HarnessEvent::Notice { .. }));
     }
