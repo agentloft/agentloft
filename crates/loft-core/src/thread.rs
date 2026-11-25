@@ -1973,7 +1973,16 @@ impl ThreadActor {
                                     ..
                                 }
                             );
-                        launched || (i.parent_id.is_some() && status == TurnStatus::Completed)
+                        // Non-subagent background tools (e.g. Antigravity's
+                        // backgrounded `run_command` / `schedule`) stay open
+                        // after the turn until the agent reports them done.
+                        let background_tool = status == TurnStatus::Completed
+                            && !self.thread.waiting_on.is_empty()
+                            && i.status == ItemStatus::InProgress
+                            && matches!(&i.body, ItemBody::ToolCall { .. });
+                        launched
+                            || background_tool
+                            || (i.parent_id.is_some() && status == TurnStatus::Completed)
                     })
                 })
                 .map(|(n, id)| (n.clone(), id.clone()))

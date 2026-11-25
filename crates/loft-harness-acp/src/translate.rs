@@ -12,7 +12,7 @@ use loft_protocol::{
     RequestKind, ToolKind, TurnStatus, Usage,
 };
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// ACP protocol version we speak.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -177,7 +177,9 @@ pub struct Translator {
     // -- agent capabilities (from `initialize`) --
     load_session: bool,
     resume_session: bool,
+    pub(crate) is_antigravity: bool,
     pub(crate) is_kiro: bool,
+    agent_version: Option<String>,
     pub(crate) auth_hint: Option<String>,
     /// The session could not be opened; every turn fails with this.
     fatal: Option<String>,
@@ -216,6 +218,30 @@ pub struct Translator {
     /// Tool call ids in arrival order, for flushing at turn end.
     tool_order: Vec<String>,
     approvals: HashMap<String, OpenApproval>,
+
+    // -- Antigravity background work & autonomous wakeups --
+    /// Non-daemon tool calls still `in_progress` after `end_turn`.
+    background_tools: HashMap<String, ToolState>,
+    /// Arrival order of `background_tools`.
+    background_order: Vec<String>,
+    /// Daemon/cancelled tool ids already closed whose late update is ignored.
+    retired_tools: HashSet<String>,
+    /// Subagents launched in the current turn (`agy < 1.5.16` returns
+    /// `end_turn` before they reply).
+    launched_subagents: Vec<String>,
+    /// Subagents still running after `end_turn` (`agy < 1.5.16`).
+    waiting_subagents: Vec<String>,
+    /// LLM steps completed since the last `invoke_subagent` call in this turn.
+    steps_since_subagent: usize,
+    /// Last `BackgroundTasks` list emitted, to avoid redundant updates.
+    last_waiting: Vec<String>,
+    /// Unsolicited turn started by Antigravity with no `session/prompt` open.
+    autonomous_turn: bool,
+    /// An assistant reply chunk arrived since the last tool/thought in the
+    /// autonomous turn.
+    autonomous_spoke: bool,
+    /// Ready to finish the autonomous turn after a short quiet window.
+    autonomous_settle: bool,
 }
 
 impl Translator {
@@ -409,10 +435,75 @@ impl Translator {
         self.fatal.is_some()
     }
 
+    pub(crate) fn needs_autonomous_settle(&self) -> bool {
+        self.autonomous_turn
+            && self.autonomous_settle
+            && self.active_prompt.is_none()
+            && self.approvals.is_empty()
+    }
+
+    pub(crate) fn finish_autonomous_turn(&mut self) -> Vec<Out> {
+        if !self.needs_autonomous_settle() {
+            return vec![];
+        }
+        self.end_turn(TurnStatus::Completed, None)
+    }
+
+    /// `agy` 1.5.14 returned `end_turn` before subagents finished; 1.5.16+
+    /// keeps `session/prompt` open until they reply.
+    fn antigravity_returns_early_on_subagent(&self) -> bool {
+        self.is_antigravity
+            && self
+                .agent_version
+                .as_deref()
+                .and_then(parse_semver)
+                .is_some_and(|v| v < (1, 5, 16))
+    }
+
+    fn background_tasks(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .background_order
+            .iter()
+            .filter_map(|id| self.background_tools.get(id))
+            .map(background_tool_label)
+            .collect();
+        labels.extend(self.waiting_subagents.iter().cloned());
+        labels
+    }
+
+    fn sync_background_tasks(&mut self) -> Vec<Out> {
+        if !self.is_antigravity {
+            return vec![];
+        }
+        let now = self.background_tasks();
+        if now == self.last_waiting {
+            return vec![];
+        }
+        self.last_waiting = now.clone();
+        vec![Out::Event(HarnessEvent::BackgroundTasks(now))]
+    }
+
+    fn begin_autonomous_turn(&mut self) -> Vec<Out> {
+        self.autonomous_turn = true;
+        self.autonomous_spoke = false;
+        self.autonomous_settle = false;
+        self.interrupted = false;
+        self.cost_at_start = self.cost_now;
+        self.waiting_subagents.clear();
+        let mut out = self.sync_background_tasks();
+        out.push(Out::Event(HarnessEvent::TurnStarted));
+        out
+    }
+
     /// A prompt with images as `(mime, base64)`.
     pub fn start_turn_with(&mut self, text: &str, images: Vec<(String, String)>) -> Vec<Out> {
         self.interrupted = false;
-        let mut out = vec![Out::Event(HarnessEvent::TurnStarted)];
+        self.autonomous_turn = false;
+        self.autonomous_spoke = false;
+        self.autonomous_settle = false;
+        self.waiting_subagents.clear();
+        let mut out = self.sync_background_tasks();
+        out.push(Out::Event(HarnessEvent::TurnStarted));
         if let Some(error) = self.fatal.clone() {
             out.push(Out::Event(HarnessEvent::TurnCompleted {
                 status: TurnStatus::Failed,
@@ -427,9 +518,12 @@ impl Translator {
     }
 
     pub(crate) fn steer_with(&mut self, text: &str, images: Vec<(String, String)>) -> Vec<Out> {
-        if self.active_prompt.is_some()
+        if (self.active_prompt.is_some() || self.autonomous_turn)
             && let Some(session) = self.session_id.clone()
         {
+            self.autonomous_turn = false;
+            self.autonomous_spoke = false;
+            self.autonomous_settle = false;
             return self.send_prompt(text, images, &session);
         }
         // The first prompt may still be waiting for initialization or a setting.
@@ -445,6 +539,20 @@ impl Translator {
 
     pub fn interrupt(&mut self) -> Vec<Out> {
         if self.active_prompt.is_none() {
+            if self.autonomous_turn {
+                let Some(session) = self.session_id.clone() else {
+                    return self.end_turn(TurnStatus::Interrupted, None);
+                };
+                self.interrupted = true;
+                let mut out = vec![Out::Send(Self::notify(
+                    "session/cancel",
+                    json!({ "sessionId": session }),
+                ))];
+                out.extend(self.cancel_approvals());
+                // No `session/prompt` RPC is in flight to answer `cancelled`.
+                out.extend(self.end_turn(TurnStatus::Interrupted, None));
+                return out;
+            }
             // Not sent yet (session still opening): drop it.
             if self.queued.pop_front().is_some() {
                 return vec![Out::Event(HarnessEvent::TurnCompleted {
@@ -732,6 +840,10 @@ impl Translator {
                     .pointer("/agentInfo/version")
                     .and_then(Value::as_str)
                     .unwrap_or("?");
+                self.agent_version = result
+                    .pointer("/agentInfo/version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 tracing::info!(
                     agent = %name,
                     %version,
@@ -986,6 +1098,24 @@ impl Translator {
             if tool.done {
                 continue;
             }
+            if self.is_antigravity
+                && status == TurnStatus::Completed
+                && tool.started
+                && tool.status.as_deref() == Some("in_progress")
+            {
+                if is_daemon_tool(&tool) {
+                    // Long-running daemons (dev servers, watchers) aren't
+                    // blocking work; close the item and remember its id so a
+                    // late exit update doesn't create a duplicate row.
+                    self.retired_tools.insert(id.clone());
+                } else {
+                    if !self.background_tools.contains_key(&id) {
+                        self.background_order.push(id.clone());
+                    }
+                    self.background_tools.insert(id, tool);
+                    continue;
+                }
+            }
             if !tool.started {
                 out.extend(self.start_tool(&id, &mut tool));
             }
@@ -997,13 +1127,43 @@ impl Translator {
             }));
         }
         self.tools.clear();
+        if self.is_antigravity && status == TurnStatus::Interrupted {
+            for id in std::mem::take(&mut self.background_order) {
+                let Some(tool) = self.background_tools.remove(&id) else {
+                    continue;
+                };
+                self.retired_tools.insert(id.clone());
+                out.push(Out::Event(HarnessEvent::ItemCompleted {
+                    native_id: id,
+                    body: Some(tool_body(&tool, &self.cwd, &self.mcp_names())),
+                    tool_result: None,
+                    status: ItemStatus::Declined,
+                }));
+            }
+            self.waiting_subagents.clear();
+        }
+        if self.antigravity_returns_early_on_subagent()
+            && status == TurnStatus::Completed
+            && !self.launched_subagents.is_empty()
+            && self.steps_since_subagent <= 1
+        {
+            self.waiting_subagents
+                .extend(std::mem::take(&mut self.launched_subagents));
+        } else {
+            self.launched_subagents.clear();
+        }
+        self.steps_since_subagent = 0;
         let mut ids: Vec<String> = self.approvals.keys().cloned().collect();
         ids.sort();
         for id in ids {
             self.approvals.remove(&id);
             out.push(Out::Event(HarnessEvent::RequestResolved { native_id: id }));
         }
+        out.extend(self.sync_background_tasks());
         self.active_prompt = None;
+        self.autonomous_turn = false;
+        self.autonomous_spoke = false;
+        self.autonomous_settle = false;
         self.pending.retain(|_, kind| *kind != Pending::Prompt);
         self.interrupted = false;
         out.push(Out::Event(HarnessEvent::TurnCompleted {
@@ -1033,11 +1193,67 @@ impl Translator {
             return vec![]; // e.g. a subagent's child session
         }
         let u = p.get("update").unwrap_or(&Value::Null);
-        match u.get("sessionUpdate").and_then(Value::as_str) {
-            Some("agent_message_chunk") => self.chunk(u, DeltaChannel::Text),
-            Some("agent_thought_chunk") => self.chunk(u, DeltaChannel::Reasoning),
-            Some("tool_call") | Some("tool_call_update") => self.tool_update(u),
-            Some("plan") => self.plan(u),
+        let update_kind = u.get("sessionUpdate").and_then(Value::as_str);
+        if self.is_antigravity
+            && matches!(update_kind, Some("tool_call" | "tool_call_update"))
+            && let Some(id) = u.get("toolCallId").and_then(Value::as_str)
+        {
+            if self.retired_tools.contains(id) {
+                if matches!(
+                    u.get("status").and_then(Value::as_str),
+                    Some("completed" | "failed")
+                ) {
+                    self.retired_tools.remove(id);
+                }
+                return vec![];
+            }
+            if self.background_tools.contains_key(id) {
+                return self.background_tool_update(id, u);
+            }
+        }
+        let mut out = Vec::new();
+        if self.is_antigravity && self.active_prompt.is_none() && !self.autonomous_turn {
+            let wakes = match update_kind {
+                Some("agent_message_chunk" | "agent_thought_chunk") => {
+                    !content_text(u.get("content").unwrap_or(&Value::Null)).is_empty()
+                }
+                Some("tool_call" | "tool_call_update" | "plan") => true,
+                _ => false,
+            };
+            if wakes {
+                out.extend(self.begin_autonomous_turn());
+            }
+        }
+        match update_kind {
+            Some("agent_message_chunk") => {
+                let text = content_text(u.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() && self.autonomous_turn {
+                    self.autonomous_spoke = true;
+                    self.autonomous_settle = false;
+                }
+                out.extend(self.chunk(u, DeltaChannel::Text));
+            }
+            Some("agent_thought_chunk") => {
+                let text = content_text(u.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() && self.autonomous_turn {
+                    self.autonomous_spoke = false;
+                    self.autonomous_settle = false;
+                }
+                out.extend(self.chunk(u, DeltaChannel::Reasoning));
+            }
+            Some("tool_call") | Some("tool_call_update") => {
+                if self.autonomous_turn {
+                    self.autonomous_spoke = false;
+                    self.autonomous_settle = false;
+                }
+                out.extend(self.tool_update(u));
+            }
+            Some("plan") => {
+                if self.autonomous_turn {
+                    self.autonomous_settle = false;
+                }
+                out.extend(self.plan(u));
+            }
             Some("current_mode_update") => {
                 if let (Some(setting), Some(id)) = (
                     self.mode_setting.as_mut(),
@@ -1045,27 +1261,47 @@ impl Translator {
                 ) {
                     setting.set_current(id);
                 }
-                vec![]
             }
             Some("config_option_update") => {
                 self.read_settings(u);
                 if self.awaiting_models && self.model_setting.is_some() {
                     self.awaiting_models = false;
-                    self.session_ready(offered_models(u))
-                } else {
-                    vec![]
+                    out.extend(self.session_ready(offered_models(u)));
                 }
             }
             Some("usage_update") => {
                 if u.pointer("/cost/currency").and_then(Value::as_str) == Some("USD") {
                     self.cost_now = u.pointer("/cost/amount").and_then(Value::as_f64);
                 }
-                match u.get("used").and_then(Value::as_u64).filter(|t| *t > 0) {
-                    Some(tokens) => vec![Out::Event(HarnessEvent::ContextUsed(ContextUse {
+                if self.is_antigravity {
+                    // Antigravity emits `usage_update` once at the end of an
+                    // LLM response. Closing the open reply message lets the UI
+                    // show "Working…" while waiting on background work before
+                    // the next step arrives.
+                    if self
+                        .stream
+                        .as_ref()
+                        .is_some_and(|s| s.channel == DeltaChannel::Text)
+                    {
+                        out.extend(self.close_stream());
+                    }
+                    let used = u.get("used").and_then(Value::as_u64).unwrap_or(0);
+                    if used > 0 && !self.launched_subagents.is_empty() {
+                        self.steps_since_subagent += 1;
+                    }
+                    if self.autonomous_turn
+                        && self.active_prompt.is_none()
+                        && self.autonomous_spoke
+                        && self.approvals.is_empty()
+                    {
+                        self.autonomous_settle = true;
+                    }
+                }
+                if let Some(tokens) = u.get("used").and_then(Value::as_u64).filter(|t| *t > 0) {
+                    out.push(Out::Event(HarnessEvent::ContextUsed(ContextUse {
                         tokens,
                         window: u.get("size").and_then(Value::as_u64),
-                    }))],
-                    None => vec![],
+                    })));
                 }
             }
             Some("notice") => {
@@ -1078,12 +1314,13 @@ impl Translator {
                     Some(d) if !d.is_empty() => format!("{title}: {d}"),
                     _ => title,
                 };
-                vec![Self::notice(level, text)]
+                out.push(Self::notice(level, text));
             }
             // user_message_chunk (replay only), available_commands_update,
             // session_info_update, compaction…: nothing to show.
-            _ => vec![],
+            _ => {}
         }
+        out
     }
 
     fn close_stream(&mut self) -> Vec<Out> {
@@ -1204,6 +1441,23 @@ impl Translator {
         if tool.started && tool.is_finished() {
             tool.done = true;
             let failed = tool.status.as_deref() == Some("failed");
+            if self.antigravity_returns_early_on_subagent() && !failed {
+                match tool.name.as_deref() {
+                    Some("invoke_subagent") => {
+                        self.launched_subagents.push(subagent_label(&tool));
+                        self.steps_since_subagent = 0;
+                    }
+                    Some("manage_subagents")
+                        if matches!(
+                            tool.raw_input.get("Action").and_then(Value::as_str),
+                            Some("kill" | "kill_all")
+                        ) =>
+                    {
+                        self.launched_subagents.clear();
+                    }
+                    _ => {}
+                }
+            }
             out.push(Out::Event(HarnessEvent::ItemCompleted {
                 native_id: id.clone(),
                 body: Some(tool_body(&tool, &self.cwd, &self.mcp_names())),
@@ -1219,6 +1473,47 @@ impl Translator {
             }));
         }
         self.tools.insert(id, tool);
+        out
+    }
+
+    /// Update a tool call that stayed running in the background past `end_turn`.
+    fn background_tool_update(&mut self, id: &str, u: &Value) -> Vec<Out> {
+        let Some(mut tool) = self.background_tools.remove(id) else {
+            return vec![];
+        };
+        tool.merge(u);
+        let mut out = Vec::new();
+        if !tool.is_finished() {
+            let text = tool_output(&tool, &self.cwd);
+            if let Some(suffix) = text.strip_prefix(tool.streamed.as_str())
+                && !suffix.is_empty()
+            {
+                out.push(Out::Event(HarnessEvent::ItemDelta {
+                    native_id: id.to_owned(),
+                    channel: DeltaChannel::Output,
+                    text: suffix.to_owned(),
+                }));
+                tool.streamed = text;
+            }
+            self.background_tools.insert(id.to_owned(), tool);
+            return out;
+        }
+        let failed = tool.status.as_deref() == Some("failed");
+        self.background_order.retain(|existing| existing != id);
+        out.push(Out::Event(HarnessEvent::ItemCompleted {
+            native_id: id.to_owned(),
+            body: Some(tool_body(&tool, &self.cwd, &self.mcp_names())),
+            tool_result: Some(ToolResult {
+                output: tool_output(&tool, &self.cwd),
+                is_error: failed,
+            }),
+            status: if failed {
+                ItemStatus::Failed
+            } else {
+                ItemStatus::Completed
+            },
+        }));
+        out.extend(self.sync_background_tasks());
         out
     }
 
@@ -1317,6 +1612,12 @@ impl Translator {
             .map(str::to_owned);
 
         let mut out = Vec::new();
+        if self.is_antigravity {
+            if self.active_prompt.is_none() && !self.autonomous_turn {
+                out.extend(self.begin_autonomous_turn());
+            }
+            self.autonomous_settle = false;
+        }
         let mut tool = tool_id
             .as_ref()
             .and_then(|id| self.tools.remove(id))
@@ -1361,10 +1662,11 @@ impl Translator {
             if let Some(id) = tool_id {
                 self.tools.insert(id, tool);
             }
-            return vec![Out::Send(Self::reply(
+            out.push(Out::Send(Self::reply(
                 rpc_id,
                 json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-            ))];
+            )));
+            return out;
         }
 
         if let Some(id) = &tool_id {
@@ -1799,11 +2101,16 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
         }
         _ => {}
     }
-    // A bare title ("shell", "glob") says nothing: show the real argument.
+    // A bare title ("shell", "glob", "Run invoke_subagent") says nothing: show
+    // the real argument.
     let generic = tool.title.is_empty()
         || tool.title.eq_ignore_ascii_case(name)
         || tool.title.eq_ignore_ascii_case(&tool_name)
-        || tool.title.eq_ignore_ascii_case(kind);
+        || tool.title.eq_ignore_ascii_case(kind)
+        || tool
+            .title
+            .strip_prefix("Run ")
+            .is_some_and(|rest| rest.eq_ignore_ascii_case(name));
     // Keep the full command in `input["command"]` when the agent only put it
     // in `title`, so collapsing `title` to one line still lets the user open
     // and inspect the whole command.
@@ -1820,17 +2127,26 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
                 .get("file_path")
                 .and_then(Value::as_str)
                 .map(|p| relative(p, cwd)),
-            _ => raw_str(&["pattern", "query", "url", "path", "description", "prompt"]).or_else(
-                || {
-                    // Code-mode tools (OpenCode `execute`): the first line.
-                    raw_str(&["code"]).and_then(|code| {
-                        code.lines()
-                            .map(str::trim)
-                            .find(|l| !l.is_empty())
-                            .map(|l| l.chars().take(100).collect())
-                    })
-                },
-            ),
+            _ => raw_str(&[
+                "Role",
+                "role",
+                "pattern",
+                "query",
+                "url",
+                "path",
+                "description",
+                "prompt",
+                "Prompt",
+            ])
+            .or_else(|| {
+                // Code-mode tools (OpenCode `execute`): the first line.
+                raw_str(&["code"]).and_then(|code| {
+                    code.lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .map(|l| l.chars().take(100).collect())
+                })
+            }),
         }
         .unwrap_or_else(|| {
             if tool.title.is_empty() {
@@ -1851,6 +2167,52 @@ fn tool_body(tool: &ToolState, cwd: &str, mcp_servers: &[String]) -> ItemBody {
         output: None,
         is_error: false,
     }
+}
+
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let core = s.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn is_daemon_tool(tool: &ToolState) -> bool {
+    tool.raw_input
+        .get("IsDaemon")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn background_tool_label(tool: &ToolState) -> String {
+    let raw = &tool.raw_input;
+    for key in ["toolSummary", "CommandLine", "command", "Prompt", "prompt"] {
+        if let Some(v) = raw.get(key).and_then(Value::as_str)
+            && !v.trim().is_empty()
+        {
+            return one_line(v, 120);
+        }
+    }
+    if !tool.title.trim().is_empty() {
+        return one_line(&tool.title, 120);
+    }
+    tool.name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| one_line(s, 120))
+        .unwrap_or_else(|| "a background task".to_owned())
+}
+
+fn subagent_label(tool: &ToolState) -> String {
+    for key in ["Role", "role", "TypeName", "type_name"] {
+        if let Some(v) = tool.raw_input.get(key).and_then(Value::as_str)
+            && !v.trim().is_empty()
+        {
+            return one_line(v, 120);
+        }
+    }
+    "subagent".to_owned()
 }
 
 /// Collapse line breaks and excess whitespace into a single-line title.
@@ -3132,5 +3494,334 @@ mod tests {
         };
         assert!(!title.contains('\n'), "title must be one line: {title:?}");
         assert_eq!(input["command"], script);
+    }
+
+    fn antigravity_translator() -> Translator {
+        let mut t = Translator::new("Antigravity", "/tmp/probe".into(), None, None, None, vec![]);
+        t.is_antigravity = true;
+        t
+    }
+
+    #[test]
+    fn antigravity_1_5_14_background_command_waits_and_wakes_autonomously() {
+        let mut t = antigravity_translator();
+        t.initialize();
+        t.start_turn("run bg");
+        let fixture = include_str!("../fixtures/antigravity-1.5.14-background-command.jsonl");
+        let mut lines = fixture.lines();
+        // Handshake + turn 1 up through `end_turn` (lines 1..=7).
+        let mut turn1 = Vec::new();
+        for _ in 0..7 {
+            turn1.extend(t.on_line(lines.next().unwrap()));
+        }
+        let evs1 = events(&turn1);
+        // `call_bg1` stays open past `end_turn` and is reported via `BackgroundTasks`.
+        assert!(!evs1.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { native_id, .. } if native_id == "call_bg1"
+        )));
+        let bg_pos = evs1
+            .iter()
+            .position(|e| matches!(
+                e,
+                HarnessEvent::BackgroundTasks(v) if v == &vec!["Sleep background task".to_owned()]
+            ))
+            .expect("waiting_on emitted");
+        let done_pos = evs1
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    HarnessEvent::TurnCompleted {
+                        status: TurnStatus::Completed,
+                        ..
+                    }
+                )
+            })
+            .expect("turn 1 completed");
+        assert!(bg_pos < done_pos, "BackgroundTasks precedes TurnCompleted");
+
+        // Background command finishes: completes the existing item and clears `waiting_on`.
+        let done_bg = t.on_line(lines.next().unwrap());
+        let done_bg_evs = events(&done_bg);
+        assert!(done_bg_evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted {
+                native_id,
+                tool_result: Some(r),
+                status: ItemStatus::Completed,
+                ..
+            } if native_id == "call_bg1" && r.output.contains("BG_DONE")
+        )));
+        assert!(done_bg_evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::BackgroundTasks(v) if v.is_empty()
+        )));
+        assert!(
+            !done_bg_evs
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::TurnStarted))
+        );
+
+        // Unsolicited reply opens an autonomous turn and arms settle after `usage_update`.
+        let wake_msg = t.on_line(lines.next().unwrap());
+        assert!(matches!(events(&wake_msg)[0], HarnessEvent::TurnStarted));
+        assert!(!t.needs_autonomous_settle());
+
+        let wake_usage = t.on_line(lines.next().unwrap());
+        assert!(events(&wake_usage).iter().any(|e| matches!(
+            e,
+            HarnessEvent::ContextUsed(ContextUse { tokens: 9780, .. })
+        )));
+        assert!(t.needs_autonomous_settle());
+
+        let settled = t.finish_autonomous_turn();
+        assert!(matches!(
+            events(&settled)[..],
+            [HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            }]
+        ));
+        assert!(!t.needs_autonomous_settle());
+    }
+
+    #[test]
+    fn antigravity_1_5_14_background_subagent_waits_and_wakes_autonomously() {
+        let mut t = antigravity_translator();
+        t.initialize();
+        t.start_turn("launch subagent");
+        let fixture = include_str!("../fixtures/antigravity-1.5.14-background-subagent.jsonl");
+        let mut lines = fixture.lines();
+        // Handshake + turn 1 through `end_turn` (lines 1..=8).
+        let mut turn1 = Vec::new();
+        for _ in 0..8 {
+            turn1.extend(t.on_line(lines.next().unwrap()));
+        }
+        let evs1 = events(&turn1);
+        // `invoke_subagent` uses `Role` instead of the bare "Run invoke_subagent".
+        assert!(evs1.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemStarted {
+                body: ItemBody::ToolCall { title, .. },
+                ..
+            } if title == "Slow Sleeper"
+        )));
+        assert!(evs1.iter().any(|e| matches!(
+            e,
+            HarnessEvent::BackgroundTasks(v) if v == &vec!["Slow Sleeper".to_owned()]
+        )));
+
+        // Leading `usage_update` on wakeup does not start a turn prematurely.
+        let pre_usage = t.on_line(lines.next().unwrap());
+        assert!(
+            !events(&pre_usage)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::TurnStarted))
+        );
+
+        // Wakeup tool call clears `waiting_on` and starts an autonomous turn.
+        let wake_tool = t.on_line(lines.next().unwrap());
+        let wake_evs = events(&wake_tool);
+        assert!(wake_evs.iter().any(|e| matches!(
+            e,
+            HarnessEvent::BackgroundTasks(v) if v.is_empty()
+        )));
+        assert!(
+            wake_evs
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::TurnStarted))
+        );
+        assert!(!t.needs_autonomous_settle());
+
+        // Tool finishes, reply streams, `usage_update` arms settle.
+        for _ in 0..3 {
+            t.on_line(lines.next().unwrap());
+        }
+        assert!(t.needs_autonomous_settle());
+        let settled = t.finish_autonomous_turn();
+        assert!(matches!(
+            events(&settled)[..],
+            [HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn antigravity_1_5_14_subagent_that_returns_before_end_turn_does_not_wait() {
+        let mut t = antigravity_translator();
+        t.initialize();
+        t.start_turn("fast subagent");
+        t.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.14"}}}"#);
+        t.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"S"}}"#);
+        t.on_line(&update(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c1", "name": "invoke_subagent",
+            "status": "in_progress", "kind": "other", "title": "Run invoke_subagent",
+            "rawInput": {"Role": "Quick Checker"}
+        })));
+        t.on_line(&update(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "c1", "name": "invoke_subagent",
+            "status": "completed", "kind": "other", "title": "Run invoke_subagent",
+            "rawInput": {"Role": "Quick Checker"}
+        })));
+        // Step 1: "Waiting..."
+        t.on_line(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Waiting."}})));
+        t.on_line(&update(
+            json!({"sessionUpdate": "usage_update", "used": 9600, "size": 1048576}),
+        ));
+        // Step 2: subagent already replied in the same prompt!
+        t.on_line(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Returned!"}})));
+        t.on_line(&update(
+            json!({"sessionUpdate": "usage_update", "used": 9800, "size": 1048576}),
+        ));
+        let out = t.on_line(r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#);
+        assert!(
+            !events(&out)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::BackgroundTasks(_)))
+        );
+    }
+
+    #[test]
+    fn antigravity_1_5_16_daemon_does_not_wait_but_wakeup_starts_and_finishes_turn() {
+        let mut t = antigravity_translator();
+        t.initialize();
+        t.start_turn("start daemon");
+        let fixture = include_str!("../fixtures/antigravity-1.5.16-daemon-wakeup.jsonl");
+        let mut lines = fixture.lines();
+        // Handshake + turn 1 through `end_turn` (lines 1..=7).
+        let mut turn1 = Vec::new();
+        for _ in 0..7 {
+            turn1.extend(t.on_line(lines.next().unwrap()));
+        }
+        let evs1 = events(&turn1);
+        // `IsDaemon: true` is closed cleanly and does NOT put the thread into `waiting_on`.
+        assert!(evs1.iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { native_id, status: ItemStatus::Completed, .. }
+                if native_id == "call_daemon1"
+        )));
+        assert!(
+            !evs1
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::BackgroundTasks(_)))
+        );
+
+        // Late exit update for the retired daemon produces no duplicate item or turn.
+        let daemon_exit = t.on_line(lines.next().unwrap());
+        assert!(events(&daemon_exit).is_empty());
+
+        // Leading usage_update does not start a turn; the wakeup tool call does.
+        t.on_line(lines.next().unwrap());
+        let wake_tool = t.on_line(lines.next().unwrap());
+        assert!(
+            events(&wake_tool)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::TurnStarted))
+        );
+        assert!(!t.needs_autonomous_settle());
+
+        // Tool completes, reply arrives, usage_update arms settle.
+        for _ in 0..3 {
+            t.on_line(lines.next().unwrap());
+        }
+        assert!(t.needs_autonomous_settle());
+        let settled = t.finish_autonomous_turn();
+        assert!(matches!(
+            events(&settled)[..],
+            [HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn antigravity_autonomous_turn_supports_steer_and_interrupt() {
+        // Steer promotes an autonomous turn to a normal prompt-backed turn.
+        let mut t = antigravity_translator();
+        t.initialize();
+        t.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.16"}}}"#);
+        t.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"S"}}"#);
+        let out = t.on_line(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Woke up."}})));
+        assert!(matches!(events(&out)[0], HarnessEvent::TurnStarted));
+        t.on_line(&update(
+            json!({"sessionUpdate": "usage_update", "used": 1000, "size": 1048576}),
+        ));
+        assert!(t.needs_autonomous_settle());
+
+        let steered = t.steer_with("keep going", Vec::new());
+        assert_eq!(sends(&steered)[0]["method"], "session/prompt");
+        assert!(!t.needs_autonomous_settle());
+        let done = t.on_line(r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#);
+        assert!(matches!(
+            events(&done)[..],
+            [HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            }]
+        ));
+
+        // Interrupt cancels and immediately completes an autonomous turn.
+        t.on_line(&update(json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "Thinking..."}})));
+        let cancelled = t.interrupt();
+        assert_eq!(sends(&cancelled)[0]["method"], "session/cancel");
+        assert!(events(&cancelled).iter().any(|e| matches!(
+            e,
+            HarnessEvent::TurnCompleted {
+                status: TurnStatus::Interrupted,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn antigravity_closes_reply_stream_on_usage_update() {
+        let mut t = antigravity_translator();
+        t.initialize();
+        t.start_turn("wait");
+        t.on_line(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.16"}}}"#);
+        t.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"S"}}"#);
+        let msg = t.on_line(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Waiting sub8."}})));
+        let msg_id = match events(&msg)[0] {
+            HarnessEvent::ItemStarted { native_id, .. } => native_id.clone(),
+            other => panic!("{other:?}"),
+        };
+        let after = t.on_line(&update(
+            json!({"sessionUpdate": "usage_update", "used": 10663, "size": 1048576}),
+        ));
+        assert!(events(&after).iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { native_id, status: ItemStatus::Completed, .. }
+                if native_id == &msg_id
+        )));
+    }
+
+    #[test]
+    fn non_antigravity_acp_does_not_start_autonomous_turns_or_keep_open_tools() {
+        let mut t = ready();
+        t.start_turn("go");
+        t.on_line(&update(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "sleep 5",
+            "kind": "execute", "status": "in_progress", "rawInput": {"command": "sleep 5"}
+        })));
+        let done = t.on_line(r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#);
+        assert!(events(&done).iter().any(|e| matches!(
+            e,
+            HarnessEvent::ItemCompleted { native_id, .. } if native_id == "t1"
+        )));
+        assert!(
+            !events(&done)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::BackgroundTasks(_)))
+        );
+        let stray = t.on_line(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "later"}})));
+        assert!(
+            !events(&stray)
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::TurnStarted))
+        );
     }
 }

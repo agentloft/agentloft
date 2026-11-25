@@ -3949,3 +3949,167 @@ async fn plan_limits_caches_until_refreshed() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unsupported);
 }
+
+/// A non-subagent background tool (such as Antigravity's backgrounded
+/// `run_command`) stays `InProgress` past `TurnCompleted` while `waiting_on`
+/// names it, receives its real result when it finishes, and an unsolicited
+/// followup turn runs and completes cleanly.
+#[tokio::test]
+async fn a_background_tool_outlives_its_turn_and_wakes_an_autonomous_turn() {
+    use loft_harness::{HarnessEvent, SessionCommand, SessionHandle, ToolResult};
+    use tokio::sync::Mutex;
+
+    struct BgToolHarness {
+        events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HarnessEvent>>>>,
+    }
+
+    impl Harness for BgToolHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId("bgtool".into())
+        }
+        fn capabilities(&self) -> loft_harness::Capabilities {
+            Default::default()
+        }
+        fn open_session(&self, _cfg: loft_harness::SessionConfig) -> anyhow::Result<SessionHandle> {
+            let (handle, mut ends) = SessionHandle::pair();
+            let slot = self.events.clone();
+            tokio::spawn(async move {
+                *slot.lock().await = Some(ends.events.clone());
+                while let Some(cmd) = ends.commands.recv().await {
+                    match cmd {
+                        SessionCommand::StartTurn(_) => {
+                            let _ = ends.events.send(HarnessEvent::TurnStarted);
+                            let _ = ends.events.send(HarnessEvent::ItemStarted {
+                                native_id: "bg1".into(),
+                                body: ItemBody::ToolCall {
+                                    tool: "Shell".into(),
+                                    tool_kind: loft_protocol::ToolKind::Command,
+                                    title: "sleep 4 && echo BG_DONE".into(),
+                                    input: serde_json::json!({ "command": "sleep 4 && echo BG_DONE" }),
+                                    output: None,
+                                    is_error: false,
+                                },
+                                parent: None,
+                            });
+                            let _ = ends.events.send(HarnessEvent::BackgroundTasks(vec![
+                                "sleep 4 && echo BG_DONE".into(),
+                            ]));
+                            let _ = ends.events.send(HarnessEvent::TurnCompleted {
+                                status: TurnStatus::Completed,
+                                usage: None,
+                                error: None,
+                            });
+                        }
+                        SessionCommand::Shutdown => break,
+                        _ => {}
+                    }
+                }
+            });
+            Ok(handle)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let tx_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HarnessEvent>>>> =
+        Arc::new(Mutex::new(None));
+    let core = Core::new(
+        Store::open(&dir.path().join("db.sqlite")).unwrap(),
+        vec![Arc::new(BgToolHarness {
+            events: tx_slot.clone(),
+        })],
+        CoreOptions::default(),
+    );
+    let Response::Project { project } = core
+        .handle(Request::AddProject {
+            path: dir.path().to_string_lossy().into_owned(),
+            name: Some("p".into()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Response::Thread { thread } = core
+        .handle(Request::CreateThread {
+            project_id: project.id,
+            harness: HarnessId("bgtool".into()),
+            title: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    core.handle(Request::SendMessage {
+        thread_id: thread.id.clone(),
+        text: "run bg".into(),
+        attachments: vec![],
+    })
+    .await
+    .unwrap();
+    wait_for(&core, &thread.id, turn_done).await;
+
+    let (thread_now, turns, items, _) = thread_snapshot(&core, &thread.id);
+    assert_eq!(turns.len(), 1);
+    assert!(thread_now.is_waiting());
+    assert_eq!(thread_now.waiting_on, vec!["sleep 4 && echo BG_DONE"]);
+    let tool = items
+        .iter()
+        .find(|i| matches!(&i.body, ItemBody::ToolCall { title, .. } if title == "sleep 4 && echo BG_DONE"))
+        .expect("background tool item");
+    assert_eq!(tool.status, ItemStatus::InProgress);
+
+    // Background tool finishes, then an unsolicited turn runs and finishes.
+    let tx = tx_slot.lock().await.clone().unwrap();
+    tx.send(HarnessEvent::ItemCompleted {
+        native_id: "bg1".into(),
+        body: None,
+        tool_result: Some(ToolResult {
+            output: "BG_DONE".into(),
+            is_error: false,
+        }),
+        status: ItemStatus::Completed,
+    })
+    .unwrap();
+    tx.send(HarnessEvent::BackgroundTasks(vec![])).unwrap();
+    wait_for(&core, &thread.id, |t, _| t.waiting_on.is_empty()).await;
+
+    let (_, _, items, _) = thread_snapshot(&core, &thread.id);
+    let tool = items.iter().find(|i| i.id == tool.id).unwrap();
+    assert_eq!(tool.status, ItemStatus::Completed);
+    assert!(matches!(
+        &tool.body,
+        ItemBody::ToolCall { output: Some(o), .. } if o == "BG_DONE"
+    ));
+
+    tx.send(HarnessEvent::TurnStarted).unwrap();
+    wait_for(&core, &thread.id, |t, turns| {
+        t.status == ThreadStatus::Running && turns.len() == 2
+    })
+    .await;
+    tx.send(HarnessEvent::ItemStarted {
+        native_id: "m2".into(),
+        body: ItemBody::AssistantMessage {
+            text: "BG finished!".into(),
+        },
+        parent: None,
+    })
+    .unwrap();
+    tx.send(HarnessEvent::ItemCompleted {
+        native_id: "m2".into(),
+        body: None,
+        tool_result: None,
+        status: ItemStatus::Completed,
+    })
+    .unwrap();
+    tx.send(HarnessEvent::TurnCompleted {
+        status: TurnStatus::Completed,
+        usage: None,
+        error: None,
+    })
+    .unwrap();
+    wait_for(&core, &thread.id, |t, turns| {
+        turns.len() == 2 && turn_done(t, turns)
+    })
+    .await;
+}

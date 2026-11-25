@@ -454,6 +454,7 @@ impl Harness for AcpHarness {
             cfg.resume.clone(),
             cfg.mcp_servers.clone(),
         );
+        translator.is_antigravity = self.id == HarnessId::ANTIGRAVITY;
         translator.is_kiro = self.id == HarnessId::KIRO;
         translator.auth_hint = self.auth_hint.map(str::to_owned);
         translator.effort = cfg.effort.clone();
@@ -639,6 +640,11 @@ enum RunEnd {
     Eof,
 }
 
+/// Quiet window after an unsolicited Antigravity message + `usage_update`
+/// before closing the autonomous turn (tool calls from the same LLM response
+/// arrive within ~10 ms).
+const AUTONOMOUS_SETTLE: Duration = Duration::from_secs(2);
+
 /// Kiro V3 can advertise models in a config update just after opening a session.
 const MODEL_OPTIONS_WAIT: Duration = Duration::from_secs(3);
 
@@ -662,6 +668,7 @@ async fn run(
     if write_json(&mut stdin, &init).await.is_err() {
         return RunEnd::Eof;
     }
+    let mut settle_deadline: Option<tokio::time::Instant> = None;
     let mut model_deadline: Option<tokio::time::Instant> = None;
     loop {
         let outs = tokio::select! {
@@ -709,7 +716,16 @@ async fn run(
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 }
             }
+            () = sleep_until_opt(settle_deadline) => {
+                settle_deadline = None;
+                t.finish_autonomous_turn()
+            }
             () = sleep_until_opt(model_deadline) => t.finish_model_wait(),
+        };
+        settle_deadline = if t.needs_autonomous_settle() {
+            Some(settle_deadline.unwrap_or_else(|| tokio::time::Instant::now() + AUTONOMOUS_SETTLE))
+        } else {
+            None
         };
         model_deadline = t.awaiting_models.then(|| {
             model_deadline.unwrap_or_else(|| tokio::time::Instant::now() + MODEL_OPTIONS_WAIT)
@@ -1058,6 +1074,71 @@ read l
                 .map(Vec::len),
             Some(0)
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_autonomous_turn_completes_after_settle_timeout() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = loft_config::private_temp_dir(&format!(
+            "agentloft-acp-autonomous-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let binary = dir.join("agy");
+        let fixture = include_str!("../fixtures/antigravity-1.5.16-daemon-wakeup.jsonl");
+        let lines: Vec<&str> = fixture.lines().collect();
+        let mut script = String::from("#!/bin/sh\n[ \"$1\" = acp ] || exit 1\n");
+        // initialize, session/new
+        for response in &lines[..2] {
+            script.push_str(&format!(
+                "read -r request || exit 1\nprintf '%s\\n' '{response}'\n"
+            ));
+        }
+        // session/prompt → turn 1 + unsolicited wakeup updates (kept open on stdin)
+        script.push_str("read -r request || exit 1\n");
+        for response in &lines[2..] {
+            script.push_str(&format!("printf '%s\\n' '{response}'\n"));
+        }
+        script.push_str("read -r request\n");
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = cfg(Vec::new());
+        config.cwd = dir.clone();
+        config.binary = Some(binary);
+        let mut session = AcpHarness::antigravity().open_session(config).unwrap();
+        session
+            .commands
+            .send(SessionCommand::StartTurn(loft_harness::TurnInput {
+                text: "Start daemon".into(),
+                images: Vec::new(),
+            }))
+            .unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut starts = 0usize;
+            let mut finishes = 0usize;
+            while let Some(event) = session.events.recv().await {
+                match event {
+                    HarnessEvent::TurnStarted => starts += 1,
+                    HarnessEvent::TurnCompleted {
+                        status: loft_protocol::TurnStatus::Completed,
+                        ..
+                    } => {
+                        finishes += 1;
+                        if finishes == 2 {
+                            return (starts, finishes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (starts, finishes)
+        })
+        .await
+        .expect("autonomous turn settles without a second prompt response");
+        assert_eq!(seen, (2, 2));
+        let _ = session.commands.send(SessionCommand::Shutdown);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
