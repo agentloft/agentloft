@@ -221,6 +221,79 @@ impl Core {
             .then_some(full)
     }
 
+    /// Resolve a file to preview in the daemon's browser as a `file://` URL.
+    /// With `confined`, paths outside `root` (absolute or `~`) must stay
+    /// inside [`Core::readable_roots`].
+    pub(crate) fn preview_file_url(
+        &self,
+        root: &FsRoot,
+        rel_path: &str,
+        confined: bool,
+    ) -> CoreResult<(ThreadId, String)> {
+        let thread_id = match root {
+            FsRoot::Thread(id) => Some(id.clone()),
+            FsRoot::Project(_) => None,
+        };
+        let anywhere = rel_path.starts_with('/')
+            || rel_path.starts_with("~/")
+            || rel_path.starts_with("file://");
+        let full = if anywhere {
+            let roots = if confined {
+                Some(self.readable_roots()?)
+            } else {
+                None
+            };
+            self.file_at(rel_path, thread_id.as_ref(), roots.as_deref())
+                .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "no such file"))?
+        } else {
+            let (_, path) = self.resolve(root, rel_path)?;
+            let meta = std::fs::metadata(&path)
+                .map_err(|e| ErrorBody::new(ErrorCode::NotFound, format!("{rel_path}: {e}")))?;
+            if !meta.is_file() {
+                return Err(ErrorBody::new(
+                    ErrorCode::BadRequest,
+                    format!("{rel_path} is not a file"),
+                ));
+            }
+            path
+        };
+        let path = full.canonicalize().unwrap_or(full);
+        let url = url::Url::from_file_path(&path)
+            .map_err(|()| ErrorBody::new(ErrorCode::BadRequest, "That isn't a file path."))?
+            .to_string();
+        Ok((thread_id.unwrap_or_else(|| ThreadId(String::new())), url))
+    }
+
+    /// Open a chromeless preview page for a local file.
+    pub(crate) async fn open_file_preview(
+        self: &Arc<Self>,
+        root: FsRoot,
+        rel_path: String,
+        width: u32,
+        height: u32,
+        scale: f32,
+        confined: bool,
+    ) -> CoreResult<loft_protocol::PageInfo> {
+        let core = self.clone();
+        let (thread_id, url) =
+            tokio::task::spawn_blocking(move || core.preview_file_url(&root, &rel_path, confined))
+                .await
+                .map_err(internal)??;
+        let (profile, executable) = self.browser_setup()?;
+        self.pages
+            .open_preview(
+                thread_id,
+                &url,
+                width,
+                height,
+                scale,
+                executable.as_deref(),
+                &profile,
+                self.bus.clone(),
+            )
+            .await
+    }
+
     /// The file a browser session may stream (a video in the web client):
     /// `path` as for `ReadPath`, inside the folders such a session may
     /// read. `None` for "outside" and "missing" alike.
@@ -434,6 +507,7 @@ impl Core {
             | Request::DeviceSet { .. }
             | Request::DeviceSettings { .. }
             | Request::PageOpen { .. }
+            | Request::PageOpenFile { .. }
             | Request::PageList { .. }
             | Request::PageNavigate { .. }
             | Request::PageInput { .. }
@@ -515,6 +589,18 @@ impl Core {
             Request::UiFiles { known } => Ok(Response::UiFiles {
                 files: self.ui_files(known.as_deref(), true)?.map(Box::new),
             }),
+            Request::PageOpenFile {
+                root,
+                rel_path,
+                width,
+                height,
+                scale,
+            } => {
+                let page = self
+                    .open_file_preview(root, rel_path, width, height, scale, true)
+                    .await?;
+                Ok(Response::Page { page })
+            }
             other => self.handle(other).await,
         }
     }
@@ -1223,6 +1309,13 @@ mod tests {
                     tab: None,
                     new_tab: false,
                 },
+                Request::PageOpenFile {
+                    root: FsRoot::Thread(thread.clone()),
+                    rel_path: "index.html".into(),
+                    width: 800,
+                    height: 600,
+                    scale: 1.0,
+                },
                 Request::PageNavigate {
                     id: id.clone(),
                     nav: loft_protocol::PageNav::Reload,
@@ -1248,7 +1341,7 @@ mod tests {
             );
         }
         // Input takes the ordered path; the check is on it too.
-        let typed = f.core.handle_inline_remote(&asks()[2], &WEB);
+        let typed = f.core.handle_inline_remote(&asks()[3], &WEB);
         assert!(matches!(&typed, Some(r) if is_forbidden(r)), "{typed:?}");
         assert!(
             f.core
@@ -1327,5 +1420,43 @@ mod tests {
         assert!(confine(&dir.path().join("a/../b"), &[dir.path().to_path_buf()]).is_none());
         assert!(confine(&dir.path().join("a/b"), &[dir.path().to_path_buf()]).is_some());
         assert!(confine(dir.path(), &[dir.path().join("a")]).is_none());
+    }
+
+    #[tokio::test]
+    async fn preview_file_url_scopes_relative_and_confined_paths() {
+        let (f, thread) = fixture().await;
+        let project_root = f.core.root_dir(&FsRoot::Thread(thread.clone())).unwrap();
+        let inside = project_root.join("page.html");
+        std::fs::write(&inside, "<h1>hi</h1>").unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("secret.html");
+        std::fs::write(&outside, "<h1>nope</h1>").unwrap();
+
+        let root = FsRoot::Thread(thread.clone());
+        let (tid, url) = f.core.preview_file_url(&root, "page.html", true).unwrap();
+        assert_eq!(tid, thread);
+        assert!(
+            url.starts_with("file://") && url.ends_with("/page.html"),
+            "{url}"
+        );
+
+        // Escaping the root or naming a missing file is refused.
+        assert!(
+            f.core
+                .preview_file_url(&root, "../secret.html", true)
+                .is_err()
+        );
+        assert!(
+            f.core
+                .preview_file_url(&root, "missing.html", true)
+                .is_err()
+        );
+
+        // Absolute path outside readable_roots: refused when confined (remote),
+        // allowed locally.
+        let outside_str = outside.to_string_lossy().into_owned();
+        assert!(f.core.preview_file_url(&root, &outside_str, true).is_err());
+        let (_, local_url) = f.core.preview_file_url(&root, &outside_str, false).unwrap();
+        assert!(local_url.starts_with("file://") && local_url.ends_with("/secret.html"));
     }
 }

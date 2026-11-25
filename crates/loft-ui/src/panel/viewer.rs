@@ -1,8 +1,9 @@
-//! File viewer: syntax-highlighted code, rendered Markdown (with a source
-//! toggle), images, office documents and PDFs (with notes for the agent), and
-//! an external-open fallback.
+//! File viewer: syntax-highlighted code, rendered Markdown and HTML previews
+//! (with a source toggle), images, office documents and PDFs (with notes for
+//! the agent), and an external-open fallback.
 
 use crate::panel::docs::{DocEvent, DocNote, DocPreview, doc_kind};
+use crate::panel::page::PageView;
 use crate::spinner::Spinner;
 use crate::store::AppStore;
 use crate::theme::Palette;
@@ -26,6 +27,12 @@ enum Content {
     Code(Entity<EditorState>),
     Markdown {
         preview: Entity<TextViewState>,
+        /// The highlighted source, built the first time it's asked for.
+        source: Option<Entity<EditorState>>,
+        text: Arc<str>,
+    },
+    Html {
+        preview: Entity<PageView>,
         /// The highlighted source, built the first time it's asked for.
         source: Option<Entity<EditorState>>,
         text: Arc<str>,
@@ -96,6 +103,21 @@ impl FileViewer {
             Content::Doc(doc) => Some(doc.clone()),
             _ => None,
         }
+    }
+
+    /// Close any daemon resources owned by this viewer (such as an HTML
+    /// preview page).
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Content::Html { preview, .. } = &self.content {
+            preview.update(cx, |p, cx| p.close(cx));
+        }
+    }
+
+    /// Re-read the file even if its bytes haven't changed, and reload any
+    /// live HTML preview (for the header Reload button).
+    fn force_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shown = None;
+        self.reload(window, cx);
     }
 
     /// Where the file is, if it is a video or a sound that plays here.
@@ -257,6 +279,34 @@ impl FileViewer {
                 cx.notify();
                 return;
             }
+            if is_html(&ext) {
+                // Rendered first in the daemon's browser; source built on demand.
+                let preview = if let Content::Html { preview, .. } = &self.content {
+                    preview.update(cx, |p, cx| p.hard_reload(cx));
+                    preview.clone()
+                } else {
+                    cx.new(|cx| {
+                        PageView::for_file(
+                            self.store.clone(),
+                            self.root.clone(),
+                            self.rel_path.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                };
+                self.content = Content::Html {
+                    preview,
+                    source: None,
+                    text: text.into(),
+                };
+                if self.show_source {
+                    self.build_source(window, cx);
+                }
+                self.pending = None;
+                cx.notify();
+                return;
+            }
             let language = language_for(&self.rel_path);
             // Parse before showing, so the file appears already coloured
             // rather than plain and then repainted. The previous content stays
@@ -281,26 +331,31 @@ impl FileViewer {
         cx.notify();
     }
 
-    /// Highlight a Markdown file's source (off the main thread) for the
+    /// Highlight a previewable file's source (off the main thread) for the
     /// Source toggle.
     fn build_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Content::Markdown {
-            source: None, text, ..
-        } = &self.content
-        else {
-            return;
+        let (language, text) = match &self.content {
+            Content::Markdown {
+                source: None, text, ..
+            } => ("markdown", text.clone()),
+            Content::Html {
+                source: None, text, ..
+            } => ("html", text.clone()),
+            _ => return,
         };
-        let text = text.clone();
         let rope = Rope::from(&*text);
-        let parse = cx.background_spawn(async move { preparse::parse("markdown", &rope) });
+        let parse = cx.background_spawn(async move { preparse::parse(language, &rope) });
         self.pending = Some(cx.spawn_in(
             window,
             async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
                 let highlighter = parse.await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    let editor = code_editor("markdown", &text, highlighter, window, cx);
-                    if let Content::Markdown { source, .. } = &mut this.content {
-                        *source = Some(editor);
+                    let editor = code_editor(language, &text, highlighter, window, cx);
+                    match &mut this.content {
+                        Content::Markdown { source, .. } | Content::Html { source, .. } => {
+                            *source = Some(editor);
+                        }
+                        _ => {}
                     }
                     this.pending = None;
                     cx.notify();
@@ -469,6 +524,10 @@ pub fn extension(path: &str) -> String {
         .unwrap_or_default()
 }
 
+fn is_html(ext: &str) -> bool {
+    matches!(ext, "html" | "htm")
+}
+
 fn image_format(ext: &str) -> Option<ImageFormat> {
     Some(match ext {
         "png" => ImageFormat::Png,
@@ -585,7 +644,10 @@ fn header_icon(
 impl Render for FileViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
-        let is_markdown = matches!(self.content, Content::Markdown { .. });
+        let has_preview = matches!(
+            self.content,
+            Content::Markdown { .. } | Content::Html { .. }
+        );
         let (dir, file) = match self.rel_path.rsplit_once('/') {
             Some((d, f)) => (format!("{d}/"), f.to_owned()),
             None => (String::new(), self.rel_path.clone()),
@@ -629,10 +691,10 @@ impl Render for FileViewer {
                         .child(human_size(self.size)),
                 )
             })
-            .when(is_markdown, |d| {
+            .when(has_preview, |d| {
                 d.child(
                     header_icon(
-                        "md-toggle",
+                        "preview-toggle",
                         if self.show_source {
                             IconName::Eye
                         } else {
@@ -690,7 +752,7 @@ impl Render for FileViewer {
             )
             .child(
                 header_icon("reload", IconName::RefreshCw, "Reload", &p)
-                    .on_click(cx.listener(|this, _, window, cx| this.reload(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.force_reload(window, cx))),
             )
             // Finder and other apps are on the computer the file is on.
             .when(!self.store.read(cx).is_elsewhere(), |d| {
@@ -754,6 +816,27 @@ impl Render for FileViewer {
                                 .size_full(),
                         ),
                     )
+                    .into_any_element(),
+            },
+            Content::Html {
+                preview, source, ..
+            } => match (self.show_source, source) {
+                (true, Some(source)) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(Editor::new(source).readonly(true).bordered(false).h_full())
+                    .into_any_element(),
+                (true, None) => v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(Spinner::new().color(p.muted_foreground))
+                    .into_any_element(),
+                (false, _) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(div().absolute().inset_0().child(preview.clone()))
                     .into_any_element(),
             },
             Content::Image(image) => div()
@@ -874,5 +957,9 @@ mod tests {
         assert_eq!(language_for("Makefile"), "make");
         assert_eq!(language_for("notes.unknown"), "text");
         assert_eq!(human_size(2048), "2.0 KB");
+        assert!(is_html(&extension("index.html")));
+        assert!(is_html(&extension("nested/page.HTM")));
+        assert!(!is_html(&extension("notes.md")));
+        assert!(!is_html(&extension("data.xml")));
     }
 }

@@ -283,7 +283,7 @@ impl Browser {
     /// until it is let through (`Fetch.requestPaused` above). A page that
     /// never showed a local file needs no such watch: the browser itself
     /// keeps web pages from opening local files.
-    async fn allow_file(self: &Arc<Self>, page: &Page, url: &str) -> Result<(), String> {
+    pub(super) async fn allow_file(self: &Arc<Self>, page: &Page, url: &str) -> Result<(), String> {
         let driver = self.drivers.of(self, &page.id);
         lock(&driver.files).insert(without_fragment(url).to_owned());
         let _once = driver.fetching.lock().await;

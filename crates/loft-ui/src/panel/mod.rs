@@ -236,6 +236,7 @@ impl WorkbenchPanel {
                     Open::Terminal { pane, .. } => pane.update(cx, |p, cx| p.close(cx)),
                     Open::Page { view } => view.update(cx, |v, cx| v.close(cx)),
                     Open::Device { view } => view.update(cx, |v, cx| v.close(cx)),
+                    Open::File { viewer, .. } => viewer.update(cx, |v, cx| v.close(cx)),
                     _ => {}
                 }
             }
@@ -964,6 +965,9 @@ impl WorkbenchPanel {
         }
         if let Open::Page { view } = &tab {
             view.update(cx, |v, cx| v.close(cx));
+        }
+        if let Open::File { viewer, .. } = &tab {
+            viewer.update(cx, |v, cx| v.close(cx));
         }
         // Closing the tab leaves the device running; nor is it shown
         // again next time.

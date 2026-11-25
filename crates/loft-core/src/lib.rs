@@ -1781,6 +1781,18 @@ impl Core {
                     .await?;
                 Ok(Response::Page { page })
             }
+            Request::PageOpenFile {
+                root,
+                rel_path,
+                width,
+                height,
+                scale,
+            } => {
+                let page = self
+                    .open_file_preview(root, rel_path, width, height, scale, false)
+                    .await?;
+                Ok(Response::Page { page })
+            }
             Request::DeviceList => {
                 let (devices, support) = self.devices.refresh().await;
                 Ok(Response::Devices { devices, support })

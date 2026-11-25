@@ -114,6 +114,8 @@ const PREVIEW_RETRY: Duration = Duration::from_millis(700);
 const PREVIEW_PATIENCE: Duration = Duration::from_secs(45);
 /// A browser tab nobody watches or uses is closed after this long.
 const UNUSED_TAB: Duration = Duration::from_secs(60 * 60);
+/// A file preview page nobody watches is closed after this long.
+const IDLE_PREVIEW: Duration = Duration::from_secs(120);
 const UNUSED_CHECK: Duration = Duration::from_secs(60);
 /// A paste or an input method's text is cut off here.
 const MAX_TEXT: usize = 100_000;
@@ -190,8 +192,20 @@ struct Page {
     /// when it is done the page is put back to the size it had when the
     /// screenshot began (so a size set in between is undone).
     shaping: tokio::sync::Mutex<()>,
+    /// Set when the page previews a local file in the file viewer rather than
+    /// being a browser tab of the thread.
+    preview: bool,
     /// Set when the page draws a view an agent made rather than a site.
     view: Option<views::ViewPage>,
+}
+
+impl Page {
+    /// Whether this is a browser tab of its thread (listed in `PageList`,
+    /// tracked as `current`, usable by agents), as opposed to an agent-drawn
+    /// view or a file-viewer HTML preview.
+    pub(super) fn is_tab(&self) -> bool {
+        self.view.is_none() && !self.preview
+    }
 }
 
 struct State {
@@ -467,6 +481,48 @@ impl Pages {
             .map_err(internal)
     }
 
+    /// Open a chromeless preview page for a local file (`file://` URL). It is
+    /// not a browser tab of the thread (never in `PageList` or `current`) and
+    /// refuses navigation to any other local `file:` document.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_preview(
+        &self,
+        thread: ThreadId,
+        file_url: &str,
+        width: u32,
+        height: u32,
+        scale: f32,
+        executable: Option<&str>,
+        profile: &Path,
+        bus: broadcast::Sender<BusMsg>,
+    ) -> Result<PageInfo, ErrorBody> {
+        let url = automation::check_file_url(file_url)?;
+        let (width, height, scale) = fit(width, height, scale);
+        let _one_at_a_time = self.opening.lock().await;
+        let browser = match self.current() {
+            Some(browser) => browser,
+            None => {
+                let browser = Browser::start(executable, profile, bus).await?;
+                *lock(&self.browser) = Some(browser.clone());
+                browser
+            }
+        };
+        let pages = lock(&browser.pages)
+            .values()
+            .filter(|p| p.view.is_none())
+            .count();
+        if pages >= MAX_PAGES {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "Too many browser tabs are open. Close one first.",
+            ));
+        }
+        browser
+            .new_preview_page(thread, url, width, height, scale)
+            .await
+            .map_err(internal)
+    }
+
     pub async fn navigate(&self, id: &PageId, nav: PageNav) -> Result<(), ErrorBody> {
         let (browser, page) = self.page(id)?;
         browser.navigate(&page, nav).await
@@ -491,7 +547,7 @@ impl Pages {
                 state.heard_last = hears;
                 (state.info.thread_id.clone(), heard)
             };
-            if page.view.is_none() {
+            if page.is_tab() {
                 lock(&browser.current).insert(thread, page.id.clone());
             }
             if heard {
@@ -812,7 +868,7 @@ impl Browser {
         let mut threads = std::collections::HashSet::new();
         let pages: Vec<(PageId, Arc<Page>)> = lock(&self.pages).drain().collect();
         for (id, page) in pages {
-            if page.view.is_none() {
+            if page.is_tab() {
                 threads.insert(lock(&page.state).info.thread_id.clone());
             }
             self.end_handover(&page, HandoffOutcome::Closed);
@@ -842,7 +898,7 @@ impl Browser {
             id: id.clone(),
             reason: reason.to_owned(),
         });
-        if page.view.is_none() {
+        if page.is_tab() {
             let thread = lock(&page.state).info.thread_id.clone();
             {
                 let mut current = lock(&self.current);
@@ -870,7 +926,7 @@ impl Browser {
     fn tabs_of(&self, thread: &ThreadId) -> Vec<PageInfo> {
         let mut tabs: Vec<PageInfo> = lock(&self.pages)
             .values()
-            .filter(|p| p.view.is_none())
+            .filter(|p| p.is_tab())
             .map(|p| lock(&p.state).info.clone())
             .filter(|info| info.thread_id == *thread)
             .collect();
@@ -890,7 +946,7 @@ impl Browser {
     fn tab(&self, thread: &ThreadId, id: &PageId) -> Option<Arc<Page>> {
         lock(&self.pages)
             .get(id)
-            .filter(|p| p.view.is_none() && lock(&p.state).info.thread_id == *thread)
+            .filter(|p| p.is_tab() && lock(&p.state).info.thread_id == *thread)
             .cloned()
     }
 
@@ -930,6 +986,33 @@ impl Browser {
         .await
     }
 
+    async fn new_preview_page(
+        self: &Arc<Self>,
+        thread: ThreadId,
+        file_url: String,
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> Result<PageInfo, String> {
+        let target = self
+            .cdp
+            .send("Target.createTarget", json!({ "url": "about:blank" }), None)
+            .await?["targetId"]
+            .as_str()
+            .ok_or("the browser made no tab")?
+            .to_owned();
+        self.adopt_inner(
+            target,
+            thread,
+            Some(file_url),
+            (width, height, scale),
+            PageAgent::default(),
+            false,
+            true,
+        )
+        .await
+    }
+
     /// Make the browser's tab `target` one of the thread's: attach to it,
     /// set it up as every tab is, and send it to `start`. `current`: it is
     /// the thread's tab used last now (a tab a page opened is not).
@@ -938,9 +1021,24 @@ impl Browser {
         target: String,
         thread: ThreadId,
         start: Option<String>,
+        size: (u32, u32, f32),
+        agent: PageAgent,
+        current: bool,
+    ) -> Result<PageInfo, String> {
+        self.adopt_inner(target, thread, start, size, agent, current, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn adopt_inner(
+        self: &Arc<Self>,
+        target: String,
+        thread: ThreadId,
+        start: Option<String>,
         (width, height, scale): (u32, u32, f32),
         agent: PageAgent,
         current: bool,
+        preview: bool,
     ) -> Result<PageInfo, String> {
         let session = self
             .cdp
@@ -1003,6 +1101,7 @@ impl Browser {
                 pointer_at: None,
                 pointer_checking: false,
             }),
+            preview,
             view: None,
         });
         lock(&self.sessions).insert(session.clone(), page.id.clone());
@@ -1059,6 +1158,9 @@ impl Browser {
                 )
                 .await?;
             if let Some(url) = start.filter(|u| u != "about:blank") {
+                if preview {
+                    self.allow_file(&page, &url).await?;
+                }
                 self.cdp
                     .send("Page.navigate", json!({ "url": url }), s)
                     .await?;
@@ -1069,7 +1171,7 @@ impl Browser {
             self.forget(&page.id, "The tab didn't open.");
             return Err(err);
         }
-        if !current {
+        if !current && !preview {
             // A window a page opened may have shown its page before the
             // events about it were asked for.
             if let Ok(reply) = self
@@ -1093,10 +1195,12 @@ impl Browser {
             }
         }
         let info = lock(&page.state).info.clone();
-        if current {
-            lock(&self.current).insert(info.thread_id.clone(), info.id.clone());
+        if !preview {
+            if current {
+                lock(&self.current).insert(info.thread_id.clone(), info.id.clone());
+            }
+            self.announce_tabs(&info.thread_id);
         }
-        self.announce_tabs(&info.thread_id);
         Ok(info)
     }
 
@@ -1371,7 +1475,7 @@ impl Browser {
             let page_scale = lock(&page.state).page_scale;
             let input = unscaled(input, page_scale);
             // Tabs and handoff (C): a person showing the agent something.
-            if page.view.is_none() {
+            if page.is_tab() {
                 self.record_input(&page, &input).await;
             }
             let at = match &input {
@@ -1476,7 +1580,7 @@ impl Browser {
                 };
                 // A window a tab's page opened (a popup, a `target=_blank`
                 // link) becomes another tab of the thread (ADR-0017 §9).
-                if opener.view.is_none() {
+                if opener.is_tab() {
                     if known.is_some() {
                         return; // being made a tab already
                     }
@@ -1558,7 +1662,7 @@ impl Browser {
                     state.main_frame = frame["id"].as_str().map(str::to_owned);
                     state.info.url = shown_url(&url);
                 }
-                if page.view.is_none() {
+                if page.is_tab() {
                     // Tabs and handoff (C): a person showing the agent
                     // something; where an agent may send the tab.
                     self.record_navigation(&page, &url);
@@ -1637,7 +1741,7 @@ impl Browser {
                 id: page.id.clone(),
             });
             // Its tab is named after it, in windows that haven't opened it.
-            if page.view.is_none() {
+            if page.is_tab() {
                 let thread = lock(&page.state).info.thread_id.clone();
                 self.announce_tabs(&thread);
             }
@@ -1672,9 +1776,14 @@ impl Browser {
                 return;
             }
             // A tab an agent named, or one waiting for a person, stays.
+            let limit = if page.preview {
+                IDLE_PREVIEW
+            } else {
+                UNUSED_TAB
+            };
             let left = {
                 let state = lock(&page.state);
-                state.viewers == 0 && state.used.elapsed() >= UNUSED_TAB
+                state.viewers == 0 && state.used.elapsed() >= limit
             } && !self.kept(&page);
             if left {
                 tracing::info!(page = %page.id.0, "closing a browser tab nobody used for a while");
@@ -2844,5 +2953,50 @@ mod tests {
         });
         assert_eq!(method, "Input.insertText");
         assert_eq!(p["text"].as_str().unwrap().len(), MAX_TEXT);
+    }
+
+    /// A file-viewer HTML preview loads its local file, streams pictures,
+    /// stays out of the thread's browser tabs, and closes cleanly. Needs Chrome.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a real browser"]
+    async fn live_a_file_preview_is_separate_from_browser_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.html");
+        std::fs::write(
+            &file,
+            "<!doctype html><html><head><title>Preview OK</title></head><body><h1>Hi</h1></body></html>",
+        )
+        .unwrap();
+        let file_url = url::Url::from_file_path(&file).unwrap().to_string();
+        let pages = Pages::default();
+        let thread = ThreadId::new();
+        let (bus, _) = broadcast::channel(256);
+        let page = pages
+            .open_preview(
+                thread.clone(),
+                &file_url,
+                600,
+                400,
+                1.0,
+                None,
+                &dir.path().join("profile"),
+                bus,
+            )
+            .await
+            .unwrap();
+        // Not listed as a browser tab and not selected as the agent's tab.
+        assert!(pages.tabs(&thread).is_empty());
+        assert!(pages.thread_page(&thread).is_none());
+        pages.watching(&page.id, true).await;
+        wait_for("preview loads its title and draws a picture", || {
+            let Ok((info, frame, _)) = pages.snapshot(&page.id) else {
+                return false;
+            };
+            info.title == "Preview OK" && frame.is_some()
+        })
+        .await;
+        pages.close(&page.id).await.unwrap();
+        assert!(pages.info(&page.id).is_none());
+        pages.shutdown().await;
     }
 }

@@ -123,7 +123,7 @@ impl Core {
     }
 
     /// Resolve `rel` under `root`, refusing anything that escapes it.
-    fn resolve(&self, root: &FsRoot, rel: &str) -> CoreResult<(PathBuf, PathBuf)> {
+    pub(crate) fn resolve(&self, root: &FsRoot, rel: &str) -> CoreResult<(PathBuf, PathBuf)> {
         let base = self.root_dir(root)?;
         let rel = Path::new(rel.trim_start_matches('/'));
         if rel.components().any(|c| {

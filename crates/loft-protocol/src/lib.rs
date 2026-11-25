@@ -546,6 +546,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         new_tab: bool,
     },
+    /// Open a chromeless browser page previewing a local file (scoped to
+    /// `root`, or an absolute/`~` path as `ReadPath` takes). Not a browser
+    /// tab of the thread (never in `PageList`, never driven by agents); closes
+    /// when the viewer closes it or goes idle. Answers `Response::Page`.
+    PageOpenFile {
+        root: FsRoot,
+        rel_path: String,
+        width: u32,
+        height: u32,
+        scale: f32,
+    },
     /// The thread's open tabs, oldest first (`Response::Pages`).
     PageList {
         thread_id: ThreadId,

@@ -437,7 +437,7 @@ impl Pages {
     /// one its next call without a `tab` goes to).
     pub fn used_by_agent(&self, id: &PageId) {
         if let Ok((browser, page)) = self.page(id)
-            && page.view.is_none()
+            && page.is_tab()
         {
             let thread = lock(&page.state).info.thread_id.clone();
             lock(&browser.current).insert(thread, id.clone());

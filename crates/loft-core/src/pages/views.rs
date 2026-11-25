@@ -384,6 +384,7 @@ impl Browser {
                 pointer_at: None,
                 pointer_checking: false,
             }),
+            preview: false,
             view: Some(ViewPage {
                 origin: loft_view::origin(req.item.as_str()),
                 thread: req.thread,

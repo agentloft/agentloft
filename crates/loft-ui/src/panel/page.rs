@@ -26,8 +26,8 @@ use gpui_kit::{
     canvas, div, img, px,
 };
 use loft_protocol::{
-    ItemId, PageAction, PageButton, PageId, PageInfo, PageInput, PageMouse, PageNav, Request,
-    Response, ThreadId, ViewTheme, page_modifiers,
+    FsRoot, ItemId, PageAction, PageButton, PageId, PageInfo, PageInput, PageMouse, PageNav,
+    Request, Response, ThreadId, ViewTheme, page_modifiers,
 };
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -274,6 +274,9 @@ pub struct PageView {
     /// item, ADR-0018) rather than a browser tab: no toolbar, as tall as
     /// its content, and it only scrolls or takes keys once clicked.
     view: Option<ItemId>,
+    /// Set when this previews a local HTML file inside the file viewer:
+    /// chromeless, fills the viewer, and closes its daemon page when dropped.
+    file: Option<(FsRoot, String)>,
     /// The look the daemon was last told (a view dresses like the app).
     themed: Option<ViewTheme>,
     /// The height a view's page last had: what it keeps while reopening.
@@ -335,13 +338,22 @@ impl PageView {
                 }
             }),
             // The view going away stops watching the page. It doesn't close
-            // it: the tab is the thread's, and others (the web client, an
-            // agent, another window) may be using it. Closing the tab does
-            // (`close`).
+            // browser tabs (the web client, an agent, or another window may be
+            // using them), but a file preview belongs only to this viewer.
             cx.on_release(|this, cx| {
                 if let Some(info) = this.info.take() {
                     this.store
                         .update(cx, |store, _| store.forget_page(&info.id));
+                    if this.file.is_some()
+                        && let Some(client) = this.store.read(cx).client()
+                    {
+                        let sent = client.request(Request::PageClose { id: info.id });
+                        cx.background_executor()
+                            .spawn(async move {
+                                let _ = sent.await;
+                            })
+                            .detach();
+                    }
                 }
                 if let Some(picture) = this.picture.take() {
                     cx.drop_image(picture, None);
@@ -379,6 +391,7 @@ impl PageView {
             last_move: None,
             last_point: Point::default(),
             view: None,
+            file: None,
             themed: None,
             last_height: None,
             seen: Rc::default(),
@@ -402,6 +415,24 @@ impl PageView {
     ) -> Self {
         let mut this = Self::new(store, thread, window, cx);
         this.view = Some(item);
+        this.last_url = None;
+        this
+    }
+
+    /// A chromeless preview of an HTML file inside the file viewer.
+    pub fn for_file(
+        store: Entity<AppStore>,
+        root: FsRoot,
+        rel_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let thread = match &root {
+            FsRoot::Thread(id) => id.clone(),
+            FsRoot::Project(_) => ThreadId(String::new()),
+        };
+        let mut this = Self::new(store, thread, window, cx);
+        this.file = Some((root, rel_path));
         this.last_url = None;
         this
     }
@@ -558,6 +589,24 @@ impl PageView {
         self.navigate(PageNav::Reload, cx);
     }
 
+    /// Reload without cache. For a file preview that navigated away from its
+    /// local file (or failed to open), reopens the file.
+    pub fn hard_reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(info) = &self.info {
+            if self.file.is_some() && !info.url.is_empty() && !info.url.starts_with("file:") {
+                self.close(cx);
+                self.tab = None;
+                self.note = None;
+                cx.notify();
+                return;
+            }
+            self.navigate(PageNav::HardReload, cx);
+        } else if self.note.is_some() {
+            self.note = None;
+            cx.notify();
+        }
+    }
+
     /// Open the page (or join it, if it is open) without having been drawn:
     /// to show it small elsewhere. It keeps the size it has.
     pub fn watch(&mut self, cx: &mut Context<Self>) {
@@ -641,8 +690,8 @@ impl PageView {
         self.opening = true;
         self.note = None;
         self.asked = Some(size);
-        let body = match &self.view {
-            Some(item) => {
+        let body = match (&self.view, &self.file) {
+            (Some(item), _) => {
                 let theme = crate::view::theme(cx);
                 self.themed = Some(theme.clone());
                 Request::ViewOpen {
@@ -653,7 +702,14 @@ impl PageView {
                     theme: Box::new(theme),
                 }
             }
-            None => Request::PageOpen {
+            (None, Some((root, rel_path))) => Request::PageOpenFile {
+                root: root.clone(),
+                rel_path: rel_path.clone(),
+                width: size.0,
+                height: size.1,
+                scale: size.2,
+            },
+            (None, None) => Request::PageOpen {
                 thread_id: self.thread.clone(),
                 url: self.last_url.clone(),
                 width: size.0,
@@ -667,7 +723,7 @@ impl PageView {
             this.opening = false;
             match result {
                 Ok(Response::Page { page }) => {
-                    let joined = this.tab.is_none() && this.view.is_none();
+                    let joined = this.tab.is_none() && this.view.is_none() && this.file.is_none();
                     this.tab = Some(page.id.clone());
                     this.known = None;
                     if std::mem::take(&mut this.address_if_blank) && page.url.is_empty() {
@@ -1719,88 +1775,96 @@ impl Render for PageView {
                 &p,
             );
         }
+        let is_file = self.file.is_some();
         self.follow_size(window, cx);
-        if std::mem::take(&mut self.address_now) {
-            self.focus_address_bar(window, cx);
-        }
-        if !self.editing_address
-            && let Some(url) = self.pending_address.take()
-        {
-            self.address
-                .update(cx, |state, cx| state.set_value(url, window, cx));
-        }
-        let info = self.info.clone();
-        let loading = self.is_loading();
-        let ready = info.is_some();
-        let prefix = if loading {
-            Spinner::new()
-                .xsmall()
-                .color(p.muted_foreground)
-                .into_any_element()
+        let (toolbar, annotate_bar, handoff_bar, dims_strip) = if is_file {
+            (None, None, None, None)
         } else {
-            Icon::new(IconName::Globe)
-                .xsmall()
-                .text_color(p.muted_foreground)
-                .into_any_element()
-        };
-        let toolbar = h_flex()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_shrink_0()
-            .px_2()
-            .gap_1()
-            .items_center()
-            .border_b_1()
-            .border_color(p.border)
-            .child(
-                Button::new("page-back")
-                    .cursor_pointer()
-                    .ghost()
-                    .small()
-                    .icon(IconName::ArrowLeft)
-                    .disabled(!info.as_ref().is_some_and(|i| i.can_go_back))
-                    .on_click(cx.listener(|this, _, _, cx| this.navigate(PageNav::Back, cx))),
-            )
-            .child(
-                Button::new("page-forward")
-                    .cursor_pointer()
-                    .ghost()
-                    .small()
-                    .icon(IconName::ArrowRight)
-                    .disabled(!info.as_ref().is_some_and(|i| i.can_go_forward))
-                    .on_click(cx.listener(|this, _, _, cx| this.navigate(PageNav::Forward, cx))),
-            )
-            .child(
-                Button::new("page-reload")
-                    .cursor_pointer()
-                    .ghost()
-                    .small()
-                    .icon(if loading {
-                        IconName::Close
-                    } else {
-                        IconName::RotateCw
-                    })
-                    .disabled(!ready)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let nav = if this.info.as_ref().is_some_and(|i| i.loading) {
-                            PageNav::Stop
-                        } else {
-                            PageNav::Reload
-                        };
-                        this.navigate(nav, cx);
-                    })),
-            )
-            .child(
-                div().flex_1().min_w_0().pl_1().child(
-                    Input::new(&self.address)
+            if std::mem::take(&mut self.address_now) {
+                self.focus_address_bar(window, cx);
+            }
+            if !self.editing_address
+                && let Some(url) = self.pending_address.take()
+            {
+                self.address
+                    .update(cx, |state, cx| state.set_value(url, window, cx));
+            }
+            let info = self.info.clone();
+            let loading = self.is_loading();
+            let ready = info.is_some();
+            let prefix = if loading {
+                Spinner::new()
+                    .xsmall()
+                    .color(p.muted_foreground)
+                    .into_any_element()
+            } else {
+                Icon::new(IconName::Globe)
+                    .xsmall()
+                    .text_color(p.muted_foreground)
+                    .into_any_element()
+            };
+            let toolbar = h_flex()
+                .h(px(TOOLBAR_HEIGHT))
+                .flex_shrink_0()
+                .px_2()
+                .gap_1()
+                .items_center()
+                .border_b_1()
+                .border_color(p.border)
+                .child(
+                    Button::new("page-back")
+                        .cursor_pointer()
+                        .ghost()
                         .small()
-                        .prefix(prefix)
-                        .disabled(!ready),
-                ),
-            )
-            .children(self.tool_buttons(cx));
-        let annotate_bar = self.annotate_bar(&p, cx);
-        let handoff_bar = self.handoff_bar(&p, cx);
-        let dims_strip = self.dims_strip(&p, window, cx);
+                        .icon(IconName::ArrowLeft)
+                        .disabled(!info.as_ref().is_some_and(|i| i.can_go_back))
+                        .on_click(cx.listener(|this, _, _, cx| this.navigate(PageNav::Back, cx))),
+                )
+                .child(
+                    Button::new("page-forward")
+                        .cursor_pointer()
+                        .ghost()
+                        .small()
+                        .icon(IconName::ArrowRight)
+                        .disabled(!info.as_ref().is_some_and(|i| i.can_go_forward))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.navigate(PageNav::Forward, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("page-reload")
+                        .cursor_pointer()
+                        .ghost()
+                        .small()
+                        .icon(if loading {
+                            IconName::Close
+                        } else {
+                            IconName::RotateCw
+                        })
+                        .disabled(!ready)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let nav = if this.info.as_ref().is_some_and(|i| i.loading) {
+                                PageNav::Stop
+                            } else {
+                                PageNav::Reload
+                            };
+                            this.navigate(nav, cx);
+                        })),
+                )
+                .child(
+                    div().flex_1().min_w_0().pl_1().child(
+                        Input::new(&self.address)
+                            .small()
+                            .prefix(prefix)
+                            .disabled(!ready),
+                    ),
+                )
+                .children(self.tool_buttons(cx));
+            let annotate_bar = self.annotate_bar(&p, cx);
+            let handoff_bar = self.handoff_bar(&p, cx);
+            let dims_strip = self.dims_strip(&p, window, cx);
+            (Some(toolbar), annotate_bar, handoff_bar, dims_strip)
+        };
 
         let (bounds, focus, entity) = (self.bounds.clone(), self.focus.clone(), cx.entity());
         let id = entity.entity_id();
@@ -1812,14 +1876,18 @@ impl Render for PageView {
                 .gap_3()
                 .child(crate::host_ui::unavailable(
                     IconName::Globe,
-                    "This tab isn't open",
+                    if is_file {
+                        "This HTML preview can't be shown"
+                    } else {
+                        "This tab isn't open"
+                    },
                     note,
                     &p,
                 ))
                 .child(
                     Button::new("page-reopen")
                         .small()
-                        .label("Open again")
+                        .label(if is_file { "Try again" } else { "Open again" })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.note = None;
                             cx.notify();
@@ -1855,12 +1923,22 @@ impl Render for PageView {
                 }
                 _ => img(picture.clone()).size_full().into_any_element(),
             },
+            (None, None) if is_file => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(Spinner::new().color(p.muted_foreground))
+                .into_any_element(),
             (None, None) => div().size_full().into_any_element(),
         };
         // Responsive mode's handles, around the page.
-        let rails = match (self.drawn(), self.bounds.get()) {
-            (Some((drawn, per_css)), Some(area)) => self.rails(drawn, area, per_css, &p),
-            _ => Vec::new(),
+        let rails = if is_file {
+            Vec::new()
+        } else {
+            match (self.drawn(), self.bounds.get()) {
+                (Some((drawn, per_css)), Some(area)) => self.rails(drawn, area, per_css, &p),
+                _ => Vec::new(),
+            }
         };
         let page = div()
             .id("page-viewport")
@@ -1869,7 +1947,11 @@ impl Render for PageView {
             .min_h_0()
             .w_full()
             .overflow_hidden()
-            .bg(gpui_kit::white())
+            .bg(if is_file && self.picture.is_none() {
+                p.background
+            } else {
+                gpui_kit::white()
+            })
             // The pointer the page wants here (a hand on a link, an I-beam
             // on text): it is a picture to us.
             .cursor(pointer_for(
@@ -1918,18 +2000,24 @@ impl Render for PageView {
             .size_full()
             .bg(p.background)
             .key_context(KEY_CONTEXT)
-            .on_action(cx.listener(|this, _: &FocusAddressBar, window, cx| {
-                this.focus_address_bar(window, cx)
+            .when(!is_file, |d| {
+                d.on_action(cx.listener(|this, _: &FocusAddressBar, window, cx| {
+                    this.focus_address_bar(window, cx)
+                }))
+            })
+            .on_action(cx.listener(move |this, _: &ReloadPage, _, cx| {
+                if is_file {
+                    this.hard_reload(cx);
+                } else {
+                    this.navigate(PageNav::Reload, cx);
+                }
             }))
-            .on_action(
-                cx.listener(|this, _: &ReloadPage, _, cx| this.navigate(PageNav::Reload, cx)),
-            )
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.navigate(PageNav::Back, cx)))
             .on_action(
                 cx.listener(|this, _: &GoForward, _, cx| this.navigate(PageNav::Forward, cx)),
             )
             .on_action(cx.listener(|this, _: &StopLoading, _, cx| this.navigate(PageNav::Stop, cx)))
-            .child(toolbar)
+            .children(toolbar)
             .children(annotate_bar)
             .children(handoff_bar)
             .children(dims_strip)
