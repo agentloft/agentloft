@@ -2813,7 +2813,7 @@ mod tests {
             "model"
         );
         assert!(t.set_effort(Some("max".into())).is_empty());
-        assert!(t.start_turn("go").is_empty());
+        assert!(sends(&t.start_turn("go")).is_empty());
         let opus = |current| json!({"configOptions": [model("claude-opus-4.8"), effort(current)]});
         let out = t.on_line(&reply(3, opus("medium")));
         assert_eq!(
