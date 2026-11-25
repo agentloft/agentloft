@@ -61,7 +61,24 @@ pub(crate) async fn adb_shell_script(
         .kill_on_drop(true);
     let input = format!("{script}\nexit\n");
     let run = async {
-        let mut child = adb.spawn().context("running adb")?;
+        // On Linux, spawning a freshly-written script (as tests do) can race
+        // with another thread's `fork` holding the writable fd briefly
+        // (`ETXTBSY`).
+        let mut child = {
+            let mut tries = 0u8;
+            loop {
+                match adb.spawn() {
+                    Ok(child) => break child,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 10 =>
+                    {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(err) => return Err(err).context("running adb"),
+                }
+            }
+        };
         let mut stdin = child.stdin.take().context("adb's stdin")?;
         // Written beside reading what it prints: a long script fills the
         // pipe before the device has read it.
