@@ -29,6 +29,7 @@ const AGENTS: &[&str] = &[
     HarnessId::OPENCODE,
     HarnessId::GEMINI,
     HarnessId::ANTIGRAVITY,
+    HarnessId::KIRO,
 ];
 
 /// What a setting holds.

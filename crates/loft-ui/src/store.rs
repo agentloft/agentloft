@@ -571,6 +571,7 @@ impl AppStore {
             HarnessId::OPENCODE,
             HarnessId::GEMINI,
             HarnessId::ANTIGRAVITY,
+            HarnessId::KIRO,
         ] {
             self.fetch_models(HarnessId(harness.into()), cx);
         }
@@ -693,6 +694,7 @@ impl AppStore {
             (HarnessId::OPENCODE, &config.harness.opencode),
             (HarnessId::GEMINI, &config.harness.gemini),
             (HarnessId::ANTIGRAVITY, &config.harness.antigravity),
+            (HarnessId::KIRO, &config.harness.kiro),
         ] {
             if !h.enabled {
                 self.disabled_agents.insert(id.to_owned());
@@ -715,6 +717,7 @@ impl AppStore {
             (HarnessId::OPENCODE, "OpenCode"),
             (HarnessId::GEMINI, "Gemini"),
             (HarnessId::ANTIGRAVITY, "Antigravity"),
+            (HarnessId::KIRO, "Kiro"),
         ] {
             if self
                 .harness_status
@@ -736,6 +739,7 @@ impl AppStore {
             HarnessId::OPENCODE,
             HarnessId::GEMINI,
             HarnessId::ANTIGRAVITY,
+            HarnessId::KIRO,
         ]
         .map(|h| HarnessId(h.into()))
         {

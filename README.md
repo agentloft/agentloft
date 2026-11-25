@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Run your coding agents side by side.</b><br>
-  A native desktop app for Claude Code, Codex and ACP agents (Antigravity, Gemini CLI, OpenCode):<br>
+  A native desktop app for Claude Code, Codex and ACP agents (Antigravity, Gemini CLI, Kiro, OpenCode):<br>
   each thread with its own worktree, live diffs, a real terminal and a browser the agent can drive.
 </p>
 
@@ -52,6 +52,7 @@ You also need:
 
 - **At least one agent, installed and signed in:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`), [Codex](https://github.com/openai/codex) (`codex`), or an ACP agent. Agentloft finds them on your `PATH`, and **Settings ▸ Agents** shows what it found.
 - **Antigravity** needs CLI 1.5.0 or later (`agy`). Sign in with `agy acp --login` on the computer running Agentloft, then select **Antigravity** when starting a thread. [Google’s Antigravity ACP guide](https://antigravity.google/docs/cli/acp/)
+- **Kiro** uses `kiro-cli`. Install the [Kiro CLI](https://kiro.dev/downloads/), run `kiro-cli login` on the computer running Agentloft, then select **Kiro** when starting a thread. [Kiro’s ACP guide](https://kiro.dev/docs/cli/acp/)
 - **`git`.** The GitHub CLI (`gh`) is optional: it is used for pull requests.
 - **Chrome, Chromium, Edge or Brave** (optional) for the browser panel and agent-drawn views.
 
@@ -69,7 +70,7 @@ Shortcuts are shown with ⌘ here; on Windows and Linux they use Ctrl. <kbd>⌘K
 
 ### Agents
 
-- **Claude Code** through its stream-json control protocol, **Codex** through `codex app-server`, and **Antigravity**, **Gemini CLI** and **OpenCode** through the [Agent Client Protocol](https://agentclientprotocol.com).
+- **Claude Code** through its stream-json control protocol, **Codex** through `codex app-server`, and **Antigravity**, **Gemini CLI**, **Kiro** and **OpenCode** through the [Agent Client Protocol](https://agentclientprotocol.com).
 - Model and permission mode per thread, from what each agent actually offers.
 - Images by paste, drag-and-drop or the paperclip; `/` slash commands and `@` file mentions complete as you type.
 - Queue messages while a turn runs: the daemon sends each one when the turn before it ends, whether the app is open or not.

@@ -6392,6 +6392,7 @@ impl WorkspaceView {
             (HarnessId::OPENCODE, "OpenCode", ""),
             (HarnessId::GEMINI, "Gemini CLI", ""),
             (HarnessId::ANTIGRAVITY, "Antigravity", ""),
+            (HarnessId::KIRO, "Kiro", ""),
         ] {
             let Some(status) = statuses.get(&HarnessId(id.into())) else {
                 continue;
@@ -8013,6 +8014,7 @@ pub fn harness_name(h: &HarnessId) -> &'static str {
         HarnessId::OPENCODE => "OpenCode",
         HarnessId::GEMINI => "Gemini",
         HarnessId::ANTIGRAVITY => "Antigravity",
+        HarnessId::KIRO => "Kiro",
         HarnessId::FAKE => "Echo",
         _ => "Agent",
     }

@@ -1,8 +1,8 @@
 //! ACP harnesses (PLAN §2.6, M6): agents that speak the Agent Client Protocol
 //! (JSON-RPC 2.0 over newline-delimited stdio) — OpenCode (`opencode acp`),
-//! Gemini CLI (`gemini --acp`) and Antigravity (`agy acp`). One agent process
-//! per active thread. The Agentloft MCP server is attached through
-//! `session/new`'s `mcpServers`.
+//! Gemini CLI (`gemini --acp`), Antigravity (`agy acp`) and Kiro (`kiro-cli acp`).
+//! One agent process per active thread, with the Agentloft MCP server attached
+//! through the session's `mcpServers`.
 //!
 //! The client advertises no `fs/*` or `terminal/*` capabilities, so agents use
 //! their own file and shell tools; Agentloft only renders and approves them.
@@ -92,6 +92,14 @@ impl AcpHarness {
         }
     }
 
+    /// Kiro CLI runs its configured agent engine.
+    pub fn kiro() -> Self {
+        Self {
+            auth_hint: Some("Run `kiro-cli login` in a terminal on the machine running Agentloft"),
+            ..Self::new(HarnessId::KIRO, "Kiro", "kiro-cli", vec!["acp".into()])
+        }
+    }
+
     fn resolve_binary(&self, cfg: &SessionConfig) -> Result<PathBuf> {
         match &cfg.binary {
             Some(bin) => Ok(bin.clone()),
@@ -170,6 +178,7 @@ fn probe_session(
     args: &[String],
     env: &HashMap<String, String>,
     auth_hint: Option<&str>,
+    wait_for_models: bool,
 ) -> Result<Vec<loft_protocol::ModelInfo>> {
     use std::io::{BufRead as _, Write as _};
     // An empty folder of the user's own, not the shared `/tmp` (on Linux)
@@ -204,6 +213,7 @@ fn probe_session(
             }
         }
     });
+    let initial_models = std::cell::Cell::new(None);
     let mut call = |id: u64,
                     method: &str,
                     params: serde_json::Value|
@@ -218,7 +228,9 @@ fn probe_session(
             let v = rx
                 .recv_timeout(left)
                 .with_context(|| format!("the agent didn't answer `{method}`"))?;
-            if v.get("id") == Some(&serde_json::json!(id)) && v.get("method").is_none() {
+            if wait_for_models && method == "session/new" && model_update(&v).is_some() {
+                initial_models.set(Some(v));
+            } else if v.get("id") == Some(&serde_json::json!(id)) && v.get("method").is_none() {
                 if let Some(err) = v.get("error") {
                     if err.get("code").and_then(serde_json::Value::as_i64) == Some(-32000)
                         && let Some(hint) = auth_hint
@@ -237,12 +249,31 @@ fn probe_session(
     };
     let result = (|| {
         let init = call(0, "initialize", translate::initialize_params())?;
-        let session = call(
+        let mut session = call(
             1,
             "session/new",
             serde_json::json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
         )?;
         let id = session.get("sessionId").cloned().unwrap_or_default();
+        if wait_for_models && translate::offered_models(&session).is_empty() {
+            let deadline = std::time::Instant::now() + MODEL_OPTIONS_WAIT;
+            let mut update = initial_models.take();
+            loop {
+                if let Some(message) = update
+                    && message.pointer("/params/sessionId") == Some(&id)
+                    && let Some(options) = model_update(&message)
+                {
+                    session["configOptions"] = options.clone();
+                    break;
+                }
+                let Ok(message) =
+                    rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                else {
+                    break;
+                };
+                update = Some(message);
+            }
+        }
         let mut models = translate::offered_models(&session);
         let mut next = 2;
         if translate::offered_efforts(&session).is_some() {
@@ -294,6 +325,14 @@ fn probe_session(
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+fn model_update(message: &serde_json::Value) -> Option<&serde_json::Value> {
+    let update = message.pointer("/params/update")?;
+    (message["method"] == "session/update"
+        && update["sessionUpdate"] == "config_option_update"
+        && !translate::offered_models(update).is_empty())
+    .then(|| &update["configOptions"])
 }
 
 /// Whether help text lists `flag` as its own option (`--acp`, not
@@ -355,7 +394,13 @@ impl Harness for AcpHarness {
             Some(b) => b,
             None => self.which(env)?,
         };
-        probe_session(&binary, &self.agent_args(&binary, env), env, self.auth_hint)
+        probe_session(
+            &binary,
+            &self.agent_args(&binary, env),
+            env,
+            self.auth_hint,
+            self.id == HarnessId::KIRO,
+        )
     }
 
     fn plan_limits(
@@ -402,6 +447,7 @@ impl Harness for AcpHarness {
             cfg.resume.clone(),
             cfg.mcp_servers.clone(),
         );
+        translator.wait_for_models = self.id == HarnessId::KIRO;
         translator.auth_hint = self.auth_hint.map(str::to_owned);
         translator.effort = cfg.effort.clone();
         // `mcp__agentloft` in allowed_tools → auto-approve that server's tools.
@@ -586,6 +632,16 @@ enum RunEnd {
     Eof,
 }
 
+/// Kiro V3 can advertise models in a config update just after opening a session.
+const MODEL_OPTIONS_WAIT: Duration = Duration::from_secs(3);
+
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run(
     mut ends: SessionEnds,
     mut t: Translator,
@@ -599,6 +655,7 @@ async fn run(
     if write_json(&mut stdin, &init).await.is_err() {
         return RunEnd::Eof;
     }
+    let mut model_deadline: Option<tokio::time::Instant> = None;
     loop {
         let outs = tokio::select! {
             line = lines.next_line() => {
@@ -645,7 +702,11 @@ async fn run(
                     Some(SessionCommand::Shutdown) | None => return RunEnd::Shutdown(stdin),
                 }
             }
+            () = sleep_until_opt(model_deadline) => t.finish_model_wait(),
         };
+        model_deadline = t.awaiting_models.then(|| {
+            model_deadline.unwrap_or_else(|| tokio::time::Instant::now() + MODEL_OPTIONS_WAIT)
+        });
         // Deliver a startup error to the first turn before dropping the
         // failed session. A retry may need a new process to pick up sign-in.
         let failed_start = t.startup_failed()
@@ -758,6 +819,36 @@ mod tests {
         assert!(agy.permission_mode_requires_restart(full.permission_mode, None));
         assert!(!agy.permission_mode_requires_restart(full.permission_mode, full.permission_mode));
         assert!(!agy.permission_mode_requires_restart(None, Some(PermissionMode::AcceptEdits)));
+        let kiro = AcpHarness::kiro();
+        assert_eq!(kiro.id().as_str(), "kiro");
+        assert_eq!(kiro.binary_name, "kiro-cli");
+        assert_eq!(
+            kiro.build_args(
+                Path::new("/nonexistent/kiro-cli"),
+                &cfg(vec!["--agent-engine=v3".into()])
+            ),
+            ["acp", "--agent-engine=v3"]
+        );
+    }
+
+    #[test]
+    fn signed_out_kiro_turn_suggests_cli_login() {
+        let mut translator = Translator::new("Kiro", "/tmp/probe".into(), None, None, None, vec![]);
+        translator.auth_hint = AcpHarness::kiro().auth_hint.map(str::to_owned);
+        translator.initialize();
+        translator.start_turn("Hello");
+        let out: Vec<_> = include_str!("../fixtures/kiro-3.6.0-auth-required.jsonl")
+            .lines()
+            .flat_map(|line| translator.on_line(line))
+            .collect();
+        assert!(out.iter().any(|o| matches!(
+            o,
+            Out::Event(HarnessEvent::TurnCompleted {
+                status: loft_protocol::TurnStatus::Failed,
+                error: Some(error),
+                ..
+            }) if error.contains("Authentication required") && error.contains("kiro-cli login")
+        )));
     }
 
     #[cfg(unix)]

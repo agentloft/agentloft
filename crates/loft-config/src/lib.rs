@@ -973,6 +973,7 @@ pub struct HarnessConfigs {
     pub opencode: HarnessConfig,
     pub gemini: HarnessConfig,
     pub antigravity: HarnessConfig,
+    pub kiro: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

@@ -96,12 +96,19 @@ fn process_matches(pid: u32, kind: &str) -> bool {
 }
 
 fn matches_command(cmd: &str, kind: &str) -> bool {
-    if kind == loft_protocol::HarnessId::ANTIGRAVITY {
-        // Processes are recorded by harness id, but the CLI is named `agy`.
+    use loft_protocol::HarnessId;
+
+    let acp_binaries: &[&str] = match kind {
+        HarnessId::ANTIGRAVITY => &["agy", "antigravity"],
+        HarnessId::KIRO => &["kiro-cli"],
+        _ => &[],
+    };
+    if !acp_binaries.is_empty() {
+        // These ACP processes are recorded by harness id, regardless of the CLI name.
         return cmd.split_once(" acp").is_some_and(|(binary, _)| {
             std::path::Path::new(binary)
                 .file_name()
-                .is_some_and(|name| name == "agy" || name == "antigravity")
+                .is_some_and(|name| acp_binaries.iter().any(|binary| name == *binary))
         });
     }
     !cmd.is_empty() && cmd.contains(kind)
@@ -119,6 +126,14 @@ mod tests {
         assert!(matches_command("/path with spaces/agy acp --sandbox", kind));
         assert!(!matches_command("/bin/agy --version", kind));
         assert!(!matches_command("/bin/sleep agy acp", kind));
+    }
+
+    #[test]
+    fn recognizes_a_kiro_acp_process() {
+        let kind = loft_protocol::HarnessId::KIRO;
+        assert!(matches_command("/path with spaces/kiro-cli acp", kind));
+        assert!(!matches_command("/bin/kiro-cli chat", kind));
+        assert!(!matches_command("/bin/sleep kiro-cli acp", kind));
     }
 
     #[test]

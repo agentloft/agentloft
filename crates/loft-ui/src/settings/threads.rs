@@ -19,11 +19,14 @@ use loft_protocol::HarnessId;
 /// `titles.agent` for "the thread's own agent".
 const SAME_AGENT: &str = "thread";
 
-/// Antigravity's ACP sessions are for interactive turns, not one-off requests.
+/// Agents whose CLI supports the one-off requests used for titles.
 fn title_agents() -> impl Iterator<Item = (&'static str, &'static str)> {
-    AGENTS
-        .into_iter()
-        .filter(|(id, _)| *id != HarnessId::ANTIGRAVITY)
+    AGENTS.into_iter().filter(|(id, _)| {
+        matches!(
+            *id,
+            HarnessId::CLAUDE | HarnessId::CODEX | HarnessId::OPENCODE | HarnessId::GEMINI
+        )
+    })
 }
 
 /// Picks for deleting archived threads: days (0 = never) and their label.

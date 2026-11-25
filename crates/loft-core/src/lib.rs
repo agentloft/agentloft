@@ -625,6 +625,7 @@ impl Core {
     fn harness_bin(&self, harness: &HarnessId) -> Result<PathBuf, String> {
         let bin = match harness.as_str() {
             HarnessId::ANTIGRAVITY => "agy",
+            HarnessId::KIRO => "kiro-cli",
             other => other,
         };
         let hcfg = harness_config(&self.config(), harness);
@@ -2705,6 +2706,7 @@ pub(crate) fn harness_config(
         HarnessId::OPENCODE => config.harness.opencode.clone(),
         HarnessId::GEMINI => config.harness.gemini.clone(),
         HarnessId::ANTIGRAVITY => config.harness.antigravity.clone(),
+        HarnessId::KIRO => config.harness.kiro.clone(),
         _ => loft_config::HarnessConfig::default(),
     }
 }

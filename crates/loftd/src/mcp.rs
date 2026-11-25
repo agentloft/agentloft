@@ -312,7 +312,7 @@ pub fn tools() -> Vec<Value> {
             json!({
                 "prompt": { "type": "string", "description": "Complete, self-contained task for the new agent" },
                 "title": { "type": "string", "description": "Short sidebar title (default: the prompt's first line)" },
-                "agent": { "type": "string", "description": "claude | codex | opencode | gemini | antigravity (default: this thread's)" },
+                "agent": { "type": "string", "description": "claude | codex | opencode | gemini | antigravity | kiro (default: this thread's)" },
                 "model": { "type": "string", "description": "Model id from list_agents (default: this thread's, or the agent's default)" },
                 "effort": { "type": "string", "description": "Reasoning effort, e.g. low | medium | high | xhigh | max" },
                 "permission_mode": { "type": "string", "enum": ["read-only", "ask-all", "accept-edits", "auto", "full-access"] },
@@ -1097,12 +1097,13 @@ fn shown_text(report: &Value) -> String {
 }
 
 /// The agents a thread may spawn, in the order they're offered.
-const AGENTS: [&str; 5] = [
+const AGENTS: [&str; 6] = [
     HarnessId::CLAUDE,
     HarnessId::CODEX,
     HarnessId::OPENCODE,
     HarnessId::GEMINI,
     HarnessId::ANTIGRAVITY,
+    HarnessId::KIRO,
 ];
 
 /// Where thread `id` stands, as thread `me`'s agent may see it.

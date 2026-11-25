@@ -284,7 +284,7 @@ pub const FINDABLE: &[Findable] = &[
     },
     Findable {
         label: "Agents",
-        keywords: "claude codex opencode gemini antigravity agy installed binary model effort permissions environment",
+        keywords: "claude codex opencode gemini antigravity agy kiro kiro-cli installed binary model effort permissions environment",
         section: Section::Agents,
     },
     Findable {

@@ -461,6 +461,7 @@ fn agent_name(id: &str) -> String {
         HarnessId::OPENCODE => "OpenCode".into(),
         HarnessId::GEMINI => "Gemini CLI".into(),
         HarnessId::ANTIGRAVITY => "Antigravity".into(),
+        HarnessId::KIRO => "Kiro".into(),
         other => other.to_owned(),
     }
 }

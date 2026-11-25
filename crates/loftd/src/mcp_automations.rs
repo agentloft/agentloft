@@ -31,7 +31,7 @@ fn spec_properties(create: bool) -> Value {
         "name": { "type": "string", "description": "Short name; it is also each run's thread title" },
         "prompt": { "type": "string", "description": "What the agent is asked on each run. Each run is a fresh thread that sees nothing else, so it must stand alone" },
         "project": { "type": "string", "description": "Project to run in (name, path or id). Default: this thread's project" },
-        "agent": { "type": "string", "description": "claude | codex | opencode | gemini | antigravity (default: this thread's)" },
+        "agent": { "type": "string", "description": "claude | codex | opencode | gemini | antigravity | kiro (default: this thread's)" },
         "model": { "type": "string", "description": "Model id from list_agents (default: this thread's)" },
         "effort": { "type": "string", "description": "Reasoning effort (default: this thread's)" },
         "permission_mode": {

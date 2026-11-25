@@ -176,6 +176,7 @@ pub struct Translator {
     // -- agent capabilities (from `initialize`) --
     load_session: bool,
     resume_session: bool,
+    pub(crate) wait_for_models: bool,
     pub(crate) auth_hint: Option<String>,
     /// The session could not be opened; every turn fails with this.
     fatal: Option<String>,
@@ -185,6 +186,7 @@ pub struct Translator {
     /// `session/load` in flight: its history replay is not re-emitted.
     replaying: bool,
     model_setting: Option<Setting>,
+    pub(crate) awaiting_models: bool,
     mode_setting: Option<Setting>,
     /// The `thought_level` option (OpenCode's `effort`). Its values depend
     /// on the model, and switching models resets it.
@@ -347,7 +349,7 @@ impl Translator {
     }
 
     fn ready_for_prompts(&self) -> Option<String> {
-        (self.settings_in_flight == 0)
+        (self.settings_in_flight == 0 && !self.awaiting_models)
             .then(|| self.session_id.clone())
             .flatten()
     }
@@ -364,6 +366,34 @@ impl Translator {
             Some((text, images)) => self.send_prompt(&text, images, &session),
             None => vec![],
         }
+    }
+
+    pub(crate) fn finish_model_wait(&mut self) -> Vec<Out> {
+        self.awaiting_models = false;
+        self.session_ready(Vec::new())
+    }
+
+    fn session_ready(&mut self, models: Vec<loft_protocol::ModelInfo>) -> Vec<Out> {
+        let mut out = vec![Out::Event(HarnessEvent::SessionReady {
+            models,
+            native_session_id: self.session_id.clone().unwrap_or_default(),
+            model: self
+                .model_setting
+                .as_ref()
+                .map(|s| s.current().to_owned())
+                .filter(|m| !m.is_empty()),
+            slash_commands: vec![],
+        })];
+        let model = self.apply_model(self.wait_for_models);
+        // A model switch resets effort. Reapply it when the switch is answered.
+        let switching = model.iter().any(|o| matches!(o, Out::Send(_)));
+        out.extend(model);
+        out.extend(self.apply_mode(false));
+        if !switching {
+            out.extend(self.apply_effort(false));
+        }
+        out.extend(self.flush_queue());
+        out
     }
 
     pub fn start_turn(&mut self, text: &str) -> Vec<Out> {
@@ -451,7 +481,7 @@ impl Translator {
 
     pub fn set_model(&mut self, model: Option<String>) -> Vec<Out> {
         self.model = model;
-        if self.session_id.is_none() {
+        if self.session_id.is_none() || self.awaiting_models {
             return vec![]; // applied once the session exists
         }
         self.apply_model(true)
@@ -706,32 +736,16 @@ impl Translator {
                         .to_owned(),
                     _ => self.resume.clone().unwrap_or_default(),
                 };
-                self.session_id = Some(session.clone());
+                self.session_id = Some(session);
                 // A fresh session's cumulative cost starts at zero; a resumed
                 // one's is unknown until the first update.
                 self.cost_now = (kind == Pending::NewSession).then_some(0.0);
                 self.read_settings(result);
-                let mut out = vec![Out::Event(HarnessEvent::SessionReady {
-                    models: offered_models(result),
-                    native_session_id: session,
-                    model: self
-                        .model_setting
-                        .as_ref()
-                        .map(|s| s.current().to_owned())
-                        .filter(|m| !m.is_empty()),
-                    slash_commands: vec![],
-                })];
-                let model = self.apply_model(false);
-                // A model switch resets the effort: it is applied when the
-                // switch is answered (`Pending::Setting`).
-                let switching = model.iter().any(|o| matches!(o, Out::Send(_)));
-                out.extend(model);
-                out.extend(self.apply_mode(false));
-                if !switching {
-                    out.extend(self.apply_effort(false));
+                if self.wait_for_models && self.model_setting.is_none() {
+                    self.awaiting_models = true;
+                    return vec![];
                 }
-                out.extend(self.flush_queue());
-                out
+                self.session_ready(offered_models(result))
             }
             Pending::Prompt => self.finish_prompt(result),
             Pending::Setting => {
@@ -1010,7 +1024,12 @@ impl Translator {
             }
             Some("config_option_update") => {
                 self.read_settings(u);
-                vec![]
+                if self.awaiting_models && self.model_setting.is_some() {
+                    self.awaiting_models = false;
+                    self.session_ready(offered_models(u))
+                } else {
+                    vec![]
+                }
             }
             Some("usage_update") => {
                 if u.pointer("/cost/currency").and_then(Value::as_str) == Some("USD") {
@@ -1279,6 +1298,19 @@ impl Translator {
             .unwrap_or_default();
         let status = tool.status.clone();
         tool.merge(call);
+        // Kiro's display title is not a tool identity. Its permission
+        // request identifies the MCP server and tool separately.
+        if let Some(mcp) = p.pointer("/_meta/kiro/mcpTool")
+            && mcp.get("version").and_then(Value::as_u64) == Some(1)
+            && let Some(server) = mcp.pointer("/identity/serverName").and_then(Value::as_str)
+            && self.mcp_servers.iter().any(|s| s.name == server)
+            && let Some(name) = mcp
+                .pointer("/identity/toolName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+        {
+            tool.name = Some(format!("mcp__{server}__{name}"));
+        }
         if !tool.started {
             // Asking for approval: show the call now.
             tool.status = Some("pending".into());
@@ -2279,6 +2311,133 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn kiro_streams_a_turn_with_models_and_approval() {
+        let mut t = Translator::new("Kiro", "/tmp/probe".into(), None, None, None, vec![]);
+        t.initialize();
+        t.start_turn("Run /bin/pwd, then say ACP ready.");
+        let fixture = include_str!("../fixtures/kiro-3.6.0-turn.jsonl");
+        let mut lines = fixture.lines();
+        let init = t.on_line(lines.next().unwrap());
+        assert_eq!(sends(&init)[0]["method"], "session/new");
+        let ready = t.on_line(lines.next().unwrap());
+        assert!(matches!(
+            events(&ready)[0],
+            HarnessEvent::SessionReady { models, model: Some(model), .. }
+                if model == "auto" && models.iter().any(|m| m.id == "claude-haiku-4.5")
+        ));
+        assert_eq!(sends(&ready)[0]["method"], "session/prompt");
+
+        t.on_line(lines.next().unwrap()); // pending tool call
+        let approval = t.on_line(lines.next().unwrap());
+        let request = events(&approval).into_iter().find_map(|e| match e {
+            HarnessEvent::RequestOpened {
+                native_id,
+                title,
+                options,
+                ..
+            } if title == "Shell: /bin/pwd" && options.contains(&DecisionKind::AllowOnce) => {
+                Some(native_id)
+            }
+            _ => None,
+        });
+        let reply = t.respond(request.expect("shell approval"), DecisionKind::AllowOnce);
+        assert_eq!(sends(&reply)[0]["result"]["outcome"]["optionId"], "accept");
+        let out: Vec<_> = lines.flat_map(|line| t.on_line(line)).collect();
+        assert!(events(&out).iter().any(|event| matches!(
+            event, HarnessEvent::ItemDelta { text, .. } if text == "ACP ready."
+        )));
+        assert!(matches!(
+            events(&out).last(),
+            Some(HarnessEvent::TurnCompleted {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn kiro_waits_for_late_model_options_before_sending_a_prompt() {
+        let mut t = Translator::new(
+            "Kiro",
+            "/tmp/probe".into(),
+            Some("claude-haiku-4.5".into()),
+            None,
+            None,
+            vec![],
+        );
+        t.wait_for_models = true;
+        t.initialize();
+        t.start_turn("Hello");
+        let fixture = include_str!("../fixtures/kiro-3.6.0-turn.jsonl");
+        let mut lines = fixture.lines();
+        t.on_line(lines.next().unwrap());
+        let mut opened: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let options = opened["result"]["configOptions"].take();
+        assert!(t.on_value(&opened).is_empty());
+        assert!(t.awaiting_models);
+
+        let out = t.on_line(&update(json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": options
+        })));
+        assert!(!t.awaiting_models);
+        assert_eq!(sends(&out).len(), 1);
+        assert_eq!(sends(&out)[0]["method"], "session/set_config_option");
+        assert_eq!(sends(&out)[0]["params"]["value"], "claude-haiku-4.5");
+        let out = t.on_line(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#);
+        assert_eq!(sends(&out)[0]["method"], "session/prompt");
+    }
+
+    #[test]
+    fn kiro_mcp_identity_connects_approval_and_tool_result() {
+        let fixture = include_str!("../fixtures/kiro-3.6.0-mcp.jsonl");
+        let mut lines = fixture.lines();
+        let call = lines.next().unwrap();
+        let request: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let start = || {
+            let mut t = ready();
+            t.mcp_servers = vec![agentloft_mcp()];
+            t.auto_allow_mcp = vec!["agentloft".into()];
+            t.start_turn("List threads");
+            t.on_line(call);
+            t
+        };
+        let mut unverified = request.clone();
+        unverified["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("_meta");
+        let out = start().on_value(&unverified);
+        assert!(
+            events(&out)
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::RequestOpened { .. }))
+        );
+
+        let mut t = start();
+        let out = t.on_value(&request);
+        assert!(events(&out).is_empty());
+        assert_eq!(
+            sends(&out)[0]["result"]["outcome"],
+            json!({"outcome": "selected", "optionId": "accept"})
+        );
+        let out = t.on_line(lines.next().unwrap());
+        assert!(events(&out).iter().any(|event| matches!(
+            event,
+            HarnessEvent::ItemStarted {
+                body: ItemBody::ToolCall { tool, tool_kind: ToolKind::Mcp, .. }, ..
+            } if tool == "mcp__agentloft__list_threads"
+        )));
+        assert!(events(&out).iter().any(|event| matches!(
+            event,
+            HarnessEvent::ItemCompleted {
+                status: ItemStatus::Completed,
+                ..
+            }
+        )));
     }
 
     #[test]
