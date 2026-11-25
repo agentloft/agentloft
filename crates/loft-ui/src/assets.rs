@@ -308,14 +308,16 @@ impl AssetSource for Assets {
     }
 }
 
-/// Agent logos (Simple Icons, CC0; marks belong to their owners). OpenCode's
-/// is our own simple glyph.
+/// Agent logos. Claude, OpenAI and Gemini are from Simple Icons (CC0), and
+/// OpenCode's is our own simple glyph. The marks belong to their owners.
 fn brand_svg(path: &str) -> Option<&'static [u8]> {
     Some(match path {
         "brand/claude.svg" => include_bytes!("../assets/brand/claude.svg"),
         "brand/openai.svg" => include_bytes!("../assets/brand/openai.svg"),
         "brand/gemini.svg" => include_bytes!("../assets/brand/gemini.svg"),
         "brand/opencode.svg" => include_bytes!("../assets/brand/opencode.svg"),
+        // kirodotdev/KiroCrew, website/src/assets/kiro-ghost-mark.svg.
+        "brand/kiro.svg" => include_bytes!("../assets/brand/kiro.svg"),
         _ => return None,
     })
 }
